@@ -23,7 +23,6 @@ use crossterm::queue;
 use app::App;
 use player::Player;
 use source::worker::SourceWorker;
-use source::youtube::YouTube;
 
 /// Redraw cadence when no input arrives. Fast enough for a smooth position
 /// clock, slow enough that an idle player is not spinning the CPU.
@@ -36,10 +35,10 @@ const BUSY_TICK: Duration = Duration::from_millis(50);
 
 fn main() -> Result<()> {
     // Fail before touching the terminal, so a missing dependency prints a plain
-    // message instead of appearing as a blank alternate screen.
-    let yt = YouTube::default();
-    yt.version()
-        .context("yt-dlp is required but could not be run")?;
+    // message instead of appearing as a blank alternate screen. On a first run
+    // this is also where yt-dlp gets fetched, which prints progress -- another
+    // reason it has to happen before the alternate screen is up.
+    let yt = source::bootstrap::locate().context("yt-dlp is required but could not be obtained")?;
 
     // Asked before the alternate screen is up, so the replies cannot land in
     // the middle of a drawn frame.

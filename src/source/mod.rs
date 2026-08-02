@@ -6,6 +6,7 @@
 //! reason the steady-state footprint stays in single-digit megabytes.
 
 pub mod auth;
+pub mod bootstrap;
 pub mod cover;
 pub mod innertube;
 pub mod library;

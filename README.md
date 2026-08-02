@@ -21,17 +21,30 @@ Three threads, so nothing that can block ever sits on the render path:
 `yt-dlp` is never kept alive: it costs ~80 MB while running, and all streaming
 and decoding happens in-process once it has handed over a URL.
 
-## Requirements
+## Install
 
-- Rust (edition 2024)
-- [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) on `PATH`
-- a JavaScript runtime — Deno, Node, or Bun — which `yt-dlp` has needed since
-  v2025.11.12 to solve YouTube's nsig/PO-token challenges
+Download `mtui.exe` from [releases](https://github.com/lightzgls/mtui/releases)
+and run it. There is nothing else to install.
 
-## Run
+Most playback is handled in-process. For the cases it cannot cover — age-gated,
+region-locked, and the capped URLs that licensed music resolves to — the app
+needs [`yt-dlp`](https://github.com/yt-dlp/yt-dlp), and fetches it for you on
+first run into `%LOCALAPPDATA%\mtui\bin` (`~/.cache/mtui/bin` elsewhere). That
+takes a few seconds and happens once. A `yt-dlp` already on your `PATH` is used
+as-is and never shadowed.
+
+It is downloaded rather than bundled on purpose: yt-dlp ships roughly monthly to
+keep up with YouTube, so a copy frozen into this binary would break within
+months. If the download fails, the app says why and installs nothing.
+
+A JavaScript runtime (Deno, Node, or Bun) is optional. `yt-dlp` uses one to
+solve YouTube's nsig/PO-token challenges, so without one the fallback path can
+still fail on a minority of tracks. The fast path never needs it.
+
+## Build from source
 
 ```sh
-cargo run --release
+cargo build --release
 ```
 
 ## Keys
