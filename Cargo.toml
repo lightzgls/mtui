@@ -1,0 +1,97 @@
+[package]
+name = "mtui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+# Audio output. Only `playback` + the two symphonia features we actually need.
+# Deliberately excludes `recording`, `dither`/`noise` (pulls rand), and every
+# codec except AAC-LC in an MP4/M4A container -- that is YouTube itag 140.
+rodio = { version = "0.22.2", default-features = false, features = [
+    "playback",
+    "symphonia-aac",
+    "symphonia-isomp4",
+] }
+
+# HTTP streaming as a Read+Seek source, backed by a fixed-size circular buffer.
+# native-tls resolves to Windows SChannel / system OpenSSL, so no C compiler and
+# no vendored crypto is required on Windows.
+stream-download = { version = "0.24.2", default-features = false, features = [
+    "http",
+    "reqwest-native-tls",
+] }
+
+# stream-download drives its downloader on tokio. `rt-multi-thread` is required,
+# not a luxury: the decoder reads synchronously from the player thread while the
+# downloader runs as a spawned task, so the runtime must keep making progress
+# outside of any `block_on`. A current-thread runtime deadlocks on the first read.
+tokio = { version = "1.53.1", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "sync",
+    "time",
+] }
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+
+# Cover art fetch. reqwest is already in the tree as stream-download's HTTP
+# client, so declaring it directly compiles nothing new. Features must stay a
+# subset of what stream-download turns on -- adding `default` would pull rustls
+# and link a second TLS stack next to SChannel.
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "native-tls",
+] }
+
+# JPEG decode for cover art. Pure Rust, and with the default `rayon` feature
+# off it has no transitive dependencies at all -- one 320x180 thumbnail does
+# not need a thread pool.
+jpeg-decoder = { version = "0.3", default-features = false }
+
+# Both are already in the tree underneath reqwest and stream-download, so
+# declaring them compiles nothing new. They are named here because the chunked
+# HTTP client in `player::chunked` has to spell out the types in
+# stream-download's `Client` trait: `Bytes` in the response body, and a stream
+# combinator to chain one range request onto the next.
+bytes = { version = "1", default-features = false }
+futures-util = { version = "0.3", default-features = false }
+
+# Already in the tree under reqwest, so declaring it compiles nothing new.
+# Google's OAuth endpoints take `application/x-www-form-urlencoded` bodies, and
+# the Data API takes query parameters with the same escaping rules. reqwest 0.13
+# does not carry `serde_urlencoded`, so `.form()` and `.query()` are not
+# available -- and hand-rolling the escaping is how a client secret containing
+# a `+` becomes an invalid_client no one can debug.
+form_urlencoded = { version = "1", default-features = false }
+
+# Already in the tree under ratatui, which uses it to measure what it draws.
+# The results list has to agree with that measurement: a CJK title is one char
+# per glyph but two terminal columns, so counting chars silently overflows the
+# row and pushes every column out of line.
+unicode-width = { version = "0.2", default-features = false }
+
+# Test-only. `stream-download` reports every reconnect, gap re-request and
+# download failure through `tracing`, and those events are the only account of
+# why a stream died mid-track -- rodio drops a failed decoder without a word.
+# Dev-only, so nothing here is linked into the shipped binary.
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "env-filter",
+] }
+
+[features]
+default = []
+# Spotify runs librespot as a child process, never linked in. See src/source/spotify.rs.
+spotify = []
+
+[profile.release]
+opt-level = "z"     # optimise for size over speed; audio decode is not CPU-bound here
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
