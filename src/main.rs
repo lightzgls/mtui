@@ -78,6 +78,11 @@ fn main() -> Result<()> {
             break;
         }
     }
+
+    // The track that was playing when the user quit. Written here rather than
+    // left to the library worker, which is not joined on the way out -- see
+    // `App::flush_listening`.
+    app.flush_listening();
     Ok(())
 }
 

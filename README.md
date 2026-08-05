@@ -61,14 +61,33 @@ How personal that page is depends on what you have configured:
 | | Shelves |
 |---|---|
 | nothing | Trending, New releases, charts, community playlists |
-| signed in | **Listen again**, **Quick picks**, **Similar to …**, **Forgotten favorites**, then the above |
+| played a few tracks | **Listen again**, **Quick picks**, **Similar to …**, **Forgotten favorites**, then the above |
 | cookie saved | your real feed, exactly as the web player shows it — including **Heard in Shorts** |
 
-Signed in, the shelves are built here rather than fetched: from your liked
-songs, and from the radio and related-tracks queues YouTube will build around
-any one of them. They are approximations. YouTube's own versions come from
-watch history, which no API this program can reach exposes — the Data API's
-history playlist has returned empty since 2016.
+Without a cookie the shelves are built here rather than fetched, and they are
+ranked from what you have actually played. MTUI keeps a journal of its own plays
+— what, when, and how far through — and scores each track on how often it comes
+up, how recently, and how often you skip it. Likes count too, but as a prior
+rather than as the whole answer.
+
+That distinction is the point. YouTube's own shelves come from watch history,
+which no API this program can reach exposes — the Data API's history playlist
+has returned empty since 2016. The history it *can* reach is the one it makes.
+
+- **Listen again** — best-scoring tracks you have played before, minus anything
+  from the last six hours. Suggesting back a song you played twenty minutes ago
+  is what makes a shelf look like it is not paying attention.
+- **Quick picks** — four radio stations seeded from four *different* artists and
+  interleaved, so the first screenful carries all four. One seed is one mood;
+  this is why the shelf no longer reads the same every launch.
+- **Forgotten favorites** — genuinely loved, genuinely stale: played properly,
+  then untouched for two months.
+- Nothing appears on the page twice, and `r` rebuilds it from different seeds.
+
+The journal lives in `plays.jsonl` beside the other config, is never uploaded on
+its own, and deleting it resets the page to its first-run behaviour. On a first
+run there is nothing to rank, so the shelves fall back to your likes and improve
+from there.
 
 A saved cookie gets the real thing. It is the only way: **OAuth cannot reach
 this feed.** A Bearer token on an InnerTube call is routed through Google's API
@@ -77,23 +96,83 @@ with it, while the same token works perfectly against the Data API. There is a
 test that pins this (`cargo test oauth_is_refused -- --ignored`) so the next
 person to wonder does not have to find out the hard way.
 
-### Saving a cookie
+### Getting a cookie
 
-Optional, and separate from signing in. In a browser signed in to
-music.youtube.com: open the network tab, reload, click any request to
-`music.youtube.com`, and copy the whole `cookie:` request header. Save it as
-one line in `cookies.txt` next to the other config:
+**Normally you do nothing.** On first launch MTUI reads the session out of your
+browser itself, using the yt-dlp it already downloaded for other reasons — it
+knows how to open a cookie jar on every platform, including the decryption that
+makes it awkward. The landing page reloads as soon as it succeeds, and the
+browser it used is named in the status bar.
+
+Every browser is tried and the first with a YouTube session wins, so this keeps
+working if you switch. Which ones *can* work is not up to MTUI:
+
+| | |
+|---|---|
+| Firefox | works everywhere — a plain SQLite jar |
+| Chrome, Edge, most Chromium forks | **fail on Windows.** Chrome 127 added App-Bound Encryption, sealing cookies with a key tied to the browser binary specifically so other programs cannot read them ([yt-dlp#10927](https://github.com/yt-dlp/yt-dlp/issues/10927)) |
+| macOS, Linux | fine across the board, though a keychain may prompt once |
+
+The browser that worked is remembered, so later launches go straight to it
+instead of probing the list — that matters, since each probe costs a process
+spawn. When a cookie expires, MTUI notices YouTube has stopped recognising it
+and re-reads the browser by itself. Nothing to re-paste.
+
+### Pasting one by hand
+
+Only needed if the automatic path cannot work — Chrome on Windows, or a browser
+that is signed out. In a browser signed in to music.youtube.com: open the
+network tab, reload, click any request to `music.youtube.com`, and copy the
+whole `cookie:` request header. Save it as one line in `cookies.txt` next to the
+other config:
 
 ```
 %APPDATA%\mtui\cookies.txt          # Windows
 $XDG_CONFIG_HOME/mtui/cookies.txt   # elsewhere
 ```
 
-Requests are then signed the way Google's own web player signs them — a SHA-1
-over the timestamp, the `SAPISID` cookie and the origin. The cookie never
-leaves your machine except back to YouTube. It expires every few weeks, at
-which point the landing page quietly falls back to the built shelves and you
-can paste a fresh one.
+A hand-written `cookies.txt` always wins over an imported one — if you pasted a
+header deliberately, that is the session you meant.
+
+Requests are signed the way Google's own web player signs them — a SHA-1 over
+the timestamp, the `SAPISID` cookie and the origin. The cookie never leaves your
+machine except back to YouTube.
+
+### Why a cookie at all
+
+Because there is no alternative, and this has been measured rather than assumed.
+InnerTube refuses OAuth outright — not just a client you registered yourself,
+but Google's own living-room TV client too. Two ignored tests pin it:
+
+```
+cargo test oauth_is_refused -- --ignored    # your Cloud Console client → 400
+cargo test tv_client       -- --ignored    # Google's TV client        → 400
+```
+
+The root cause is that Google publishes no OAuth scope for watch history or the
+music feed at all. The Data API covers likes, playlists, subscriptions and
+uploads; the `HL` history playlist has returned empty since 2016. No sign-in can
+grant a permission that does not exist, which is why "just add a proper login"
+is not an available fix.
+
+### What syncs back
+
+With a cookie saved, plays made in MTUI are reported to YouTube the same way the
+web player reports them, so they land in your real listening history and feed
+everywhere else. Liking a track with `f` already wrote through to your account
+via the Data API, cookie or not.
+
+Both are best-effort by nature. The reporting endpoints are undocumented and
+answer `204` whether they accepted a play or discarded it, so the only real
+check is whether your history fills up — there is an ignored test that reports
+one play and tells you where to look:
+
+```
+cargo test reports_a_play -- --ignored --nocapture
+```
+
+Nothing here is load-bearing. A play that fails to report is still played, still
+journalled, and still ranked on MTUI's own shelves.
 
 Nothing is fetched for the page beyond one round trip at launch, plus three
 more behind it for the built shelves. No cover art is fetched per card: that
@@ -164,7 +243,7 @@ tabs are unaffected.
 | `j` / `k`, arrows | move (in a list, or scroll a player-page panel) |
 | `h` / `l`, `Tab`, `1`–`4` | switch tabs (on the player page) |
 | `H` or `Esc` | back to the landing page, or out of the player page |
-| `r` | reload the landing page |
+| `r` | refresh the landing page — rebuilds it from different seeds |
 | `Enter` | play, or open what the card stands for |
 | `Space` | pause |
 | `n` / `p` | next / previous in the queue |

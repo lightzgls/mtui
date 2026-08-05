@@ -16,6 +16,7 @@ use crate::player::{Command, PlayState, Player, Snapshot};
 use crate::source::{StreamUrl, Track};
 use crate::source::cover::Cover;
 use crate::source::home::{Card, Shelf, Target};
+use crate::source::journal;
 use crate::source::library::Playlist;
 use crate::source::watch::{Comments, Lyrics, Watch};
 use crate::source::worker::{Request, Response, SourceWorker};
@@ -469,6 +470,24 @@ pub struct App {
     /// Consecutive tracks the queue has skipped past for failing to resolve.
     /// Reset by anything that plays.
     skips: u8,
+    /// The track being listened to, and the furthest into it playback has got.
+    ///
+    /// Held here rather than read off the snapshot when it is needed, because by
+    /// the time a play is over there is nothing left to read: the track has
+    /// ended, the snapshot says `Idle` at position zero, and the page below has
+    /// already been replaced with whatever came next. This is what
+    /// [`App::finish_listening`] reports from.
+    ///
+    /// The *furthest*, not the latest: seeking backwards must not shorten what
+    /// the user is recorded as having heard.
+    listening: Option<(Track, Duration)>,
+    /// Steps the radio seeds on the landing page along, so asking for it again
+    /// gives a different page rather than the one already on screen.
+    rotation: usize,
+    /// Whether the browser import has been asked for this session. Once only:
+    /// a successful import asks for the landing page again, and without this
+    /// that second request would ask for another import behind it, forever.
+    imported: bool,
 
     player: Player,
     source: SourceWorker,
@@ -536,6 +555,9 @@ impl App {
             last_state: PlayState::Idle,
             auto: false,
             skips: 0,
+            listening: None,
+            rotation: 0,
+            imported: false,
             player,
             source,
         };
@@ -683,6 +705,14 @@ impl App {
                 // Warm the first card while the user is still reading the page,
                 // the same bargain the results list makes.
                 self.selection_settled = Some(Instant::now());
+            }
+            Response::CookiesImported(browser) => {
+                // The page on screen was built without a session. There is a
+                // better one available now, so it is asked for again -- this is
+                // the whole point of doing the import in the background rather
+                // than holding the first frame back behind it.
+                self.status = format!("read your YouTube session from {browser}");
+                self.request_home();
             }
             Response::PersonalShelves(shelves) => {
                 self.home_pending = false;
@@ -1045,6 +1075,12 @@ impl App {
     /// `auto` marks a play the queue started rather than the user; only those
     /// are allowed to step over a track that will not resolve.
     fn play_track(&mut self, track: Track, auto: bool) {
+        // Before anything else touches the player: whatever was playing is over
+        // as of this call, and this is the last moment its position is still
+        // readable. Every play in the program funnels through here, so this
+        // covers a skip, a queue advance and a fresh choice alike.
+        self.finish_listening();
+        self.listening = Some((track.clone(), Duration::ZERO));
         self.auto = auto;
         // Only from a list; the player page is not somewhere to go back to.
         if self.view != View::Playing {
@@ -1203,6 +1239,17 @@ impl App {
             && snap.error.is_none();
         self.last_state = snap.state;
 
+        // Sampled every frame rather than read once at the end, because at the
+        // end there is nothing to read: an ended track reports position zero.
+        if let Some((_, heard)) = self.listening.as_mut()
+            && snap.state != PlayState::Idle
+        {
+            *heard = (*heard).max(snap.position);
+        }
+        if ended {
+            self.finish_listening();
+        }
+
         // Never while a track is on its way. `busy` used to stand in for this
         // and is not the same question: it is set by a search or a playlist
         // fetch as well, and cleared by any of their responses -- so a search
@@ -1257,6 +1304,46 @@ impl App {
     /// Not `busy`: this runs at launch, and a busy flag set before the first
     /// frame would hold off the prefetch and spin the event loop at the faster
     /// tick for as long as YouTube took to answer.
+    /// Hands the finished play to the worker, which journals it and -- with a
+    /// cookie saved -- reports it to YouTube.
+    ///
+    /// Idempotent by construction: the track is taken, so the several paths that
+    /// can end a play (the queue advancing, a new choice, a stop, quitting) may
+    /// all call this and only the first does anything.
+    ///
+    /// Nothing is reported for a track that never produced sound, which is what
+    /// keeps a resolve that failed out of the history as a play that happened.
+    fn finish_listening(&mut self) {
+        let Some((track, heard)) = self.listening.take() else {
+            return;
+        };
+        if heard.is_zero() {
+            return;
+        }
+        // Not `busy`, and no response expected: the user is not waiting on this
+        // and there is nothing to tell them about it either way.
+        let _ = self.source.send(Request::ReportPlay {
+            track,
+            listened: heard,
+        });
+    }
+
+    /// Writes the play in progress straight to the journal, for the way out.
+    ///
+    /// [`Self::finish_listening`] hands the play to the library worker, which is
+    /// the right thread for it -- except at exit, where that thread is not
+    /// joined and the process may be gone before it runs. Quitting mid-song is
+    /// an ordinary way to end a session, so the track it happens on is worth
+    /// keeping rather than losing to a race.
+    pub fn flush_listening(&mut self) {
+        let Some((track, heard)) = self.listening.take() else {
+            return;
+        };
+        if !heard.is_zero() {
+            journal::record_final(&track, heard);
+        }
+    }
+
     fn request_home(&mut self) {
         self.home_pending = self.source.send(Request::Home).is_ok();
         if !self.home_pending {
@@ -1266,7 +1353,16 @@ impl App {
         // Queued behind the feed on the same serial thread, which is the order
         // that matters: the feed is one round trip and puts a page on screen,
         // where these are four and go in front of it when they land.
-        let _ = self.source.send(Request::PersonalShelves);
+        let _ = self.source.send(Request::PersonalShelves {
+            rotation: self.rotation,
+        });
+        // Last of the three, because it is the slowest and the only one that
+        // spawns a process. It answers with nothing at all when a session is
+        // already in hand, which is every launch after the first.
+        if !self.imported {
+            self.imported = true;
+            let _ = self.source.send(Request::ImportCookies { force: false });
+        }
     }
 
     /// Asks for the playlist list, reporting a dead worker rather than leaving
@@ -1548,7 +1644,12 @@ impl App {
             KeyCode::PageUp => self.home_shelf = self.home_shelf.saturating_sub(3),
             KeyCode::Enter => self.open_card(),
             KeyCode::Char('r') => {
-                self.status = "reloading the home feed ...".to_string();
+                // Steps the radio seeds on, so this is a genuine refresh rather
+                // than a re-fetch of the page already on screen. The old feed
+                // rotated itself once an hour and had no way to be asked; this
+                // is the same idea put under the key that was already reloading.
+                self.rotation += 1;
+                self.status = "refreshing the home feed ...".to_string();
                 self.request_home();
             }
             KeyCode::Char('/') | KeyCode::Char('i') => {
@@ -1756,6 +1857,9 @@ impl App {
     /// there is nothing to advance through. A stop that left the queue running
     /// would be a pause with extra steps.
     fn stop(&mut self) {
+        // Stopping halfway through is still having listened that far, and this
+        // is the last point at which how far is known.
+        self.finish_listening();
         let _ = self.player.send(Command::Stop);
         self.status = "stopped".to_string();
         self.now = None;

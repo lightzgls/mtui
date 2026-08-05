@@ -31,6 +31,14 @@ const TOKEN_FILE: &str = "tokens.json";
 /// browser signed in to YouTube Music.
 const COOKIE_FILE: &str = "cookies.txt";
 
+/// Ours: written by the browser import and replaced whenever it runs again.
+///
+/// Kept apart from [`COOKIE_FILE`] for the same reason [`TOKEN_FILE`] is kept
+/// apart from [`CLIENT_FILE`] -- a file the user wrote by hand must never be
+/// silently overwritten by something this program regenerated, and a user who
+/// pasted a cookie deliberately has said which one they want used.
+const IMPORT_FILE: &str = "browser-cookies.json";
+
 /// Shown when there is no client to read. Long because it is the entire setup
 /// procedure, and a user hitting this has no other documentation to hand.
 const SETUP_HELP: &str = "\
@@ -129,15 +137,39 @@ impl Cookies {
             return Ok(None);
         }
 
-        let sapisid = sapisid(&header).with_context(|| {
-            format!(
-                "{} has no SAPISID cookie in it. Copy the whole `cookie:` request \
-                 header from a music.youtube.com request in your browser's network tab",
-                path.display()
-            )
-        })?;
+        Self::from_header(&header)
+            .with_context(|| {
+                format!(
+                    "{} has no SAPISID cookie in it. Copy the whole `cookie:` request \
+                     header from a music.youtube.com request in your browser's network tab",
+                    path.display()
+                )
+            })
+            .map(Some)
+    }
 
-        Ok(Some(Self { header, sapisid }))
+    /// Builds from a raw `Cookie:` header, or `None` when it carries nothing to
+    /// sign with. Split out from [`Self::load`] so the parse can be exercised
+    /// without a file behind it.
+    pub fn from_header(raw: &str) -> Option<Self> {
+        let header = raw.trim().to_string();
+        Some(Self {
+            sapisid: sapisid(&header)?,
+            header,
+        })
+    }
+
+    /// The cookies to actually use, from wherever they came from.
+    ///
+    /// Hand-written first: a user who pasted a header has said which session
+    /// they want, and an import quietly winning over it would be the program
+    /// overruling them. The import is the fallback, and the ordinary case --
+    /// most users will never create `cookies.txt` at all.
+    pub fn available() -> Result<Option<Self>> {
+        if let Some(manual) = Self::load()? {
+            return Ok(Some(manual));
+        }
+        Ok(Import::load().and_then(|import| Self::from_header(&import.header)))
     }
 
     pub fn header(&self) -> &str {
@@ -146,6 +178,57 @@ impl Cookies {
 
     pub fn sapisid(&self) -> &str {
         &self.sapisid
+    }
+}
+
+/// A session read out of a browser, and which browser it came from.
+///
+/// The browser's name is the point of storing this as a record rather than as a
+/// bare header: probing every browser costs a process spawn each, and going
+/// straight back to the one that worked last time is the difference between a
+/// re-import that is unnoticeable and one that takes ten seconds.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Import {
+    pub browser: String,
+    pub header: String,
+    /// Unix seconds. Not used to decide staleness -- only YouTube knows when a
+    /// cookie died, and it says so by refusing -- but it is what makes a stale
+    /// import legible when someone looks at the file.
+    pub at: u64,
+}
+
+impl Import {
+    /// Reads the last import, or `None` if there has never been one.
+    ///
+    /// Infallible by design: this is a cache of something re-derivable, so a
+    /// file that will not parse is worth exactly one re-import and no error.
+    pub fn load() -> Option<Self> {
+        let path = dir().ok()?.join(IMPORT_FILE);
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let dir = dir()?;
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
+        let path = dir.join(IMPORT_FILE);
+
+        let body = serde_json::to_vec_pretty(self).context("could not encode the import")?;
+        fs::write(&path, body).with_context(|| format!("could not write {}", path.display()))?;
+        // A full account credential, so it gets the same treatment the refresh
+        // token does rather than the default permissions of a new file.
+        restrict(&path)?;
+        Ok(())
+    }
+
+    /// Forgets the import, so the next launch reads the browser again.
+    pub fn forget() -> Result<()> {
+        let path = dir()?.join(IMPORT_FILE);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("could not remove {}", path.display())),
+        }
     }
 }
 

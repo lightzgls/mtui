@@ -7,11 +7,14 @@
 
 pub mod auth;
 pub mod bootstrap;
+pub mod browser;
 pub mod cover;
 pub mod home;
 pub mod innertube;
+pub mod journal;
 pub mod library;
 pub mod sapisid;
+pub mod stats;
 pub mod watch;
 pub mod worker;
 pub mod youtube;

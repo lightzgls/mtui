@@ -20,11 +20,14 @@
 //! - `musicResponsiveListItemRenderer` -- the list rows ("Quick picks",
 //!   "Trending"). Always playable.
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use super::auth::Http;
 use super::innertube::{MUSIC_CLIENT_NAME, MUSIC_CLIENT_VERSION, flex_column, parse_duration};
+use super::journal::Journal;
 use super::sapisid;
 use super::{Track, UNKNOWN_ARTIST};
 use crate::config::Cookies;
@@ -261,77 +264,209 @@ pub(super) fn post(http: &Http, url: &str, cookies: Option<&Cookies>, extra: Val
     Ok(serde_json::from_slice(&raw)?)
 }
 
-/// Shelves built from what the account has liked, for when there is no cookie
-/// to ask YouTube for the real ones.
+/// Radio stations blended into "Quick picks".
 ///
-/// Approximations, and named as such in the comments if not on screen: YouTube
-/// builds these from watch history, which no API this program can reach exposes
-/// -- the Data API's history playlist has returned empty since 2016. Likes are
-/// the closest thing an OAuth session can see to "music this person chose".
+/// The single biggest thing wrong with the shelf this replaces: one seed is one
+/// station, and one station is one mood, so a page built from it read the same
+/// however much the user's taste varied. Four seeds by four different artists
+/// cost four round trips -- they run while a landing page is already on screen,
+/// so nobody is waiting on them -- and produce a shelf that looks like a person.
+const SEEDS: usize = 4;
+
+/// Shelves built from this account's listening, for when there is no cookie to
+/// ask YouTube for the real ones.
+///
+/// Ranked by [`crate::source::journal`] rather than taken in like-order. The
+/// distinction matters more than it sounds: YouTube builds its own shelves from
+/// watch history, which no API this program can reach exposes -- the Data API's
+/// history playlist has returned empty since 2016 -- so what stands in for it is
+/// the history MTUI keeps of its own plays, scored for how often, how recently,
+/// and how far through. Likes fold in as a prior rather than as the whole
+/// answer, which is what keeps a page from being the like list in four orders.
+///
+/// Until the journal has something to say, the old behaviour is exactly what
+/// happens: `taste` reports itself uninformed, and every shelf falls back to
+/// likes. A first run looks the way it always did and improves from there.
 ///
 /// `likes` is expected most-recently-liked first, which is the order the Data
-/// API returns them in.
-pub fn personal(http: &Http, likes: &[Track]) -> Vec<Shelf> {
+/// API returns them in; `rotation` steps the seeds along so a refresh gives a
+/// different page.
+pub fn personal(http: &Http, likes: &[Track], journal: &Journal, rotation: usize) -> Vec<Shelf> {
+    let now = sapisid::unix_now();
+    let taste = journal.taste(likes, now);
+    let informed = taste.is_informed();
+
     let mut shelves = Vec::new();
-    if likes.is_empty() {
+    // Nothing played and nothing liked: there is genuinely no user here to
+    // build a page for, and the generic feed behind this is the right answer.
+    if likes.is_empty() && !informed {
         return shelves;
     }
 
-    shelves.push(Shelf {
-        title: "Listen again".to_string(),
-        cards: likes.iter().take(SHELF_DEPTH).map(Card::from_track).collect(),
-    });
+    // Every id the page may not use again. Shelves are built in order and each
+    // one skips what the ones above it took, because the same song in three
+    // shelves is the other half of why this page felt repetitive -- a small
+    // library guarantees the overlap, and nothing was checking for it.
+    //
+    // Seeded with what was played in the last few hours, so that rule covers the
+    // radios too: a station seeded from a song someone has been playing all
+    // morning returns that morning's songs, and recommending those back is the
+    // thing that makes a shelf look like it is not paying attention.
+    let mut seen: HashSet<String> = taste.recent().clone();
 
-    // Rotated by the hour rather than randomly: no RNG is linked into this
-    // program, an hour is long enough that the page is stable across a session,
-    // and it is short enough that the shelf is not the same one every day.
-    let seed = &likes[(sapisid::unix_now() / 3600) as usize % likes.len()];
-
-    // The queue YouTube would play after this song. Its first entry is the seed
-    // itself, which the user already knows they like.
-    if let Ok(json) = post(
-        http,
-        NEXT_URL,
-        None,
-        serde_json::json!({
-            "videoId": seed.id,
-            "playlistId": format!("RDAMVM{}", seed.id),
-        }),
-    ) {
-        let cards: Vec<Card> = queue(&json)
+    let listen_again: Vec<Card> = if informed {
+        taste
+            .listen_again(SHELF_DEPTH)
             .into_iter()
-            .filter(|card| !matches!(&card.target, Target::Play { video_id } if *video_id == seed.id))
-            .take(SHELF_DEPTH)
-            .collect();
-        if !cards.is_empty() {
-            shelves.push(Shelf {
-                title: "Quick picks".to_string(),
-                cards,
-            });
-        }
+            .map(|ranked| Card::from_track(&ranked.track))
+            .collect()
+    } else {
+        likes.iter().take(SHELF_DEPTH).map(Card::from_track).collect()
+    };
+    push(&mut shelves, &mut seen, "Listen again", listen_again);
 
-        // The "Related" tab of that same response, which costs one further
-        // call and is where YouTube keeps "You might also like".
-        if let Some(id) = related_id(&json) {
-            shelves.extend(similar_to(http, &id, &seed.title));
-        }
-    }
+    // The radios. Seeds come from the ranking when there is one and from the
+    // likes when there is not, but the shelf is built the same way either way.
+    let seeds: Vec<Track> = if informed {
+        taste
+            .seeds(SEEDS, rotation)
+            .into_iter()
+            .map(|ranked| ranked.track.clone())
+            .collect()
+    } else {
+        distinct_by_artist(likes, SEEDS, rotation)
+    };
 
-    // Only when there are enough likes for the old ones to be different songs
-    // from the recent ones.
-    if likes.len() >= MIN_LIKES_FOR_OLD {
-        shelves.push(Shelf {
-            title: "Forgotten favorites".to_string(),
-            cards: likes
-                .iter()
-                .rev()
-                .take(SHELF_DEPTH)
-                .map(Card::from_track)
+    let mut picks: Vec<Vec<Card>> = Vec::new();
+    let mut similar: Option<Shelf> = None;
+    for seed in &seeds {
+        let Ok(json) = post(
+            http,
+            NEXT_URL,
+            None,
+            serde_json::json!({
+                "videoId": seed.id,
+                "playlistId": format!("RDAMVM{}", seed.id),
+            }),
+        ) else {
+            continue;
+        };
+
+        picks.push(
+            queue(&json)
+                .into_iter()
+                // The station's first entry is the seed itself, which the user
+                // already knows about.
+                .filter(|card| !matches!(&card.target, Target::Play { video_id } if *video_id == seed.id))
                 .collect(),
-        });
+        );
+
+        // "Similar to X" is built from the first seed that offers a Related
+        // tab, and only from one: it names a song, and a shelf named after four
+        // of them would be named after none.
+        if similar.is_none()
+            && let Some(id) = related_id(&json)
+        {
+            similar = similar_to(http, &id, &seed.title);
+        }
     }
+
+    push(&mut shelves, &mut seen, "Quick picks", interleave(picks));
+
+    if let Some(shelf) = similar {
+        push(&mut shelves, &mut seen, &shelf.title.clone(), shelf.cards);
+    }
+
+    let forgotten: Vec<Card> = if informed {
+        taste
+            .forgotten(SHELF_DEPTH, now)
+            .into_iter()
+            .map(|ranked| Card::from_track(&ranked.track))
+            .collect()
+    } else if likes.len() >= MIN_LIKES_FOR_OLD {
+        // The old approximation, kept for the cold-start path only: with no
+        // journal there is no way to tell what has gone cold, and the far end
+        // of the like list is the least-bad guess at it.
+        likes.iter().rev().take(SHELF_DEPTH).map(Card::from_track).collect()
+    } else {
+        Vec::new()
+    };
+    push(&mut shelves, &mut seen, "Forgotten favorites", forgotten);
 
     shelves
+}
+
+/// Adds a shelf, dropping the cards already used above it.
+///
+/// A shelf that is left with too little to be worth a row is dropped entirely
+/// rather than shown short -- two cards under a heading looks like something
+/// failed, which on this page it has not.
+fn push(shelves: &mut Vec<Shelf>, seen: &mut HashSet<String>, title: &str, cards: Vec<Card>) {
+    const MIN_CARDS: usize = 3;
+
+    // Filtered against `seen` without writing to it, because a shelf that turns
+    // out to be too thin is not shown -- and marking its cards as used would
+    // then withhold them from the shelf below, which might have had room.
+    let cards: Vec<Card> = cards
+        .into_iter()
+        .filter(|card| match &card.target {
+            Target::Play { video_id } => !seen.contains(video_id),
+            // Albums and artists are not songs and cannot collide with them.
+            Target::Open { .. } => true,
+        })
+        .take(SHELF_DEPTH)
+        .collect();
+
+    if cards.len() < MIN_CARDS {
+        return;
+    }
+    for card in &cards {
+        if let Target::Play { video_id } = &card.target {
+            seen.insert(video_id.clone());
+        }
+    }
+    shelves.push(Shelf {
+        title: title.to_string(),
+        cards,
+    });
+}
+
+/// Rounds through the stations, taking one card from each in turn.
+///
+/// Concatenating them instead would put the whole of the first seed's radio at
+/// the front, which is the same shelf as before with three more hidden off the
+/// right-hand edge. Interleaving is what makes the first screenful -- the only
+/// part most people see -- carry all four.
+fn interleave(stations: Vec<Vec<Card>>) -> Vec<Card> {
+    let deepest = stations.iter().map(Vec::len).max().unwrap_or(0);
+    let mut cards = Vec::new();
+    for index in 0..deepest {
+        for station in &stations {
+            if let Some(card) = station.get(index) {
+                cards.push(card.clone());
+            }
+        }
+    }
+    cards
+}
+
+/// Up to `count` tracks by different artists, starting `rotation` in.
+///
+/// The cold-start counterpart to [`crate::source::journal::Taste::seeds`], for
+/// a first run with likes but no plays behind it.
+fn distinct_by_artist(tracks: &[Track], count: usize, rotation: usize) -> Vec<Track> {
+    let mut artists = HashSet::new();
+    let candidates: Vec<&Track> = tracks
+        .iter()
+        .filter(|track| artists.insert(track.uploader.to_lowercase()))
+        .collect();
+
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    (0..count.min(candidates.len()))
+        .map(|i| candidates[(rotation + i) % candidates.len()].clone())
+        .collect()
 }
 
 /// The "Similar to X" shelf, from the related page of a seed track.
@@ -776,6 +911,121 @@ mod tests {
         assert!(parse_row(&row).is_none());
     }
 
+    /// A playable card, for the assembly tests below.
+    fn playable(id: &str) -> Card {
+        Card {
+            title: format!("song {id}"),
+            subtitle: "Song • Someone".to_string(),
+            target: Target::Play {
+                video_id: id.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn stations_are_interleaved_rather_than_concatenated() {
+        // The first screenful is the only part most people see, so it has to
+        // carry all four stations rather than the whole of the first one.
+        let cards = interleave(vec![
+            vec![playable("a1"), playable("a2"), playable("a3")],
+            vec![playable("b1"), playable("b2")],
+            vec![playable("c1")],
+        ]);
+
+        let ids: Vec<&str> = cards
+            .iter()
+            .map(|card| match &card.target {
+                Target::Play { video_id } => video_id.as_str(),
+                Target::Open { .. } => unreachable!(),
+            })
+            .collect();
+        // Round by round, and a station that runs out is simply skipped rather
+        // than padding the rounds after it.
+        assert_eq!(ids, ["a1", "b1", "c1", "a2", "b2", "a3"]);
+    }
+
+    #[test]
+    fn a_song_used_by_one_shelf_is_not_reused_by_the_next() {
+        let mut shelves = Vec::new();
+        let mut seen = HashSet::new();
+
+        push(
+            &mut shelves,
+            &mut seen,
+            "Listen again",
+            vec![playable("a"), playable("b"), playable("c")],
+        );
+        // Two of these are already above, so what is left is too thin to be a
+        // row and the shelf is dropped rather than shown with one card in it.
+        push(
+            &mut shelves,
+            &mut seen,
+            "Quick picks",
+            vec![playable("a"), playable("b"), playable("d")],
+        );
+        assert_eq!(shelves.len(), 1, "a shelf of leftovers was kept");
+
+        push(
+            &mut shelves,
+            &mut seen,
+            "Similar to x",
+            vec![playable("d"), playable("e"), playable("f"), playable("a")],
+        );
+        assert_eq!(shelves.len(), 2);
+        assert_eq!(shelves[1].cards.len(), 3, "the duplicate survived");
+    }
+
+    #[test]
+    fn albums_never_collide_with_songs() {
+        // Two cards can carry the same id in different senses -- a browse id is
+        // not a video id -- so only playable cards are deduplicated.
+        let mut shelves = Vec::new();
+        let mut seen = HashSet::new();
+        let album = || Card {
+            title: "Currents".to_string(),
+            subtitle: "Album • Tame Impala".to_string(),
+            target: Target::Open {
+                browse_id: "MPREb_abc".to_string(),
+            },
+        };
+
+        push(&mut shelves, &mut seen, "Albums", vec![album(), album(), album()]);
+        assert_eq!(shelves[0].cards.len(), 3);
+    }
+
+    #[test]
+    fn cold_start_seeds_spread_across_artists() {
+        // With no journal there is nothing scored, so seeds come off the like
+        // list -- but the one-artist-per-station rule still has to hold, or a
+        // library dominated by one artist gives four copies of one station.
+        let likes = vec![
+            track("a", "Dominic Fike"),
+            track("b", "Dominic Fike"),
+            track("c", "Mr.Kitty"),
+            track("d", "Crystal Castles"),
+        ];
+
+        let seeds = distinct_by_artist(&likes, 4, 0);
+        assert_eq!(seeds.len(), 3, "one artist took two seeds");
+        assert_eq!(seeds[0].id, "a");
+
+        // Rotating steps along and wraps rather than running out.
+        assert_eq!(distinct_by_artist(&likes, 1, 1)[0].id, "c");
+        assert_eq!(distinct_by_artist(&likes, 1, 3)[0].id, "a");
+        assert!(distinct_by_artist(&[], 4, 0).is_empty());
+    }
+
+    fn track(id: &str, artist: &str) -> Track {
+        Track {
+            id: id.to_string(),
+            title: format!("song {id}"),
+            uploader: artist.to_string(),
+            duration: None,
+            album: None,
+            playlist_item_id: None,
+        }
+    }
+
     #[test]
     fn a_label_drops_the_type_marker_and_the_counts() {
         assert_eq!(artist("Song • Radiohead"), Some("Radiohead"));
@@ -805,8 +1055,11 @@ mod tests {
     #[test]
     #[ignore = "hits the live YouTube Music API with the saved cookie"]
     fn cookie_home_against_the_live_api() {
-        let Some(cookies) = Cookies::load().expect("cookies.txt should parse") else {
-            println!("no cookies.txt saved -- nothing to check");
+        // `available`, not `load`: a cookie read out of the browser has to buy
+        // the same feed a hand-pasted one does, and testing only the pasted
+        // path would leave the one almost everybody uses uncovered.
+        let Some(cookies) = Cookies::available().expect("the saved cookies should parse") else {
+            println!("no cookie saved or imported -- nothing to check");
             return;
         };
 
@@ -887,6 +1140,142 @@ mod tests {
         );
     }
 
+    /// The living-room client Google ships in its own TV app.
+    ///
+    /// Publicly known, and used by `ytmusicapi` among others. It is here for one
+    /// question only: [`oauth_is_refused_by_innertube`] proves that a token from
+    /// a *user-registered* Cloud Console client is refused, and the hypothesis is
+    /// that the refusal is about which client asked rather than about OAuth
+    /// itself. Same protocol, same scope, different client identity.
+    const TV_CLIENT_ID: &str =
+        "861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com";
+    const TV_CLIENT_SECRET: &str = "SboVhoG9s0rNafixCSGGKXAT";
+
+    /// The TV client identity, for the InnerTube request itself. A token issued
+    /// to the living-room client is plausibly only honoured on calls that look
+    /// like they came from it, so both are tried below rather than assumed.
+    const TV_INNERTUBE_NAME: &str = "TVHTML5";
+    const TV_INNERTUBE_VERSION: &str = "7.20241201.15.00";
+
+    /// Whether a TV-client OAuth token reaches the personalised feed.
+    ///
+    /// **It does not.** Measured 2026-08-05 against a live account: the code is
+    /// issued, the user approves it, Google returns a perfectly good access
+    /// token -- and InnerTube answers `400` to it, under the living-room client
+    /// identity and under `WEB_REMIX` alike.
+    ///
+    /// That is the third refusal on record, after [`oauth_is_refused_by_innertube`]
+    /// with a user-registered Cloud Console client. The pattern is now clear
+    /// enough to design around: InnerTube refuses Bearer authentication as such,
+    /// not any particular client asking. There is no OAuth route to a
+    /// personalised feed, and the cookie is the only door.
+    ///
+    /// Kept, and asserted rather than printed, because the cost of being wrong
+    /// about this later is high: if Google ever does open it up, this is what
+    /// says so. It is the only test here that needs a phone.
+    ///
+    /// Read-only -- it browses the home feed and writes nothing. It does create
+    /// a real OAuth grant, which is worth removing again at
+    /// myaccount.google.com/permissions once it has failed.
+    ///
+    /// `cargo test tv_client -- --ignored --nocapture`
+    #[test]
+    #[ignore = "opens a device-code sign-in that has to be approved on a phone"]
+    fn tv_client_oauth_against_innertube() {
+        use super::super::auth;
+        use crate::config::Credentials;
+
+        let http = Http::new().expect("client should build");
+        let creds = Credentials {
+            client_id: TV_CLIENT_ID.to_string(),
+            client_secret: TV_CLIENT_SECRET.to_string(),
+        };
+
+        let code = auth::start(&http, &creds).expect("the TV client should be issued a code");
+        println!(
+            "\n  go to {} and enter    {}\n  waiting ...",
+            code.verification_url, code.user_code
+        );
+
+        let tokens = auth::wait_for_approval(&http, &creds, &code)
+            .expect("the code should be approved");
+        println!("  approved\n");
+
+        // Both identities, because a token issued to the living-room client may
+        // only be honoured on a request that presents as one.
+        for (name, version) in [
+            (TV_INNERTUBE_NAME, TV_INNERTUBE_VERSION),
+            (MUSIC_CLIENT_NAME, MUSIC_CLIENT_VERSION),
+        ] {
+            let request = http
+                .client()
+                .post(BROWSE_URL)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(
+                    reqwest::header::AUTHORIZATION,
+                    format!("Bearer {}", tokens.access_token),
+                )
+                .body(
+                    serde_json::to_vec(&serde_json::json!({
+                        "browseId": HOME_ID,
+                        "context": { "client": {
+                            "clientName": name,
+                            "clientVersion": version,
+                            "hl": "en",
+                        } }
+                    }))
+                    .unwrap(),
+                );
+
+            let (status, raw) = http.send(request).expect("the request should complete");
+            print!("  {name:<10} HTTP {status}");
+            if !(200..300).contains(&status) {
+                println!("  -- refused");
+                // The recorded outcome. A pass here would mean the whole
+                // cookie apparatus could be deleted, so it is worth failing
+                // loudly rather than quietly printing a surprise.
+                assert_eq!(
+                    status, 400,
+                    "InnerTube answered {name} with {status} rather than the \
+                     expected 400 -- something about Bearer auth has changed"
+                );
+                continue;
+            }
+
+            let json: Value = match serde_json::from_slice(&raw) {
+                Ok(json) => json,
+                Err(_) => {
+                    println!("  -- accepted but the body is not JSON");
+                    continue;
+                }
+            };
+            let shelves = parse_shelves(&json);
+            let found: Vec<&str> = PERSONAL
+                .iter()
+                .copied()
+                .filter(|name| shelves.iter().any(|s| s.title.starts_with(name)))
+                .collect();
+
+            println!("  {} shelves, personal: {found:?}", shelves.len());
+            for shelf in shelves.iter().take(8) {
+                println!("      {}", shelf.title);
+            }
+
+            // Never reached as of the measurement above. If it ever is, the
+            // distinction below is the one that decides the design:
+            // accepted-but-generic looks like success and is worth nothing.
+            if found.is_empty() {
+                println!("      ^ authenticated, but this is the signed-out feed");
+            } else {
+                panic!(
+                    "TV-client OAuth now reaches the personalised feed under \
+                     {name} -- the cookie has stopped being the only door, and \
+                     the sign-in should be rebuilt on this"
+                );
+            }
+        }
+    }
+
     /// Hits the live API, like the resolver's and the search's own live tests.
     /// A failure here means the landing page fell back or came up empty, not
     /// that the build is broken.
@@ -929,7 +1318,13 @@ mod live_personal {
     use super::*;
     use crate::source::library::{LIKED_ID, Library};
 
-    /// The shelves built from the signed-in account's likes, end to end.
+    /// The shelves built from this account's listening, end to end, against the
+    /// real journal on this machine.
+    ///
+    /// Prints the page twice, at two rotations. That is the part worth looking
+    /// at by eye: the complaint this whole path answers is that the page read
+    /// the same every time, and two identical printouts here would mean it
+    /// still does.
     ///
     /// `cargo test built_shelves -- --ignored --nocapture`
     #[test]
@@ -937,30 +1332,66 @@ mod live_personal {
     fn built_shelves_against_the_live_account() {
         use std::time::Instant;
 
+        use crate::source::journal::Journal;
+
         let mut library = Library::new().expect("library should build");
-        if !library.is_signed_in() {
-            println!("not signed in -- nothing to build from");
+        let journal = Journal::load();
+
+        let likes = if library.is_signed_in() {
+            let start = Instant::now();
+            let likes = library.tracks(LIKED_ID, 100).expect("liked songs should load");
+            println!("{} liked songs in {:.2}s", likes.len(), start.elapsed().as_secs_f64());
+            likes
+        } else {
+            println!("not signed in -- building from the journal alone");
+            Vec::new()
+        };
+
+        let mut pages = Vec::new();
+        for rotation in [0, 1] {
+            let start = Instant::now();
+            let shelves = personal(library.http(), &likes, &journal, rotation);
+            println!(
+                "\n=== rotation {rotation}: {} shelves in {:.2}s ===",
+                shelves.len(),
+                start.elapsed().as_secs_f64()
+            );
+
+            for shelf in &shelves {
+                println!("{} ({} cards)", shelf.title, shelf.cards.len());
+                for card in shelf.cards.iter().take(4) {
+                    println!("   {:<44.42} {:.34}", card.title, card.subtitle);
+                }
+                assert!(!shelf.cards.is_empty(), "{} is empty", shelf.title);
+            }
+
+            // No song may appear on the page twice, whatever it scored.
+            let mut seen = HashSet::new();
+            for shelf in &shelves {
+                for card in &shelf.cards {
+                    if let Target::Play { video_id } = &card.target {
+                        assert!(
+                            seen.insert(video_id.clone()),
+                            "{video_id} appears on the page more than once"
+                        );
+                    }
+                }
+            }
+            pages.push(seen);
+        }
+
+        if likes.is_empty() && pages[0].is_empty() {
+            println!("\nno likes and an empty journal -- there is nothing to build a page from");
             return;
         }
+        assert!(!pages[0].is_empty(), "the page came back with nothing playable");
 
-        let start = Instant::now();
-        let likes = library.tracks(LIKED_ID, 100).expect("liked songs should load");
-        println!("{} liked songs in {:.2}s", likes.len(), start.elapsed().as_secs_f64());
-
-        let start = Instant::now();
-        let shelves = personal(library.http(), &likes);
-        println!("{} shelves in {:.2}s\n", shelves.len(), start.elapsed().as_secs_f64());
-
-        for shelf in &shelves {
-            println!("{} ({} cards)", shelf.title, shelf.cards.len());
-            for card in shelf.cards.iter().take(4) {
-                println!("   {:<44.42} {:.34}", card.title, card.subtitle);
-            }
-        }
-
-        assert!(!shelves.is_empty(), "a signed-in account should build shelves");
-        for shelf in &shelves {
-            assert!(!shelf.cards.is_empty(), "{} is empty", shelf.title);
-        }
+        // Not an assert: with one artist in the journal there is only one seed
+        // to rotate through, and that is a thin history rather than a bug.
+        let shared = pages[0].intersection(&pages[1]).count();
+        println!(
+            "\nrotation 0 and 1 share {shared} of {} songs",
+            pages[0].len()
+        );
     }
 }

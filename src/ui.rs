@@ -102,7 +102,10 @@ const HINTS_TRACKS: &str = "/ search  L library  a add  f like  q quit";
 /// The landing page. `Esc` and `H` also return here from the track list, and
 /// neither fits beside what that line already has to offer -- so this one names
 /// what moves the cursor instead, which is the part a grid needs said.
-const HINTS_HOME: &str = "Enter play  hjkl move  / search  q quit";
+/// `r` is named here and not on the playing variant below, where there is no
+/// room for it: it rebuilds the page from different seeds rather than merely
+/// re-fetching it, which is not something a user would think to try unprompted.
+const HINTS_HOME: &str = "Enter play  hjkl move  r refresh  / search  q quit";
 /// The player page. `n`, `p` and the tab keys are what it is for; `Esc` is
 /// named because the view is entered without being asked for and the way out of
 /// it is the first thing a user looks for. `+-` is named beside the volume bar

@@ -85,6 +85,9 @@ struct YtDlpEntry {
     duration: Option<f64>,
 }
 
+/// Cloneable because it is only a path: the library thread runs the same binary
+/// to read browser cookies, and locating a second copy for that would be absurd.
+#[derive(Clone)]
 pub struct YouTube {
     /// Path to the binary, so a user with a non-PATH install can point at it.
     bin: String,
@@ -101,6 +104,16 @@ impl Default for YouTube {
 impl YouTube {
     pub fn new(bin: impl Into<String>) -> Self {
         Self { bin: bin.into() }
+    }
+
+    /// The binary, lent to [`crate::source::browser`].
+    ///
+    /// Reading cookies out of a browser is not a yt-dlp call in the sense the
+    /// rest of this file means -- nothing is searched for or resolved -- but it
+    /// is the same binary, and locating a second copy of it to run one more
+    /// flag against would be absurd.
+    pub(super) fn bin(&self) -> &str {
+        &self.bin
     }
 
     /// Verifies yt-dlp is present and returns its version.
