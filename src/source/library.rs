@@ -88,6 +88,17 @@ impl Library {
         self.session = None;
     }
 
+    /// The HTTP machinery, lent to [`crate::source::home`].
+    ///
+    /// The home feed is not a Data API call and has no business in this file,
+    /// but it is built from what this one reads -- the user's liked songs --
+    /// and building a second client beside this one would mean a second
+    /// connection pool and a second TLS handshake for the same host.
+    pub(super) fn http(&self) -> &Http {
+        &self.http
+    }
+
+
     /// The user's playlists, with "Liked songs" in front.
     ///
     /// Liked songs lead because they are the list a music player is actually
@@ -176,6 +187,7 @@ impl Library {
                         .pointer("/snippet/videoOwnerChannelTitle")
                         .or_else(|| item.pointer("/snippet/channelTitle"))
                         .and_then(|v| v.as_str())
+                        .map(artist_of)
                         .unwrap_or(UNKNOWN_ARTIST);
                     Some((video.to_string(), row.to_string(), owner.to_string()))
                 })
@@ -382,6 +394,18 @@ impl Library {
     }
 }
 
+/// Strips the suffix YouTube puts on the auto-generated channels it creates for
+/// released music.
+///
+/// Every art track on the platform is uploaded to a channel called "Artist -
+/// Topic", so without this every row from the Data API reads "Malcolm Todd -
+/// Topic" where YouTube Music's own corpus would say "Malcolm Todd". It is the
+/// one piece of guesswork in this file that is not guesswork: the suffix is
+/// generated, not typed, and means exactly one thing.
+fn artist_of(channel: &str) -> &str {
+    channel.strip_suffix(" - Topic").unwrap_or(channel).trim()
+}
+
 /// Turns a `videos.list` response into tracks.
 fn parse_videos(json: &serde_json::Value) -> Vec<Track> {
     json["items"]
@@ -399,6 +423,7 @@ fn parse_videos(json: &serde_json::Value) -> Vec<Track> {
                 uploader: item
                     .pointer("/snippet/channelTitle")
                     .and_then(|t| t.as_str())
+                    .map(artist_of)
                     .filter(|t| !t.is_empty())
                     .unwrap_or(UNKNOWN_ARTIST)
                     .to_string(),
@@ -541,6 +566,23 @@ mod tests {
     fn an_empty_response_yields_no_tracks() {
         assert!(parse_videos(&serde_json::json!({})).is_empty());
         assert!(parse_videos(&serde_json::json!({ "items": [] })).is_empty());
+    }
+
+    #[test]
+    fn the_topic_channel_suffix_is_stripped() {
+        // Released music is uploaded to auto-generated "Artist - Topic"
+        // channels, so without this every row on the landing page reads like a
+        // YouTube channel rather than like an artist.
+        let json = serde_json::json!({
+            "items": [ video("x", "Roommates", "Malcolm Todd - Topic", "PT2M31S") ]
+        });
+        assert_eq!(parse_videos(&json)[0].uploader, "Malcolm Todd");
+
+        // A real channel that merely mentions the word is left alone, and so is
+        // an artist whose name ends in something similar.
+        assert_eq!(artist_of("Topic"), "Topic");
+        assert_eq!(artist_of("Hot Topic Radio"), "Hot Topic Radio");
+        assert_eq!(artist_of("Daft Punk"), "Daft Punk");
     }
 
     #[test]

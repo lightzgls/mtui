@@ -32,7 +32,19 @@ const AUDIO_ITAG: u32 = 140;
 /// winning, the fallback is right there and will do the job properly.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-const PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player";
+/// The player API, asked on YouTube Music's host rather than YouTube's own.
+///
+/// It is the same endpoint either way: the host is a front end, and the client
+/// identity in the request body is what decides the answer. What differs is
+/// what a network can do to it. Restricted Mode is enforced by pointing
+/// `www.youtube.com` at `restrict.youtube.com`, and that front end refuses
+/// anything flagged as mature with `This video is restricted` -- for a music
+/// player, the odd explicit track, on a machine where everything else works.
+/// `music.youtube.com` carries no such mapping. Measured on a network that
+/// applies it: a track `www` answered `ERROR` for resolved here with an
+/// ordinary itag 140 URL, and an unrestricted video answered identically on
+/// both.
+const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player";
 
 /// Where a capped URL stops being served. Measured, not documented: every
 /// capped URL seen answers ranges below one mebibyte and 403s from there on.
@@ -51,8 +63,11 @@ const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search";
 /// and podcast episodes -- none of which we can hand to a decoder.
 const SONGS_FILTER: &str = "EgWKAQIIAWoKEAoQCRADEAQQBQ%3D%3D";
 
-const MUSIC_CLIENT_NAME: &str = "WEB_REMIX";
-const MUSIC_CLIENT_VERSION: &str = "1.20241127.01.00";
+/// Shared with [`crate::source::home`], which talks to the same corpus through
+/// the same client. Two identities drifting apart is how one of them starts
+/// getting refused for reasons the other cannot reproduce.
+pub(super) const MUSIC_CLIENT_NAME: &str = "WEB_REMIX";
+pub(super) const MUSIC_CLIENT_VERSION: &str = "1.20241127.01.00";
 
 /// A player client identity. These values travel together -- mismatching a
 /// name, version and user agent is how a request starts getting refused.
@@ -390,7 +405,10 @@ fn parse_track(item: &serde_json::Value) -> Option<Track> {
 }
 
 /// Joins the text runs of one display column into a single string.
-fn flex_column(item: &serde_json::Value, index: usize) -> Option<String> {
+///
+/// Shared with [`crate::source::home`]: the flexible-column shape is the same
+/// wherever YouTube Music draws a list row, whatever the row happens to mean.
+pub(super) fn flex_column(item: &serde_json::Value, index: usize) -> Option<String> {
     let runs = item
         .pointer(&format!(
             "/flexColumns/{index}/musicResponsiveListItemFlexColumnRenderer/text/runs"
@@ -406,7 +424,7 @@ fn flex_column(item: &serde_json::Value, index: usize) -> Option<String> {
 
 /// Parses `M:SS` or `H:MM:SS` into a duration. Anything else is `None`, which
 /// the UI renders as `LIVE`.
-fn parse_duration(text: &str) -> Option<Duration> {
+pub(super) fn parse_duration(text: &str) -> Option<Duration> {
     let mut secs: u64 = 0;
     let mut fields = 0;
     for field in text.trim().split(':') {

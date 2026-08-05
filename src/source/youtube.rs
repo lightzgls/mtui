@@ -25,6 +25,12 @@ const AUDIO_FORMAT: &str = "140/bestaudio[ext=m4a]";
 /// cannot grow the heap.
 pub const MAX_RESULTS: usize = 200;
 
+/// What YouTube answers when Restricted Mode, rather than the video, is the
+/// problem. Matched on the phrase that is stable across the wordings: the
+/// sentence after it varies with whether a Workspace policy or a network is
+/// named as the source.
+const RESTRICTED: &str = "This video is restricted";
+
 /// Flags for a search: list the results without visiting each video page.
 const SEARCH_FLAGS: &[&str] = &[
     "--flat-playlist",
@@ -40,6 +46,31 @@ const SEARCH_FLAGS: &[&str] = &[
 /// it could be dropped without notice. `--print` is documented and produces an
 /// identical URL. `--format` is passed separately since it takes an argument.
 const RESOLVE_FLAGS: &[&str] = &["--print", "urls", "--no-warnings", "--ignore-config"];
+
+/// The retry that gets past Restricted Mode.
+///
+/// `web_music` is the one client yt-dlp routes to `music.youtube.com`, and that
+/// host is not remapped by the DNS entry Restricted Mode is enforced with --
+/// see [`restricted_mode`]. `player_skip=webpage,configs` keeps the rest of the
+/// extraction off `www.youtube.com` too, which is the whole point: one request
+/// to the restricted host and the answer is `Video unavailable` again.
+///
+/// Measured against a track www refuses: this returns a URL that serves every
+/// byte of the file, where the player API's own answer for it stops after a
+/// mebibyte. yt-dlp solves the JS challenge that the cap is the absence of.
+const MUSIC_CLIENT_FLAGS: &[&str] = &[
+    "--extractor-args",
+    "youtube:player_client=web_music;player_skip=webpage,configs",
+];
+
+/// What the retry above will take, in order of preference.
+///
+/// `web_music` offers exactly one format for these tracks: 18, the progressive
+/// mp4 -- AAC-LC at ~96 kbps beside a 360p video track nothing here decodes.
+/// Worse than [`AUDIO_FORMAT`], which is why it is only ever reached after the
+/// normal attempt has failed, and much better than a track that will not play.
+/// The audio-only itags stay ahead of it in case a future client offers one.
+const MUSIC_FORMAT: &str = "140/bestaudio[ext=m4a]/18";
 
 /// Shape of the `--dump-json` fields we consume. yt-dlp emits far more; serde
 /// drops the rest rather than allocating it.
@@ -146,11 +177,38 @@ impl YouTube {
     /// This is the expensive call (~2-4 s, ~80 MB transient). Callers should
     /// consult the URL cache first and prefetch the next queue item during
     /// playback so this cost lands off the critical path.
+    ///
+    /// A track Restricted Mode is hiding costs a second invocation on top of
+    /// that, through YouTube Music's client -- which is the only way this
+    /// program has of playing one at all. Paid only by the tracks that need it:
+    /// the retry is reached from a failure, never speculatively.
     pub fn resolve(&self, video_id: &str) -> Result<StreamUrl> {
+        let why = match self.resolve_as(video_id, AUDIO_FORMAT, &[]) {
+            Ok(stream) => return Ok(stream),
+            Err(why) => why,
+        };
+
+        // Anything else -- a private video, a dead id, a missing binary -- is
+        // reported as it stands. There is nothing another client would know
+        // about it that this one did not.
+        if !format!("{why:#}").contains(RESTRICTED) {
+            return Err(why);
+        }
+
+        self.resolve_as(video_id, MUSIC_FORMAT, MUSIC_CLIENT_FLAGS)
+            // The retry's own failure is not what is worth reporting. Whatever
+            // it says, the thing standing in the way is the one the first
+            // attempt already named, and it is the one with a fix attached.
+            .map_err(|_| anyhow::anyhow!("{}", restricted_mode(video_id)))
+    }
+
+    /// One yt-dlp invocation, for a given format and extra flags.
+    fn resolve_as(&self, video_id: &str, format: &str, extra: &[&str]) -> Result<StreamUrl> {
         let out = Command::new(&self.bin)
             .arg("--format")
-            .arg(AUDIO_FORMAT)
+            .arg(format)
             .args(RESOLVE_FLAGS)
+            .args(extra)
             .arg(format!("https://www.youtube.com/watch?v={video_id}"))
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
@@ -227,12 +285,63 @@ pub(super) fn parse_expiry(url: &str) -> Option<SystemTime> {
 /// one. Falls back to the last non-empty line so we never report nothing.
 fn first_error_line(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
-    text.lines()
+    let line = text
+        .lines()
         .find(|l| l.contains("ERROR"))
         .or_else(|| text.lines().rev().find(|l| !l.trim().is_empty()))
         .unwrap_or("no error output")
-        .trim()
-        .to_string()
+        .trim();
+    strip_preamble(line).to_string()
+}
+
+/// Drops yt-dlp's `ERROR: [youtube] <id>: ` preamble, leaving the sentence.
+///
+/// Every part of it is already known here: the caller names the id it asked
+/// about, and the extractor is always the same one. What it costs is the front
+/// half of a line that has to fit a status bar beside the key hints -- so the
+/// preamble survives and the half that says what happened is what gets cut.
+fn strip_preamble(line: &str) -> &str {
+    let line = line.strip_prefix("ERROR: ").unwrap_or(line);
+    // `[youtube]`, or whichever extractor answered.
+    let line = match line.strip_prefix('[') {
+        Some(rest) => rest.split_once("] ").map_or(line, |(_, tail)| tail),
+        None => line,
+    };
+    // Then the id, which is this call's own argument coming back. Checked
+    // rather than assumed: the messages themselves contain colons, and a
+    // failure that names no id must not lose its first clause to this.
+    match line.split_once(": ") {
+        Some((head, tail)) if is_video_id(head) => tail,
+        _ => line,
+    }
+}
+
+/// What to say about a track Restricted Mode is hiding.
+///
+/// Reached only once the YouTube Music retry has failed as well, so it is the
+/// end of the road rather than the first sign of trouble.
+///
+/// Spelled out rather than passing YouTube's own sentence through, which asks
+/// the user to "check the ... network administrator restrictions" without
+/// saying what to check or how. The failure is otherwise invisible from inside
+/// the program: the session works, search works, most tracks play, and the
+/// ones something flagged as mature come back as though they did not exist.
+///
+/// Deliberately several lines, which is what routes it to an overlay instead
+/// of a status bar that would clip it mid-word.
+fn restricted_mode(video_id: &str) -> String {
+    format!(
+        "{video_id} is blocked by YouTube's Restricted Mode, and the retry \
+         through YouTube Music could not reach it either.\n\n\
+         Restricted Mode is applied by the network, not by this program. It \
+         points www.youtube.com at restrictmoderate.youtube.com \
+         (216.239.38.119) or restrict.youtube.com (216.239.38.120), and that \
+         front end refuses whatever it treats as mature -- which for a music \
+         player is the occasional explicit track.\n\n\
+         `nslookup www.youtube.com` tells you whether this is it: an answer in \
+         216.239.38.x is Restricted Mode. Turning on DNS-over-HTTPS, or using \
+         a network without the policy, lifts it for every track at once."
+    )
 }
 
 #[cfg(test)]
@@ -295,10 +404,12 @@ mod tests {
         };
         let help = String::from_utf8_lossy(&out.stdout);
 
-        // Non-flag arguments (values like "urls") are skipped.
+        // Non-flag arguments (values like "urls", or the extractor-args
+        // string itself) are skipped.
         let flags = SEARCH_FLAGS
             .iter()
             .chain(RESOLVE_FLAGS)
+            .chain(MUSIC_CLIENT_FLAGS)
             .chain(["--format"].iter())
             .filter(|a| a.starts_with("--"));
 
@@ -335,6 +446,87 @@ mod tests {
         assert_eq!(extract_video_id("daft punk around the world"), None);
         assert_eq!(extract_video_id("short"), None);
         assert_eq!(extract_video_id("hello world"), None);
+    }
+
+    #[test]
+    fn an_error_line_keeps_only_what_the_caller_does_not_already_know() {
+        let stderr = b"WARNING: something noisy\n\
+                       ERROR: [youtube] GwSSrwryxN0: Video unavailable. This video is restricted.\n"
+            as &[u8];
+        assert_eq!(
+            first_error_line(stderr),
+            "Video unavailable. This video is restricted."
+        );
+    }
+
+    #[test]
+    fn a_message_that_names_no_id_keeps_its_first_clause() {
+        // "Unable to download webpage" reads as a sentence with a colon in it,
+        // not as a preamble. Cutting at the first colon would throw away the
+        // half that says what failed.
+        let stderr = b"ERROR: unable to download webpage: timed out\n" as &[u8];
+        assert_eq!(
+            first_error_line(stderr),
+            "unable to download webpage: timed out"
+        );
+    }
+
+    #[test]
+    fn nothing_on_stderr_still_reports_something() {
+        assert_eq!(first_error_line(b""), "no error output");
+    }
+
+    #[test]
+    fn restricted_mode_is_answered_rather_than_repeated() {
+        // The trigger phrase, as YouTube's restricted front end sends it.
+        let stderr = b"ERROR: [youtube] GwSSrwryxN0: Video unavailable. This video is restricted. \
+                       Please check the Google Workspace administrator and/or the network \
+                       administrator restrictions.\n" as &[u8];
+        assert!(first_error_line(stderr).contains(RESTRICTED));
+
+        let said = restricted_mode("GwSSrwryxN0");
+        assert!(said.contains("GwSSrwryxN0"));
+        assert!(said.contains("Restricted Mode"));
+        // Multi-line is what routes it to an overlay instead of the status bar,
+        // where a paragraph of instructions would be cut after a few words.
+        assert!(said.contains('\n'));
+    }
+
+    /// The Restricted Mode fallback, end to end.
+    ///
+    /// On a network that does not apply Restricted Mode the first attempt
+    /// simply succeeds, so this prints which path answered rather than
+    /// insisting on one. Behind Restricted Mode it is the whole difference
+    /// between a track that plays and one that appears not to exist.
+    ///
+    /// Needs yt-dlp on PATH; the app itself uses the copy it fetched into its
+    /// own directory, which is not the same thing.
+    ///
+    /// `cargo test --release past_restricted_mode -- --ignored --nocapture`
+    #[test]
+    #[ignore = "hits the network; only means anything behind Restricted Mode"]
+    fn resolves_past_restricted_mode() {
+        if Command::new("yt-dlp").arg("--version").output().is_err() {
+            eprintln!("skipping: yt-dlp is not on PATH");
+            return;
+        }
+
+        let id = std::env::var("MTUI_VIDEO_ID").unwrap_or_else(|_| "GwSSrwryxN0".into());
+        let yt = YouTube::default();
+
+        let Err(why) = yt.resolve_as(&id, AUDIO_FORMAT, &[]) else {
+            println!("{id} is not restricted on this network");
+            return;
+        };
+
+        let why = format!("{why:#}");
+        assert!(why.contains(RESTRICTED), "{id} failed for another reason: {why}");
+
+        let stream = yt
+            .resolve(&id)
+            .expect("the YouTube Music retry should reach a restricted track");
+        println!("{id}: restricted on www, recovered through music.youtube.com");
+        assert!(stream.url.starts_with("https://"));
     }
 
     #[test]

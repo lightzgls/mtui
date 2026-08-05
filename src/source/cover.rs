@@ -10,24 +10,27 @@
 //! uploads is the album art and for a music video is a frame from it. Real
 //! album art would mean a second metadata source, which is a separate feature.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use jpeg_decoder::PixelFormat;
 
 /// Longest edge kept after downscaling, in image pixels.
 ///
-/// Set to keep everything YouTube actually has: maxresdefault is 1280x720, so
-/// its album art is at most 720 on a side and this discards nothing. Anything
-/// lower would mean upscaling a shrunken copy back up for a full-window cover,
-/// which is throwing away detail and then inventing it again.
+/// Set to keep everything YouTube actually has. The largest thumbnail it serves
+/// is 1280x720, so this discards nothing: square album art arrives pillarboxed
+/// inside that canvas and comes out of [`trim_bars`] at 720x720, while a 16:9
+/// cover keeps all 1280 columns instead of being squashed to 720 before the
+/// renderer has said how big a pane it has. Anything lower would mean upscaling
+/// a shrunken copy back up for a full-window cover, which is throwing away
+/// detail and then inventing it again.
 ///
-/// The cost is honest and worth naming: 720x720 of RGB is 1.5 MB, resident only
-/// while a track is playing and dropped the moment one stops. That is the price
-/// of a picture rather than a mosaic.
-const MAX_EDGE: u32 = 720;
+/// The cost is honest and worth naming: a 1280x720 cover is 2.7 MB of RGB,
+/// resident only while a track is playing and dropped the moment one stops.
+/// That is the price of a picture rather than a mosaic.
+const MAX_EDGE: u32 = 1280;
 
-/// Ceiling on the response body. These thumbnails run 20-40 KB; anything
+/// Ceiling on the response body. A 1280x720 thumbnail runs 60-90 KB; anything
 /// wildly past that is not one, and buffering it would undo the point.
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -40,9 +43,25 @@ const BAR_TOLERANCE: u32 = 14;
 /// genuinely flat-coloured cover from being cropped away to nothing.
 const MAX_TRIM_PERCENT: u32 = 45;
 
-/// Whole-request budget. A cover is decoration: it is not worth making the
-/// worker unavailable for a real request while a slow CDN edge thinks about it.
+/// Whole-fetch budget, spanning every name in [`SIZES`] rather than each. A
+/// cover is decoration: it is not worth making the worker unavailable for a
+/// real request while a slow CDN edge thinks about it, and a ladder that spent
+/// this much per rung could sit on the cover thread for four times as long.
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Thumbnail names to try, largest first.
+///
+/// What matters is how many pixels survive [`trim_bars`], since every one of
+/// these is the source frame fitted into a fixed canvas: square album art comes
+/// out of the first two at 720x720, out of `sddefault` at 480x480, and out of
+/// `hqdefault` at 360x360.
+///
+/// `maxresdefault` and `hq720` are the same 1280x720 image under two names, and
+/// both are here because neither is generated for every upload -- an older or
+/// low-resolution one may have `hq720` and no `maxresdefault`. `sddefault` sits
+/// between them and the one size YouTube always has, so a track missing the top
+/// two lands on 480x480 rather than dropping straight to 360x360.
+const SIZES: &[&str] = &["maxresdefault", "hq720", "sddefault", "hqdefault"];
 
 /// A decoded, downscaled thumbnail, held as tightly packed 8-bit RGB.
 #[derive(Clone)]
@@ -117,24 +136,38 @@ impl Cover {
     }
 }
 
-/// Fetches and decodes the thumbnail for a YouTube video id.
+/// Fetches and decodes the thumbnail for a YouTube video id, taking the largest
+/// size that upload actually has.
 pub fn fetch(video_id: &str) -> Result<Cover> {
-    // Biggest first. Every thumbnail pads the source frame with bars that
-    // trim_bars() removes, so what matters is how many pixels survive the crop:
-    // maxresdefault holds square album art at 720x720, hqdefault at 360x360.
-    // maxresdefault is missing for plenty of uploads, hence the fallback --
-    // hqdefault is the one size YouTube always has.
-    let body = get(&url(video_id, "maxresdefault"))
-        .or_else(|_| get(&url(video_id, "hqdefault")))
-        .with_context(|| format!("could not fetch thumbnail for {video_id}"))?;
-    decode(&body)
+    let deadline = Instant::now() + TIMEOUT;
+    let mut last = None;
+
+    for name in SIZES {
+        // A missing size answers 404 in milliseconds, so the ladder normally
+        // costs nothing; this only bites when the CDN is unreachable, and then
+        // it stops rather than spending the budget again on the next name.
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        // Decode failures fall through with the fetch failures: a truncated or
+        // otherwise unreadable JPEG at one size says nothing about the next,
+        // and there is a smaller copy of the same picture right below it.
+        match get(&url(video_id, name), left).and_then(|body| decode(&body)) {
+            Ok(cover) => return Ok(cover),
+            Err(e) => last = Some(e),
+        }
+    }
+
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no thumbnail sizes are configured")))
+        .with_context(|| format!("could not fetch a thumbnail for {video_id}"))
 }
 
 fn url(video_id: &str, name: &str) -> String {
     format!("https://i.ytimg.com/vi/{video_id}/{name}.jpg")
 }
 
-fn get(url: &str) -> Result<Vec<u8>> {
+fn get(url: &str, timeout: Duration) -> Result<Vec<u8>> {
     // A current-thread runtime, built for this one request and dropped with it.
     // The worker thread blocks on the request anyway, so there is nothing for a
     // resident reactor to do between tracks.
@@ -146,7 +179,7 @@ fn get(url: &str) -> Result<Vec<u8>> {
     runtime.block_on(async {
         let response = reqwest::Client::new()
             .get(url)
-            .timeout(TIMEOUT)
+            .timeout(timeout)
             .send()
             .await?
             .error_for_status()?;
@@ -340,9 +373,20 @@ mod tests {
 
     #[test]
     fn shrink_preserves_aspect_ratio() {
+        // Twice the ceiling on the long edge, so this actually shrinks.
+        let (w, h) = (MAX_EDGE * 2, MAX_EDGE * 2 * 9 / 16);
+        let src = vec![128; (w * h * 3) as usize];
+        let cover = shrink(w, h, &src);
+        assert_eq!((cover.width, cover.height), (MAX_EDGE, MAX_EDGE * 9 / 16));
+    }
+
+    #[test]
+    fn the_largest_thumbnail_youtube_serves_is_kept_whole() {
+        // 1280x720 is maxresdefault, and nothing about it may be thrown away
+        // before the renderer has said what size pane it has.
         let src = vec![128; (1280 * 720 * 3) as usize];
         let cover = shrink(1280, 720, &src);
-        assert_eq!((cover.width, cover.height), (MAX_EDGE, MAX_EDGE * 9 / 16));
+        assert_eq!((cover.width, cover.height), (1280, 720));
     }
 
     #[test]
@@ -478,8 +522,14 @@ mod tests {
     fn fetches_a_real_thumbnail() {
         let cover = fetch("dQw4w9WgXcQ").expect("thumbnail should fetch and decode");
         // Exact dimensions depend on how much padding this particular upload
-        // arrives with, so assert the invariants instead.
-        assert_eq!(cover.width.max(cover.height), MAX_EDGE);
+        // arrives with, so assert the invariants instead. The lower bound is
+        // the point of the ladder: anything under 720 on the long edge means a
+        // rung was skipped and a small copy came back in place of the big one.
+        let longest = cover.width.max(cover.height);
+        assert!(
+            (720..=MAX_EDGE).contains(&longest),
+            "long edge is {longest}"
+        );
         assert_eq!(cover.rgb.len() as u32, cover.width * cover.height * 3);
     }
 }

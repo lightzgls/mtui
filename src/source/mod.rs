@@ -8,8 +8,11 @@
 pub mod auth;
 pub mod bootstrap;
 pub mod cover;
+pub mod home;
 pub mod innertube;
 pub mod library;
+pub mod sapisid;
+pub mod watch;
 pub mod worker;
 pub mod youtube;
 

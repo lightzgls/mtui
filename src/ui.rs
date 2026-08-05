@@ -12,12 +12,16 @@ use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph};
 
-use crate::app::{App, CoverSize, ImagePlan, Mode, Overlay, SignIn, View};
+use crate::app::{
+    App, CoverSize, ImagePlan, Mode, NowPlaying, Overlay, Panel, RelatedRow, SignIn, Tab, View,
+};
 use crate::graphics::Graphics;
 use crate::player::{PlayState, Snapshot};
+use crate::source::Track;
 use crate::source::cover::Cover;
+use crate::source::home::{Card, Shelf};
 use crate::source::library::Playlist;
 
 /// Width reserved for the right-aligned duration column, including padding.
@@ -44,24 +48,86 @@ const COVER_MAX_WIDTH: u16 = 56;
 /// thin to read titles in, so it is dropped instead.
 const MIN_WIDTH_WITH_COVER: u16 = 64;
 
+/// Bounds on the player page's panel, borders included.
+///
+/// The floor is what the tab row measures: four names and their padding come to
+/// thirty-two columns, and a panel that cannot show its own tabs cannot be
+/// navigated. The ceiling exists so a wide terminal spends its columns on the
+/// cover, which is the thing that gets better with more of them.
+const PANEL_MIN_WIDTH: u16 = 34;
+const PANEL_MAX_WIDTH: u16 = 52;
+
+/// Rows the player page reserves under the cover: the title, the artist, a
+/// blank, the progress bar, and the volume bar.
+const INFO_HEIGHT: u16 = 5;
+
+/// Widest the volume bar is drawn, however much room the panel has. It is a
+/// setting rather than a position, so it is deliberately shorter than the
+/// progress bar above it -- two bars of the same length read as two of the
+/// same thing.
+const VOLUME_BAR_WIDTH: usize = 12;
+
+/// Columns a queue row spends on the `▶` marker and the space either side.
+const QUEUE_MARKER_WIDTH: usize = 3;
+
+/// Rows the Up next panel spends on naming the queue before listing it. These
+/// do not scroll, so they come off the viewport rather than out of the list.
+const UP_NEXT_HEADER: usize = 3;
+
+/// Width of the artist column in a queue row, and the title width defended
+/// before one is granted. Same principle as [`MIN_TITLE_WIDTH`] in the results
+/// list, at the narrower scale a side panel can afford.
+const QUEUE_ARTIST_WIDTH: usize = 14;
+const MIN_QUEUE_TITLE: usize = 16;
+
 /// Name width defended in a playlist row before its track count is granted.
 /// Same principle as [`MIN_TITLE_WIDTH`]: the label outranks the metadata.
 const MIN_PLAYLIST_NAME: usize = 8;
 
 /// Columns the status bar reserves for the key hints. Every hint below has to
 /// fit, since the column truncates rather than wraps.
-const HINTS_WIDTH: u16 = 42;
+///
+/// Six wider than it was, bought from the track name beside it, so that the two
+/// keys a playing track adds -- back to its page, and away to the notification
+/// area -- can be named without any of the existing hints being dropped for
+/// them. The name gives up less than it looks: it is the one thing on this bar
+/// that is also written across the pane above in full.
+const HINTS_WIDTH: u16 = 52;
 
 /// Named rather than inlined into [`hint_line`] so the test that checks they
 /// fit [`HINTS_WIDTH`] measures the strings that are actually drawn.
 const HINTS_EDITING: &str = "Enter run   Esc browse   ^L your library";
 const HINTS_PLAYLISTS: &str = "Enter open  r reload  x sign out  Esc back";
 const HINTS_TRACKS: &str = "/ search  L library  a add  f like  q quit";
+/// The landing page. `Esc` and `H` also return here from the track list, and
+/// neither fits beside what that line already has to offer -- so this one names
+/// what moves the cursor instead, which is the part a grid needs said.
+const HINTS_HOME: &str = "Enter play  hjkl move  / search  q quit";
+/// The player page. `n`, `p` and the tab keys are what it is for; `Esc` is
+/// named because the view is entered without being asked for and the way out of
+/// it is the first thing a user looks for. `+-` is named beside the volume bar
+/// this page draws, since a bar with no key named for it invites hunting.
+const HINTS_PLAYING: &str = "hl tabs  n next  jk scroll  +- vol  Esc back  B tray";
 /// Offered in either browse view with no session. `a`, `f`, `x` and `Enter` on
 /// a playlist all need one, so naming them to a signed-out user advertises keys
 /// that can only answer by starting a sign-in they did not ask for. Every key
 /// here works in both views, which is what lets one line serve both.
 const HINTS_SIGNED_OUT: &str = "A sign in   / search   q quit";
+
+/// The same four lines for when something is playing and its page is not on
+/// screen, each naming the two keys that only mean anything then: `P` back to
+/// the page, and `B` away from the terminal altogether.
+///
+/// A separate set rather than a line appended to the others, because the column
+/// is full: every one of these gives up a hint to make the room. What they give
+/// up is the least of what they offered -- `q` has `Ctrl-C` behind it, and
+/// reload and sign-out are session-long errands -- and what they gain is the
+/// only thing on screen that says a playing track can be returned to at all,
+/// or left running without a window.
+const HINTS_PLAYLISTS_PLAYING: &str = "Enter open  r reload  Esc back  P player  B tray";
+const HINTS_TRACKS_PLAYING: &str = "/ search  L library  a add  f like  P player  B tray";
+const HINTS_HOME_PLAYING: &str = "Enter play  hjkl move  / search  P player  B tray";
+const HINTS_SIGNED_OUT_PLAYING: &str = "A sign in   / search   P player   B tray   q quit";
 
 /// Full height of the sign-in panel, borders included. Below this the compact
 /// layout runs instead.
@@ -86,6 +152,30 @@ const CODE_BOX_PADDING: u16 = 6;
 /// Width reserved for the "expires in m:ss" column.
 const EXPIRY_WIDTH: u16 = 16;
 
+/// Card geometry on the landing page, borders included.
+///
+/// Two lines of text inside: a title and the subtitle YouTube Music writes
+/// under it. A third would fit more of a long title and cost a shelf off the
+/// bottom of the page, which is the wrong trade -- the shelves are what the
+/// page is for.
+const CARD_WIDTH: u16 = 26;
+const CARD_HEIGHT: u16 = 4;
+
+/// One shelf: its heading, its cards, and a blank row under them so two shelves
+/// do not read as one block of boxes.
+const SHELF_HEIGHT: u16 = CARD_HEIGHT + 2;
+
+/// Below this a card holds nothing but borders and an ellipsis, so the page
+/// stands down and says so rather than drawing a column of empty boxes.
+const MIN_HOME_WIDTH: u16 = 24;
+
+/// Columns the `▌` before a shelf heading occupies, space included.
+const MARKER_WIDTH: usize = 2;
+
+/// Heading width defended before the position counter is granted. Same
+/// principle as [`MIN_PLAYLIST_NAME`].
+const MIN_SHELF_TITLE: usize = 8;
+
 const HINT_HIDE: &str = "  Esc hides this";
 const HINT_HIDE_RUNNING: &str = "  Esc hides this -- the sign-in keeps running";
 
@@ -97,20 +187,39 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    let (list_area, cover_area) = split_cover(app, main_area);
-
     render_search(frame, app, search_area);
-    if let Some(area) = list_area {
-        match app.view {
-            View::Tracks => render_results(frame, app, area),
-            View::Playlists => render_playlists(frame, app, area),
+
+    // The player page lays itself out around the cover rather than beside it,
+    // so it reserves its own rect instead of going through `split_cover`.
+    let cover_area = if app.view == View::Playing {
+        render_player(frame, app, main_area)
+    } else {
+        let (list_area, cover_area) = split_cover(app, main_area);
+        if let Some(area) = list_area {
+            match app.view {
+                View::Home => render_home(frame, app, area),
+                View::Tracks => render_results(frame, app, area),
+                View::Playlists => render_playlists(frame, app, area),
+                // Handled above.
+                View::Playing => {}
+            }
         }
-    }
-    render_status(frame, app, status_area);
+        cover_area
+    };
+    render_status(frame, app, status_area, page_draws_progress(app, main_area));
 
     // Planned last so it can reach into the finished buffer and mark the cells
     // the image covers.
-    let size = app.cover_size;
+    //
+    // The player page always draws the cover full-size: `Side` exists to frame
+    // a picture sitting next to a list, and here it is the subject of the view
+    // rather than an annotation on one. The rect it is centred in has already
+    // been carved out by `render_player`.
+    let size = if app.view == View::Playing {
+        CoverSize::Full
+    } else {
+        app.cover_size
+    };
     app.image = match (cover_area, app.cover.as_ref()) {
         // Sixel pixels are not in ratatui's buffer, so an overlay drawn over
         // them would not cover them -- the modal would appear with the picture
@@ -608,6 +717,14 @@ fn split_cover(app: &App, area: Rect) -> (Option<Rect>, Option<Rect>) {
     if app.cover_size == CoverSize::Full {
         return (None, Some(area));
     }
+    // The landing page is laid out across the full width -- a side pane there
+    // costs it a column of cards, and the cover of what is already playing is
+    // not what someone browsing for the next track is looking at. `c` still
+    // takes the whole window, which is an explicit request rather than a
+    // default.
+    if app.view == View::Home {
+        return (Some(area), None);
+    }
     let width = (area.width * 2 / 5).clamp(COVER_MIN_WIDTH, COVER_MAX_WIDTH);
     let [list, cover] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(width)]).areas(area);
@@ -678,6 +795,248 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
         let x = inner.x + app.query.chars().count().min(inner.width as usize) as u16;
         frame.set_cursor_position((x, inner.y));
     }
+}
+
+/// The landing page: YouTube Music's shelves, drawn as rows of cards.
+///
+/// Virtualized in both directions, on the same principle as the results list --
+/// only the shelves on screen are laid out, and only the cards visible within
+/// each of them are built. A feed of twelve shelves costs what one screenful
+/// costs.
+fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::bordered().title(app.list_title());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.home.is_empty() || inner.width < MIN_HOME_WIDTH || inner.height < CARD_HEIGHT + 1 {
+        let hint = if !app.home.is_empty() {
+            // Too small to draw a card in, which is a fact about the window
+            // rather than a failure worth explaining.
+            "the window is too small for the home feed"
+        } else if app.home_pending {
+            "loading ..."
+        } else {
+            // Both halves matter: `r` is the only way to ask again, and a user
+            // who cannot get a feed can still use every other part of this.
+            "no home feed -- press r to try again, or / to search"
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+            inner,
+        );
+        return;
+    }
+
+    // Cards are widened to fill the row rather than left at [`CARD_WIDTH`] with
+    // a ragged margin: the leftover columns are worth more inside the titles
+    // than they are as whitespace on the right.
+    let across = (inner.width / CARD_WIDTH).max(1);
+    let down = (inner.height / SHELF_HEIGHT).max(1);
+    app.clamp_home(down as usize, across as usize);
+
+    let cursor = HomeCursor {
+        top: app.home_top,
+        shelf: app.home_shelf,
+        card: app.home_card,
+    };
+    render_feed(frame, &app.home, inner, cursor, &app.home_scroll);
+}
+
+/// Where the cursor stands on the landing page as a whole.
+#[derive(Debug, Clone, Copy)]
+struct HomeCursor {
+    /// First visible shelf.
+    top: usize,
+    shelf: usize,
+    card: usize,
+}
+
+/// Stacks the visible shelves down the pane.
+///
+/// Split from [`render_home`] so the page can be drawn from shelves alone --
+/// which is what lets it be previewed and tested without standing up a player
+/// and a worker thread behind an `App`.
+fn render_feed(
+    frame: &mut Frame,
+    shelves: &[Shelf],
+    area: Rect,
+    cursor: HomeCursor,
+    scroll: &[usize],
+) {
+    let across = (area.width / CARD_WIDTH).max(1);
+    let slot = area.width / across;
+
+    let mut y = area.y;
+    for (index, shelf) in shelves.iter().enumerate().skip(cursor.top) {
+        // A shelf that would be cut off halfway is not drawn at all: half a
+        // card reads as a rendering fault, where a blank row reads as the end
+        // of the page.
+        if y + CARD_HEIGHT + 1 > area.y + area.height {
+            break;
+        }
+        let row = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: CARD_HEIGHT + 1,
+        };
+        render_shelf(
+            frame,
+            shelf,
+            row,
+            ShelfCursor {
+                focused: index == cursor.shelf,
+                selected: cursor.card,
+                offset: scroll.get(index).copied().unwrap_or(0),
+            },
+            (across, slot),
+        );
+        y += SHELF_HEIGHT;
+    }
+}
+
+/// Where the cursor stands in one shelf, as far as that shelf needs to know.
+#[derive(Debug, Clone, Copy)]
+struct ShelfCursor {
+    /// Whether the cursor is in this shelf at all. Only one shelf draws a
+    /// selection, so that the page has a single cursor rather than one per row.
+    focused: bool,
+    selected: usize,
+    /// Leftmost visible card.
+    offset: usize,
+}
+
+/// One shelf: a heading, then as many cards as fit beside each other.
+fn render_shelf(
+    frame: &mut Frame,
+    shelf: &Shelf,
+    area: Rect,
+    cursor: ShelfCursor,
+    (across, slot): (u16, u16),
+) {
+    let [heading, cards] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(CARD_HEIGHT)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(heading_line(shelf, cursor, area.width as usize)),
+        heading,
+    );
+
+    for column in 0..across {
+        let Some(card) = shelf.cards.get(cursor.offset + column as usize) else {
+            break;
+        };
+        let rect = Rect {
+            x: cards.x + column * slot,
+            // One column of the slot is left as the gap between cards.
+            width: slot.saturating_sub(1),
+            ..cards
+        };
+        let selected = cursor.focused && cursor.offset + column as usize == cursor.selected;
+        render_card(frame, card, rect, selected);
+    }
+}
+
+/// A shelf's heading: the name YouTube gave it, and -- when the cursor is in it
+/// -- how far along the shelf the cursor has got.
+///
+/// The counter is only drawn for the focused shelf because it is the only one
+/// whose position can change, and a row of counters on shelves nobody is
+/// looking at is noise that competes with the headings themselves.
+fn heading_line(shelf: &Shelf, cursor: ShelfCursor, width: usize) -> Line<'static> {
+    // Narrower than the marker and there is no heading to draw, only an
+    // overhang. The pane refuses to draw cards well before this.
+    if width < MARKER_WIDTH + 1 {
+        return Line::from("");
+    }
+
+    let (marker, title_style) = if cursor.focused {
+        (
+            Style::default().fg(Color::Cyan),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
+        )
+    };
+
+    let counter = if cursor.focused && shelf.cards.len() > 1 {
+        format!("{} of {} ", cursor.selected + 1, shelf.cards.len())
+    } else {
+        String::new()
+    };
+    // The name outranks the position, the same way a playlist row's name
+    // outranks its track count: a counter beside a two-letter stub of a
+    // heading says where the cursor is in a shelf the user can no longer
+    // identify.
+    let counter = if width >= MARKER_WIDTH + MIN_SHELF_TITLE + counter.len() {
+        counter
+    } else {
+        String::new()
+    };
+
+    // The marker leads, and the counter is right-aligned against the far edge
+    // of the shelf.
+    let room = width.saturating_sub(MARKER_WIDTH + counter.len());
+    let title = truncate(&shelf.title, room);
+    let pad = room.saturating_sub(display_width(&title));
+
+    Line::from(vec![
+        Span::styled("▌ ", marker),
+        Span::styled(title, title_style),
+        Span::styled(
+            format!("{:pad$}{counter}", "", pad = pad),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+/// One card: a box with a title and whatever YouTube wrote under it.
+///
+/// The leading glyph says what Enter will do, which is the one thing the two
+/// kinds of card do not otherwise distinguish: a song plays, and an album or a
+/// playlist opens into a list. Without it the difference is only discoverable
+/// by pressing Enter and seeing what happens.
+fn render_card(frame: &mut Frame, card: &Card, area: Rect, selected: bool) {
+    let border = if selected {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let title = if selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    // One column of padding either side, so text never touches the border.
+    let room = inner.width.saturating_sub(2) as usize;
+    let glyph = if card.is_playable() { "▶ " } else { "≡ " };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(format!(" {glyph}"), Style::default().fg(Color::DarkGray)),
+            Span::styled(truncate(&card.title, room.saturating_sub(2)), title),
+        ]),
+        Line::from(Span::styled(
+            format!(" {}", truncate(&card.subtitle, room)),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The user's playlists, with "Liked songs" pinned at the top.
@@ -771,6 +1130,537 @@ fn playlist_line(playlist: &Playlist, selected: bool, width: usize) -> Line<'sta
             },
         ),
     ])
+}
+
+/// The player page: the cover of what is playing, and beside it the tab the
+/// user has open.
+///
+/// Returns the rect the cover should be centred in, which the caller paints --
+/// the picture is not part of ratatui's buffer on the sixel path, so it cannot
+/// be drawn from here.
+fn render_player(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
+    // Nothing is playing, so there is no page. Reachable for one frame after a
+    // stop, before the key handler's view change is drawn.
+    let now = app.now.as_ref()?;
+
+    // An explicit request for the whole window outranks the layout: `c` means
+    // the picture, and the panel beside it is what the user asked to be rid of.
+    if app.cover_size == CoverSize::Full {
+        return Some(area);
+    }
+
+    // Too narrow to carry both. The panel wins rather than the picture: it is
+    // where the queue, the lyrics and the comments are, and a cover squeezed
+    // into twenty columns is a smudge.
+    if area.width < MIN_WIDTH_WITH_COVER {
+        render_panel(frame, app, area);
+        return None;
+    }
+
+    let panel_width = (area.width * 2 / 5).clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH);
+    let [art_area, panel_area] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(panel_width)]).areas(area);
+
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(app.list_title());
+    let inner = block.inner(art_area);
+    frame.render_widget(block, art_area);
+
+    // The picture takes what the track's own details do not need. Below the
+    // point where the details would leave it nothing, the details go instead:
+    // a title and a progress bar are the parts a player cannot do without.
+    let (art, info) = if inner.height > INFO_HEIGHT {
+        let [art, info] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(INFO_HEIGHT)]).areas(inner);
+        (Some(art), info)
+    } else {
+        (None, inner)
+    };
+    render_track_info(frame, now, app.snapshot(), info);
+
+    render_panel(frame, app, panel_area);
+    art
+}
+
+/// The title, artist and progress of what is playing.
+fn render_track_info(frame: &mut Frame, now: &NowPlaying, snap: Snapshot, area: Rect) {
+    let width = area.width as usize;
+    let mut lines = vec![
+        Line::from(Span::styled(
+            truncate(&now.title, width),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            truncate(&now.byline(), width),
+            Style::default().fg(Color::Gray),
+        )),
+    ];
+    if area.height > 2 {
+        lines.push(Line::from(""));
+        lines.push(progress_line(&snap, now.duration, width));
+    }
+    // Last, because it is the one row here that is about the player rather than
+    // about the track: a short panel spends what it has on the song.
+    if area.height > 4 {
+        lines.push(volume_line(snap.volume, width));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The scrubber: a bar, and the clock beside it.
+///
+/// The length comes from the queue rather than from the player, which knows
+/// only how far it has got -- so a track whose length never arrived gets a
+/// clock and no bar rather than a bar that would have to lie about the end.
+fn progress_line<'a>(snap: &Snapshot, total: Option<Duration>, width: usize) -> Line<'a> {
+    let position = snap.position;
+    let clock = match total {
+        Some(total) => format!(" {} / {}", clock(position), clock(total)),
+        None => format!(" {}", clock(position)),
+    };
+
+    let bar_width = width.saturating_sub(clock.chars().count() + 1);
+    let Some(total) = total.filter(|total| !total.is_zero() && bar_width >= 4) else {
+        return Line::from(Span::styled(clock, Style::default().fg(Color::Gray)));
+    };
+
+    // Saturating rather than clamped after the fact: a position past the end is
+    // an ordinary thing to see for a moment, since the container's length and
+    // what the decoder yields never agree to the sample.
+    let filled = ((position.as_secs_f64() / total.as_secs_f64()).min(1.0) * bar_width as f64)
+        .round() as usize;
+
+    Line::from(vec![
+        Span::styled(
+            "━".repeat(filled),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "─".repeat(bar_width - filled),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(clock, Style::default().fg(Color::Gray)),
+    ])
+}
+
+/// The volume, as a bar and the number beside it: `vol ━━━━━━━━────  80%`.
+///
+/// The bar is drawn against 100% rather than against the 200% the player will
+/// accept, because 100% is where every track plays until the user says
+/// otherwise -- a bar sitting half-full at the ordinary volume reads as a
+/// fault. A boost fills it and colours it instead, which says "past the end of
+/// the scale" without pretending the scale is twice as long.
+fn volume_line<'a>(volume: f32, width: usize) -> Line<'a> {
+    const LEAD: &str = "vol ";
+    let label = format!("  {:.0}%", volume * 100.0);
+
+    let bar_width = width
+        .saturating_sub(LEAD.len() + label.chars().count())
+        .min(VOLUME_BAR_WIDTH);
+    // Nothing left to draw a bar in, so the number says it on its own -- the
+    // part a user actually reads a volume off.
+    if bar_width < 4 {
+        return Line::from(Span::styled(
+            format!("{LEAD}{}", label.trim_start()),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
+    let filled = (f64::from(volume.min(1.0)) * bar_width as f64).round() as usize;
+    let fill = if volume > 1.0 {
+        Color::Yellow
+    } else {
+        Color::Gray
+    };
+
+    Line::from(vec![
+        Span::styled(LEAD, Style::default().fg(Color::DarkGray)),
+        Span::styled("━".repeat(filled), Style::default().fg(fill)),
+        Span::styled(
+            "─".repeat(bar_width - filled),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(label, Style::default().fg(Color::Gray)),
+    ])
+}
+
+/// The tabbed panel: the row of tab names, and whichever one is open.
+///
+/// The panel renderers below draw with a cursor they clamp for themselves, and
+/// hand back how long their contents turned out to be; this is where that
+/// length is written back to the cursor the keys move. Doing it in that order
+/// means a frame is never drawn with a cursor past the end of a panel whose
+/// length only became knowable while drawing it.
+fn render_panel(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::bordered().border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 2 {
+        return;
+    }
+
+    let Some(now) = app.now.as_ref() else {
+        return;
+    };
+    let tab = now.tab;
+    let [tabs, content] =
+        Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+    render_tabs(frame, tab, tabs);
+
+    let total = match tab {
+        Tab::UpNext => render_up_next(frame, now, content),
+        Tab::Lyrics => render_lyrics(frame, now, content),
+        Tab::Comments => render_comments(frame, now, content),
+        Tab::Related => render_related(frame, now, content),
+    };
+    // A list stops at its last row; a wall of text stops one screenful short of
+    // its end. `render_up_next` keeps its header out of the scroll, so what it
+    // reports is rows rather than lines and the viewport must match.
+    let selects = matches!(tab, Tab::UpNext | Tab::Related);
+    let viewport = (content.height as usize).saturating_sub(if tab == Tab::UpNext {
+        UP_NEXT_HEADER
+    } else {
+        0
+    });
+    app.clamp_page(viewport, total, selects);
+}
+
+/// The tab names, with the open one underlined.
+///
+/// Underlined rather than highlighted: the panel below is dense, and a filled
+/// bar across the top of it would be the loudest thing on the page. The rule is
+/// drawn as its own row so it reads as the edge of the panel, which is what it
+/// is.
+fn render_tabs(frame: &mut Frame, open: Tab, area: Rect) {
+    let mut labels = Vec::new();
+    let mut rule = Vec::new();
+
+    for tab in Tab::ALL {
+        let selected = tab == open;
+        let style = if selected {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        labels.push(Span::styled(format!(" {} ", tab.label()), style));
+
+        // Under the letters rather than under the padding, so the rule reads as
+        // belonging to the name above it rather than to the gap beside it.
+        let width = tab.label().chars().count();
+        rule.push(Span::styled(
+            format!(" {} ", if selected { "─" } else { " " }.repeat(width)),
+            Style::default().fg(Color::Red),
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(vec![Line::from(labels), Line::from(rule)]), area);
+}
+
+/// The queue, headed by what it is a queue of. Returns its length in rows.
+///
+/// The heading does not scroll with the rows: what a queue is a queue of is the
+/// one thing on this panel that stays true however far down it the user is.
+fn render_up_next(frame: &mut Frame, now: &NowPlaying, area: Rect) -> usize {
+    if now.queue.is_empty() {
+        message(frame, "loading the queue ...", area);
+        return 0;
+    }
+
+    let width = area.width as usize;
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Playing from",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            format!(" {}", truncate(&now.queue_title, width.saturating_sub(1))),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    debug_assert_eq!(lines.len(), UP_NEXT_HEADER);
+
+    let viewport = (area.height as usize).saturating_sub(UP_NEXT_HEADER);
+    let cursor = now.cursor().min(now.queue.len().saturating_sub(1));
+    let offset = centred_offset(cursor, viewport, now.queue.len());
+
+    lines.extend(
+        now.queue
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(viewport)
+            .map(|(index, track)| {
+                queue_line(track, index == cursor, Some(index) == now.playing, width)
+            }),
+    );
+
+    frame.render_widget(Paragraph::new(lines), area);
+    now.queue.len()
+}
+
+/// One queue row: a marker for the track playing, the title, and its length.
+fn queue_line<'a>(track: &Track, selected: bool, playing: bool, width: usize) -> Line<'a> {
+    let style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if playing {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let dim = |colour: Color| if selected { style } else { Style::default().fg(colour) };
+
+    let duration = track.duration_str();
+    // The marker, and the length with a space after it.
+    let text_width = width.saturating_sub(QUEUE_MARKER_WIDTH + duration.chars().count() + 1);
+    // The artist gets a column when the panel is wide enough to carry one
+    // without the titles becoming unreadable, and is dropped rather than
+    // stacked below when it is not: two rows per track would halve a queue that
+    // only shows a handful of them as it is.
+    let (title_width, artist_width) = if text_width >= MIN_QUEUE_TITLE + QUEUE_ARTIST_WIDTH {
+        (text_width - QUEUE_ARTIST_WIDTH, QUEUE_ARTIST_WIDTH)
+    } else {
+        (text_width, 0)
+    };
+
+    let mut spans = vec![
+        Span::styled(
+            format!(" {} ", if playing { "▶" } else { " " }),
+            if playing { style } else { dim(Color::DarkGray) },
+        ),
+        Span::styled(cell(&track.title, title_width), style),
+    ];
+    if artist_width > 0 {
+        spans.push(Span::styled(cell(&track.uploader, artist_width), dim(Color::Gray)));
+    }
+    spans.push(Span::styled(format!("{duration} "), dim(Color::DarkGray)));
+
+    Line::from(spans)
+}
+
+/// The lyrics, wrapped to the panel and scrolled by line. Returns the number of
+/// lines the wrap produced.
+fn render_lyrics(frame: &mut Frame, now: &NowPlaying, area: Rect) -> usize {
+    let width = (area.width as usize).saturating_sub(2);
+    let Panel::Ready(lyrics) = &now.lyrics else {
+        message(frame, waiting_on(&now.lyrics), area);
+        return 0;
+    };
+
+    // Wrapped here rather than by `Paragraph::wrap` because the panel scrolls
+    // by line, and only a wrap we did ourselves can be counted.
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(source) = &lyrics.source {
+        lines.push(source.clone());
+        lines.push(String::new());
+    }
+    for paragraph in lyrics.text.lines() {
+        if paragraph.trim().is_empty() {
+            lines.push(String::new());
+        } else {
+            lines.extend(wrap(paragraph, width));
+        }
+    }
+
+    let viewport = area.height as usize;
+    let source_lines = lyrics.source.is_some() as usize * 2;
+    let offset = now.cursor().min(lines.len().saturating_sub(viewport));
+
+    let drawn: Vec<Line> = lines
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(viewport)
+        .map(|(index, line)| {
+            let style = if index < source_lines {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Line::from(Span::styled(format!(" {line}"), style))
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(drawn), area);
+    lines.len()
+}
+
+/// The comment section, as a scrolling column of blocks. Returns its height in
+/// lines.
+fn render_comments(frame: &mut Frame, now: &NowPlaying, area: Rect) -> usize {
+    let width = (area.width as usize).saturating_sub(2);
+    let Panel::Ready(comments) = &now.comments else {
+        message(frame, waiting_on(&now.comments), area);
+        return 0;
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    if !comments.total.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" {}", truncate(&comments.total, width)),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    for comment in &comments.items {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {}", truncate(&comment.author, width.saturating_sub(1))),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                format!("  {}", comment.published),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        lines.extend(
+            wrap(&comment.text, width)
+                .into_iter()
+                .map(|line| Line::from(Span::raw(format!(" {line}")))),
+        );
+
+        // Only when YouTube gave us either; a comment with no likes and no
+        // replies is better off without a row of zeroes under it.
+        let mut footer = Vec::new();
+        if !comment.likes.is_empty() {
+            footer.push(format!("{} likes", comment.likes));
+        }
+        if !comment.replies.is_empty() {
+            footer.push(format!("{} replies", comment.replies));
+        }
+        if !footer.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(" {}", footer.join("   ")),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    let viewport = area.height as usize;
+    let total = lines.len();
+    let offset = now.cursor().min(total.saturating_sub(viewport));
+
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(offset).take(viewport).collect::<Vec<_>>()),
+        area,
+    );
+    total
+}
+
+/// The Related tab: shelves of recommendations, flattened into one list.
+/// Returns its length in rows.
+fn render_related(frame: &mut Frame, now: &NowPlaying, area: Rect) -> usize {
+    if !matches!(now.related, Panel::Ready(_)) {
+        message(frame, waiting_on(&now.related), area);
+        return 0;
+    }
+
+    let viewport = area.height as usize;
+    let width = area.width as usize;
+    let rows = now.related_rows();
+    let cursor = now.cursor().min(rows.len().saturating_sub(1));
+    let offset = centred_offset(cursor, viewport, rows.len());
+
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(viewport)
+        .map(|(index, row)| match row {
+            RelatedRow::Heading(title) => Line::from(Span::styled(
+                format!(" {}", truncate(title, width.saturating_sub(1))),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            RelatedRow::Card(card) => related_line(card, index == cursor, width),
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), area);
+    rows.len()
+}
+
+/// One recommendation: its title, and under it whatever YouTube wrote about it.
+fn related_line<'a>(card: &Card, selected: bool, width: usize) -> Line<'a> {
+    let style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let subtitle = if selected {
+        style
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    // Split across the row rather than stacked, because a card's subtitle names
+    // its type as often as its artist -- "Playlist • 405 views" is not worth a
+    // line of a panel this short.
+    let title_width = (width.saturating_sub(2) * 3 / 5).max(1);
+    let rest = width.saturating_sub(title_width + 2);
+
+    Line::from(vec![
+        Span::styled(format!("   {}", cell(&card.title, title_width)), style),
+        Span::styled(cell(&card.subtitle, rest), subtitle),
+    ])
+}
+
+/// The panel's contents when it has none: what it is waiting for, or why there
+/// will never be any.
+fn message(frame: &mut Frame, text: &str, area: Rect) {
+    let lines: Vec<Line> = wrap(text, (area.width as usize).saturating_sub(2))
+        .into_iter()
+        .map(|line| Line::from(Span::styled(format!(" {line}"), Style::default().fg(Color::DarkGray))))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// What an empty panel should say for itself.
+fn waiting_on<T>(panel: &Panel<T>) -> &str {
+    match panel {
+        // Idle is a fetch that has not started because the watch response has
+        // not landed yet, which from here is indistinguishable from loading --
+        // and is about to become it.
+        Panel::Idle | Panel::Loading => "loading ...",
+        Panel::Empty(why) => why,
+        Panel::Ready(_) => "",
+    }
+}
+
+/// First visible row of a list that keeps its cursor near the middle.
+///
+/// Centred rather than scrolled at the edges, which is what lets the panel hold
+/// no scroll offset of its own: where to start is a function of where the
+/// cursor is, so nothing has to be remembered between frames.
+fn centred_offset(cursor: usize, viewport: usize, total: usize) -> usize {
+    if viewport == 0 || total <= viewport {
+        return 0;
+    }
+    cursor
+        .saturating_sub(viewport / 2)
+        .min(total - viewport)
+}
+
+/// `H:MM:SS` / `M:SS`, matching how the results list writes a length.
+fn clock(d: Duration) -> String {
+    let total = d.as_secs();
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -967,7 +1857,25 @@ fn sample(cover: &Cover, x: u32, y: u32, px_w: u32, px_h: u32) -> Color {
     Color::Rgb(r, g, b)
 }
 
-fn render_status(frame: &mut Frame, app: &App, area: Rect) {
+/// Whether the player page is drawing the track's own progress bar, which
+/// carries a clock beside it.
+///
+/// Mirrors the conditions [`render_player`] and [`render_track_info`] lay
+/// themselves out by: a full-size cover takes the window outright, a narrow one
+/// spends it all on the panel, and a short one keeps only the title and the
+/// artist. The status bar asks this so that the elapsed time is said once on
+/// screen rather than twice.
+fn page_draws_progress(app: &App, area: Rect) -> bool {
+    app.view == View::Playing
+        && app.now.is_some()
+        && app.cover_size != CoverSize::Full
+        && area.width >= MIN_WIDTH_WITH_COVER
+        // The two rows of border, and then the rows the details need before a
+        // progress bar is among them.
+        && area.height.saturating_sub(2) > 2
+}
+
+fn render_status(frame: &mut Frame, app: &App, area: Rect, page_draws_progress: bool) {
     let snap = app.snapshot();
     let block = Block::bordered().border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
@@ -976,7 +1884,15 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let [now_playing, hints] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(HINTS_WIDTH)]).areas(inner);
 
-    frame.render_widget(Paragraph::new(now_playing_line(&snap, app)), now_playing);
+    frame.render_widget(
+        Paragraph::new(now_playing_line(
+            &snap,
+            app,
+            !page_draws_progress,
+            now_playing.width as usize,
+        )),
+        now_playing,
+    );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint_line(app),
@@ -997,19 +1913,50 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 /// All three fit the reserved width exactly; adding to any of them means
 /// widening the column, not letting it truncate.
 fn hint_line(app: &App) -> &'static str {
+    // Something is playing and the page built around it is not on screen. That
+    // page is entered by playing rather than by asking for it, so a user who
+    // leaves has no reason to know it can be gone back to -- and unlike every
+    // other view here, there is nothing on screen to stumble into that reopens
+    // it. Naming `P` is the whole of what makes it reachable a second time.
+    //
+    // Not offered in the search box, where `P` types a P like every other
+    // printable key, and not on the player page, which is already open.
+    let away = app.now.is_some() && app.view != View::Playing;
     match (app.mode, app.view) {
         (Mode::Editing, _) => HINTS_EDITING,
+        // Before the signed-out line: every key it names works with no session,
+        // and this is the one view a signed-out user reaches by playing
+        // something rather than by asking for it.
+        (_, View::Playing) => HINTS_PLAYING,
+        // The landing page needs no session and offers no key that does, so it
+        // keeps its own hints rather than the signed-out ones -- which exist to
+        // avoid advertising keys that can only answer with a sign-in.
+        (_, View::Home) if away => HINTS_HOME_PLAYING,
+        (_, View::Home) => HINTS_HOME,
+        _ if !app.signed_in && away => HINTS_SIGNED_OUT_PLAYING,
         _ if !app.signed_in => HINTS_SIGNED_OUT,
+        (_, View::Playlists) if away => HINTS_PLAYLISTS_PLAYING,
         (_, View::Playlists) => HINTS_PLAYLISTS,
+        (_, View::Tracks) if away => HINTS_TRACKS_PLAYING,
         (_, View::Tracks) => HINTS_TRACKS,
     }
 }
 
-fn now_playing_line<'a>(snap: &'a Snapshot, app: &'a App) -> Line<'a> {
+/// What is playing, for the bar along the bottom.
+///
+/// `clock` is false while the player page is showing a progress bar of its own:
+/// the elapsed time belongs beside that bar, and a second copy of the same
+/// ticking number in the corner is one the eye has to keep checking against.
+fn now_playing_line<'a>(snap: &'a Snapshot, app: &'a App, clock: bool, width: usize) -> Line<'a> {
     // An error outranks everything else -- it is the thing the user must see.
+    //
+    // Truncated rather than left to the buffer's own clipping, which cuts at
+    // the column the hints begin at and leaves the last word of the message
+    // running into the first word of a hint. An ellipsis at least says that
+    // there was more of it.
     if let Some(err) = &snap.error {
         return Line::from(Span::styled(
-            format!(" {err}"),
+            format!(" {}", truncate(err, width.saturating_sub(1))),
             Style::default().fg(Color::Red),
         ));
     }
@@ -1023,20 +1970,24 @@ fn now_playing_line<'a>(snap: &'a Snapshot, app: &'a App) -> Line<'a> {
 
     if snap.state == PlayState::Idle {
         return Line::from(Span::styled(
-            format!(" {}", app.status),
+            format!(" {}", truncate(&app.status, width.saturating_sub(1))),
             Style::default().fg(Color::DarkGray),
         ));
     }
 
-    let secs = snap.position.as_secs();
-    Line::from(vec![
-        Span::styled(format!(" {symbol} "), Style::default().fg(colour)),
-        Span::raw(format!("{}:{:02}  ", secs / 60, secs % 60)),
-        Span::styled(
-            truncate(&snap.title, 60),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ])
+    let mut spans = vec![Span::styled(
+        format!(" {symbol} "),
+        Style::default().fg(colour),
+    )];
+    if clock {
+        let secs = snap.position.as_secs();
+        spans.push(Span::raw(format!("{}:{:02}  ", secs / 60, secs % 60)));
+    }
+    spans.push(Span::styled(
+        truncate(&snap.title, 60),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    Line::from(spans)
 }
 
 /// Splits a results row into title, artist and album widths.
@@ -1127,6 +2078,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+    use crate::source::watch::{Comment, Comments, Lyrics};
 
     /// A 16:9 cover, as every YouTube thumbnail is once shrunk.
     fn wide() -> Cover {
@@ -1504,6 +2456,618 @@ mod tests {
         assert!(impostor.contains('7'));
     }
 
+    use crate::source::home::Target;
+
+    fn song(title: &str, subtitle: &str) -> Card {
+        Card {
+            title: title.to_string(),
+            subtitle: subtitle.to_string(),
+            target: Target::Play {
+                video_id: "aaaaaaaaaaa".to_string(),
+            },
+        }
+    }
+
+    fn album(title: &str, subtitle: &str) -> Card {
+        Card {
+            title: title.to_string(),
+            subtitle: subtitle.to_string(),
+            target: Target::Open {
+                browse_id: "MPREb_x".to_string(),
+            },
+        }
+    }
+
+    /// Prints the landing page at a couple of window sizes, for eyeballing a
+    /// layout change.
+    ///
+    /// `cargo test preview_home -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prints a layout preview rather than asserting"]
+    fn preview_home() {
+        let shelves = vec![
+            quick_picks(),
+            Shelf {
+                title: "Albums for you".to_string(),
+                cards: vec![
+                    album("Currents", "Album • Tame Impala"),
+                    album("Luv(sic) Hexalogy", "Album • Nujabes"),
+                    album("kyoto rain", "Album • Seycara Orchestral"),
+                    album("Pink Tape", "Album • Lil Uzi Vert"),
+                ],
+            },
+            Shelf {
+                title: "New releases".to_string(),
+                cards: vec![
+                    song("GAMBLER'S FALLACY", "Single • AZALI & stickii B"),
+                    song("i have a secret", "Single • ThxSoMch"),
+                    song("Người Im Lặng Gặp Người Hay Nói", "Song • HIEUTHUHAI"),
+                ],
+            },
+        ];
+
+        for (width, height) in [(100u16, 22u16), (64, 16)] {
+            println!("\n--- {width}x{height} ---");
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let block = Block::bordered().title(" home ");
+                    let area = Rect::new(0, 0, width, height);
+                    let inner = block.inner(area);
+                    frame.render_widget(block, area);
+                    let cursor = HomeCursor {
+                        top: 0,
+                        shelf: 1,
+                        card: 1,
+                    };
+                    render_feed(frame, &shelves, inner, cursor, &[0, 0, 0]);
+                })
+                .unwrap();
+
+            let buf = terminal.backend().buffer();
+            for y in 0..height {
+                let row: String = (0..width).map(|x| buf[(x, y)].symbol()).collect();
+                println!("{}", row.trim_end());
+            }
+        }
+    }
+
+    /// A track as the queue holds them.
+    fn queued(title: &str, artist: &str, secs: u64) -> Track {
+        Track {
+            id: title.to_string(),
+            title: title.to_string(),
+            uploader: artist.to_string(),
+            duration: Some(Duration::from_secs(secs)),
+            album: None,
+            playlist_item_id: None,
+        }
+    }
+
+    /// The player page as it looks a second into a track, queue and all.
+    fn playing() -> NowPlaying {
+        let mut now = NowPlaying::new(&Track {
+            id: "letithappen".to_string(),
+            title: "Let It Happen".to_string(),
+            uploader: "Tame Impala".to_string(),
+            duration: Some(Duration::from_secs(468)),
+            album: Some("Currents".to_string()),
+            playlist_item_id: None,
+        });
+        now.queue_title = "Let It Happen Mix".to_string();
+        now.queue = vec![
+            queued("Let It Happen", "Tame Impala", 468),
+            queued("The Moment", "Tame Impala", 256),
+            queued("Clean Slate", "Passion Mango", 180),
+            queued("Chest Pain (I Love)", "Malcolm Todd", 201),
+            queued("Razzmatazz", "I DONT KNOW HOW BUT THEY FOUND ME", 259),
+            queued("Show Me How", "Men I Trust", 216),
+            queued("Dust Bunny", "Crumb", 185),
+        ];
+        now.playing = Some(0);
+        now
+    }
+
+    /// One panel drawn on its own, as one string per row.
+    fn drawn_panel(now: &NowPlaying, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                let [tabs, content] =
+                    Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(area);
+                render_tabs(frame, now.tab, tabs);
+                match now.tab {
+                    Tab::UpNext => render_up_next(frame, now, content),
+                    Tab::Lyrics => render_lyrics(frame, now, content),
+                    Tab::Comments => render_comments(frame, now, content),
+                    Tab::Related => render_related(frame, now, content),
+                };
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_open_tab_is_the_underlined_one() {
+        let mut now = playing();
+        now.tab = Tab::Comments;
+        let rows = drawn_panel(&now, 44, 6);
+
+        assert!(rows[0].contains("COMMENTS"), "every tab is named: {:?}", rows[0]);
+        // The rule sits under the open tab and nothing else, which is the only
+        // thing on the row that says which panel is showing.
+        let rule = &rows[1];
+        assert_eq!(rule.trim(), "─".repeat("COMMENTS".chars().count()));
+        assert_eq!(
+            rule.find('─'),
+            rows[0].find("COMMENTS"),
+            "the rule sits under the letters, not the padding: {rule:?}"
+        );
+    }
+
+    #[test]
+    fn the_queue_marks_what_is_playing() {
+        let rows = drawn_panel(&playing(), 44, 12);
+
+        assert!(rows[2].contains("Playing from"));
+        assert!(rows[3].contains("Let It Happen Mix"));
+        // The marker is on the playing track and on no other row.
+        let marked: Vec<&String> = rows.iter().filter(|row| row.contains('▶')).collect();
+        assert_eq!(marked.len(), 1, "exactly one row plays: {rows:#?}");
+        assert!(marked[0].contains("Let It Happen"));
+        assert!(marked[0].contains("7:48"), "and states its length: {:?}", marked[0]);
+    }
+
+    #[test]
+    fn the_queue_heading_does_not_scroll_with_the_rows() {
+        // Scrolled to the bottom of a queue that does not fit. What the queue
+        // is a queue of stays true wherever the cursor is, so it stays put.
+        let mut now = playing();
+        now.cursor[Tab::UpNext.index()] = now.queue.len() - 1;
+        let rows = drawn_panel(&now, 44, 9);
+
+        assert!(rows[2].contains("Playing from"), "{rows:#?}");
+        assert!(rows[3].contains("Let It Happen Mix"));
+        assert!(
+            rows.iter().any(|row| row.contains("Dust Bunny")),
+            "the last row scrolled to should be visible: {rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("The Moment")),
+            "and the rows above it should have scrolled off: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn an_unfetched_panel_says_it_is_loading_and_a_failed_one_says_why() {
+        let mut now = playing();
+        now.tab = Tab::Lyrics;
+        assert!(drawn_panel(&now, 44, 6)[2].contains("loading"));
+
+        now.lyrics = Panel::Empty("no lyrics are published for this track".to_string());
+        let rows = drawn_panel(&now, 44, 6);
+        assert!(
+            rows[2].contains("no lyrics"),
+            "the reason belongs in the panel, not the status bar: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn lyrics_scroll_by_line_and_stop_a_screenful_short_of_the_end() {
+        let mut now = playing();
+        now.tab = Tab::Lyrics;
+        now.lyrics = Panel::Ready(Lyrics {
+            text: (1..=20).map(|n| format!("line {n}\n")).collect(),
+            source: Some("Source: Musixmatch".to_string()),
+        });
+
+        let top = drawn_panel(&now, 44, 8);
+        assert!(top[2].contains("Musixmatch"), "{top:#?}");
+        assert!(top[4].contains("line 1"));
+
+        // Six lines of content in an eight-row pane, two of them tabs: the last
+        // line has to stay on screen rather than scrolling past the top.
+        now.cursor[Tab::Lyrics.index()] = usize::MAX;
+        let bottom = drawn_panel(&now, 44, 8);
+        assert!(
+            bottom.iter().any(|row| row.contains("line 20")),
+            "the end of the lyrics should be reachable: {bottom:#?}"
+        );
+    }
+
+    #[test]
+    fn a_comment_shows_who_wrote_it_when_and_what_it_got() {
+        let mut now = playing();
+        now.tab = Tab::Comments;
+        now.comments = Panel::Ready(Comments {
+            total: "8,407 Comments".to_string(),
+            items: vec![Comment {
+                author: "@SpeartonFromOrder".to_string(),
+                published: "4 months ago".to_string(),
+                text: "Don't search for best part. Just let it happen".to_string(),
+                likes: "10K".to_string(),
+                replies: "67".to_string(),
+            }],
+        });
+
+        let rows = drawn_panel(&now, 44, 10);
+        assert!(rows[2].contains("8,407 Comments"), "{rows:#?}");
+        assert!(rows[4].contains("@SpeartonFromOrder"));
+        assert!(rows[4].contains("4 months ago"));
+        // Wrapped to the panel rather than truncated: a comment cut off at the
+        // right margin is one nobody can read the point of.
+        assert!(rows[5].contains("Don't search for best part."), "{rows:#?}");
+        assert!(rows[6].contains("happen"), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains("10K likes")));
+        assert!(rows.iter().any(|row| row.contains("67 replies")));
+    }
+
+    #[test]
+    fn related_lists_each_shelf_under_its_own_heading() {
+        let mut now = playing();
+        now.tab = Tab::Related;
+        now.related = Panel::Ready(vec![
+            Shelf {
+                title: "You might also like".to_string(),
+                cards: vec![
+                    song("Eventually", "Tame Impala • Currents"),
+                    song("Yes I'm Changing", "Tame Impala • Currents"),
+                ],
+            },
+            Shelf {
+                title: "Recommended playlists".to_string(),
+                cards: vec![album("one step, another step", "Playlist")],
+            },
+        ]);
+
+        let rows = drawn_panel(&now, 44, 10);
+        assert!(rows[2].contains("You might also like"), "{rows:#?}");
+        assert!(rows[3].contains("Eventually"));
+        assert!(rows[3].contains("Tame Impala"));
+        assert!(rows.iter().any(|row| row.contains("Recommended playlists")));
+        assert!(rows.iter().any(|row| row.contains("one step, another step")));
+    }
+
+    #[test]
+    fn the_progress_bar_fills_in_proportion() {
+        let snap = |secs: u64| Snapshot {
+            position: Duration::from_secs(secs),
+            ..Default::default()
+        };
+        let filled = |line: Line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.matches('━').count())
+                .sum::<usize>()
+        };
+
+        let total = Some(Duration::from_secs(100));
+        // 40 columns less the " 0:00 / 1:40" clock and its space leaves 27.
+        assert_eq!(filled(progress_line(&snap(0), total, 40)), 0);
+        assert_eq!(filled(progress_line(&snap(100), total, 40)), 27);
+        assert_eq!(filled(progress_line(&snap(50), total, 40)), 14);
+
+        // Past the end, which happens for a moment on every track: the
+        // container's length and what the decoder yields never quite agree.
+        assert_eq!(filled(progress_line(&snap(105), total, 40)), 27);
+    }
+
+    #[test]
+    fn a_track_of_unknown_length_gets_a_clock_and_no_bar() {
+        let snap = Snapshot {
+            position: Duration::from_secs(65),
+            ..Default::default()
+        };
+        // A livestream has no end to draw a bar towards, and one drawn anyway
+        // would have to invent where it is.
+        let line = progress_line(&snap, None, 40);
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].content.trim(), "1:05");
+    }
+
+    #[test]
+    fn the_cursor_stays_near_the_middle_of_a_long_list() {
+        // Nothing to scroll: everything fits.
+        assert_eq!(centred_offset(3, 10, 5), 0);
+        // Near the top, the list stays pinned there rather than centring a
+        // cursor that has nothing above it.
+        assert_eq!(centred_offset(1, 10, 40), 0);
+        assert_eq!(centred_offset(20, 10, 40), 15);
+        // And at the bottom it stops rather than scrolling past the last row.
+        assert_eq!(centred_offset(39, 10, 40), 30);
+        assert_eq!(centred_offset(5, 0, 40), 0);
+    }
+
+    #[test]
+    fn the_track_details_name_the_song_the_artist_and_the_album() {
+        let now = playing();
+        assert_eq!(now.byline(), "Tame Impala • Currents");
+
+        let mut terminal = Terminal::new(TestBackend::new(40, INFO_HEIGHT)).unwrap();
+        terminal
+            .draw(|frame| {
+                let snap = Snapshot {
+                    position: Duration::from_secs(1),
+                    volume: 0.8,
+                    ..Default::default()
+                };
+                render_track_info(frame, &now, snap, Rect::new(0, 0, 40, INFO_HEIGHT));
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..40)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(row(0), "Let It Happen");
+        assert_eq!(row(1), "Tame Impala • Currents");
+        assert!(row(3).ends_with("0:01 / 7:48"), "{:?}", row(3));
+        assert_eq!(row(4), "vol ━━━━━━━━━━──  80%");
+    }
+
+    #[test]
+    fn the_volume_bar_fills_against_a_hundred_percent() {
+        let bar = |volume: f32| volume_line(volume, 40).spans[1].content.chars().count();
+
+        assert_eq!(bar(0.0), 0);
+        assert_eq!(bar(0.5), VOLUME_BAR_WIDTH / 2);
+        assert_eq!(bar(1.0), VOLUME_BAR_WIDTH);
+        // Boost: the bar has nowhere further to go, so it says so in colour
+        // rather than by growing a scale nothing else is measured against.
+        assert_eq!(bar(2.0), VOLUME_BAR_WIDTH);
+        assert_eq!(volume_line(2.0, 40).spans[1].style.fg, Some(Color::Yellow));
+        assert_eq!(volume_line(1.0, 40).spans[1].style.fg, Some(Color::Gray));
+    }
+
+    #[test]
+    fn a_volume_with_no_room_for_a_bar_is_still_a_number() {
+        // The panel is the width of the label and no more. A bar of two cells
+        // would be decoration; the percentage is what is actually read.
+        let line = volume_line(0.75, 12);
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].content, "vol 75%");
+    }
+
+    /// Prints the whole player page, for eyeballing it against what YouTube
+    /// Music draws.
+    ///
+    /// `cargo test preview_player -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prints a layout preview rather than asserting"]
+    fn preview_player() {
+        let mut now = playing();
+        now.lyrics = Panel::Ready(Lyrics {
+            text: "It's always around me, all this noise, but\n\n\
+                   Not nearly as loud as the voice saying\n\n\
+                   \"Let it happen, let it happen\"\n\n\
+                   \"Just let it happen, let it happen\"\n\n\
+                   All this running around"
+                .to_string(),
+            source: Some("Source: Musixmatch".to_string()),
+        });
+        now.comments = Panel::Ready(Comments {
+            total: "8,407 Comments".to_string(),
+            items: vec![
+                Comment {
+                    author: "@SpeartonFromOrder".to_string(),
+                    published: "4 months ago".to_string(),
+                    text: "Don't search for best part. Just let it happen".to_string(),
+                    likes: "10K".to_string(),
+                    replies: "67".to_string(),
+                },
+                Comment {
+                    author: "@jujuca.lol912".to_string(),
+                    published: "5 months ago".to_string(),
+                    text: "I won't let depression win".to_string(),
+                    likes: "10K".to_string(),
+                    replies: "226".to_string(),
+                },
+            ],
+        });
+        now.related = Panel::Ready(vec![Shelf {
+            title: "You might also like".to_string(),
+            cards: vec![
+                song("Eventually", "Tame Impala • Currents"),
+                song("Yes I'm Changing", "Tame Impala • Currents"),
+                song("Breathe Deeper", "Tame Impala • The Slow Rush"),
+            ],
+        }]);
+
+        for (width, height) in [(44u16, 16u16), (36, 16)] {
+            for tab in Tab::ALL {
+                now.tab = tab;
+                println!("\n--- {} at {width}x{height} ---", tab.label());
+                for row in drawn_panel(&now, width, height) {
+                    println!("|{row}");
+                }
+            }
+        }
+
+        println!("\n--- the details under the cover, at 46 columns ---");
+        let mut terminal = Terminal::new(TestBackend::new(46, INFO_HEIGHT)).unwrap();
+        terminal
+            .draw(|frame| {
+                let snap = Snapshot {
+                    position: Duration::from_secs(133),
+                    volume: 0.8,
+                    ..Default::default()
+                };
+                render_track_info(frame, &now, snap, Rect::new(0, 0, 46, INFO_HEIGHT));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        for y in 0..INFO_HEIGHT {
+            let row: String = (0..46).map(|x| buf[(x, y)].symbol()).collect();
+            println!("|{}", row.trim_end());
+        }
+    }
+
+    /// A shelf drawn on its own, as one string per row.
+    fn drawn_shelf(width: u16, shelf: &Shelf, cursor: ShelfCursor) -> Vec<String> {
+        let height = CARD_HEIGHT + 1;
+        let across = (width / CARD_WIDTH).max(1);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_shelf(
+                    frame,
+                    shelf,
+                    Rect::new(0, 0, width, height),
+                    cursor,
+                    (across, width / across),
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    fn quick_picks() -> Shelf {
+        Shelf {
+            title: "Quick picks".to_string(),
+            cards: vec![
+                song("Is It True", "Tame Impala"),
+                song("Nice Boys", "TEMPOREX"),
+                song("Homage", "Mild High Club"),
+                song("Feather", "Nujabes"),
+                song("Shake", "Yeek"),
+            ],
+        }
+    }
+
+    fn cursor(selected: usize, offset: usize) -> ShelfCursor {
+        ShelfCursor {
+            focused: true,
+            selected,
+            offset,
+        }
+    }
+
+    #[test]
+    fn a_shelf_draws_its_heading_and_as_many_cards_as_fit() {
+        // 80 columns holds three 26-wide cards with four left over.
+        let rows = drawn_shelf(80, &quick_picks(), cursor(0, 0));
+        assert!(rows[0].contains("Quick picks"), "{rows:#?}");
+
+        let text = rows.join("\n");
+        assert!(text.contains("Is It True"));
+        assert!(text.contains("Nice Boys"));
+        assert!(text.contains("Homage"));
+        // The fourth card is off the end of the row, not squeezed onto it.
+        assert!(!text.contains("Feather"), "{rows:#?}");
+    }
+
+    /// The counter is the only thing on screen that says a shelf runs past the
+    /// edge of the window, so a shelf scrolled off its first card must still
+    /// say where in it the cursor is.
+    #[test]
+    fn a_focused_shelf_says_how_far_along_it_the_cursor_is() {
+        let rows = drawn_shelf(80, &quick_picks(), cursor(4, 2));
+        assert!(rows[0].contains("5 of 5"), "{:?}", rows[0]);
+
+        // Unfocused, there is no cursor in it to report.
+        let unfocused = ShelfCursor {
+            focused: false,
+            selected: 0,
+            offset: 0,
+        };
+        assert!(!drawn_shelf(80, &quick_picks(), unfocused)[0].contains("of 5"));
+    }
+
+    /// Enter does two different things depending on the card, and this is the
+    /// only thing on the page that says which.
+    #[test]
+    fn a_card_says_whether_it_plays_or_opens() {
+        let shelf = Shelf {
+            title: "Albums for you".to_string(),
+            cards: vec![song("Creep", "Radiohead"), album("Currents", "Tame Impala")],
+        };
+        let text = drawn_shelf(80, &shelf, cursor(0, 0)).join("\n");
+        assert!(text.contains("▶ Creep"), "{text}");
+        assert!(text.contains("≡ Currents"), "{text}");
+    }
+
+    /// The selection is what the whole page is navigated by, so it has to be
+    /// visible -- and on exactly one card.
+    #[test]
+    fn exactly_one_card_is_highlighted() {
+        let mut terminal = Terminal::new(TestBackend::new(80, CARD_HEIGHT + 1)).unwrap();
+        let shelf = quick_picks();
+        terminal
+            .draw(|frame| {
+                render_shelf(
+                    frame,
+                    &shelf,
+                    Rect::new(0, 0, 80, CARD_HEIGHT + 1),
+                    cursor(1, 0),
+                    (3, 26),
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+
+        // Top-left corner of each of the three drawn cards, on the row under
+        // the heading.
+        let corners: Vec<Color> = (0..3).map(|card| buf[(card * 26, 1)].fg).collect();
+        assert_eq!(corners, [Color::DarkGray, Color::Cyan, Color::DarkGray]);
+    }
+
+    /// Titles are what the page is read by, and a card is narrow. Overflowing
+    /// one would run its title into the card beside it.
+    #[test]
+    fn a_long_title_is_truncated_inside_its_card() {
+        let shelf = Shelf {
+            title: "New releases".to_string(),
+            cards: vec![song(
+                "Get Lucky (feat. Pharrell Williams and Nile Rodgers)",
+                "Daft Punk, Pharrell Williams & Nile Rodgers • 6:10",
+            )],
+        };
+        for width in [40, 60, 80, 120] {
+            for row in drawn_shelf(width, &shelf, cursor(0, 0)) {
+                assert_eq!(
+                    display_width(&row),
+                    width as usize,
+                    "a {width}-wide shelf drew {row:?}"
+                );
+            }
+        }
+    }
+
+    /// A shelf heading is one row and truncates rather than wrapping, so a long
+    /// name must not push the counter off the end of it.
+    #[test]
+    fn a_heading_fits_its_row_whatever_the_shelf_is_called() {
+        let shelf = Shelf {
+            title: "Recommended because you listened to something with a very long name"
+                .to_string(),
+            cards: vec![song("a", "b"), song("c", "d")],
+        };
+        for width in 4..120 {
+            assert!(
+                heading_line(&shelf, cursor(1, 0), width).width() <= width,
+                "heading overflows a {width}-wide shelf"
+            );
+        }
+    }
+
     /// Everything the sign-in panel drew, as one string per row.
     ///
     /// Read back from a real draw rather than asserted on the `Line`s going in:
@@ -1691,12 +3255,40 @@ mod tests {
             HINTS_PLAYLISTS,
             HINTS_TRACKS,
             HINTS_SIGNED_OUT,
+            HINTS_HOME,
+            HINTS_PLAYING,
+            HINTS_PLAYLISTS_PLAYING,
+            HINTS_TRACKS_PLAYING,
+            HINTS_HOME_PLAYING,
+            HINTS_SIGNED_OUT_PLAYING,
         ] {
             assert!(
                 display_width(hint) <= HINTS_WIDTH as usize,
                 "{hint:?} is {} columns, over the {HINTS_WIDTH} reserved",
                 display_width(hint)
             );
+        }
+    }
+
+    #[test]
+    fn every_view_names_the_way_back_to_a_playing_track() {
+        // The player page is entered by playing something rather than by asking
+        // for it, so nothing about leaving it teaches the user it can be
+        // reopened. Whichever list they leave it for has to say so.
+        for hint in [
+            HINTS_PLAYLISTS_PLAYING,
+            HINTS_TRACKS_PLAYING,
+            HINTS_HOME_PLAYING,
+            HINTS_SIGNED_OUT_PLAYING,
+        ] {
+            assert!(hint.contains("P player"), "{hint:?} does not name P");
+            assert!(hint.contains("B tray"), "{hint:?} does not name B");
+        }
+        // `B` refuses with nothing playing, so the lines shown then must not
+        // offer it -- a key that answers "nothing is playing" is worse than no
+        // key at all.
+        for hint in [HINTS_PLAYLISTS, HINTS_TRACKS, HINTS_HOME, HINTS_SIGNED_OUT] {
+            assert!(!hint.contains("B tray"), "{hint:?} offers B with nothing playing");
         }
     }
 

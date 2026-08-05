@@ -8,6 +8,7 @@
 pub mod backend;
 pub mod chunked;
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -39,6 +40,16 @@ const PROGRESS: Duration = Duration::from_secs(5);
 /// Instructions from the UI to the player thread.
 #[derive(Debug, Clone)]
 pub enum Command {
+    /// A different track is being loaded: stop, and say so.
+    ///
+    /// Sent the moment the user chooses something, which is seconds before the
+    /// [`Self::Play`] that follows it -- resolving a URL spawns yt-dlp. Without
+    /// this the previous song keeps playing under the new one's title and
+    /// progress bar for the whole of that wait, which is the player telling the
+    /// user two different things about what they are listening to.
+    Load {
+        title: String,
+    },
     /// Stream and play a resolved URL, replacing whatever is playing.
     Play {
         url: String,
@@ -237,17 +248,35 @@ fn run(rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>) {
     // branch on the state without taking the lock the UI is reading through.
     let mut state = PlayState::Idle;
     let mut track: Option<Track> = None;
+    // Commands pulled off the channel ahead of time, which is how opening a
+    // stream can notice that it has been superseded. Drained before the channel
+    // is read again, so nothing here waits longer than it would have.
+    let mut queued: VecDeque<Command> = VecDeque::new();
 
     loop {
-        let cmd = match rx.recv_timeout(TICK) {
-            Ok(cmd) => Some(cmd),
-            Err(RecvTimeoutError::Timeout) => None,
-            // The Player handle was dropped; nothing can command us again.
-            Err(RecvTimeoutError::Disconnected) => break,
+        let cmd = match queued.pop_front() {
+            Some(cmd) => Some(cmd),
+            None => match rx.recv_timeout(TICK) {
+                Ok(cmd) => Some(cmd),
+                Err(RecvTimeoutError::Timeout) => None,
+                // The Player handle was dropped; nothing can command us again.
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
         };
 
         if let Some(cmd) = cmd {
             match cmd {
+                Command::Load { title } => {
+                    player.stop();
+                    track = None;
+                    state = PlayState::Buffering;
+                    update(&snapshot, |s| {
+                        s.state = PlayState::Buffering;
+                        s.title = title;
+                        s.position = Duration::ZERO;
+                        s.error = None;
+                    });
+                }
                 Command::Play { url, title } => {
                     update(&snapshot, |s| {
                         s.state = PlayState::Buffering;
@@ -258,8 +287,17 @@ fn run(rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>) {
                     // The loop's own copy is left alone until this settles: the
                     // open below blocks, and nothing can read it in the
                     // meantime. What the UI renders is the snapshot above.
-                    match start_stream(&runtime, &player, &url, Duration::ZERO) {
-                        Ok(total) => {
+                    match open_stream(&runtime, &url) {
+                        Ok((decoder, total)) => {
+                            // Opening blocks this thread for a second or more,
+                            // and whatever arrived during it is newer than this
+                            // track. Starting it now would mean a burst of the
+                            // song the user just left before the one they chose
+                            // -- so the stream is dropped unheard.
+                            if drain(&rx, &mut queued) {
+                                continue;
+                            }
+                            play_source(&player, decoder, Duration::ZERO);
                             track = Some(Track {
                                 url,
                                 total,
@@ -423,23 +461,53 @@ fn rebuild(
     }
 }
 
-/// Opens the network stream and hands it to rodio, starting `skip` into the
-/// track. Returns the track's length when the container states one.
+/// Takes everything waiting on the channel, reporting whether any of it makes
+/// the stream just opened not worth starting.
+///
+/// Only the commands that replace what is playing count. A volume change or a
+/// pause arriving during an open says nothing about which track the user wants;
+/// they are queued and applied to the track once it starts, as they would have
+/// been anyway.
+fn drain(rx: &Receiver<Command>, queued: &mut VecDeque<Command>) -> bool {
+    let mut superseded = false;
+    while let Ok(cmd) = rx.try_recv() {
+        superseded |= matches!(
+            cmd,
+            Command::Load { .. } | Command::Play { .. } | Command::Stop | Command::Shutdown
+        );
+        queued.push_back(cmd);
+    }
+    superseded
+}
+
+/// Opens the network stream and decodes its header, without touching playback.
+///
+/// Separate from [`play_source`] because this is the part that blocks -- a
+/// second or more of network -- and what the user wants can change inside it.
+/// Nothing audible happens until the caller commits.
+///
+/// Returns the track's length when the container states one, read here because
+/// it is the only place it can be had: it is what tells a track that ended from
+/// a stream that died.
 ///
 /// `Decoder::new_mp4` is used rather than the probing `Decoder::new`: we always
 /// request itag 140, so format sniffing would only waste a seek and a read.
-fn start_stream(
+fn open_stream(
     runtime: &tokio::runtime::Runtime,
-    player: &rodio::Player,
     url: &str,
-    skip: Duration,
-) -> Result<Option<Duration>> {
+) -> Result<(rodio::Decoder<backend::AudioStream>, Option<Duration>)> {
     let stream = runtime.block_on(backend::open(url))?;
     let decoder = rodio::Decoder::new_mp4(stream).context("could not decode audio stream")?;
-    // Read before the decoder is moved: this is what tells a track that ended
-    // from a stream that died, and it is the only place it can be had.
     let total = decoder.total_duration();
+    Ok((decoder, total))
+}
 
+/// Hands an opened stream to rodio, starting `skip` into the track.
+fn play_source(
+    player: &rodio::Player,
+    decoder: rodio::Decoder<backend::AudioStream>,
+    skip: Duration,
+) {
     // Replace whatever was playing; rodio queues appended sources otherwise.
     player.stop();
     if skip.is_zero() {
@@ -452,6 +520,20 @@ fn start_stream(
         player.append(decoder.skip_duration(skip));
     }
     player.play();
+}
+
+/// Opens and starts in one step, for the rebuild path -- which is recovering a
+/// track that is already playing rather than starting one the user chose, so
+/// there is nothing for a newer choice to supersede. A choice that does arrive
+/// stops it through the [`Command::Load`] queued behind this.
+fn start_stream(
+    runtime: &tokio::runtime::Runtime,
+    player: &rodio::Player,
+    url: &str,
+    skip: Duration,
+) -> Result<Option<Duration>> {
+    let (decoder, total) = open_stream(runtime, url)?;
+    play_source(player, decoder, skip);
     Ok(total)
 }
 
@@ -542,6 +624,44 @@ mod tests {
         stalled.rebuilds = 1;
         stalled.note_progress();
         assert_eq!(stalled.rebuilds, 1);
+    }
+
+    /// Opening a stream blocks for a second or more. What arrives during it
+    /// decides whether the track that was opened is still the one wanted.
+    #[test]
+    fn a_choice_made_while_a_stream_opens_supersedes_it() {
+        let (tx, rx) = channel();
+        let mut queued = VecDeque::new();
+
+        // Nothing waiting: the track that was opened is still the one to play.
+        assert!(!drain(&rx, &mut queued));
+        assert!(queued.is_empty());
+
+        // A volume change says nothing about which track is wanted, so it is
+        // kept for the new track rather than taken as a reason to drop it.
+        tx.send(Command::SetVolume(0.5)).unwrap();
+        assert!(!drain(&rx, &mut queued));
+        assert_eq!(queued.len(), 1);
+
+        // The user chose something else while this was opening.
+        tx.send(Command::Load {
+            title: "another".into(),
+        })
+        .unwrap();
+        assert!(drain(&rx, &mut queued));
+        // Everything drained is kept in order: the commands still have to run,
+        // it is only the stream in hand that is thrown away.
+        assert_eq!(queued.len(), 2);
+        assert!(matches!(queued[0], Command::SetVolume(_)));
+        assert!(matches!(queued[1], Command::Load { .. }));
+    }
+
+    #[test]
+    fn a_stop_during_an_open_also_supersedes_it() {
+        let (tx, rx) = channel();
+        let mut queued = VecDeque::new();
+        tx.send(Command::Stop).unwrap();
+        assert!(drain(&rx, &mut queued), "nothing should start after a stop");
     }
 
     #[test]

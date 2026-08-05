@@ -27,6 +27,10 @@ const CLIENT_FILE: &str = "client.json";
 /// the user typed -- including comments and formatting serde would not preserve.
 const TOKEN_FILE: &str = "tokens.json";
 
+/// Written by hand, and optional. Holds one `Cookie:` header copied out of a
+/// browser signed in to YouTube Music.
+const COOKIE_FILE: &str = "cookies.txt";
+
 /// Shown when there is no client to read. Long because it is the entire setup
 /// procedure, and a user hitting this has no other documentation to hand.
 const SETUP_HELP: &str = "\
@@ -82,6 +86,82 @@ impl Credentials {
         }
         Ok(creds)
     }
+}
+
+/// A browser session, copied out of a browser by hand.
+///
+/// The only thing that buys a personalised YouTube Music feed. The OAuth tokens
+/// above cannot: Google refuses Bearer-authenticated InnerTube calls outright,
+/// so the shelves built from a user's own listening -- "Listen again", "Quick
+/// picks", "Heard in Shorts" -- are reachable only the way Google's own web
+/// player reaches them, by signing requests over a cookie.
+///
+/// Entirely optional, and read on the same terms as everything else here: a
+/// user who never creates this file never touches it, and the landing page
+/// falls back to shelves built from their liked songs.
+#[derive(Debug, Clone)]
+pub struct Cookies {
+    /// The whole header, sent back verbatim. Which cookies YouTube wants is
+    /// YouTube's business, and trimming it to the ones that look relevant is
+    /// how a session stops working for reasons nobody can see.
+    header: String,
+    /// The one value that is also signed over. Extracted here so a file that
+    /// cannot work says so when it is read, rather than on the first request.
+    sapisid: String,
+}
+
+impl Cookies {
+    /// Loads the cookie header, or `None` when the user has not saved one.
+    ///
+    /// A file that exists but carries no `SAPISID` is an error rather than a
+    /// `None`: the user did something deliberate and it will not work, which is
+    /// worth saying now instead of silently serving them the generic feed.
+    pub fn load() -> Result<Option<Self>> {
+        let path = dir()?.join(COOKIE_FILE);
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
+        };
+
+        let header = raw.trim().to_string();
+        if header.is_empty() {
+            return Ok(None);
+        }
+
+        let sapisid = sapisid(&header).with_context(|| {
+            format!(
+                "{} has no SAPISID cookie in it. Copy the whole `cookie:` request \
+                 header from a music.youtube.com request in your browser's network tab",
+                path.display()
+            )
+        })?;
+
+        Ok(Some(Self { header, sapisid }))
+    }
+
+    pub fn header(&self) -> &str {
+        &self.header
+    }
+
+    pub fn sapisid(&self) -> &str {
+        &self.sapisid
+    }
+}
+
+/// Pulls the value Google signs requests over out of a cookie header.
+///
+/// `__Secure-3PAPISID` is accepted as well as `SAPISID`: a browser in a
+/// third-party-cookie-restricted context is issued the former and not always
+/// the latter, and they carry the same value for this purpose.
+fn sapisid(header: &str) -> Option<String> {
+    let named = |name: &str| {
+        header.split(';').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key.trim() == name).then(|| value.trim().to_string())
+        })
+    };
+    named("SAPISID").or_else(|| named("__Secure-3PAPISID"))
 }
 
 /// What Google gave us in exchange for the user's consent.
@@ -231,6 +311,38 @@ mod tests {
     fn a_rotated_refresh_token_replaces_the_old_one() {
         let refreshed = tokens(0).refreshed_with("a".into(), Some("rotated".into()), 3600);
         assert_eq!(refreshed.refresh_token, "rotated");
+    }
+
+    #[test]
+    fn finds_the_signing_cookie_in_a_real_header() {
+        // A browser sends a dozen of these in one line, in no fixed order.
+        let header = "VISITOR_INFO1_LIVE=abc; YSC=def; SAPISID=ThE0nEtHaTmAtTeRs; \
+                      __Secure-1PSID=xyz; PREF=tz=Asia.Ho_Chi_Minh";
+        assert_eq!(sapisid(header).as_deref(), Some("ThE0nEtHaTmAtTeRs"));
+    }
+
+    #[test]
+    fn falls_back_to_the_third_party_cookie() {
+        // A browser restricting third-party cookies issues `__Secure-3PAPISID`
+        // and not always `SAPISID`; they carry the same value for signing.
+        let header = "YSC=def; __Secure-3PAPISID=SameValue; PREF=x";
+        assert_eq!(sapisid(header).as_deref(), Some("SameValue"));
+    }
+
+    #[test]
+    fn a_cookie_name_that_merely_ends_in_sapisid_is_not_it() {
+        // `__Secure-1PAPISID` is a different cookie and signing with it fails
+        // in a way that looks exactly like an expired session.
+        let header = "__Secure-1PAPISID=wrong; HSID=x";
+        assert_eq!(sapisid(header), None);
+    }
+
+    #[test]
+    fn a_header_with_nothing_to_sign_with_is_rejected() {
+        assert_eq!(sapisid("YSC=def; PREF=x"), None);
+        assert_eq!(sapisid(""), None);
+        // A value containing `=` (base64 padding) survives the split.
+        assert_eq!(sapisid("SAPISID=pad==").as_deref(), Some("pad=="));
     }
 
     #[test]
