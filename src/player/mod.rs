@@ -55,8 +55,6 @@ pub enum Command {
         url: String,
         title: String,
     },
-    Pause,
-    Resume,
     TogglePause,
     Stop,
     Seek(Duration),
@@ -314,14 +312,6 @@ fn run(rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>) {
                             set_error(&snapshot, format!("{e:#}"));
                         }
                     }
-                }
-                Command::Pause => {
-                    player.pause();
-                    state = set_state(&snapshot, PlayState::Paused);
-                }
-                Command::Resume => {
-                    player.play();
-                    state = set_state(&snapshot, PlayState::Playing);
                 }
                 Command::TogglePause => {
                     if player.is_paused() {
