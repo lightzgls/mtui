@@ -29,7 +29,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use super::auth::{self, Http};
 use super::cover::{self, Cover};
@@ -37,8 +37,8 @@ use super::home::{self, Shelf};
 use super::innertube::InnerTube;
 use super::journal::{Journal, Play};
 use super::library::{self, Library, Playlist};
-use super::{browser, sapisid, stats, watch};
 use super::{StreamUrl, Track, UrlCache};
+use super::{browser, lrclib, sapisid, stats, watch};
 use crate::config::{Cookies, Credentials, Import, Tokens};
 use crate::source::youtube::YouTube;
 
@@ -123,9 +123,16 @@ pub enum Request {
     /// video id travels with each so a response that arrives after the user has
     /// skipped on can be discarded; the browse id is what [`Request::Watch`]
     /// handed back.
+    ///
+    /// Lyrics take theirs as an `Option`, unlike the panels below: a track with
+    /// no lyrics page on YouTube is exactly the track [`lrclib`] exists to
+    /// answer for, so "there is no browse id" has to reach the worker rather
+    /// than stopping the request. `query` is what LRCLIB is asked with, and is
+    /// `None` when the track is too thinly named to ask about at all.
     Lyrics {
         video_id: String,
-        browse_id: String,
+        browse_id: Option<String>,
+        query: Option<lrclib::Query>,
     },
     Related {
         video_id: String,
@@ -366,11 +373,30 @@ impl SourceWorker {
 
     pub fn send(&self, req: Request) -> Result<()> {
         // Counted before the request is queued, so that a resolve already
-        // sitting in the queue can see that a newer one exists behind it.
-        if matches!(req, Request::Resolve { .. }) {
+        // sitting in the queue can see that a newer one exists behind it. That
+        // order is the whole point, and it is why the count has to be given
+        // back when the queueing then fails: a resolve counted but never queued
+        // leaves `asked` permanently ahead of what the source thread can take,
+        // and every later resolve reads as superseded and is dropped in
+        // silence. Only reachable once that thread is already gone -- but "the
+        // worker died and now nothing plays" is a far worse way to find out
+        // than the error this returns.
+        let counted = matches!(req, Request::Resolve { .. });
+        if counted {
             self.resolves.fetch_add(1, Ordering::SeqCst);
         }
+        let sent = self.route(req);
+        if counted && sent.is_err() {
+            self.resolves.fetch_sub(1, Ordering::SeqCst);
+        }
+        sent
+    }
 
+    /// Hands one request to the thread that runs it.
+    ///
+    /// Split out of [`Self::send`] so the resolve count above has a single
+    /// place to be undone, rather than one per routing arm.
+    fn route(&self, req: Request) -> Result<()> {
         match req {
             Request::Cover { .. } => self.cover_tx.send(req).context("cover worker is gone"),
             // Not queued anywhere: this one blocks for as long as the user
@@ -404,11 +430,49 @@ impl SourceWorker {
     }
 
     /// Non-blocking poll, called once per UI frame. `None` means nothing new.
+    ///
+    /// A disconnected channel reads the same as an empty one on purpose: every
+    /// worker is detached except the source thread, so a dead one must leave
+    /// the UI drawing and playing rather than wedging it. Spelled out rather
+    /// than written as `.ok()` -- which is what the allow below is for -- so
+    /// that treating the two the same is visibly a decision.
+    #[allow(clippy::manual_ok_err)]
     pub fn poll(&self) -> Option<Response> {
         match self.rx.try_recv() {
             Ok(res) => Some(res),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
         }
+    }
+}
+
+/// Names a request, for the asserts that catch a misrouted one.
+///
+/// Only ever reached from a `debug_assert!` that has already failed, so what it
+/// is worth is naming *which* request went to the wrong thread -- "a request"
+/// would leave whoever hit it re-reading [`SourceWorker::send`] to guess.
+fn name(req: &Request) -> &'static str {
+    match req {
+        Request::Search { .. } => "Search",
+        Request::Resolve { .. } => "Resolve",
+        Request::Prefetch { .. } => "Prefetch",
+        Request::Cover { .. } => "Cover",
+        Request::Home => "Home",
+        Request::PersonalShelves { .. } => "PersonalShelves",
+        Request::ImportCookies { .. } => "ImportCookies",
+        Request::ReportPlay { .. } => "ReportPlay",
+        Request::OpenBrowse { .. } => "OpenBrowse",
+        Request::Watch { .. } => "Watch",
+        Request::Lyrics { .. } => "Lyrics",
+        Request::Related { .. } => "Related",
+        Request::Comments { .. } => "Comments",
+        Request::SignIn => "SignIn",
+        Request::SignOut => "SignOut",
+        Request::Playlists => "Playlists",
+        Request::OpenPlaylist { .. } => "OpenPlaylist",
+        Request::AddToPlaylist { .. } => "AddToPlaylist",
+        Request::RemoveFromPlaylist { .. } => "RemoveFromPlaylist",
+        Request::ToggleLike { .. } => "ToggleLike",
+        Request::Shutdown => "Shutdown",
     }
 }
 
@@ -484,27 +548,16 @@ fn run(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>, asked: &AtomicU
                 Response::Prefetched { id, ready }
             }
             Request::Shutdown => break,
-            // Routed to the cover, library or sign-in threads by `send`.
+            // Routed to the cover, library, page or sign-in threads by `send`.
             // Reaching here would mean that routing and this match had drifted
             // apart -- ignored rather than answered, since replying to a
-            // request this thread never ran would be worse than silence.
-            Request::Cover { .. }
-            | Request::SignIn
-            | Request::SignOut
-            | Request::Home
-            | Request::PersonalShelves { .. }
-            | Request::ReportPlay { .. }
-            | Request::ImportCookies { .. }
-            | Request::OpenBrowse { .. }
-            | Request::Playlists
-            | Request::OpenPlaylist { .. }
-            | Request::AddToPlaylist { .. }
-            | Request::RemoveFromPlaylist { .. }
-            | Request::ToggleLike { .. }
-            | Request::Watch { .. }
-            | Request::Lyrics { .. }
-            | Request::Related { .. }
-            | Request::Comments { .. } => continue,
+            // request this thread never ran would be worse than silence. The
+            // assert makes that drift fail a test run instead of costing the
+            // user a request that is answered by nobody.
+            other => {
+                debug_assert!(false, "{} was routed to the source thread", name(&other));
+                continue;
+            }
         };
 
         // A send error means the UI is already gone; stop rather than
@@ -821,7 +874,10 @@ fn handle_library(
         }
         // Routed elsewhere by `send`; reaching here would mean that routing and
         // this match had drifted apart.
-        _ => return Ok(None),
+        other => {
+            debug_assert!(false, "{} was routed to the library thread", name(&other));
+            return Ok(None);
+        }
     };
 
     Ok(Some(response))
@@ -851,8 +907,10 @@ fn run_pages(rx: Receiver<Request>, tx: Sender<Response>) {
             Request::Lyrics {
                 video_id,
                 browse_id,
+                query,
             } => Response::Lyrics {
-                lyrics: watch::lyrics(&http, &browse_id).map_err(|e| format!("{e:#}")),
+                lyrics: lyrics(&http, browse_id.as_deref(), query.as_ref())
+                    .map_err(|e| format!("{e:#}")),
                 video_id,
             },
             Request::Related {
@@ -869,7 +927,10 @@ fn run_pages(rx: Receiver<Request>, tx: Sender<Response>) {
             Request::Shutdown => break,
             // Routed elsewhere by `send`; reaching here would mean that routing
             // and this match had drifted apart.
-            _ => continue,
+            other => {
+                debug_assert!(false, "{} was routed to the page thread", name(&other));
+                continue;
+            }
         };
 
         if tx.send(response).is_err() {
@@ -878,8 +939,79 @@ fn run_pages(rx: Receiver<Request>, tx: Sender<Response>) {
     }
 }
 
+/// The best lyrics available for one track, from either of the two sources.
+///
+/// YouTube is asked first and its words are always preferred: they are the ones
+/// matched to the recording that is actually playing. What it often does not
+/// have is *timings* -- it publishes those only for its own catalogue -- and
+/// without them the panel is a wall of text with nothing to follow. LRCLIB is
+/// asked only for what is missing, in one of two ways:
+///
+/// - YouTube gave words but no timings: keep its words, lay LRCLIB's timings
+///   over them, and say so in the credit.
+/// - YouTube has no lyrics page at all, or the fetch failed: LRCLIB is the only
+///   chance, and its own words are better than an empty tab.
+///
+/// Whichever way it goes, LRCLIB failing is never what the user is told about:
+/// the error surfaced is YouTube's, because that is the source the tab is
+/// nominally showing.
+fn lyrics(
+    http: &Http,
+    browse_id: Option<&str>,
+    query: Option<&lrclib::Query>,
+) -> Result<watch::Lyrics> {
+    let found = browse_id.map(|browse_id| watch::lyrics(http, browse_id));
+
+    match found {
+        // Timed by YouTube itself. Nothing to add, and a second round trip
+        // would buy a worse answer than the one in hand.
+        Some(Ok(lyrics)) if !lyrics.timed.is_empty() => Ok(lyrics),
+
+        // Words but no timings -- a cover, a live take, most of what is not in
+        // YouTube's own catalogue.
+        Some(Ok(mut lyrics)) => {
+            if let Some(timed) = query.and_then(|query| lrclib::timed(http, query)) {
+                lyrics.timed = timed;
+                // The words on screen are still YouTube's; what changed is that
+                // they now scroll. Crediting both is the honest version, and
+                // the panel has one line to say it in.
+                lyrics.source = Some(match lyrics.source {
+                    Some(source) => format!("{source} • Timings: LRCLIB"),
+                    None => "Timings: LRCLIB".to_string(),
+                });
+            }
+            Ok(lyrics)
+        }
+
+        // No lyrics page, or YouTube would not answer for one.
+        other => {
+            if let Some(timed) = query.and_then(|query| lrclib::timed(http, query)) {
+                return Ok(watch::Lyrics::from_timed(timed, Some("Source: LRCLIB")));
+            }
+            match other {
+                Some(Err(e)) => Err(e),
+                _ => bail!("no lyrics are published for this track"),
+            }
+        }
+    }
+}
+
 fn run_covers(rx: Receiver<Request>, tx: Sender<Response>) {
-    while let Ok(Request::Cover { id }) = rx.recv() {
+    while let Ok(req) = rx.recv() {
+        let id = match req {
+            Request::Cover { id } => id,
+            Request::Shutdown => break,
+            // Routed elsewhere by `send`; reaching here would mean that routing
+            // and this match had drifted apart. Skipped rather than taken as a
+            // reason to stop -- this loop used to match `Cover` alone, so a
+            // misrouted request ended it, and since nothing joins this thread
+            // the whole session would silently go without covers.
+            other => {
+                debug_assert!(false, "{} was routed to the cover thread", name(&other));
+                continue;
+            }
+        };
+
         // Deliberately not reported as `Failed`: the status line is showing
         // what is playing, and a missing picture is not worth replacing that
         // with an error the user can do nothing about. The UI renders no cover

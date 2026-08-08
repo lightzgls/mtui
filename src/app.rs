@@ -18,6 +18,7 @@ use crate::source::cover::Cover;
 use crate::source::home::{Card, Shelf, Target};
 use crate::source::journal;
 use crate::source::library::Playlist;
+use crate::source::lrclib;
 use crate::source::watch::{Comments, Lyrics, Watch};
 use crate::source::worker::{Request, Response, SourceWorker};
 use crate::source::youtube::{MAX_RESULTS, extract_video_id};
@@ -201,6 +202,16 @@ pub struct NowPlaying {
     /// left off. For the two list tabs this is the selected row; for lyrics and
     /// comments, which have nothing to select, it is the first visible line.
     pub cursor: [usize; Tab::ALL.len()],
+    /// Whether the lyrics panel is scrolling itself to keep the line being sung
+    /// on screen. On until the user scrolls, because a panel that yanks itself
+    /// back every 200 ms is one they cannot read ahead in; back on when they
+    /// open the tab again, which is the one gesture that means "show me where
+    /// we are" and needs no key of its own.
+    ///
+    /// Only ever true of a track whose lyrics came back timed -- with no
+    /// timings there is nothing to follow, and the panel scrolls as it always
+    /// did.
+    pub follow_lyrics: bool,
     pub lyrics: Panel<Lyrics>,
     pub comments: Panel<Comments>,
     pub related: Panel<Vec<Shelf>>,
@@ -209,6 +220,13 @@ pub struct NowPlaying {
     /// lyrics, and that is not a failure.
     lyrics_id: Option<String>,
     related_id: Option<String>,
+    /// Whether the watch response has come back, successfully or not.
+    ///
+    /// Distinct from `lyrics_id.is_some()`, which it used to be read as: a
+    /// track with no lyrics page is still worth asking LRCLIB about, and only
+    /// this says the difference between "there is no page" and "we have not
+    /// heard yet".
+    watched: bool,
 }
 
 impl NowPlaying {
@@ -224,12 +242,28 @@ impl NowPlaying {
             playing: None,
             tab: Tab::UpNext,
             cursor: [0; Tab::ALL.len()],
+            follow_lyrics: true,
             lyrics: Panel::Idle,
             comments: Panel::Idle,
             related: Panel::Idle,
             lyrics_id: None,
             related_id: None,
+            watched: false,
         }
+    }
+
+    /// What LRCLIB should be asked about this track, if it can be asked at all.
+    ///
+    /// Built from the page rather than the queue row because it is the playing
+    /// track this is for, and `None` when the track is too thinly named to
+    /// match on -- see [`lrclib::Query::new`].
+    fn lyrics_query(&self) -> Option<lrclib::Query> {
+        lrclib::Query::new(
+            &self.artist,
+            &self.title,
+            self.album.as_deref(),
+            self.duration,
+        )
     }
 
     /// One line under the title, as YouTube Music writes it: "Tame Impala •
@@ -249,6 +283,39 @@ impl NowPlaying {
     fn cursor_mut(&mut self) -> &mut usize {
         let index = self.tab.index();
         &mut self.cursor[index]
+    }
+
+    /// Moves the open tab's cursor, and hands the lyrics panel back to the
+    /// user: they have said where they want to be looking, and a panel that
+    /// yanks itself back to the singer is one they cannot read ahead in.
+    ///
+    /// Only the near end is clamped here. The far end is the renderer's, which
+    /// is what knows how long each panel is once it has wrapped it.
+    fn scroll(&mut self, delta: isize) {
+        self.follow_lyrics = false;
+        let cursor = self.cursor_mut();
+        *cursor = cursor.saturating_add_signed(delta);
+    }
+
+    /// [`Self::scroll`] straight to a line, for `g` and `G`.
+    fn jump(&mut self, to: usize) {
+        self.follow_lyrics = false;
+        *self.cursor_mut() = to;
+    }
+
+    /// Opens a tab, and reports whether that was a change.
+    ///
+    /// Landing on Lyrics is what asks for the line being sung, whether or not
+    /// the tab changed: pressing `2` while already there is how a user who has
+    /// scrolled off says "back to the song", and it needs no key of its own.
+    /// The caller uses the return to decide whether to start a fetch.
+    fn open(&mut self, tab: Tab) -> bool {
+        if tab == Tab::Lyrics {
+            self.follow_lyrics = true;
+        }
+        let changed = self.tab != tab;
+        self.tab = tab;
+        changed
     }
 
     /// The track the queue would play next, if there is one.
@@ -646,10 +713,12 @@ impl App {
         // clearing the flag there would drop the redraw cadence back to the
         // idle one for the rest of the wait that flag exists to cover.
         //
-        // A resolve is excluded for a different reason: it is only the answer
-        // to what the user is waiting for when it is for the track they are
-        // waiting on, and one for a track they have skipped past must not
-        // declare the wait over. `apply_resolved` clears the flag when it is.
+        // A resolve is excluded for a different reason: a play never sets this
+        // flag in the first place -- it tracks `pending` instead, for the
+        // reason `play_track` gives -- so there is nothing here for a resolve
+        // to be clearing. What it would clear is some *other* request's flag,
+        // still in flight, and `awaiting` would then stop reporting a wait that
+        // is still going on.
         if !matches!(
             response,
             Response::Cover { .. }
@@ -1003,17 +1072,27 @@ impl App {
         let Some(now) = self.for_track(video_id) else {
             return;
         };
+        // Set whether or not it succeeded: this is the round trip the Lyrics
+        // tab waits on, and what it does next depends only on there having
+        // been one.
+        now.watched = true;
+
         let watch = match watch {
             Ok(watch) => watch,
             Err(why) => {
                 // No queue is not an error worth a status line: the track is
-                // playing, and the panels say so for themselves. Both of the
-                // ids the other tabs need came from this response, so neither
-                // is ever coming -- settled here rather than left to say
-                // "loading" for the rest of the track.
+                // playing, and the panels say so for themselves. Related's
+                // browse id came from this response, so it is never coming --
+                // settled here rather than left to say "loading" for the rest
+                // of the track.
                 now.playing = None;
-                now.lyrics = Panel::Empty(why.clone());
-                now.related = Panel::Empty(why);
+                now.related = Panel::Empty(why.clone());
+                // Lyrics are not settled with it: LRCLIB needs only the artist
+                // and title, and both arrived with the track rather than in
+                // this response. Left idle, the fetch starts on the next tick.
+                if now.lyrics_query().is_none() {
+                    now.lyrics = Panel::Empty(why);
+                }
                 return;
             }
         };
@@ -1025,7 +1104,11 @@ impl App {
         // no lyrics -- an instrumental, or most videos -- shows a panel that
         // says "loading" for as long as it plays, because the fetch that would
         // have finished the sentence is one there is no id to make.
-        if now.lyrics_id.is_none() {
+        //
+        // Lyrics are settled only when LRCLIB cannot be asked either. YouTube
+        // offering no lyrics page is the ordinary case for anything outside its
+        // own catalogue, and is the case the second source exists for.
+        if now.lyrics_id.is_none() && now.lyrics_query().is_none() {
             now.lyrics = Panel::Empty("no lyrics are published for this track".to_string());
         }
         if now.related_id.is_none() {
@@ -1174,19 +1257,22 @@ impl App {
         let request = match now.tab {
             // Already in hand: the queue arrives with the watch response.
             Tab::UpNext => return,
-            Tab::Lyrics if now.lyrics.is_idle() => match now.lyrics_id.clone() {
-                Some(browse_id) => {
-                    now.lyrics = Panel::Loading;
-                    Request::Lyrics {
-                        video_id,
-                        browse_id,
-                    }
+            // Waits on the watch response rather than on the browse id it
+            // carries: a track with no lyrics page is not a track with no
+            // lyrics, it is the one LRCLIB is there to answer for. Until the
+            // response lands there is no telling which of the two this is, so
+            // the panel is left idle and `tick_page` opens it again.
+            Tab::Lyrics if now.lyrics.is_idle() => {
+                if !now.watched {
+                    return;
                 }
-                // The watch response has not arrived yet, so there is nothing
-                // to ask with. Left idle deliberately: `tick_page` opens it
-                // again the moment the ids land.
-                None => return,
-            },
+                now.lyrics = Panel::Loading;
+                Request::Lyrics {
+                    video_id,
+                    browse_id: now.lyrics_id.clone(),
+                    query: now.lyrics_query(),
+                }
+            }
             Tab::Related if now.related.is_idle() => match now.related_id.clone() {
                 Some(browse_id) => {
                     now.related = Panel::Loading;
@@ -1217,7 +1303,7 @@ impl App {
     /// tab in that window would otherwise leave it idle forever.
     pub fn tick_page(&mut self) {
         let waiting = self.now.as_ref().is_some_and(|now| match now.tab {
-            Tab::Lyrics => now.lyrics.is_idle() && now.lyrics_id.is_some(),
+            Tab::Lyrics => now.lyrics.is_idle() && now.watched,
             Tab::Related => now.related.is_idle() && now.related_id.is_some(),
             _ => false,
         });
@@ -1299,11 +1385,6 @@ impl App {
         }
     }
 
-    /// Asks for the landing page.
-    ///
-    /// Not `busy`: this runs at launch, and a busy flag set before the first
-    /// frame would hold off the prefetch and spin the event loop at the faster
-    /// tick for as long as YouTube took to answer.
     /// Hands the finished play to the worker, which journals it and -- with a
     /// cookie saved -- reports it to YouTube.
     ///
@@ -1344,6 +1425,13 @@ impl App {
         }
     }
 
+    /// Asks for the landing page.
+    ///
+    /// Not `busy`: this runs at launch, and a busy flag set before the first
+    /// frame would hold off the prefetch and spin the event loop at the faster
+    /// tick for as long as YouTube took to answer. [`Self::home_pending`] is
+    /// what stands in for it, and says only what the pane needs -- the
+    /// difference between "loading" and "there is no feed".
     fn request_home(&mut self) {
         self.home_pending = self.source.send(Request::Home).is_ok();
         if !self.home_pending {
@@ -1476,6 +1564,20 @@ impl App {
         };
         let cursor = now.cursor_mut();
         *cursor = (*cursor).min(last);
+    }
+
+    /// Puts the open panel's cursor where the panel scrolled itself to.
+    ///
+    /// Called by the renderer when the lyrics panel is following the singer,
+    /// which is the one case where something other than a key decides what is
+    /// on screen. Written back rather than kept beside the cursor so that the
+    /// moment the user takes over -- one press of `j` -- they carry on from the
+    /// line they were looking at, instead of from wherever they had scrolled to
+    /// before the follow began.
+    pub fn follow_page(&mut self, offset: usize) {
+        if let Some(now) = self.now.as_mut() {
+            *now.cursor_mut() = offset;
+        }
     }
 
     /// [`Self::clamp_scroll`] for the playlist list, which scrolls separately.
@@ -1743,19 +1845,11 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.scroll_page(-1),
             KeyCode::PageDown => self.scroll_page(10),
             KeyCode::PageUp => self.scroll_page(-10),
-            KeyCode::Char('g') | KeyCode::Home => {
-                if let Some(now) = self.now.as_mut() {
-                    *now.cursor_mut() = 0;
-                }
-            }
+            KeyCode::Char('g') | KeyCode::Home => self.jump_page(0),
             // No length is known here for the text panels, so this asks for a
             // line no panel has and lets the renderer -- which knows how long
             // each of them is -- clamp it to the last one.
-            KeyCode::Char('G') | KeyCode::End => {
-                if let Some(now) = self.now.as_mut() {
-                    *now.cursor_mut() = usize::MAX;
-                }
-            }
+            KeyCode::Char('G') | KeyCode::End => self.jump_page(usize::MAX),
             KeyCode::Enter => self.open_page_row(),
             KeyCode::Char('n') => self.advance(1, false),
             KeyCode::Char('p') => self.advance(-1, false),
@@ -1788,20 +1882,24 @@ impl App {
         // Applied in one place rather than in each arm above, so that every way
         // of changing tabs also starts the fetch behind the new one.
         if let (Some(now), Some(tab)) = (self.now.as_mut(), tab)
-            && now.tab != tab
+            && now.open(tab)
         {
-            now.tab = tab;
             self.request_tab();
         }
         Ok(())
     }
 
-    /// Moves the cursor of the open tab. Bounded only below; the renderer is
-    /// what knows how long each panel is and clamps the other end.
+    /// Moves the cursor of the open tab, when there is a page to move it on.
     fn scroll_page(&mut self, delta: isize) {
         if let Some(now) = self.now.as_mut() {
-            let cursor = now.cursor_mut();
-            *cursor = cursor.saturating_add_signed(delta);
+            now.scroll(delta);
+        }
+    }
+
+    /// [`Self::scroll_page`] straight to a line, for `g` and `G`.
+    fn jump_page(&mut self, to: usize) {
+        if let Some(now) = self.now.as_mut() {
+            now.jump(to);
         }
     }
 
@@ -2339,5 +2437,103 @@ impl App {
                 .saturating_sub(Duration::from_secs(secs.unsigned_abs()))
         };
         let _ = self.player.send(Command::Seek(target));
+    }
+}
+
+/// Tests for [`NowPlaying`] alone.
+///
+/// [`App`] itself is not constructed here and deliberately has no tests: it
+/// owns a [`Player`], which opens an audio device, and a [`SourceWorker`],
+/// which spawns threads and may go to the network. [`NowPlaying`] is the part
+/// that holds the player page's state, is cheap to build, and is where the
+/// decisions worth pinning down actually live.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn playing() -> NowPlaying {
+        NowPlaying::new(&Track {
+            id: "letithappen".to_string(),
+            title: "Let It Happen".to_string(),
+            uploader: "Tame Impala".to_string(),
+            duration: Some(Duration::from_secs(468)),
+            album: Some("Currents".to_string()),
+            playlist_item_id: None,
+        })
+    }
+
+    #[test]
+    fn a_new_page_follows_the_singer_until_told_otherwise() {
+        assert!(
+            playing().follow_lyrics,
+            "a track just started is one nobody has scrolled yet"
+        );
+    }
+
+    #[test]
+    fn scrolling_the_lyrics_hands_them_back_to_the_user() {
+        let mut now = playing();
+        now.open(Tab::Lyrics);
+
+        now.scroll(3);
+        assert_eq!(now.cursor(), 3);
+        assert!(
+            !now.follow_lyrics,
+            "a panel that yanks itself back to the singer cannot be read ahead in"
+        );
+
+        // Bounded below only: the far end needs the wrapped length, which is
+        // the renderer's to know.
+        now.scroll(-10);
+        assert_eq!(now.cursor(), 0);
+    }
+
+    #[test]
+    fn jumping_to_an_end_hands_them_back_too() {
+        let mut now = playing();
+        now.open(Tab::Lyrics);
+
+        // What `G` asks for: a line no panel has, for the renderer to clamp.
+        now.jump(usize::MAX);
+        assert_eq!(now.cursor(), usize::MAX);
+        assert!(!now.follow_lyrics);
+
+        now.follow_lyrics = true;
+        now.jump(0);
+        assert!(!now.follow_lyrics, "`g` is a scroll like any other");
+    }
+
+    #[test]
+    fn opening_the_lyrics_tab_again_is_how_you_get_back_to_the_song() {
+        let mut now = playing();
+        assert!(now.open(Tab::Lyrics), "that was a change of tab");
+        now.scroll(20);
+        assert!(!now.follow_lyrics);
+
+        // Pressing `2` while already on Lyrics: not a change of tab, so no
+        // fetch is started, but it is the gesture that means "show me where we
+        // are" -- and it needs no key of its own.
+        assert!(!now.open(Tab::Lyrics), "the tab did not change");
+        assert!(now.follow_lyrics, "the panel should be following again");
+        assert_eq!(now.cursor(), 20, "the cursor is the renderer's to move");
+    }
+
+    #[test]
+    fn the_other_tabs_leave_the_lyrics_alone() {
+        let mut now = playing();
+        now.open(Tab::Lyrics);
+        now.scroll(20);
+
+        // Walking away and back through another tab does re-arm it, because
+        // arriving on Lyrics is the gesture; walking *past* it does not.
+        assert!(now.open(Tab::Comments));
+        assert!(!now.follow_lyrics);
+        now.scroll(5);
+        assert_eq!(now.cursor(), 5, "each tab keeps its own cursor");
+        assert_eq!(
+            now.cursor[Tab::Lyrics.index()],
+            20,
+            "the lyrics cursor is where it was left"
+        );
     }
 }

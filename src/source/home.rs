@@ -207,10 +207,25 @@ pub fn tracks(http: &Http, browse_id: &str) -> Result<Vec<Track>> {
 
 /// One `browse` call against YouTube Music's internal API.
 pub(super) fn browse(http: &Http, cookies: Option<&Cookies>, browse_id: &str) -> Result<Value> {
-    post(
+    browse_as(http, cookies, browse_id, MUSIC_CLIENT_VERSION)
+}
+
+/// [`browse`], as a stated version of the music client.
+///
+/// Only [`crate::source::watch::lyrics`] asks for anything but
+/// [`MUSIC_CLIENT_VERSION`], and it does so for one capability that the pinned
+/// version is not served -- see the constant beside it.
+pub(super) fn browse_as(
+    http: &Http,
+    cookies: Option<&Cookies>,
+    browse_id: &str,
+    client_version: &str,
+) -> Result<Value> {
+    post_as(
         http,
         BROWSE_URL,
         cookies,
+        client_version,
         serde_json::json!({ "browseId": browse_id }),
     )
     .with_context(|| format!("could not load {browse_id}"))
@@ -221,11 +236,22 @@ pub(super) fn browse(http: &Http, cookies: Option<&Cookies>, browse_id: &str) ->
 /// The context travels with every request and has to match what a real client
 /// would send; `extra` is whatever the particular endpoint wants on top.
 pub(super) fn post(http: &Http, url: &str, cookies: Option<&Cookies>, extra: Value) -> Result<Value> {
+    post_as(http, url, cookies, MUSIC_CLIENT_VERSION, extra)
+}
+
+/// [`post`], as a stated version of the music client.
+fn post_as(
+    http: &Http,
+    url: &str,
+    cookies: Option<&Cookies>,
+    client_version: &str,
+    extra: Value,
+) -> Result<Value> {
     let mut body = serde_json::json!({
         "context": {
             "client": {
                 "clientName": MUSIC_CLIENT_NAME,
-                "clientVersion": MUSIC_CLIENT_VERSION,
+                "clientVersion": client_version,
                 "hl": "en",
             }
         }

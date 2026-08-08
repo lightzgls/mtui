@@ -196,6 +196,16 @@ there.
 queue is fetched when a track starts, because it decides what plays next; the
 other three are one request each, made the first time you open that tab.
 
+**The lyrics follow the singer.** When the line timings are available the panel
+marks the line being sung, dims the rest of the song around it, and scrolls
+itself to keep it in the middle. Scrolling it yourself hands it back — it stays
+where you put it — and pressing `2` again picks the song back up.
+
+YouTube publishes timings only for its own catalogue, so for a cover, a live
+take or anything not uploaded by a label they come from
+[LRCLIB](https://lrclib.net) instead, credited in the panel. When neither has
+them the tab still shows the words, just without the highlight.
+
 **The queue plays itself.** When a track ends the next one starts, and it has
 already been resolved in the background while the current one played — so the
 gap is a channel round trip rather than the several seconds a cold resolve

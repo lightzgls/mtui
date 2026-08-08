@@ -16,6 +16,8 @@
 //! them, so they come from youtube.com proper, as its web client asks for them
 //! -- one call for a continuation token and a second to redeem it.
 
+use std::time::Duration;
+
 use anyhow::{Result, bail};
 use serde_json::Value;
 
@@ -45,6 +47,27 @@ const MAX_COMMENTS: usize = 50;
 /// happened to land in the same renderer.
 const MAX_LYRICS: usize = 8_000;
 
+/// Ceiling on the timed lines kept for one track. A song runs to well under a
+/// hundred; this is a bound on a response that has stopped being a song.
+///
+/// Shared with [`crate::source::lrclib`], which parses the same lines out of a
+/// different source: two bounds on one panel would be two numbers to keep in
+/// step, and the panel does not care which provider filled it.
+pub(super) const MAX_TIMED_LINES: usize = 400;
+
+/// The client version served lyrics *with their timings*.
+///
+/// Deliberately not [`crate::source::innertube::MUSIC_CLIENT_VERSION`], which
+/// every other call here pins and shares. The lyrics browse is the one endpoint
+/// whose answer depends on how new the client claims to be: asked as the pinned
+/// version it returns the same words as a flat block of text, and asked as this
+/// one it returns them line by line with a cue range on each. Both shapes are
+/// parsed below, so a version Google eventually stops serving costs the
+/// highlighting and nothing else -- which is why this is a local exception to
+/// the one-identity rule rather than a bump of the shared constant, whose job
+/// is to keep search, browse and the queue from drifting apart.
+const TIMED_LYRICS_CLIENT_VERSION: &str = "1.20250122.01.00";
+
 /// The queue a track plays inside, and where to find the rest of its page.
 ///
 /// The two ids are handed back rather than followed, because following them is
@@ -66,10 +89,67 @@ pub struct Watch {
 /// Lyrics, and whoever YouTube licensed them from.
 #[derive(Debug, Clone)]
 pub struct Lyrics {
+    /// The whole thing as one block, which is all there is to show for a track
+    /// whose lyrics were never timed.
     pub text: String,
     /// "Source: Musixmatch". Shown because the tab is otherwise a wall of text
     /// with no indication it came from anywhere.
     pub source: Option<String>,
+    /// The same words split into the lines they are sung as, each with the
+    /// moment it starts. Empty when YouTube published no timings for this
+    /// track, which is the common case outside its own catalogue.
+    pub timed: Vec<TimedLine>,
+}
+
+/// One line of lyrics and the moment the singer reaches it.
+///
+/// The cue range YouTube sends also states where the line *ends*, which is not
+/// kept: for all but the gaps it is the next line's start, and through a gap
+/// the line just sung is the one that should stay marked anyway. Nothing here
+/// can answer a question the start does not, and an unread field is one more
+/// thing to keep true.
+#[derive(Debug, Clone)]
+pub struct TimedLine {
+    pub text: String,
+    pub start: Duration,
+}
+
+impl Lyrics {
+    /// Lyrics built from timed lines, whichever source produced them.
+    ///
+    /// The block is derived here rather than at the point of use so that the
+    /// two cannot disagree about how the lines are joined: a narrow panel may
+    /// still want to draw the whole thing as text, and it should be the same
+    /// text either way.
+    ///
+    /// An empty credit is treated as no credit: the panel draws the line it is
+    /// given, and a blank one is a row of the song's height spent saying
+    /// nothing.
+    pub(super) fn from_timed(timed: Vec<TimedLine>, source: Option<&str>) -> Self {
+        Self {
+            text: timed
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            source: source
+                .map(str::trim)
+                .filter(|source| !source.is_empty())
+                .map(str::to_string),
+            timed,
+        }
+    }
+
+    /// Which line is being sung at `position`, if any.
+    ///
+    /// The *last* line to have started rather than the one whose range covers
+    /// the position: through an instrumental break the line just sung stays
+    /// marked, which is what a listener reading along expects, and what YouTube
+    /// Music itself does. `None` only before the first line and for a track
+    /// with no timings at all.
+    pub fn singing(&self, position: Duration) -> Option<usize> {
+        self.timed.iter().rposition(|line| line.start <= position)
+    }
 }
 
 /// One top-level comment. Replies are counted but not fetched: each thread is
@@ -128,29 +208,92 @@ pub fn fetch(http: &Http, video_id: &str) -> Result<Watch> {
 }
 
 /// The lyrics behind the browse id [`fetch`] handed back.
+///
+/// One call, two possible shapes back. Asked as a client new enough to render
+/// them, YouTube answers with the lines and their cue ranges, which is what
+/// lets the panel follow the singer; asked about a track it has no timings for
+/// -- a cover, a live take, most of what is not in its own catalogue -- it
+/// answers the older way, with the words in one block. The timed shape is tried
+/// first and the block is the fallback, so the tab has lyrics in it either way
+/// and only the highlighting depends on which arrived.
 pub fn lyrics(http: &Http, browse_id: &str) -> Result<Lyrics> {
-    let json = home::browse(http, None, browse_id)?;
+    let json = home::browse_as(http, None, browse_id, TIMED_LYRICS_CLIENT_VERSION)?;
 
+    timed_lyrics(&json)
+        .or_else(|| block_lyrics(&json))
+        .ok_or_else(|| anyhow::anyhow!("no lyrics are published for this track"))
+}
+
+/// Lyrics line by line, each with the moment it is sung.
+///
+/// The lines arrive beside the render tree rather than inside it, under a model
+/// the web client hands to its own lyrics component, so they are found by
+/// walking for the array rather than by a path through renderers that would be
+/// correct for exactly one layout.
+fn timed_lyrics(json: &Value) -> Option<Lyrics> {
+    let mut found = Vec::new();
+    home::collect(json, "timedLyricsData", &mut found);
+
+    let timed: Vec<TimedLine> = found
+        .first()?
+        .as_array()?
+        .iter()
+        .filter_map(parse_timed_line)
+        .take(MAX_TIMED_LINES)
+        .collect();
+    if timed.is_empty() {
+        return None;
+    }
+
+    let mut sources = Vec::new();
+    home::collect(json, "sourceMessage", &mut sources);
+    let source = sources.first().and_then(|source| source.as_str());
+
+    Some(Lyrics::from_timed(timed, source))
+}
+
+/// One line and the start of its cue range.
+///
+/// A line with no start is dropped rather than placed at zero: it would mark
+/// itself as the one being sung for the whole of the intro, which is worse than
+/// the line simply not being there.
+fn parse_timed_line(raw: &Value) -> Option<TimedLine> {
+    Some(TimedLine {
+        text: raw["lyricLine"].as_str()?.to_string(),
+        start: Duration::from_millis(millis(&raw["cueRange"]["startTimeMilliseconds"])?),
+    })
+}
+
+/// A time in milliseconds, however this response chose to write it.
+///
+/// A 64-bit field is a *string* in Google's JSON encoding of protobuf, which is
+/// what these are -- but the number is accepted too, because a field that only
+/// ever parses one way is a field nobody notices has changed shape.
+fn millis(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+/// The older shape: every word in one description shelf, and no timings.
+fn block_lyrics(json: &Value) -> Option<Lyrics> {
     let mut shelves = Vec::new();
-    home::collect(&json, "musicDescriptionShelfRenderer", &mut shelves);
-
-    let shelf = shelves
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("no lyrics are published for this track"))?;
+    home::collect(json, "musicDescriptionShelfRenderer", &mut shelves);
+    let shelf = shelves.first()?;
 
     let mut text = shelf
         .pointer("/description/runs")
-        .and_then(home::runs_text)
-        .ok_or_else(|| anyhow::anyhow!("no lyrics are published for this track"))?;
+        .and_then(home::runs_text)?;
     text.truncate(
         text.char_indices()
             .nth(MAX_LYRICS)
             .map_or(text.len(), |(at, _)| at),
     );
 
-    Ok(Lyrics {
+    Some(Lyrics {
         text,
         source: shelf.pointer("/footer/runs").and_then(home::runs_text),
+        timed: Vec::new(),
     })
 }
 
@@ -579,6 +722,140 @@ mod tests {
             "playlistPanelRenderer": { "title": { "runs": [ { "text": "Discovery" } ] } }
         });
         assert_eq!(queue_title(&nested).as_deref(), Some("Discovery"));
+    }
+
+    /// A response carrying lyrics line by line, with `start` written however
+    /// the caller asks for it.
+    ///
+    /// The words are invented: nothing in the parsing depends on what a line
+    /// says, and a fixture of somebody's real lyric would be a copy of it
+    /// sitting in the repository for no benefit to the test.
+    fn timed_response(starts: Vec<Value>) -> Value {
+        let lines: Vec<Value> = starts
+            .into_iter()
+            .enumerate()
+            .map(|(n, start)| {
+                serde_json::json!({
+                    "lyricLine": format!("sung line {n}"),
+                    "cueRange": { "startTimeMilliseconds": start },
+                })
+            })
+            .collect();
+
+        // Nested well below the top level, as the real response nests it inside
+        // the element model the web client hands its lyrics component: the
+        // parser walks for the key rather than following a path, and a fixture
+        // that put it at the root would not exercise that.
+        serde_json::json!({ "contents": { "elementRenderer": { "model": {
+            "timedLyricsModel": { "lyricsData": {
+                "timedLyricsData": lines,
+                "sourceMessage": "Source: Musixmatch",
+            } }
+        } } } })
+    }
+
+    #[test]
+    fn reads_lyrics_line_by_line_with_the_moment_each_is_sung() {
+        let json = timed_response(vec![
+            serde_json::json!(0),
+            serde_json::json!(4_500),
+            serde_json::json!(9_250),
+        ]);
+
+        let lyrics = timed_lyrics(&json).expect("a timed response should parse");
+        assert_eq!(lyrics.timed.len(), 3);
+        assert_eq!(lyrics.timed[1].text, "sung line 1");
+        assert_eq!(lyrics.timed[1].start, Duration::from_millis(4_500));
+        assert_eq!(lyrics.source.as_deref(), Some("Source: Musixmatch"));
+        // The block is kept alongside the lines so a caller that wants the
+        // whole thing does not have to decide how to join them.
+        assert_eq!(lyrics.text, "sung line 0\nsung line 1\nsung line 2");
+    }
+
+    #[test]
+    fn a_time_is_read_whether_it_arrives_as_a_number_or_a_string() {
+        // Google's JSON encoding of protobuf writes 64-bit fields as strings,
+        // so the same field can arrive either way from the same endpoint.
+        assert_eq!(millis(&serde_json::json!(4_500)), Some(4_500));
+        assert_eq!(millis(&serde_json::json!("4500")), Some(4_500));
+        assert_eq!(millis(&serde_json::json!("not a number")), None);
+        assert_eq!(millis(&Value::Null), None);
+
+        let json = timed_response(vec![serde_json::json!("0"), serde_json::json!("7000")]);
+        let lyrics = timed_lyrics(&json).expect("stringified times should parse");
+        assert_eq!(lyrics.timed[1].start, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn a_line_with_no_time_is_dropped_rather_than_placed_at_the_start() {
+        // Placed at zero it would mark itself as the line being sung for the
+        // whole of the intro, which is worse than it not being there.
+        let json = timed_response(vec![
+            serde_json::json!(0),
+            Value::Null,
+            serde_json::json!(9_000),
+        ]);
+
+        let lyrics = timed_lyrics(&json).expect("the timed lines should still parse");
+        assert_eq!(lyrics.timed.len(), 2);
+        assert_eq!(lyrics.timed[1].start, Duration::from_secs(9));
+    }
+
+    #[test]
+    fn a_response_with_no_timings_falls_back_to_the_block() {
+        let json = serde_json::json!({ "musicDescriptionShelfRenderer": {
+            "description": { "runs": [ { "text": "sung line 0\nsung line 1" } ] },
+            "footer": { "runs": [ { "text": "Source: Musixmatch" } ] },
+        } });
+
+        assert!(
+            timed_lyrics(&json).is_none(),
+            "there are no timings in the older shape"
+        );
+        let lyrics = block_lyrics(&json).expect("the block should still parse");
+        assert_eq!(lyrics.text, "sung line 0\nsung line 1");
+        assert_eq!(lyrics.source.as_deref(), Some("Source: Musixmatch"));
+        assert!(
+            lyrics.timed.is_empty(),
+            "the block shape carries no timings to highlight from"
+        );
+
+        // An empty array is not timings either, and must not shadow the block.
+        let empty = timed_response(Vec::new());
+        assert!(timed_lyrics(&empty).is_none());
+    }
+
+    #[test]
+    fn the_line_being_sung_is_the_last_one_to_have_started() {
+        let lyrics = timed_lyrics(&timed_response(vec![
+            serde_json::json!(1_000),
+            serde_json::json!(5_000),
+            serde_json::json!(9_000),
+        ]))
+        .expect("a timed response should parse");
+
+        // Before the first line there is nothing to mark: an intro should not
+        // highlight words nobody is singing yet.
+        assert_eq!(lyrics.singing(Duration::ZERO), None);
+        assert_eq!(lyrics.singing(Duration::from_millis(999)), None);
+        // A line is sung from the instant it starts.
+        assert_eq!(lyrics.singing(Duration::from_secs(1)), Some(0));
+        assert_eq!(lyrics.singing(Duration::from_millis(4_999)), Some(0));
+        assert_eq!(lyrics.singing(Duration::from_secs(5)), Some(1));
+        // Past the last line it stays marked rather than clearing: through an
+        // outro the line just sung is what a reader is still looking at.
+        assert_eq!(lyrics.singing(Duration::from_secs(600)), Some(2));
+    }
+
+    #[test]
+    fn a_track_with_no_timings_never_marks_a_line() {
+        let lyrics = Lyrics {
+            text: "sung line 0".to_string(),
+            source: None,
+            timed: Vec::new(),
+        };
+        assert_eq!(lyrics.singing(Duration::ZERO), None);
+        assert_eq!(lyrics.singing(Duration::from_secs(90)), None);
     }
 
     #[test]

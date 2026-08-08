@@ -80,6 +80,11 @@ const UP_NEXT_HEADER: usize = 3;
 const QUEUE_ARTIST_WIDTH: usize = 14;
 const MIN_QUEUE_TITLE: usize = 16;
 
+/// Columns the lyrics panel keeps to the left of every line, for the mark
+/// against the one being sung. Held even when nothing is marked, so that a line
+/// becoming the current one does not shift the whole panel sideways.
+const LYRIC_GUTTER: usize = 2;
+
 /// Name width defended in a playlist row before its track count is granted.
 /// Same principle as [`MIN_TITLE_WIDTH`]: the label outranks the metadata.
 const MIN_PLAYLIST_NAME: usize = 8;
@@ -1297,6 +1302,9 @@ fn volume_line<'a>(volume: f32, width: usize) -> Line<'a> {
 /// means a frame is never drawn with a cursor past the end of a panel whose
 /// length only became knowable while drawing it.
 fn render_panel(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Taken before the page is borrowed, since the lyrics panel needs it and
+    // the borrow below is what stops it being asked for down there.
+    let snap = app.snapshot();
     let block = Block::bordered().border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1312,12 +1320,22 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
     render_tabs(frame, tab, tabs);
 
+    // Set only by the lyrics panel, and only while it is following the singer:
+    // where it scrolled itself to, which becomes the cursor the keys move.
+    let mut following = None;
     let total = match tab {
         Tab::UpNext => render_up_next(frame, now, content),
-        Tab::Lyrics => render_lyrics(frame, now, content),
+        Tab::Lyrics => {
+            let (total, offset) = render_lyrics(frame, now, &snap, content);
+            following = offset;
+            total
+        }
         Tab::Comments => render_comments(frame, now, content),
         Tab::Related => render_related(frame, now, content),
     };
+    if let Some(offset) = following {
+        app.follow_page(offset);
+    }
     // A list stops at its last row; a wall of text stops one screenful short of
     // its end. `render_up_next` keeps its header out of the scroll, so what it
     // reports is rows rather than lines and the viewport must match.
@@ -1446,51 +1464,154 @@ fn queue_line<'a>(track: &Track, selected: bool, playing: bool, width: usize) ->
     Line::from(spans)
 }
 
-/// The lyrics, wrapped to the panel and scrolled by line. Returns the number of
-/// lines the wrap produced.
-fn render_lyrics(frame: &mut Frame, now: &NowPlaying, area: Rect) -> usize {
-    let width = (area.width as usize).saturating_sub(2);
+/// The lyrics, wrapped to the panel and scrolled by line.
+///
+/// Returns the number of lines the wrap produced, and -- while the panel is
+/// following the singer -- the offset it put itself at, which the caller writes
+/// back to the cursor the keys move. Only a wrap done here can be counted, and
+/// only a count can be turned into a line to scroll to, which is why both
+/// numbers come back from the drawing rather than being worked out before it.
+fn render_lyrics(
+    frame: &mut Frame,
+    now: &NowPlaying,
+    snap: &Snapshot,
+    area: Rect,
+) -> (usize, Option<usize>) {
+    let width = (area.width as usize).saturating_sub(LYRIC_GUTTER + 1);
     let Panel::Ready(lyrics) = &now.lyrics else {
         message(frame, waiting_on(&now.lyrics), area);
-        return 0;
+        return (0, None);
     };
 
-    // Wrapped here rather than by `Paragraph::wrap` because the panel scrolls
-    // by line, and only a wrap we did ourselves can be counted.
-    let mut lines: Vec<String> = Vec::new();
+    // Which line the track is on, for a track whose lyrics came back timed.
+    // `None` covers both "not timed" and "not there yet", and neither wants a
+    // line marked.
+    let singing = lyrics.singing(snap.position);
+
+    // Each drawn row: its text, the timed line it was wrapped out of, and
+    // whether it is that line's first row -- which is where the mark goes, and
+    // which only the wrap done here can know. The credit and the blank line
+    // under it belong to no lyric and stay `None`, which is also what every
+    // line of an untimed track is.
+    let mut lines: Vec<(String, Option<usize>, bool)> = Vec::new();
     if let Some(source) = &lyrics.source {
-        lines.push(source.clone());
-        lines.push(String::new());
+        lines.push((source.clone(), None, false));
+        lines.push((String::new(), None, false));
     }
-    for paragraph in lyrics.text.lines() {
-        if paragraph.trim().is_empty() {
-            lines.push(String::new());
-        } else {
-            lines.extend(wrap(paragraph, width));
+    let credit = lines.len();
+
+    if lyrics.timed.is_empty() {
+        for paragraph in lyrics.text.lines() {
+            if paragraph.trim().is_empty() {
+                lines.push((String::new(), None, false));
+            } else {
+                lines.extend(
+                    wrap(paragraph, width)
+                        .into_iter()
+                        .map(|line| (line, None, false)),
+                );
+            }
+        }
+    } else {
+        for (at, timed) in lyrics.timed.iter().enumerate() {
+            if timed.text.trim().is_empty() {
+                // A verse gap is one row, and is its own first.
+                lines.push((String::new(), Some(at), true));
+            } else {
+                lines.extend(
+                    wrap(&timed.text, width)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(row, line)| (line, Some(at), row == 0)),
+                );
+            }
         }
     }
 
     let viewport = area.height as usize;
-    let source_lines = lyrics.source.is_some() as usize * 2;
-    let offset = now.cursor().min(lines.len().saturating_sub(viewport));
+    // Centred rather than scrolled to the top: what has just been sung is as
+    // much of the reason to read along as what is coming, and a line pinned to
+    // the top edge shows none of it.
+    let following = singing.filter(|_| now.follow_lyrics).map(|at| {
+        let first = lines
+            .iter()
+            .position(|(_, from, _)| *from == Some(at))
+            .unwrap_or(0);
+        centred_offset(first, viewport, lines.len())
+    });
+    let offset =
+        following.unwrap_or_else(|| now.cursor().min(lines.len().saturating_sub(viewport)));
 
     let drawn: Vec<Line> = lines
         .iter()
         .enumerate()
         .skip(offset)
         .take(viewport)
-        .map(|(index, line)| {
-            let style = if index < source_lines {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            Line::from(Span::styled(format!(" {line}"), style))
+        .map(|(index, (text, from, first))| {
+            lyric_line(text, index < credit, *from, singing, *first)
         })
         .collect();
 
     frame.render_widget(Paragraph::new(drawn), area);
-    lines.len()
+    (lines.len(), following)
+}
+
+/// One drawn row of the lyrics panel, styled for where the track has got to.
+///
+/// Two styles only: the lyric being sung, and everything else -- the rest of
+/// the song, sung or not yet, and the source credit with it. One thing on the
+/// panel is bright and nothing else is, so there is nothing to work out.
+///
+/// The dim end is [`Color::DarkGray`] rather than [`Color::Gray`] because grey
+/// against white is not the contrast it looks like in source: `Gray` is ANSI 7
+/// and `White` is ANSI 15, and on a good many terminal themes those are the
+/// same colour, which leaves the sung line distinguished by its boldness alone.
+/// `DarkGray` is ANSI 8, and 8-against-15 is the widest gap the sixteen-colour
+/// palette has.
+///
+/// The dimming is conditional on there being something to contrast *with*. A
+/// track with no timings never has a line being sung, and dimming all of it
+/// would leave a panel that is only harder to read than before -- so with
+/// nothing sung the words stay at ordinary body grey.
+///
+/// A marker as well as a colour, because on a terminal that renders bold as
+/// bright and nothing else, colour alone is not a reliable way to say which
+/// line of twenty is the one. The two are decided separately below -- the
+/// colour belongs to every row of the sung lyric, the marker only to its first.
+fn lyric_line<'a>(
+    text: &str,
+    credit: bool,
+    from: Option<usize>,
+    singing: Option<usize>,
+    first: bool,
+) -> Line<'a> {
+    // The credit is about the panel rather than the song, and is never the line
+    // being sung. `from.is_some()` is what stops a row of an *untimed* track
+    // counting: there both it and `singing` are `None`, and `None == None`.
+    let sung = !credit && from.is_some() && from == singing;
+
+    let style = if sung {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else if credit || singing.is_some() {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        // Nothing is being sung: an untimed track, or a timed one still in its
+        // intro. Dimming buys contrast against a bright line, and with no
+        // bright line it buys nothing -- it would just leave the whole panel
+        // harder to read than it was before any of this.
+        Style::default().fg(Color::Gray)
+    };
+
+    // Once per lyric rather than once per row: a lyric that wraps is still one
+    // line being sung, and a bar down each of its rows reads as several.
+    let marker = if sung && first { "▌" } else { " " };
+
+    Line::from(vec![
+        Span::styled(format!("{marker} "), style),
+        Span::styled(text.to_string(), style),
+    ])
 }
 
 /// The comment section, as a scrolling column of blocks. Returns its height in
@@ -2081,7 +2202,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::source::watch::{Comment, Comments, Lyrics};
+    use crate::source::watch::{Comment, Comments, Lyrics, TimedLine};
 
     /// A 16:9 cover, as every YouTube thumbnail is once shrunk.
     fn wide() -> Cover {
@@ -2571,8 +2692,51 @@ mod tests {
         now
     }
 
+    /// Lyrics as YouTube returns them for a track it holds timings for: the
+    /// lines split as they are sung, each with the moment it starts.
+    ///
+    /// The words are invented rather than a real song's. Nothing here depends
+    /// on what they say -- only on how many lines there are, how long each one
+    /// wraps to, and how far apart their starts sit -- and a fixture that is
+    /// somebody's copyrighted lyric is one the tests cannot be shown in full.
+    /// Each line names its own index, so a test that finds the wrong line
+    /// highlighted says which one it found.
+    fn timed_lyrics() -> Lyrics {
+        let timed: Vec<TimedLine> = (0..8)
+            .map(|n| TimedLine {
+                text: format!("sung line {n}, a lyric long enough to wrap in a narrow panel"),
+                start: Duration::from_secs(n * 5),
+            })
+            .collect();
+
+        Lyrics {
+            text: timed
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            source: Some("Source: Musixmatch".to_string()),
+            timed,
+        }
+    }
+
     /// One panel drawn on its own, as one string per row.
     fn drawn_panel(now: &NowPlaying, width: u16, height: u16) -> Vec<String> {
+        drawn_panel_at(now, Duration::ZERO, width, height)
+    }
+
+    /// [`drawn_panel`], with the track a given way through -- which only the
+    /// lyrics panel reads, and is the whole of what it follows.
+    fn drawn_panel_at(
+        now: &NowPlaying,
+        position: Duration,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let snap = Snapshot {
+            position,
+            ..Default::default()
+        };
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
@@ -2582,7 +2746,7 @@ mod tests {
                 render_tabs(frame, now.tab, tabs);
                 match now.tab {
                     Tab::UpNext => render_up_next(frame, now, content),
-                    Tab::Lyrics => render_lyrics(frame, now, content),
+                    Tab::Lyrics => render_lyrics(frame, now, &snap, content).0,
                     Tab::Comments => render_comments(frame, now, content),
                     Tab::Related => render_related(frame, now, content),
                 };
@@ -2673,6 +2837,7 @@ mod tests {
         now.lyrics = Panel::Ready(Lyrics {
             text: (1..=20).map(|n| format!("line {n}\n")).collect(),
             source: Some("Source: Musixmatch".to_string()),
+            timed: Vec::new(),
         });
 
         let top = drawn_panel(&now, 44, 8);
@@ -2687,6 +2852,213 @@ mod tests {
             bottom.iter().any(|row| row.contains("line 20")),
             "the end of the lyrics should be reachable: {bottom:#?}"
         );
+    }
+
+    /// The row carrying the mark, and where in the panel it sits. `None` when
+    /// no line is marked, which is a distinct outcome from the wrong one being
+    /// marked and is asserted on in its own right below.
+    fn marked(rows: &[String]) -> Option<(usize, &String)> {
+        rows.iter().enumerate().find(|(_, row)| row.contains('▌'))
+    }
+
+    #[test]
+    fn the_line_being_sung_is_the_marked_one() {
+        let mut now = playing();
+        now.tab = Tab::Lyrics;
+        now.lyrics = Panel::Ready(timed_lyrics());
+
+        // Wide enough that every lyric is one row, so what the test is about is
+        // which line is marked rather than how a line wrapped.
+        let rows = drawn_panel_at(&now, Duration::from_secs(22), 70, 8);
+        let (_, row) =
+            marked(&rows).unwrap_or_else(|| panic!("a line should be marked: {rows:#?}"));
+        assert!(
+            row.contains("sung line 4"),
+            "the fifth line starts at 20s and the sixth at 25s: {row:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.contains('▌')).count(),
+            1,
+            "one lyric is being sung, so one mark: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_lyric_is_marked_once_at_its_first_row() {
+        let mut now = playing();
+        now.tab = Tab::Lyrics;
+        now.lyrics = Panel::Ready(timed_lyrics());
+
+        // Narrow enough that every lyric wraps onto two rows. One mark, on the
+        // row the lyric starts at: a bar down each of its rows would read as
+        // several lines being sung rather than one occupying several rows.
+        let rows = drawn_panel_at(&now, Duration::from_secs(22), 44, 10);
+        let (at, row) =
+            marked(&rows).unwrap_or_else(|| panic!("a line should be marked: {rows:#?}"));
+
+        assert_eq!(
+            rows.iter().filter(|row| row.contains('▌')).count(),
+            1,
+            "one mark however many rows the lyric wraps onto: {rows:#?}"
+        );
+        assert!(row.contains("sung line 4"), "{rows:#?}");
+        assert!(
+            !row.contains("narrow panel"),
+            "the mark belongs on the row the lyric starts at: {rows:#?}"
+        );
+        // The rest of the lyric is still drawn, just unmarked.
+        assert!(
+            rows[at + 1].contains("narrow panel"),
+            "the wrapped remainder should follow it: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_marked_before_the_first_line_is_sung() {
+        let mut now = playing();
+        now.tab = Tab::Lyrics;
+        now.lyrics = Panel::Ready(timed_lyrics());
+
+        // The fixture's first line starts at zero, so this is the case of a
+        // track whose words have not begun: an intro should mark nothing.
+        let mut late = timed_lyrics();
+        late.timed[0].start = Duration::from_secs(9);
+        now.lyrics = Panel::Ready(late);
+
+        let rows = drawn_panel_at(&now, Duration::from_secs(3), 70, 8);
+        assert!(
+            marked(&rows).is_none(),
+            "no line has started yet: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn the_panel_keeps_the_line_being_sung_near_the_middle() {
+        let mut now = playing();
+        now.tab = Tab::Lyrics;
+        now.lyrics = Panel::Ready(timed_lyrics());
+
+        // Far enough in that the panel has to have scrolled: the sixth line is
+        // past the bottom of a six-row viewport showing the top of the lyrics.
+        let rows = drawn_panel_at(&now, Duration::from_secs(27), 70, 8);
+        let (at, row) =
+            marked(&rows).unwrap_or_else(|| panic!("a line should be marked: {rows:#?}"));
+        assert!(row.contains("sung line 5"), "{row:?}");
+        // Two rows of tabs above a six-row viewport: centred means the middle
+        // of the panel, not the top edge, so what has just been sung is still
+        // readable above it.
+        assert!(
+            (4..=6).contains(&at),
+            "the marked line should sit mid-panel, not at an edge: row {at} of {rows:#?}"
+        );
+
+        // And it moves down the lyrics rather than staying put as time passes.
+        let later = drawn_panel_at(&now, Duration::from_secs(35), 70, 8);
+        let (_, row) =
+            marked(&later).unwrap_or_else(|| panic!("a line should be marked: {later:#?}"));
+        assert!(row.contains("sung line 7"), "{row:?}");
+    }
+
+    #[test]
+    fn a_user_who_has_scrolled_keeps_the_view_they_scrolled_to() {
+        let mut now = playing();
+        now.tab = Tab::Lyrics;
+        now.lyrics = Panel::Ready(timed_lyrics());
+        // What `scroll_page` does: the panel stops following and the cursor
+        // decides what is on screen, however far through the track it is.
+        now.follow_lyrics = false;
+        now.cursor[Tab::Lyrics.index()] = 0;
+
+        let rows = drawn_panel_at(&now, Duration::from_secs(35), 70, 8);
+        assert!(
+            rows[2].contains("Musixmatch"),
+            "the panel should still be at the top: {rows:#?}"
+        );
+        assert!(
+            marked(&rows).is_none(),
+            "the line being sung is off screen, and the panel stays where it \
+             was put rather than chasing it: {rows:#?}"
+        );
+
+        // Only the scrolling is handed over, not the highlight: a sung line
+        // that happens to be on screen is still marked.
+        let early = drawn_panel_at(&now, Duration::from_secs(8), 70, 8);
+        let (_, row) =
+            marked(&early).unwrap_or_else(|| panic!("a line should be marked: {early:#?}"));
+        assert!(row.contains("sung line 1"), "{row:?}");
+    }
+
+    #[test]
+    fn a_track_with_no_timings_draws_as_it_always_did() {
+        let mut now = playing();
+        now.tab = Tab::Lyrics;
+        now.lyrics = Panel::Ready(Lyrics {
+            text: (1..=20).map(|n| format!("line {n}\n")).collect(),
+            source: Some("Source: Musixmatch".to_string()),
+            timed: Vec::new(),
+        });
+
+        // However far through the track, an untimed panel has nothing to mark
+        // and nothing to follow: it scrolls by cursor as it did before.
+        let rows = drawn_panel_at(&now, Duration::from_secs(120), 44, 8);
+        assert!(marked(&rows).is_none(), "{rows:#?}");
+        assert!(rows[2].contains("Musixmatch"), "{rows:#?}");
+        assert!(rows[4].contains("line 1"), "{rows:#?}");
+    }
+
+    #[test]
+    fn only_the_lyric_being_sung_is_emphasised() {
+        // Bold *and* a marker for the current line: on a terminal that renders
+        // bold as bright and nothing else, colour alone would not say which
+        // line of twenty is the one.
+        let current = lyric_line("now", false, Some(3), Some(3), true);
+        assert_eq!(current.spans[0].content, "▌ ");
+        assert_eq!(current.spans[1].style.fg, Some(Color::White));
+        assert!(current.spans[1].style.add_modifier.contains(Modifier::BOLD));
+
+        // Every other lyric reads the same, whether it has been sung or not:
+        // one of them is "here" and the rest are the song around it, and a
+        // third shade would only be something to work out.
+        //
+        // DarkGray rather than Gray, and that is the whole of the contrast:
+        // Gray is ANSI 7 to White's ANSI 15, which on many themes is no
+        // difference at all and leaves the sung line marked by boldness alone.
+        let sung = lyric_line("before", false, Some(2), Some(3), true);
+        let ahead = lyric_line("after", false, Some(4), Some(3), true);
+        assert_eq!(sung.spans[0].content, "  ");
+        assert_eq!(sung.spans[1].style.fg, Some(Color::DarkGray));
+        assert_eq!(ahead.spans[1].style.fg, Some(Color::DarkGray));
+        assert_eq!(sung.spans[1].style, ahead.spans[1].style);
+        assert!(
+            !sung.spans[1].style.add_modifier.contains(Modifier::BOLD),
+            "and no bold either, or the dimming buys nothing"
+        );
+
+        // A track with no timings has no line being sung, so there is nothing
+        // for dimming to contrast with: the words stay at ordinary body grey
+        // rather than the whole panel going dark and gaining nothing for it.
+        let plain = lyric_line("plain", false, None, None, false);
+        assert_eq!(plain.spans[0].content, "  ");
+        assert_eq!(plain.spans[1].style.fg, Some(Color::Gray));
+        // Same for a timed track still in its intro.
+        assert_eq!(
+            lyric_line("intro", false, Some(0), None, true).spans[1]
+                .style
+                .fg,
+            Some(Color::Gray)
+        );
+
+        // The continuation of a wrapped lyric: still emphasised, since it is
+        // the same line being sung, but the mark stays on the row it started.
+        let wrapped = lyric_line("...and on", false, Some(3), Some(3), false);
+        assert_eq!(wrapped.spans[0].content, "  ");
+        assert_eq!(wrapped.spans[1].style, current.spans[1].style);
+
+        // The credit is about the panel rather than the song, and is never the
+        // line being sung whatever index it happens to sit at.
+        let credit = lyric_line("Source: Musixmatch", true, None, Some(0), true);
+        assert_eq!(credit.spans[0].content, "  ");
+        assert_eq!(credit.spans[1].style.fg, Some(Color::DarkGray));
     }
 
     #[test]
@@ -2854,15 +3226,7 @@ mod tests {
     #[ignore = "prints a layout preview rather than asserting"]
     fn preview_player() {
         let mut now = playing();
-        now.lyrics = Panel::Ready(Lyrics {
-            text: "It's always around me, all this noise, but\n\n\
-                   Not nearly as loud as the voice saying\n\n\
-                   \"Let it happen, let it happen\"\n\n\
-                   \"Just let it happen, let it happen\"\n\n\
-                   All this running around"
-                .to_string(),
-            source: Some("Source: Musixmatch".to_string()),
-        });
+        now.lyrics = Panel::Ready(timed_lyrics());
         now.comments = Panel::Ready(Comments {
             total: "8,407 Comments".to_string(),
             items: vec![
