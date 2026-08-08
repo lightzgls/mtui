@@ -434,13 +434,6 @@ pub(super) fn parse_duration(text: &str) -> Option<Duration> {
     (2..=3).contains(&fields).then(|| Duration::from_secs(secs))
 }
 
-/// Picks the audio stream to play: itag 140 if offered, otherwise any
-/// unciphered audio-only MP4.
-///
-/// The fallback matters because the itag on offer varies by client and video;
-/// insisting on 140 alone would send perfectly playable videos down the slow
-/// path. Anything chosen here must still be AAC in MP4, since that is the only
-/// decoder compiled in.
 /// The file's size, which googlevideo states in the URL it signs as `clen`.
 fn content_length(url: &str) -> Option<u64> {
     url.split(['?', '&'])
@@ -449,6 +442,13 @@ fn content_length(url: &str) -> Option<u64> {
         .ok()
 }
 
+/// Picks the audio stream to play: itag 140 if offered, otherwise any
+/// unciphered audio-only MP4.
+///
+/// The fallback matters because the itag on offer varies by client and video;
+/// insisting on 140 alone would send perfectly playable videos down the slow
+/// path. Anything chosen here must still be AAC in MP4, since that is the only
+/// decoder compiled in.
 fn pick_audio(formats: &[Format]) -> Option<&str> {
     let usable = |f: &Format| {
         f.mime_type

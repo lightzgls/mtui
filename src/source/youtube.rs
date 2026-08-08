@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
-use super::{StreamUrl, Track};
+use super::{StreamUrl, Track, UNKNOWN_ARTIST};
 
 /// itag 140: AAC-LC in an MP4 container, ~130 kbps.
 ///
@@ -170,7 +170,7 @@ impl YouTube {
             .filter_map(|line| serde_json::from_str::<YtDlpEntry>(line).ok())
             .map(|e| Track {
                 title: e.title.unwrap_or_else(|| "(untitled)".to_string()),
-                uploader: e.uploader.unwrap_or_else(|| "unknown".to_string()),
+                uploader: e.uploader.unwrap_or_else(|| UNKNOWN_ARTIST.to_string()),
                 duration: e.duration.filter(|d| *d > 0.0).map(Duration::from_secs_f64),
                 // A flat search listing carries no album; only the music
                 // corpus knows one.

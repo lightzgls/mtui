@@ -288,6 +288,16 @@ fn trim_bars(width: u32, height: u32, rgb: &[u8]) -> (u32, u32, u32, u32) {
 }
 
 fn crop(width: u32, rgb: &[u8], x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
+    // Note what this does *not* check: `h`. An image trimmed only at the bottom
+    // takes this path and gets the whole buffer back, trailing bar rows and
+    // all. That is still correct, but only because `y == 0` and `w == width`
+    // make the wanted region a prefix of the buffer, and the sole caller hands
+    // the result straight to `shrink(w, h, ..)`, which never reads past
+    // `w * h * 3`. A caller that read the whole slice would get bar pixels.
+    debug_assert!(
+        (x, y, w) != (0, 0, width) || (h * width * 3) as usize <= rgb.len(),
+        "the untrimmed fast path assumes the wanted rows are a prefix"
+    );
     if (x, y, w) == (0, 0, width) {
         return rgb.to_vec();
     }
