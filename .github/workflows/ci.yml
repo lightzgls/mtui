@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A CI failure should name the assertion that failed, not a stack address.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    # Both, deliberately. Windows is what MTUI ships for; Linux is what keeps
+    # the `#[cfg(not(windows))]` halves of `tray` and `console` from rotting
+    # unnoticed, since nothing else ever compiles them.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup directly rather than a third-party action, on the same trade the
+      # rest of this project makes about dependencies. Edition 2024 needs 1.85+,
+      # which stable has been since early 2025.
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      # rodio's `playback` feature pulls cpal, which links ALSA on Linux. No
+      # audio device is needed to build or test -- only the headers.
+      - name: Install ALSA headers
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-cargo-
+
+      # The `#[ignore]`d tests are excluded by default and must stay that way:
+      # they hit YouTube, Google and LRCLIB, and several write to a real account
+      # behind a saved cookie. See their doc comments for how to run them.
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+# Deliberately no `cargo fmt --check`. This codebase is hand-formatted in
+# places rustfmt disagrees with -- one-line struct variants, import order,
+# builder chains kept on one line -- and gating on it would either fail every
+# run or force a reformat of the whole tree. Adding it is a decision about
+# house style, not about correctness, so it is left out rather than snuck in.

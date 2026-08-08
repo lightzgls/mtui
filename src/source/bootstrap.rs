@@ -269,10 +269,19 @@ mod tests {
         assert_ne!(bin, config);
     }
 
+    /// The contract [`install`] offers: whatever happens, the temporary file is
+    /// gone.
+    ///
+    /// Ignored for the same reason every other network test here is. There is
+    /// no way to drive this without the network -- the cleanup being checked is
+    /// the one [`download`] performs -- and on a working connection it fetches
+    /// the whole 17 MB binary, which is not something a plain `cargo test`
+    /// should do on every run.
+    ///
+    /// `cargo test a_partial_download -- --ignored --nocapture`
     #[test]
+    #[ignore = "downloads yt-dlp from github.com"]
     fn a_partial_download_is_not_left_behind() {
-        // The contract install() offers: whatever fails, the temporary file is
-        // gone. Driven here with an unwritable destination.
         let dir = std::env::temp_dir().join("mtui-bootstrap-test");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
