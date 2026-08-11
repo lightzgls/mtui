@@ -1,0 +1,4 @@
+// The application icon. Id 1 rather than a name because Explorer, the taskbar
+// and the alt-tab list all show the lowest-numbered icon in a binary, and
+// `tray.rs` asks for this one by the same number.
+1 ICON "mtui.ico"

@@ -50,6 +50,70 @@ still fail on a minority of tracks. The fast path never needs it.
 cargo build --release
 ```
 
+## Pinning it to the taskbar
+
+```powershell
+powershell -File scripts/install-shortcut.ps1
+```
+
+That puts an MTUI shortcut in your Start menu, pointing at whichever binary it
+finds — a `cargo install`ed one first, then this repository's release build.
+Press Start, type `MTUI`, right-click the result, then **More → Pin to
+taskbar**. `-Desktop` puts a copy on the desktop too, `-Exe` names a binary
+somewhere else, `-WindowsTerminal` is below, and `-Uninstall` takes back
+everything it added.
+
+The last click has to be yours. Windows 10 1809 took the "Pin to taskbar" verb
+away from scripts and nothing has replaced it, so no installer can pin anything
+for you any more, however politely it asks.
+
+The icon is `canvas.png`, compiled into `mtui.exe` as a resource at seven sizes
+from 16px up, which is what Explorer, the shortcut, alt-tab and the notification
+area all draw. `scripts/make-icon.ps1` rebuilds `assets/mtui.ico` from the
+drawing — it knocks out the white square the disc is painted on, and draws every
+size from the 500px original rather than from the size above it. `build.rs`
+compiles the result in, using `windres` or the SDK's `rc.exe` depending on the
+toolchain, and warns rather than failing if it can find neither.
+
+### The one place the icon does not reach
+
+The taskbar button MTUI runs under is not MTUI's to decide. On Windows 11 a
+console program is opened by whatever is set as the default terminal
+application, and if that is Windows Terminal — as it is out of the box — then
+the window belongs to Windows Terminal, and the button is Windows Terminal's.
+The pinned MTUI button sits beside it rather than lighting up.
+
+Three ways out of that were tried and none of them work:
+
+- A profile icon does not reach the window. Windows Terminal hands back a
+  byte-identical window icon whichever profile is running.
+- `SetConsoleIcon`, the undocumented kernel32 call that used to do exactly this,
+  is refused by the Windows 11 console host and leaves the icon untouched.
+- Launching through `conhost.exe mtui.exe` puts the console host's own icon on
+  the window, not the icon of the program it is hosting.
+
+What does work is making Windows Console Host the default terminal — in Settings
+under *System → For developers → Terminal*, or in Windows Terminal's own
+*Settings → Startup*. Then the window belongs to the MTUI process itself: it
+carries MTUI's icon, and it has no app id of its own, so the taskbar groups it
+under `mtui.exe` exactly as it groups the pinned shortcut. The price is sixel:
+the console host's device-attributes reply has no `4` in it, so
+covers fall back to the half-block renderer — still the right picture, about a
+tenth the detail in each direction. It is also a setting for every console
+program on the machine, not just this one.
+
+Short of that:
+
+```powershell
+powershell -File scripts/install-shortcut.ps1 -WindowsTerminal
+```
+
+adds an MTUI profile to Windows Terminal — a fragment under
+`%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\MTUI`, which needs no
+administrator and no restart — and points the shortcut at it. The icon is then
+on the tab and in the new-tab dropdown, and cover art keeps its pixels. The
+taskbar button is still Windows Terminal's; that part has no answer.
+
 ## The landing page
 
 It opens on a page of shelves — the same shape YouTube Music's home page has,

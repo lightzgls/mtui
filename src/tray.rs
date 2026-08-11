@@ -49,6 +49,15 @@ mod imp {
         fn PostQuitMessage(code: i32);
         fn PostMessageW(hwnd: Handle, msg: u32, w: Wparam, l: Lparam) -> i32;
         fn LoadIconW(instance: Handle, name: *const u16) -> Handle;
+        fn LoadImageW(
+            instance: Handle,
+            name: *const u16,
+            kind: u32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> Handle;
+        fn GetSystemMetrics(index: i32) -> i32;
         fn CreatePopupMenu() -> Handle;
         fn AppendMenuW(menu: Handle, flags: u32, id: usize, item: *const u16) -> i32;
         fn TrackPopupMenu(
@@ -159,7 +168,25 @@ mod imp {
     /// -- the point of it here -- never shown on the taskbar next to real
     /// windows. It exists solely to be sent the icon's clicks.
     const HWND_MESSAGE: Handle = -3;
-    const IDI_APPLICATION: *const u16 = 32512 as *const u16;
+
+    // Icon ids, which go in the same pointer-shaped argument as a resource
+    // name: the loaders take either, and tell them apart by the high bits.
+    // `without_provenance` rather than a cast because no pointer is being made
+    // here -- it is a number, and the call reads it back out as one.
+
+    /// The stock icon Windows keeps for programs that bring none of their own.
+    const IDI_APPLICATION: *const u16 = std::ptr::without_provenance(32512);
+    /// MTUI's own, as `build.rs` compiled it in under the id `assets/mtui.rc`
+    /// gives it.
+    const ICON_ID: *const u16 = std::ptr::without_provenance(1);
+    const IMAGE_ICON: u32 = 1;
+    /// Asks for the process-wide copy of the icon rather than a fresh one.
+    /// That is what makes it safe never to destroy it: the icon is loaded once
+    /// per tooltip update -- twice a second, for as long as MTUI is in the
+    /// background -- and a copy each time would be a handle leak on a timer.
+    const LR_SHARED: u32 = 0x8000;
+    const SM_CXSMICON: i32 = 49;
+    const SM_CYSMICON: i32 = 50;
 
     /// Menu ids. Arbitrary, and only ever compared against what
     /// [`TrackPopupMenu`] returns.
@@ -376,7 +403,7 @@ mod imp {
                 id: 1,
                 flags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
                 callback_message: WM_TRAY,
-                icon: unsafe { LoadIconW(0, IDI_APPLICATION) },
+                icon: app_icon(),
                 tip: [0; 128],
                 state: 0,
                 state_mask: 0,
@@ -406,6 +433,30 @@ mod imp {
             if let Some(pump) = self.pump.take() {
                 let _ = pump.join();
             }
+        }
+    }
+
+    /// MTUI's icon, at the size the notification area draws at.
+    ///
+    /// The size is asked for rather than left to `LoadIconW`, which would take
+    /// the 32px drawing and let the shell squeeze it into a 16px slot. The
+    /// resource holds a 16px drawing made for that slot, and naming the small-
+    /// icon metrics is what picks it -- on a scaled display those metrics are
+    /// larger, and the request lands on one of the bigger drawings instead.
+    fn app_icon() -> Handle {
+        let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+        let cx = unsafe { GetSystemMetrics(SM_CXSMICON) };
+        let cy = unsafe { GetSystemMetrics(SM_CYSMICON) };
+        let icon = unsafe { LoadImageW(instance, ICON_ID, IMAGE_ICON, cx, cy, LR_SHARED) };
+
+        // A binary built where no resource compiler could be found has no icon
+        // in it -- see build.rs, which warns and carries on rather than failing
+        // the build. The stock icon is not much, but the alternative is a blank
+        // gap in the notification area with the whole interface behind it.
+        if icon != 0 {
+            icon
+        } else {
+            unsafe { LoadIconW(0, IDI_APPLICATION) }
         }
     }
 
