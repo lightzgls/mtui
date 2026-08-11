@@ -67,6 +67,10 @@ pub enum Request {
     Resolve {
         id: String,
         title: String,
+        /// Set when recovering a track whose stream died. The cached URL is
+        /// then the one that just failed, so answering from cache would hand
+        /// back exactly what is being recovered from.
+        bypass_cache: bool,
     },
     /// Resolve into the cache before the user has committed to anything, so the
     /// Enter that follows costs a channel round trip instead of a process spawn.
@@ -521,7 +525,11 @@ fn run(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>, asked: &AtomicU
                 Ok(tracks) => Response::Results(tracks),
                 Err(e) => Response::Failed(format!("{e:#}")),
             },
-            Request::Resolve { id, title } => {
+            Request::Resolve {
+                id,
+                title,
+                bypass_cache,
+            } => {
                 taken += 1;
                 // A newer play is already queued behind this one, so nobody is
                 // waiting on it any more. Spending seconds of yt-dlp on it
@@ -532,7 +540,7 @@ fn run(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>, asked: &AtomicU
                 if taken < asked.load(Ordering::SeqCst) {
                     continue;
                 }
-                let stream = resolve(&yt, tube.as_ref(), &mut cache, &id)
+                let stream = resolve(&yt, tube.as_ref(), &mut cache, &id, bypass_cache)
                     .map_err(|e| format!("{e:#}"));
                 Response::Resolved { id, title, stream }
             }
@@ -543,7 +551,7 @@ fn run(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>, asked: &AtomicU
                 let ready = if taken < asked.load(Ordering::SeqCst) {
                     cache.get(&id).is_some()
                 } else {
-                    resolve(&yt, tube.as_ref(), &mut cache, &id).is_ok()
+                    resolve(&yt, tube.as_ref(), &mut cache, &id, false).is_ok()
                 };
                 Response::Prefetched { id, ready }
             }
@@ -585,29 +593,40 @@ fn search(yt: &YouTube, tube: Option<&InnerTube>, query: &str, limit: usize) -> 
 
 /// Resolves `id` by the cheapest route that works, filling the cache.
 ///
-/// Three tiers, cheapest first: the cache (free), YouTube's player API
-/// (~0.2 s), then yt-dlp (~4 s). The cache is what keeps a replay -- or a play
-/// the user was prefetched into -- from paying anything at all.
+/// The cache (free) in front of [`super::resolve_stream`], which is the rest of
+/// the cascade. A hit is what keeps a replay -- or a play the user was
+/// prefetched into -- from paying anything at all.
 ///
-/// A player API failure is swallowed rather than reported. It is expected for
-/// age-gated and region-locked videos, the user did not ask for that path
-/// specifically, and yt-dlp is about to answer the same question properly. If
-/// yt-dlp also fails, *its* error is the one worth showing.
+/// Two things here are not the cascade's business. A capped URL is never
+/// cached: it is returned and played, because a first minute beats nothing, but
+/// recovering from it depends on being able to ask for a *different* URL next
+/// time and a cache hit would hand back this one.
+///
+/// And `bypass_cache` is set when the player is recovering a track whose stream
+/// died, where the cached URL is precisely the one that just failed. Answering
+/// with it again is how a track that broke once stayed broken for the six hours
+/// until its signature lapsed.
 fn resolve(
     yt: &YouTube,
     tube: Option<&InnerTube>,
     cache: &mut UrlCache,
     id: &str,
+    bypass_cache: bool,
 ) -> Result<StreamUrl> {
-    if let Some(hit) = cache.get(id) {
+    if bypass_cache {
+        cache.invalidate(id);
+    } else if let Some(hit) = cache.get(id) {
         return Ok(hit);
     }
 
-    let stream = match tube.and_then(|t| t.resolve(id).ok()) {
-        Some(fast) => fast,
-        None => yt.resolve(id)?,
-    };
-    cache.insert(id.to_string(), stream.clone());
+    // The same cascade either way, cap check included. Skipping the check to
+    // answer a recovery faster was tried and is wrong: the capped URL is what
+    // is being recovered *from*, and a cascade that does not check hands back
+    // another one just like it.
+    let (stream, whole) = super::resolve_stream(yt, tube, id)?;
+    if whole {
+        cache.insert(id.to_string(), stream.clone());
+    }
     Ok(stream)
 }
 

@@ -17,6 +17,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rodio::Source;
 
+use chunked::{StreamFault, StreamLink};
+
 /// How short of the end a drained source is still a finished track.
 ///
 /// The container's duration and what the decoder actually yields never agree to
@@ -51,9 +53,30 @@ pub enum Command {
         title: String,
     },
     /// Stream and play a resolved URL, replacing whatever is playing.
+    ///
+    /// `id` is carried so that a stream which dies mid-track can be recovered
+    /// against a freshly resolved URL rather than the one that just failed --
+    /// see [`PlayerEvent::NeedsUrl`].
     Play {
         url: String,
         title: String,
+        id: String,
+    },
+    /// Carry on the current track from `from`, against a newly resolved URL.
+    ///
+    /// The answer to [`PlayerEvent::NeedsUrl`]. Unlike [`Self::Play`] this does
+    /// not reset the title, the position, or the rebuild budget: it is the same
+    /// track continuing, not a new one starting.
+    Resume {
+        url: String,
+        from: Duration,
+    },
+    /// A requested URL could not be produced, so the track cannot go on.
+    ///
+    /// Sent instead of leaving the player parked in `Buffering` forever, which
+    /// is what a silent failure to answer [`PlayerEvent::NeedsUrl`] would mean.
+    ResumeFailed {
+        why: String,
     },
     TogglePause,
     Stop,
@@ -61,6 +84,27 @@ pub enum Command {
     /// Clamped to 0.0..=2.0 by the player thread.
     SetVolume(f32),
     Shutdown,
+}
+
+/// Something the player needs from the app, which owns the source worker.
+///
+/// The player thread deliberately cannot resolve a URL itself -- that means
+/// yt-dlp, a cache and a network client, none of which belong next to the audio
+/// callback. So it asks, the same way the UI asks it to play.
+#[derive(Debug, Clone)]
+pub enum PlayerEvent {
+    /// The stream stopped being served and a fresh URL is needed to carry on
+    /// from `from`.
+    ///
+    /// The URL the track was started with is not reusable here, and reusing it
+    /// is what the recovery path used to do: three rebuilds against the very
+    /// URL that had just refused, all failing at the same byte within seconds
+    /// of each other, and the track given up on.
+    ///
+    /// Answering this is the app's job because resolving properly means the
+    /// whole cascade, cap check included -- a cheaper answer can hand back a URL
+    /// with the same ceiling as the one being recovered from.
+    NeedsUrl { id: String, from: Duration },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -88,6 +132,8 @@ pub struct Snapshot {
 /// Handle to the player thread. Dropping it stops playback and joins the thread.
 pub struct Player {
     tx: Sender<Command>,
+    /// Requests from the player thread back to the app. See [`PlayerEvent`].
+    events: Receiver<PlayerEvent>,
     snapshot: Arc<Mutex<Snapshot>>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -96,6 +142,7 @@ impl Player {
     /// Spawns the player thread and its private tokio runtime.
     pub fn spawn() -> Result<Self> {
         let (tx, rx) = channel();
+        let (events_tx, events) = channel();
         let snapshot = Arc::new(Mutex::new(Snapshot {
             volume: 1.0,
             ..Default::default()
@@ -104,11 +151,12 @@ impl Player {
         let thread_snapshot = Arc::clone(&snapshot);
         let handle = thread::Builder::new()
             .name("mtui-player".to_string())
-            .spawn(move || run(rx, thread_snapshot))
+            .spawn(move || run(rx, events_tx, thread_snapshot))
             .context("failed to spawn player thread")?;
 
         Ok(Self {
             tx,
+            events,
             snapshot,
             handle: Some(handle),
         })
@@ -117,6 +165,14 @@ impl Player {
     /// Sends a command. Fails only if the player thread has died.
     pub fn send(&self, cmd: Command) -> Result<()> {
         self.tx.send(cmd).context("player thread is gone")
+    }
+
+    /// Takes the next thing the player is waiting on, if there is one.
+    ///
+    /// Never blocks: called from the app's event loop beside the source
+    /// worker's own responses.
+    pub fn poll_event(&self) -> Option<PlayerEvent> {
+        self.events.try_recv().ok()
     }
 
     /// Current state for rendering. Never blocks meaningfully -- the lock is
@@ -148,14 +204,34 @@ impl Drop for Player {
 /// the track is, and how far it got, is what separates them.
 struct Track {
     url: String,
+    /// The video this is, so a dead stream can be re-resolved rather than
+    /// reopened at the URL that just refused us.
+    id: String,
+    /// What the current stream's downloader hit, if anything. This is the one
+    /// piece of hard evidence in the whole decision below -- everything else is
+    /// inference from the clock. It is also how a fresh URL is handed down to a
+    /// download that has been refused. See [`chunked::StreamLink`].
+    link: StreamLink,
     /// Length according to the container. `None` for a livestream, which has no
-    /// end to fall short of -- so a drained source is always taken at its word.
+    /// end to fall short of -- so a drained source is taken at its word unless
+    /// the downloader recorded a reason not to.
     total: Option<Duration>,
     /// Track time the current rodio source begins at. Non-zero once a stream
     /// has been rebuilt: rodio's clock restarts with every source it is given.
     offset: Duration,
     /// Last position published, and where a rebuild picks up.
     position: Duration,
+    /// Where a seek was aimed, until the stream is seen to have played on past
+    /// it. `None` the rest of the time.
+    ///
+    /// A seek is answered before it is carried out, and answered `Ok` either
+    /// way: rodio reports the position it was asked for, and the decoder only
+    /// discovers whether the stream could follow when it reads the next packet.
+    /// If it could not, the source ends the way a finished track does -- so
+    /// without this the recovery below would pick up at the position the dead
+    /// decoder was left reporting, which is the target it never reached, or
+    /// call the track finished and move on to the next song.
+    seeking_to: Option<Duration>,
     rebuilds: u8,
 }
 
@@ -167,7 +243,14 @@ enum Ending {
     /// The stream died this far in. Worth another attempt.
     Stalled(Duration),
     /// The stream died and the rebuild budget is spent.
-    GaveUp(Duration, Duration),
+    GaveUp {
+        at: Duration,
+        /// `None` for a livestream, which never had a length to fall short of.
+        total: Option<Duration>,
+        /// What the downloader hit, when it recorded anything. Carried so the
+        /// message can name a cause instead of only a position.
+        fault: Option<StreamFault>,
+    },
 }
 
 impl Track {
@@ -182,17 +265,72 @@ impl Track {
         }
     }
 
-    fn ending(&self) -> Ending {
-        let Some(total) = self.total else {
-            return Ending::Finished;
+    /// Records a seek to `target` as outstanding.
+    ///
+    /// Not past the end, where a seek is answered by saturating at it: there is
+    /// nothing left for the stream to have failed to reach, and holding a
+    /// target it can never play past would answer the last seek of a track with
+    /// a stream reopened only to find it over.
+    fn aim_at(&mut self, target: Duration) {
+        self.seeking_to = match self.total {
+            Some(total) if target + END_GRACE >= total => None,
+            _ => Some(target),
         };
-        if self.position + END_GRACE >= total {
-            return Ending::Finished;
+    }
+
+    /// Records where the stream has played to, and with it whether a seek has
+    /// been reached.
+    ///
+    /// A seek is believed once the stream has played on *past* it. Until then
+    /// rodio is only repeating the position it was asked to seek to, which a
+    /// stream that could not follow it never reached.
+    fn played_to(&mut self, position: Duration) {
+        self.position = position;
+        if self.seeking_to.is_some_and(|target| position > target) {
+            self.seeking_to = None;
         }
+    }
+
+    fn ending(&self) -> Ending {
+        // Where a rebuild picks up. A source that drained with a seek still
+        // outstanding never played from where it was sent, so recovery aims at
+        // the target rather than at the position it was left reporting.
+        let from = self.seeking_to.unwrap_or(self.position);
+        let fault = self.link.fault();
+
+        // The end-of-track tests give way while a seek is outstanding: a drain
+        // there is the seek having failed, however near the end of the track it
+        // landed, and reading it as Finished would answer a rewind by playing
+        // the next song.
+        if self.seeking_to.is_none() {
+            match self.total {
+                // The music played. A refusal on the last chunk is real but no
+                // longer interesting -- rebuilding here would replay the last
+                // few seconds only to arrive at the same end.
+                Some(total) if self.position + END_GRACE >= total => return Ending::Finished,
+                // Fell short of a stated length: a stall, as it always was.
+                Some(_) => {}
+                // No stated length, and the downloader recorded nothing wrong.
+                // A livestream has no end to have fallen short of, so a drain
+                // is taken at its word.
+                None if fault.is_none() => return Ending::Finished,
+                // No stated length, but the stream died of something nameable.
+                // This is the case that used to advance silently to the next
+                // song: a fragmented container states no duration, so every
+                // mid-track refusal on one was read as a track that ended.
+                None => {}
+            }
+        }
+
         if self.rebuilds >= MAX_REBUILDS {
-            return Ending::GaveUp(self.position, total);
+            Ending::GaveUp {
+                at: from,
+                total: self.total,
+                fault,
+            }
+        } else {
+            Ending::Stalled(from)
         }
-        Ending::Stalled(self.position)
     }
 }
 
@@ -203,7 +341,7 @@ fn clock(d: Duration) -> String {
 }
 
 /// Player thread body. Owns the output device, the decoder, and the runtime.
-fn run(rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>) {
+fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<Snapshot>>) {
     // One worker thread, dedicated to stream-download's downloader task.
     //
     // This must be a multi-thread runtime even though there is only ever one
@@ -250,6 +388,9 @@ fn run(rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>) {
     // stream can notice that it has been superseded. Drained before the channel
     // is read again, so nothing here waits longer than it would have.
     let mut queued: VecDeque<Command> = VecDeque::new();
+    // Whether a fresh URL has already been asked for and not yet answered, so a
+    // downloader waiting ten seconds is not asked about forty times over.
+    let mut asked_for_url = false;
 
     loop {
         let cmd = match queued.pop_front() {
@@ -275,7 +416,7 @@ fn run(rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>) {
                         s.error = None;
                     });
                 }
-                Command::Play { url, title } => {
+                Command::Play { url, title, id } => {
                     update(&snapshot, |s| {
                         s.state = PlayState::Buffering;
                         s.title = title.clone();
@@ -286,7 +427,7 @@ fn run(rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>) {
                     // open below blocks, and nothing can read it in the
                     // meantime. What the UI renders is the snapshot above.
                     match open_stream(&runtime, &url) {
-                        Ok((decoder, total)) => {
+                        Ok((decoder, total, link)) => {
                             // Opening blocks this thread for a second or more,
                             // and whatever arrived during it is newer than this
                             // track. Starting it now would mean a burst of the
@@ -298,9 +439,12 @@ fn run(rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>) {
                             play_source(&player, decoder, Duration::ZERO);
                             track = Some(Track {
                                 url,
+                                id,
+                                link,
                                 total,
                                 offset: Duration::ZERO,
                                 position: Duration::ZERO,
+                                seeking_to: None,
                                 rebuilds: 0,
                             });
                             state = set_state(&snapshot, PlayState::Playing);
@@ -312,6 +456,67 @@ fn run(rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>) {
                             set_error(&snapshot, format!("{e:#}"));
                         }
                     }
+                }
+                Command::Resume { url, from } => {
+                    // Nothing to carry on: the track was stopped or replaced
+                    // while the app was resolving. The URL just fetched is
+                    // simply dropped -- starting it would play a song the user
+                    // has already left.
+                    let Some(cur) = track.as_mut() else {
+                        continue;
+                    };
+                    cur.url = url;
+
+                    // The stream is still running and only wants a signature
+                    // that is still honoured. Handing the URL straight down to
+                    // the chunk loop is the cheap path: it re-asks for the byte
+                    // range it was refused, and the music never stops.
+                    //
+                    // Rebuilding instead would restart the decoder and wind it
+                    // forward from byte zero to get back to where it already
+                    // was -- audible, and pointless when the bytes are simply
+                    // waiting behind a URL that has been replaced.
+                    if cur.link.wants_url().is_some() && cur.link.supply_url(&cur.url) {
+                        continue;
+                    }
+
+                    let url = cur.url.clone();
+                    match start_stream(&runtime, &player, &url, from) {
+                        Ok((total, link)) => {
+                            // The fresh stream reports its own faults, and its
+                            // own length -- a re-resolve can land on a
+                            // different itag, and the old figure would then be
+                            // the wrong thing to measure the end against.
+                            if let Some(cur) = track.as_mut() {
+                                cur.link = link;
+                                if total.is_some() {
+                                    cur.total = total;
+                                }
+                            }
+                            state = set_state(&snapshot, PlayState::Playing);
+                        }
+                        Err(e) => {
+                            player.stop();
+                            track = None;
+                            state = PlayState::Idle;
+                            set_error(
+                                &snapshot,
+                                format!("stream stopped at {}: {e:#}", clock(from)),
+                            );
+                        }
+                    }
+                }
+                Command::ResumeFailed { why } => {
+                    // Let a downloader still waiting stop waiting. Without
+                    // this it sits out its whole timeout for an answer that
+                    // has already come back empty.
+                    if let Some(cur) = track.as_ref() {
+                        cur.link.decline();
+                    }
+                    player.stop();
+                    track = None;
+                    state = PlayState::Idle;
+                    set_error(&snapshot, why);
                 }
                 Command::TogglePause => {
                     if player.is_paused() {
@@ -336,20 +541,40 @@ fn run(rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>) {
                     // rodio's clock is relative to the source it was given,
                     // which after a rebuild does not begin at the track's
                     // start. Everywhere else here speaks in track time.
-                    if let Some(offset) = track.as_ref().map(|cur| cur.offset) {
+                    // Aimed before the attempt, because a seek that kills the
+                    // source has to be recovered at the target and by then this
+                    // is the only thing that remembers it.
+                    let aimed = track.as_mut().map(|cur| {
+                        let seek = (cur.offset, target < cur.position);
+                        cur.aim_at(target);
+                        seek
+                    });
+                    if let Some((offset, backwards)) = aimed {
                         match target.checked_sub(offset) {
-                            // Served from the ring buffer, which is instant.
-                            // If it turns out not to hold the target, the read
-                            // after it fails and the source drains -- and the
-                            // tick below rebuilds at `position`, which is the
-                            // target, so the seek still lands.
-                            Some(within) if player.try_seek(within).is_ok() => {
-                                if let Some(cur) = track.as_mut() {
-                                    cur.position = target;
-                                }
-                            }
-                            // Before this source begins, or refused outright:
-                            // only a fresh stream can reach it.
+                            // Forwards, symphonia reads ahead and discards,
+                            // which lands exactly.
+                            //
+                            // The position is left to the tick below rather
+                            // than written from the target here: rodio answers
+                            // with the position it was asked for whether or not
+                            // the stream could follow, and a clock running
+                            // ahead of the audio takes the lyrics with it.
+                            Some(within) if !backwards && player.try_seek(within).is_ok() => {}
+                            // Backwards, or before this source begins: only a
+                            // fresh stream can reach it.
+                            //
+                            // A rewind is never attempted in place, however
+                            // little of it there is. The bytes are usually
+                            // still in the ring buffer, but the decoder has
+                            // been told it cannot seek in that buffer -- so it
+                            // answers by moving its own sample pointer,
+                            // reports success, and fails the next read, which
+                            // rodio reads as a source that ended. That is the
+                            // silent path that left the clock, and the lyrics
+                            // marked off it, describing a rewind the audio
+                            // never made. Winding a fresh stream forward costs
+                            // the time it takes to open one and lands where it
+                            // was sent.
                             _ => {
                                 state = rebuild(
                                     &runtime, &player, &snapshot, &mut track, target,
@@ -371,11 +596,41 @@ fn run(rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>) {
         let drained = player.empty();
         if let Some(cur) = track.as_mut() {
             if !drained {
-                cur.position = cur.offset + player.get_pos();
+                cur.played_to(cur.offset + player.get_pos());
             }
             cur.note_progress();
             let position = cur.position;
             update(&snapshot, |s| s.position = position);
+        }
+
+        // A download that has been refused mid-stream, asking for a signature
+        // that is still honoured. Answered while the audio keeps
+        // playing: the ring buffer holds about thirty seconds and a resolve
+        // costs a fraction of that, so the swap is inaudible and nothing above
+        // the chunk loop ever learns it happened.
+        //
+        // Checked before the drain test below, because catching it here is what
+        // stops it ever becoming a drain.
+        if let Some(cur) = track.as_ref()
+            && !asked_for_url
+            && cur.link.wants_url().is_some()
+        {
+            asked_for_url = events
+                .send(PlayerEvent::NeedsUrl {
+                    id: cur.id.clone(),
+                    from: cur.position,
+                })
+                .is_ok();
+            if !asked_for_url {
+                // Nobody can answer, so let the downloader stop waiting and
+                // fail in the open rather than sitting out its whole timeout.
+                cur.link.decline();
+            }
+        }
+        // The request was answered, or the downloader gave up on it. Either way
+        // the next refusal is a new question.
+        if track.as_ref().is_none_or(|cur| cur.link.wants_url().is_none()) {
+            asked_for_url = false;
         }
 
         // rodio drains its queue when a source ends -- and it ends a source
@@ -396,17 +651,20 @@ fn run(rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>) {
                 if let Some(cur) = track.as_mut() {
                     cur.rebuilds += 1;
                 }
-                state = rebuild(&runtime, &player, &snapshot, &mut track, from);
+                // Asks the app for a fresh URL rather than reopening the one
+                // that just died. Reopening was the whole reason this path
+                // could not recover: a URL googlevideo has stopped serving past
+                // some byte refuses the same byte every time, so all three
+                // attempts died at the same place within a few seconds of each
+                // other and the budget was gone before the network was.
+                state = request_url(&events, &snapshot, &mut track, from);
             }
-            Ending::GaveUp(at, total) => {
+            Ending::GaveUp { at, total, fault } => {
                 track = None;
                 state = PlayState::Idle;
                 // Silence with a full progress bar is the worst outcome here:
                 // it tells the user their music stopped and nothing else.
-                set_error(
-                    &snapshot,
-                    format!("stream stopped at {} of {}", clock(at), clock(total)),
-                );
+                set_error(&snapshot, stopped_message(at, total, fault));
             }
         }
     }
@@ -414,13 +672,80 @@ fn run(rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>) {
     player.stop();
 }
 
+/// Names where playback stopped, and why when the reason was recorded.
+///
+/// The position alone was all this could ever say before, because by the time
+/// the player noticed silence the reason had been discarded three layers down.
+/// "stopped at 0:31 of 3:44" tells the user what they can already hear;
+/// "(HTTP 403 at 1.0 MiB)" tells them, and a bug report, which of several very
+/// different faults it was.
+fn stopped_message(
+    at: Duration,
+    total: Option<Duration>,
+    fault: Option<StreamFault>,
+) -> String {
+    let mut msg = match total {
+        Some(total) => format!("stream stopped at {} of {}", clock(at), clock(total)),
+        None => format!("stream stopped at {}", clock(at)),
+    };
+    if let Some(fault) = fault {
+        msg.push_str(&format!(" ({fault})"));
+    }
+    msg
+}
+
+/// Asks the app for a fresh URL for the current track, to carry on from `from`.
+///
+/// The counterpart to [`rebuild`], and the difference between them is the whole
+/// fix for tracks that stopped a few seconds in. A rebuild reopens the URL in
+/// hand, which is right when the stream is healthy and the user simply wants to
+/// be somewhere else in it. It is exactly wrong when the stream *died*: the
+/// commonest cause is googlevideo refusing to serve past some byte on that
+/// particular signed URL, and reopening it walks into the same refusal at the
+/// same offset every time.
+///
+/// So this hands the problem to the app, which owns the resolver and the cache,
+/// and parks in `Buffering` until [`Command::Resume`] arrives.
+fn request_url(
+    events: &Sender<PlayerEvent>,
+    snapshot: &Arc<Mutex<Snapshot>>,
+    track: &mut Option<Track>,
+    from: Duration,
+) -> PlayState {
+    let Some(cur) = track.as_mut() else {
+        return PlayState::Idle;
+    };
+    cur.offset = from;
+    cur.position = from;
+    // A fresh stream wound forward lands where it was told to by construction,
+    // so nothing is left outstanding for the recovery above to aim at.
+    cur.seeking_to = None;
+    let id = cur.id.clone();
+
+    update(snapshot, |s| {
+        s.state = PlayState::Buffering;
+        s.position = from;
+    });
+
+    if events.send(PlayerEvent::NeedsUrl { id, from }).is_err() {
+        // The app is gone, so nothing is ever going to answer. Better to stop
+        // than to sit in `Buffering` forever.
+        *track = None;
+        set_error(snapshot, format!("stream stopped at {}", clock(from)));
+        return PlayState::Idle;
+    }
+
+    PlayState::Buffering
+}
+
 /// Reopens the current track's stream so it plays from `from`, and reports the
 /// state to settle in.
 ///
-/// This is the whole recovery path: a stream that died mid-track cannot be
-/// resumed in place, because the bytes it needs are long gone from a ring
-/// buffer that holds thirty seconds. A fresh stream can be wound forward to any
-/// point in the track, so that is what a rebuild is.
+/// Used for a seek the user asked for, where the URL in hand is known good --
+/// the stream was playing a moment ago. A stream that *died* is recovered
+/// through [`request_url`] instead, which replaces the URL rather than trusting
+/// it. A fresh stream can be wound forward to any point in the track, so that
+/// is what a rebuild is.
 fn rebuild(
     runtime: &tokio::runtime::Runtime,
     player: &rodio::Player,
@@ -433,6 +758,9 @@ fn rebuild(
     };
     cur.offset = from;
     cur.position = from;
+    // A fresh stream wound forward lands where it was told to by construction,
+    // so nothing is left outstanding for the recovery above to aim at.
+    cur.seeking_to = None;
     let url = cur.url.clone();
 
     update(snapshot, |s| {
@@ -441,7 +769,15 @@ fn rebuild(
     });
 
     match start_stream(runtime, player, &url, from) {
-        Ok(_) => set_state(snapshot, PlayState::Playing),
+        Ok((_, link)) => {
+            // The old stream's log described a stream that no longer exists.
+            // Leaving it in place would let a fault from before the seek decide
+            // how the *next* drain is read.
+            if let Some(cur) = track.as_mut() {
+                cur.link = link;
+            }
+            set_state(snapshot, PlayState::Playing)
+        }
         Err(e) => {
             player.stop();
             *track = None;
@@ -480,16 +816,16 @@ fn drain(rx: &Receiver<Command>, queued: &mut VecDeque<Command>) -> bool {
 /// it is the only place it can be had: it is what tells a track that ended from
 /// a stream that died.
 ///
-/// `Decoder::new_mp4` is used rather than the probing `Decoder::new`: we always
-/// request itag 140, so format sniffing would only waste a seek and a read.
+/// How the stream is handed to symphonia -- and why it is left unable to seek
+/// backwards in it -- is [`backend::decoder`].
 fn open_stream(
     runtime: &tokio::runtime::Runtime,
     url: &str,
-) -> Result<(rodio::Decoder<backend::AudioStream>, Option<Duration>)> {
-    let stream = runtime.block_on(backend::open(url))?;
-    let decoder = rodio::Decoder::new_mp4(stream).context("could not decode audio stream")?;
+) -> Result<(rodio::Decoder<backend::AudioStream>, Option<Duration>, StreamLink)> {
+    let (stream, link) = runtime.block_on(backend::open(url))?;
+    let decoder = backend::decoder(stream)?;
     let total = decoder.total_duration();
-    Ok((decoder, total))
+    Ok((decoder, total, link))
 }
 
 /// Hands an opened stream to rodio, starting `skip` into the track.
@@ -521,10 +857,10 @@ fn start_stream(
     player: &rodio::Player,
     url: &str,
     skip: Duration,
-) -> Result<Option<Duration>> {
-    let (decoder, total) = open_stream(runtime, url)?;
+) -> Result<(Option<Duration>, StreamLink)> {
+    let (decoder, total, link) = open_stream(runtime, url)?;
     play_source(player, decoder, skip);
-    Ok(total)
+    Ok((total, link))
 }
 
 /// Publishes a state and hands it back, so the loop's copy and the snapshot
@@ -554,10 +890,31 @@ mod tests {
     fn track(position: u64, total: Option<u64>) -> Track {
         Track {
             url: "https://example.com/a.m4a".into(),
+            id: "dQw4w9WgXcQ".into(),
+            link: StreamLink::default(),
             total: total.map(Duration::from_secs),
             offset: Duration::ZERO,
             position: Duration::from_secs(position),
+            seeking_to: None,
             rebuilds: 0,
+        }
+    }
+
+    /// The same track, whose downloader recorded a refusal at `offset`.
+    fn faulted(position: u64, total: Option<u64>, offset: u64) -> Track {
+        let cur = track(position, total);
+        cur.link.record_for_test(StreamFault {
+            status: Some(reqwest::StatusCode::FORBIDDEN),
+            offset,
+        });
+        cur
+    }
+
+    /// The same track, with a seek to `target` outstanding.
+    fn seeking(position: u64, total: Option<u64>, target: u64) -> Track {
+        Track {
+            seeking_to: Some(Duration::from_secs(target)),
+            ..track(position, total)
         }
     }
 
@@ -587,14 +944,144 @@ mod tests {
         assert!(matches!(track(80, None).ending(), Ending::Finished));
     }
 
+    /// The silent-skip case, and the reason the downloader now writes down what
+    /// it hit. A container that states no duration -- a livestream, or a
+    /// fragmented mp4 whose sample table is short -- used to make every
+    /// mid-track death indistinguishable from a track that ended, so the queue
+    /// advanced to the next song with no error and no attempt to recover. A
+    /// recorded refusal is evidence the position alone could never supply.
+    #[test]
+    fn a_livestream_that_was_refused_is_a_stall_not_an_ending() {
+        let Ending::Stalled(from) = faulted(80, None, 1024 * 1024).ending() else {
+            panic!("a stream refused mid-track has not finished, stated length or not");
+        };
+        assert_eq!(from, Duration::from_secs(80));
+    }
+
+    /// A refusal on the last chunk is real but no longer interesting: the music
+    /// played. Recovering there would replay the last few seconds only to
+    /// arrive at the same end, and would do it on every track whose final range
+    /// request happens to be refused.
+    #[test]
+    fn a_fault_at_the_very_end_is_still_a_finished_track() {
+        assert!(matches!(
+            faulted(211, Some(213), 3_400_000).ending(),
+            Ending::Finished
+        ));
+    }
+
     #[test]
     fn a_spent_budget_reports_instead_of_retrying() {
         let mut stuck = track(80, Some(213));
         stuck.rebuilds = MAX_REBUILDS;
-        let Ending::GaveUp(at, total) = stuck.ending() else {
+        let Ending::GaveUp { at, total, .. } = stuck.ending() else {
             panic!("the budget is spent, so this must not ask for another rebuild");
         };
-        assert_eq!((at, total), (Duration::from_secs(80), Duration::from_secs(213)));
+        assert_eq!(
+            (at, total),
+            (Duration::from_secs(80), Some(Duration::from_secs(213)))
+        );
+    }
+
+    /// What the user is left with when nothing worked, and the one place the
+    /// cause is allowed to reach them. "stopped at 0:31 of 3:33" describes what
+    /// they can already hear; the fault names which of several very different
+    /// failures it was.
+    #[test]
+    fn the_message_names_the_fault_when_one_was_recorded() {
+        let mut stuck = faulted(31, Some(213), 1024 * 1024);
+        stuck.rebuilds = MAX_REBUILDS;
+        let Ending::GaveUp { at, total, fault } = stuck.ending() else {
+            panic!("the budget is spent, so this must not ask for another rebuild");
+        };
+        assert_eq!(
+            stopped_message(at, total, fault),
+            "stream stopped at 0:31 of 3:33 (HTTP 403 at 1.0 MiB)"
+        );
+
+        // Nothing recorded, so nothing invented.
+        assert_eq!(
+            stopped_message(at, total, None),
+            "stream stopped at 0:31 of 3:33"
+        );
+
+        // A livestream has no length to name, and saying "of 0:00" would be
+        // worse than saying nothing.
+        assert_eq!(stopped_message(at, None, None), "stream stopped at 0:31");
+    }
+
+    /// The rewind case: a stream that could not follow the seek ends silently,
+    /// and picking up where the dead decoder claimed to be would put the audio
+    /// back where the rewind started while the clock -- and the lyrics reading
+    /// off it -- stayed at the target.
+    #[test]
+    fn a_drain_under_a_seek_is_recovered_at_the_target() {
+        let Ending::Stalled(from) = seeking(80, Some(213), 45).ending() else {
+            panic!("a source that drained under a seek has not finished");
+        };
+        assert_eq!(
+            from,
+            Duration::from_secs(45),
+            "the rebuild picks up where the seek was aimed"
+        );
+    }
+
+    /// Otherwise a rewind landing inside the last few seconds would be read as
+    /// the track ending, and answered by playing the next song.
+    #[test]
+    fn a_seek_outstanding_is_never_a_finished_track() {
+        assert!(matches!(
+            seeking(213, Some(213), 200).ending(),
+            Ending::Stalled(_)
+        ));
+        // Nor for a livestream, where a drain is otherwise always taken at its
+        // word for want of anything to have fallen short of.
+        assert!(matches!(seeking(80, None, 45).ending(), Ending::Stalled(_)));
+    }
+
+    #[test]
+    fn a_seek_is_believed_once_the_stream_plays_past_it() {
+        let mut rewinding = track(80, Some(213));
+        rewinding.aim_at(Duration::from_secs(45));
+
+        // Arriving at the target proves nothing: rodio reports the position it
+        // was asked to seek to whether or not the stream could follow.
+        rewinding.played_to(Duration::from_secs(45));
+        assert_eq!(rewinding.seeking_to, Some(Duration::from_secs(45)));
+
+        // Playing on from it could only have come from audio decoded there.
+        rewinding.played_to(Duration::from_secs(46));
+        assert_eq!(rewinding.seeking_to, None);
+    }
+
+    /// Otherwise pressing forward once more at the end of a song would open a
+    /// stream only to discover the track was over.
+    #[test]
+    fn a_seek_past_the_end_is_not_held_outstanding() {
+        let mut ending = track(211, Some(213));
+        ending.aim_at(Duration::from_secs(240));
+        assert_eq!(ending.seeking_to, None);
+        // So a drain right afterwards is read as the track ending, which is
+        // what it is, rather than as a seek to recover.
+        assert!(matches!(ending.ending(), Ending::Finished));
+
+        // A livestream has no end to have been sent past.
+        let mut live = track(200, None);
+        live.aim_at(Duration::from_secs(240));
+        assert_eq!(live.seeking_to, Some(Duration::from_secs(240)));
+    }
+
+    #[test]
+    fn a_spent_budget_reports_the_seek_target_too() {
+        let mut stuck = seeking(80, Some(213), 45);
+        stuck.rebuilds = MAX_REBUILDS;
+        let Ending::GaveUp { at, total, .. } = stuck.ending() else {
+            panic!("the budget is spent, so this must not ask for another rebuild");
+        };
+        assert_eq!(
+            (at, total),
+            (Duration::from_secs(45), Some(Duration::from_secs(213)))
+        );
     }
 
     #[test]

@@ -46,10 +46,6 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// both.
 const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player";
 
-/// Where a capped URL stops being served. Measured, not documented: every
-/// capped URL seen answers ranges below one mebibyte and 403s from there on.
-const CAP_BYTES: u64 = 1024 * 1024;
-
 /// YouTube *Music*'s search, which is a different corpus to YouTube's.
 ///
 /// Plain `ytsearch` returns whatever the site has: reaction videos, hour-long
@@ -168,6 +164,17 @@ impl InnerTube {
         Ok(Self { client, runtime })
     }
 
+    /// Whether googlevideo will serve all of `url`. See
+    /// [`super::serves_whole_file`], which this lends its client and runtime.
+    ///
+    /// Lent rather than duplicated so the probe rides the pooled connection and
+    /// warm TLS session this already holds -- the check costs a few tens of
+    /// milliseconds that way, and a fresh client would cost a handshake. The
+    /// probe applies to any googlevideo URL, whichever tier produced it.
+    pub fn serves_whole_file(&self, url: &str) -> bool {
+        super::serves_whole_file(&self.runtime, &self.client, url)
+    }
+
     /// Resolves a video id to a directly streamable audio URL.
     ///
     /// Errors are ordinary here rather than exceptional: callers are expected
@@ -238,63 +245,17 @@ impl InnerTube {
             );
         }
 
-        let url = pick_audio(&response.streaming_data.adaptive_formats)
+        let (url, _itag) = pick_audio(&response.streaming_data.adaptive_formats)
             .with_context(|| format!("player API returned no usable audio for {video_id}"))?;
 
-        if !self.serves_whole_file(url) {
-            bail!("{} returned a capped URL for {video_id}", client.name);
-        }
-
+        // The cap check itself now lives in [`super::serves_whole_file`] and is
+        // applied by the caller to whatever tier answers -- the cap is a
+        // property of a signed googlevideo URL, not of the route that produced
+        // one, and guarding only this route let yt-dlp's answers through
+        // unchecked.
         Ok(StreamUrl {
             expires_at: parse_expiry(url),
             url: url.to_string(),
-        })
-    }
-
-    /// Whether YouTube will serve all of `url`, or only the start of it.
-    ///
-    /// A resolve that succeeds is not the same thing as a URL that plays. For
-    /// some tracks -- licensed music, in every case seen here -- the player API
-    /// answers with a URL that serves its first mebibyte and then refuses every
-    /// range past it with a 403. Nothing in the response says so, and the first
-    /// mebibyte plays: about sixty-five seconds of audio, after which the sound
-    /// stops mid-song. By then the resolve is a minute in the past, the decoder
-    /// reports only that it has no more samples, and what the user sees is a
-    /// track that stopped for no reason.
-    ///
-    /// yt-dlp's URL for the same video has no such cap, so this is worth
-    /// catching -- and a failure here is exactly what makes the caller fall
-    /// back to it, the same as any other refusal.
-    ///
-    /// One request for one byte, on a pooled connection, against a fast path
-    /// that already costs a round trip: a few tens of milliseconds to avoid
-    /// three seconds of yt-dlp when the URL is good, and a minute of music that
-    /// dies when it is not.
-    fn serves_whole_file(&self, url: &str) -> bool {
-        let last = match content_length(url) {
-            // Under the cap there is nothing past it to be refused.
-            Some(clen) if clen <= CAP_BYTES => return true,
-            Some(clen) => clen - 1,
-            // No length to aim at, so ask at the cap itself. A file that ends
-            // before it answers 416, which is not a refusal.
-            None => CAP_BYTES,
-        };
-
-        self.runtime.block_on(async {
-            let sent = self
-                .client
-                .get(url)
-                .header(reqwest::header::RANGE, format!("bytes={last}-{last}"))
-                .send()
-                .await;
-            match sent {
-                Ok(response) => response.status() != reqwest::StatusCode::FORBIDDEN,
-                // A URL that cannot be reached at all is not a capped one, and
-                // the stream is about to find that out for itself. Refusing it
-                // here would send every resolve to yt-dlp the moment the
-                // network hiccups.
-                Err(_) => true,
-            }
         })
     }
 
@@ -434,33 +395,45 @@ pub(super) fn parse_duration(text: &str) -> Option<Duration> {
     (2..=3).contains(&fields).then(|| Duration::from_secs(secs))
 }
 
-/// The file's size, which googlevideo states in the URL it signs as `clen`.
-fn content_length(url: &str) -> Option<u64> {
-    url.split(['?', '&'])
-        .find_map(|kv| kv.strip_prefix("clen="))?
-        .parse()
-        .ok()
-}
+/// Audio-only MP4 itags, cheapest first.
+///
+/// Order is by bitrate, and that is not a preference about sound quality -- it
+/// is the byte budget. Every one of these decodes identically here, but a
+/// capped URL is capped in *bytes*, so the same one-mebibyte ceiling is about
+/// sixty-five seconds of itag 140 and half that of itag 141. Picking the
+/// smallest stream that works buys the most music per byte served, and the most
+/// jitter tolerance out of a fixed ring buffer.
+///
+/// 140 is AAC-LC ~128 kbps, 139 is HE-AAC ~48 kbps, 141 is AAC-LC ~256 kbps.
+const AUDIO_ITAGS: &[u32] = &[AUDIO_ITAG, 139, 141];
 
-/// Picks the audio stream to play: itag 140 if offered, otherwise any
-/// unciphered audio-only MP4.
+/// Picks the audio stream to play: a known audio-only MP4 itag by preference,
+/// otherwise any unciphered one.
 ///
 /// The fallback matters because the itag on offer varies by client and video;
 /// insisting on 140 alone would send perfectly playable videos down the slow
 /// path. Anything chosen here must still be AAC in MP4, since that is the only
 /// decoder compiled in.
-fn pick_audio(formats: &[Format]) -> Option<&str> {
-    let usable = |f: &Format| {
-        f.mime_type
-            .as_deref()
-            .is_some_and(|m| m.starts_with("audio/mp4"))
+///
+/// Returns the itag alongside the URL so a failure can name the format it was
+/// playing. A track that dies early on itag 141 and a track that dies early on
+/// itag 140 are the same symptom with twice the byte rate between them, and
+/// without this there is no way to tell them apart after the fact.
+fn pick_audio(formats: &[Format]) -> Option<(&str, u32)> {
+    let usable = |f: &&Format| {
+        f.url.is_some()
+            && f.mime_type
+                .as_deref()
+                .is_some_and(|m| m.starts_with("audio/mp4"))
     };
 
-    formats
+    let preferred = AUDIO_ITAGS
         .iter()
-        .find(|f| f.itag == AUDIO_ITAG && f.url.is_some())
-        .or_else(|| formats.iter().find(|f| f.url.is_some() && usable(f)))
-        .and_then(|f| f.url.as_deref())
+        .find_map(|itag| formats.iter().find(|f| f.itag == *itag && f.url.is_some()));
+
+    preferred
+        .or_else(|| formats.iter().find(usable))
+        .and_then(|f| Some((f.url.as_deref()?, f.itag)))
 }
 
 #[cfg(test)]
@@ -481,13 +454,35 @@ mod tests {
             format(251, Some("opus"), "audio/webm; codecs=\"opus\""),
             format(140, Some("aac"), "audio/mp4; codecs=\"mp4a.40.2\""),
         ];
-        assert_eq!(pick_audio(&formats), Some("aac"));
+        assert_eq!(pick_audio(&formats), Some(("aac", 140)));
     }
 
     #[test]
     fn falls_back_to_any_unciphered_mp4_audio() {
         let formats = vec![format(139, Some("aac-low"), "audio/mp4; codecs=\"mp4a.40.5\"")];
-        assert_eq!(pick_audio(&formats), Some("aac-low"));
+        assert_eq!(pick_audio(&formats), Some(("aac-low", 139)));
+    }
+
+    /// The byte budget, not the sound: a capped URL is capped in bytes, so the
+    /// same one-mebibyte ceiling is twice as much music at 128 kbps as at 256.
+    /// Choosing the fatter stream when a leaner one is on offer halves how far
+    /// a capped track gets before it stops.
+    #[test]
+    fn prefers_the_leaner_stream_over_a_fatter_one() {
+        let formats = vec![
+            format(141, Some("aac-256"), "audio/mp4; codecs=\"mp4a.40.2\""),
+            format(139, Some("aac-48"), "audio/mp4; codecs=\"mp4a.40.5\""),
+        ];
+        assert_eq!(pick_audio(&formats), Some(("aac-48", 139)));
+
+        // 140 still wins outright when it is offered: it is the format the
+        // decoder is compiled for and the one every measurement here assumes.
+        let formats = vec![
+            format(141, Some("aac-256"), "audio/mp4; codecs=\"mp4a.40.2\""),
+            format(140, Some("aac-128"), "audio/mp4; codecs=\"mp4a.40.2\""),
+            format(139, Some("aac-48"), "audio/mp4; codecs=\"mp4a.40.5\""),
+        ];
+        assert_eq!(pick_audio(&formats), Some(("aac-128", 140)));
     }
 
     #[test]
@@ -680,6 +675,11 @@ mod tests {
 #[cfg(test)]
 mod capped_urls {
     use super::*;
+    // The cap check moved to `crate::source`, where it can guard every resolve
+    // tier rather than only this one. These tests followed it as far as the
+    // import: what they assert is about the cascade, which is still rooted
+    // here.
+    use crate::source::content_length;
 
     #[test]
     fn reads_the_file_size_the_url_states() {
@@ -706,12 +706,18 @@ mod capped_urls {
     #[ignore = "hits the network"]
     fn serves_the_whole_file() {
         let id = std::env::var("MTUI_VIDEO_ID").unwrap_or_else(|_| "nNN88hijp-o".into());
-        let tube = InnerTube::new().expect("client should build");
-        let stream = tube
-            .resolve(&id)
-            .inspect_err(|e| println!("player API declined, falling back: {e:#}"))
-            .or_else(|_| crate::source::youtube::YouTube::default().resolve(&id))
+        let tube = InnerTube::new().ok();
+        let yt = crate::source::youtube::YouTube::default();
+        // The shared cascade, which is the point of the test: what must serve
+        // its last byte is the URL the app would really stream, and that is
+        // decided by which tier's answer survives the cap check -- not by
+        // whichever tier happened to respond first.
+        let (stream, whole) = crate::source::resolve_stream(&yt, tube.as_ref(), &id)
             .expect("neither the player API nor yt-dlp resolved the track");
+        assert!(
+            whole,
+            "the cascade knew this URL was capped and handed it over anyway"
+        );
 
         let clen = content_length(&stream.url).expect("a signed URL states its length");
         let last = clen - 1;

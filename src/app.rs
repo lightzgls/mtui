@@ -12,7 +12,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::Tokens;
 use crate::graphics::Graphics;
-use crate::player::{Command, PlayState, Player, Snapshot};
+use crate::player::{Command, PlayState, Player, PlayerEvent, Snapshot};
 use crate::source::{StreamUrl, Track};
 use crate::source::cover::Cover;
 use crate::source::home::{Card, Shelf, Target};
@@ -556,8 +556,23 @@ pub struct App {
     /// that second request would ask for another import behind it, forever.
     imported: bool,
 
+    /// A track whose stream died, waiting on a fresh URL to carry on with.
+    ///
+    /// Held separately from [`Self::pending`] because the two mean opposite
+    /// things about what is on screen: `pending` is a track the user chose and
+    /// is waiting to hear, so its answer replaces the title, the page and the
+    /// cover. This is a track already playing, and its answer must change none
+    /// of that -- only where the audio is read from.
+    resuming: Option<Resuming>,
+
     player: Player,
     source: SourceWorker,
+}
+
+/// A track being recovered mid-play, and where playback has to pick up.
+struct Resuming {
+    id: String,
+    from: Duration,
 }
 
 /// Turns a panel fetch into what the panel should show.
@@ -625,6 +640,7 @@ impl App {
             listening: None,
             rotation: 0,
             imported: false,
+            resuming: None,
             player,
             source,
         };
@@ -703,6 +719,53 @@ impl App {
         while let Some(response) = self.source.poll() {
             self.apply(response);
         }
+        self.poll_player();
+    }
+
+    /// Answers what the player thread cannot do for itself.
+    ///
+    /// It owns the decoder and the output device and nothing else on purpose --
+    /// resolving a URL means yt-dlp, a cache and a network client, none of
+    /// which belong on the thread feeding the speakers. So when a stream dies
+    /// and needs a new one, it asks here.
+    fn poll_player(&mut self) {
+        while let Some(event) = self.player.poll_event() {
+            match event {
+                PlayerEvent::NeedsUrl { id, from } => self.resume_track(id, from),
+            }
+        }
+    }
+
+    /// Resolves a fresh URL for a track whose stream died, and hands it back.
+    ///
+    /// The cache is bypassed deliberately: the entry it holds for this track is
+    /// the URL that just failed. Handing it back was how a track that stopped
+    /// once stopped at the same second on every replay for the rest of the
+    /// session, and then quietly started working hours later when the
+    /// signature expired.
+    fn resume_track(&mut self, id: String, from: Duration) {
+        let Some((track, _)) = self.listening.as_ref() else {
+            // Nothing is playing any more, so there is nothing to carry on.
+            let _ = self.player.send(Command::ResumeFailed {
+                why: "playback stopped".to_string(),
+            });
+            return;
+        };
+        let title = track.label();
+
+        self.status = format!("reconnecting {title} ...");
+        let request = Request::Resolve {
+            id: id.clone(),
+            title,
+            bypass_cache: true,
+        };
+        if self.source.send(request).is_err() {
+            let _ = self.player.send(Command::ResumeFailed {
+                why: "source worker is not running".to_string(),
+            });
+            return;
+        }
+        self.resuming = Some(Resuming { id, from });
     }
 
     fn apply(&mut self, response: Response) {
@@ -996,6 +1059,33 @@ impl App {
     /// Every one of them used to be played, which is what put the previous song
     /// under the current one's title and cover; here they are dropped instead.
     fn apply_resolved(&mut self, id: &str, title: String, stream: Result<StreamUrl, String>) {
+        // A recovery, not a choice. Checked first because none of what follows
+        // applies to it: the track is already playing, already named and
+        // already on screen, and the only thing being replaced is the URL the
+        // audio comes from. Running it through the path below would restart the
+        // song from the beginning under its own title.
+        if self.resuming.as_ref().is_some_and(|r| r.id == id) {
+            let from = self.resuming.take().expect("just matched").from;
+            let cmd = match stream {
+                Ok(stream) => {
+                    self.status = format!("playing {title}");
+                    Command::Resume {
+                        url: stream.url,
+                        from,
+                    }
+                }
+                // Nothing left to try. Reported rather than dropped: the player
+                // is parked in `Buffering` waiting for this, and silence here
+                // would leave it there naming a track it is never going to
+                // play another second of.
+                Err(why) => Command::ResumeFailed {
+                    why: why.lines().next().unwrap_or(&why).to_string(),
+                },
+            };
+            let _ = self.player.send(cmd);
+            return;
+        }
+
         if self.pending.as_deref() != Some(id) {
             return;
         }
@@ -1013,6 +1103,7 @@ impl App {
                 let _ = self.player.send(Command::Play {
                     url: stream.url,
                     title,
+                    id: id.to_string(),
                 });
                 return;
             }
@@ -1165,6 +1256,10 @@ impl App {
         self.finish_listening();
         self.listening = Some((track.clone(), Duration::ZERO));
         self.auto = auto;
+        // Whatever the previous track was waiting on, it is not waiting any
+        // more. Left set, a recovery URL arriving for the song just left would
+        // be applied to the one that replaced it.
+        self.resuming = None;
         // Only from a list; the player page is not somewhere to go back to.
         if self.view != View::Playing {
             self.back_to = self.view;
@@ -1227,6 +1322,10 @@ impl App {
             // The label, not the bare title: this is what the status bar shows
             // for as long as the track plays.
             title: track.label(),
+            // A track the user chose. The cache is exactly what should answer
+            // it when it can -- that is the difference between pressing Enter
+            // on a replay and waiting three seconds for yt-dlp again.
+            bypass_cache: false,
         };
         if self.source.send(request).is_err() {
             self.pending = None;
@@ -1963,8 +2062,10 @@ impl App {
         self.now = None;
         self.auto = false;
         // A resolve may still be in flight; without this it would start playing
-        // moments after the user asked for silence.
+        // moments after the user asked for silence. A recovery in flight is the
+        // same hazard by the other route.
         self.pending = None;
+        self.resuming = None;
         // Nothing is playing, so nothing owns the cover pane.
         self.cover = None;
         self.cover_id = None;

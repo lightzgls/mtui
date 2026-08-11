@@ -146,6 +146,20 @@ impl UrlCache {
         Some(url)
     }
 
+    /// Drops the entry for `id`, so the next lookup has to resolve again.
+    ///
+    /// Expiry alone is not enough to keep a bad URL out. A URL that googlevideo
+    /// has stopped serving past some byte carries an `expire` six hours out and
+    /// looks perfectly valid to [`StreamUrl::is_valid`], so a track that died
+    /// mid-song was handed the very same URL on every replay for the rest of
+    /// the session -- and then started working on its own once the signature
+    /// lapsed, which is as confusing a bug as this program has had.
+    pub fn invalidate(&mut self, id: &str) {
+        if let Some(pos) = self.entries.iter().position(|(k, _)| k == id) {
+            self.entries.remove(pos);
+        }
+    }
+
     /// Inserts as most-recent, evicting the least-recent entry when full.
     pub fn insert(&mut self, id: String, url: StreamUrl) {
         if let Some(pos) = self.entries.iter().position(|(k, _)| *k == id) {
@@ -161,6 +175,124 @@ impl Default for UrlCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Where a capped URL stops being served. Measured, not documented: every
+/// capped URL seen answers ranges below one mebibyte and 403s from there on.
+pub const CAP_BYTES: u64 = 1024 * 1024;
+
+/// Whether YouTube will serve all of `url`, or only the start of it.
+///
+/// A resolve that succeeds is not the same thing as a URL that plays. For some
+/// tracks -- licensed music, in every case seen here -- the answer is a URL
+/// that serves its first mebibyte and then refuses every range past it with a
+/// 403. Nothing in the response says so, and the first mebibyte plays: about
+/// sixty-five seconds at itag 140, and proportionally less on anything with a
+/// higher bitrate -- roughly ten on itag 18, whose video track shares the byte
+/// budget. By then the resolve is a minute in the past and what the user sees
+/// is a track that stopped for no reason.
+///
+/// This lives here, rather than beside the player API that first needed it,
+/// because the cap is a property of a signed googlevideo URL and not of the
+/// route that produced one. Guarding a single tier let the others hand out
+/// exactly the URLs it was written to catch.
+///
+/// One request for one byte on a pooled connection, against resolves that cost
+/// a round trip at best and three seconds at worst.
+pub fn serves_whole_file(
+    runtime: &tokio::runtime::Runtime,
+    client: &reqwest::Client,
+    url: &str,
+) -> bool {
+    // The file's own last byte, which is the one question that settles it: a
+    // URL that will serve that will serve everything before it.
+    let last = match content_length(url) {
+        // Under the cap there is nothing past it to be refused, so this costs
+        // nothing and is skipped. Measured 2026-08-11: the ceiling sits exactly
+        // at CAP_BYTES -- ranges below it are served and ranges above it are
+        // refused -- so a file that ends first cannot be truncated by it.
+        Some(clen) if clen <= CAP_BYTES => return true,
+        Some(clen) => clen - 1,
+        // No length to aim at, so ask at the cap itself. A file that ends
+        // before it answers 416, which is not a refusal.
+        None => CAP_BYTES,
+    };
+
+    runtime.block_on(serves_byte(client, url, last))
+}
+
+/// Whether the server will hand over the single byte at `at`.
+///
+/// A network failure is retried once before being taken for an answer.
+/// Previously any transport error at all was read as "not capped", on the
+/// reasoning that the stream would find out for itself -- but the stream finds
+/// out by going silent thirty seconds into a song, which is the failure this
+/// check exists to prevent. One retry keeps a passing hiccup from sending every
+/// resolve down the slow path, without letting a capped URL through on one.
+async fn serves_byte(client: &reqwest::Client, url: &str, at: u64) -> bool {
+    for _ in 0..2 {
+        let sent = client
+            .get(url)
+            .header(reqwest::header::RANGE, format!("bytes={at}-{at}"))
+            .send()
+            .await;
+        if let Ok(response) = sent {
+            return response.status() != reqwest::StatusCode::FORBIDDEN;
+        }
+    }
+    // Never reached the server at all. That is not evidence of a cap, and
+    // refusing here would send every resolve to yt-dlp on a passing hiccup.
+    true
+}
+
+/// Resolves `id` to a URL that will actually play, by the cheapest route that
+/// works. The cascade itself, with no cache in front of it.
+///
+/// Two tiers: YouTube's player API (~0.2 s), then yt-dlp (~4 s). A player API
+/// failure is swallowed rather than reported -- it is expected for age-gated
+/// and region-locked videos, and yt-dlp is about to answer the same question
+/// properly. If yt-dlp also fails, *its* error is the one worth showing.
+///
+/// This lives here, rather than inside the worker that used to own it, because
+/// it is the definition of "the URL this program would play" and more than one
+/// caller needs exactly that. When the cap check lived inside
+/// [`InnerTube::resolve`], every direct caller got it for free; moving the
+/// check out to cover yt-dlp as well would silently have taken it away from
+/// them. Sharing the cascade is what keeps the tests measuring the URL the app
+/// really streams instead of one nothing ever plays.
+///
+/// Returns the URL and whether it is known to serve the whole file. A capped
+/// URL is still returned: it plays its first minute or so, which beats
+/// refusing the track outright, and the caller is told so it can decline to
+/// cache what it must be able to ask for again.
+pub fn resolve_stream(
+    yt: &youtube::YouTube,
+    tube: Option<&innertube::InnerTube>,
+    id: &str,
+) -> anyhow::Result<(StreamUrl, bool)> {
+    // With no player API there is no pooled client to probe with either, and
+    // building one for a single check would cost a TLS handshake per resolve.
+    // Unchecked is what this has always been in that case.
+    let serves_whole = |url: &str| tube.is_none_or(|t| t.serves_whole_file(url));
+
+    // The fast path, taken only when what it returns will play to the end.
+    if let Some(fast) = tube.and_then(|t| t.resolve(id).ok())
+        && serves_whole(&fast.url)
+    {
+        return Ok((fast, true));
+    }
+
+    let slow = yt.resolve(id)?;
+    let whole = serves_whole(&slow.url);
+    Ok((slow, whole))
+}
+
+/// The file's size, which googlevideo states in the URL it signs as `clen`.
+pub fn content_length(url: &str) -> Option<u64> {
+    url.split(['?', '&'])
+        .find_map(|kv| kv.strip_prefix("clen="))?
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
@@ -180,6 +312,29 @@ mod tests {
         cache.insert("a".into(), url("a"));
         assert_eq!(cache.get("a").unwrap().url, "https://example.com/a.m4a");
         assert!(cache.get("b").is_none());
+    }
+
+    /// A URL that failed has to be forgettable before it expires.
+    ///
+    /// Expiry alone does not cover it: a URL googlevideo has stopped serving
+    /// past some byte still carries an `expire` six hours out, so it stays
+    /// perfectly valid by every test the cache applies and gets handed back on
+    /// every replay. That is how one track stopped at the same second all
+    /// session and then started working by itself the next morning.
+    #[test]
+    fn an_invalidated_entry_is_gone_before_it_expires() {
+        let mut cache = UrlCache::new();
+        cache.insert("a".into(), url("a"));
+        cache.insert("b".into(), url("b"));
+
+        cache.invalidate("a");
+        assert!(cache.get("a").is_none(), "the failed URL must not come back");
+        // Only the one named: a track that failed says nothing about the rest.
+        assert!(cache.get("b").is_some());
+
+        // Invalidating something absent is not an error -- a track can fail
+        // before it was ever cached, which is exactly the capped-URL case.
+        cache.invalidate("nothing");
     }
 
     #[test]
