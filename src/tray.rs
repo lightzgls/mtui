@@ -566,6 +566,9 @@ mod imp {
 
     use anyhow::{Result, anyhow};
 
+    // Only the Windows message pump constructs these variants; the portable
+    // shape lets the rest of the event loop compile on unsupported platforms.
+    #[allow(dead_code)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TrayCommand {
         Show,
