@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::config::Tokens;
+use crate::config::{self, Tokens};
+use crate::discord::{Activity, Clock, Presence};
 use crate::graphics::Graphics;
 use crate::player::{Command, PlayState, Player, PlayerEvent, Snapshot};
-use crate::source::{StreamUrl, Track};
+use crate::source::{StreamUrl, Track, UNKNOWN_ARTIST};
 use crate::source::cover::Cover;
 use crate::source::home::{Card, Shelf, Target};
 use crate::source::journal;
@@ -565,6 +566,11 @@ pub struct App {
     /// of that -- only where the audio is read from.
     resuming: Option<Resuming>,
 
+    /// The card on the user's Discord profile. Holds the last one published, so
+    /// that recomputing it every tick costs a comparison rather than a socket
+    /// write -- see [`crate::discord`].
+    presence: Presence,
+
     player: Player,
     source: SourceWorker,
 }
@@ -641,6 +647,10 @@ impl App {
             rotation: 0,
             imported: false,
             resuming: None,
+            // Started whether or not Discord is running and whether or not the
+            // switch is on: what this costs while idle is one sleeping thread,
+            // and deciding later would mean deciding on the render path.
+            presence: Presence::spawn(config::Discord::application_id(), config::Presence::load()),
             player,
             source,
         };
@@ -1445,6 +1455,84 @@ impl App {
         }
     }
 
+    /// Offers Discord the card that should be showing. Called once per frame in
+    /// both faces of the program -- the card is the one thing about a
+    /// backgrounded player that other people can see, so it must not stop
+    /// updating when the window goes away.
+    ///
+    /// Cheap on every tick that changes nothing, which is nearly all of them:
+    /// [`Presence::publish`] compares before it sends, and nothing here touches
+    /// a socket.
+    pub fn tick_presence(&mut self) {
+        let activity = self.activity();
+        self.presence.publish(activity);
+    }
+
+    /// What the Discord card should say right now, or `None` for no card.
+    ///
+    /// Built fresh each tick rather than at the points that change it. There
+    /// are a dozen of those -- a play, a stop, a pause, a seek, a queue
+    /// advance, a stream recovered onto a new URL -- and one of them being
+    /// forgotten would leave a stale track on the user's profile long after
+    /// they had stopped listening to it. Deriving from the same snapshot the
+    /// status bar draws from makes that class of bug unrepresentable.
+    fn activity(&self) -> Option<Activity> {
+        let now = self.now.as_ref()?;
+        let snap = self.snapshot();
+        // Idle is a track that ended or was stopped, and there is nothing to
+        // say about either. `now` outlives it by a frame or two while the queue
+        // works out what is next, which is exactly the window this closes.
+        if snap.state == PlayState::Idle {
+            return None;
+        }
+
+        let paused = snap.state == PlayState::Paused;
+        // No clock while paused -- Discord cannot hold a bar still, see
+        // `Activity::clock` -- and none while buffering either, where the
+        // position is zero and a bar would jump backwards the moment audio
+        // started.
+        let clock = (!paused && snap.state != PlayState::Buffering).then(|| {
+            let start_ms = crate::discord::now_ms().saturating_sub(snap.position.as_millis() as u64);
+            Clock {
+                start_ms,
+                // A livestream has no length, so it gets a clock that counts up
+                // rather than one that counts down to an end it will not reach.
+                end_ms: now.duration.map(|d| start_ms + d.as_millis() as u64),
+            }
+        });
+
+        Some(Activity {
+            video_id: now.video_id.clone(),
+            title: now.title.clone(),
+            // Dropped rather than shown as "unknown", on the same rule as
+            // [`Track::label`]: a source that could not name an artist has not
+            // named one, and a blank line reads better on a public profile than
+            // a confident wrong answer.
+            artist: match now.artist.as_str() {
+                UNKNOWN_ARTIST => String::new(),
+                artist => artist.to_string(),
+            },
+            album: now.album.clone(),
+            paused,
+            clock,
+        })
+    }
+
+    /// Turns the Discord card on or off, and remembers which.
+    ///
+    /// Written to disk rather than kept for the session: this decides whether
+    /// what someone listens to is visible to everyone they share a server with,
+    /// and a privacy switch that quietly flips back on at the next launch is
+    /// not one.
+    fn toggle_presence(&mut self) {
+        let enabled = self.presence.toggle();
+        self.status = self.presence.status();
+        // Best effort. A config directory that cannot be written costs the user
+        // the setting surviving a restart, which is not worth refusing the
+        // keypress over -- and the status line has already said where it landed.
+        let _ = config::Presence::save(enabled);
+    }
+
     /// Moves `delta` tracks through the queue and plays what it lands on.
     ///
     /// Silent at either end: there is nothing before the first track, and the
@@ -1862,6 +1950,7 @@ impl App {
             KeyCode::Char('A') => self.begin_sign_in(),
             KeyCode::Char('P') | KeyCode::Char('p') => self.open_player(),
             KeyCode::Char('B') => self.background(),
+            KeyCode::Char('D') => self.toggle_presence(),
             // Back to whatever the track list was showing, when there is one.
             KeyCode::Esc if !self.results.is_empty() => self.view = View::Tracks,
             KeyCode::Char('c') => self.cover_size = self.cover_size.toggled(),
@@ -1966,6 +2055,7 @@ impl App {
             KeyCode::Char('L') => self.open_library(),
             KeyCode::Char('A') => self.begin_sign_in(),
             KeyCode::Char('B') => self.background(),
+            KeyCode::Char('D') => self.toggle_presence(),
             KeyCode::Char('/') | KeyCode::Char('i') => {
                 self.view = View::Tracks;
                 self.mode = Mode::Editing;
@@ -2093,6 +2183,7 @@ impl App {
             KeyCode::Char('A') => self.begin_sign_in(),
             KeyCode::Char('P') | KeyCode::Char('p') => self.open_player(),
             KeyCode::Char('B') => self.background(),
+            KeyCode::Char('D') => self.toggle_presence(),
             KeyCode::Char('x') => self.sign_out(),
             // Back to whatever the track list was showing before, or to the
             // landing page when it was showing nothing.
@@ -2180,6 +2271,7 @@ impl App {
             // takes the interface away, and finding the way back means finding
             // an icon in the notification area. `P` costs a keypress to undo.
             KeyCode::Char('B') => self.background(),
+            KeyCode::Char('D') => self.toggle_presence(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_volume(VOLUME_STEP),
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_volume(-VOLUME_STEP),
             KeyCode::Right => self.seek_relative(5),

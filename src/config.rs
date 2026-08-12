@@ -39,6 +39,19 @@ const COOKIE_FILE: &str = "cookies.txt";
 /// pasted a cookie deliberately has said which one they want used.
 const IMPORT_FILE: &str = "browser-cookies.json";
 
+/// Written by hand, and optional. Points the Discord presence at a different
+/// application than the one built in, which is a thing only a fork needs.
+const DISCORD_FILE: &str = "discord.json";
+
+/// Ours: the Discord presence switch, written when the user flips it.
+///
+/// A separate file from [`DISCORD_FILE`] under the same rule as the pairs
+/// above. The two are written by different hands and at wildly different
+/// rates -- one is typed once by somebody running their own build, the other is
+/// rewritten by a keypress -- and folding them together would mean a toggle
+/// serialising over an id the user typed.
+const PRESENCE_FILE: &str = "presence.json";
+
 /// Shown when there is no client to read. Long because it is the entire setup
 /// procedure, and a user hitting this has no other documentation to hand.
 const SETUP_HELP: &str = "\
@@ -229,6 +242,77 @@ impl Import {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e).with_context(|| format!("could not remove {}", path.display())),
         }
+    }
+}
+
+/// The Discord application the presence should be published under, when the
+/// user has named one.
+///
+/// Only a fork or a private build needs this: the shipped binary carries an id
+/// of its own, and unlike the Google client in [`Credentials`] there is nothing
+/// secret about either -- an application id travels in every presence payload
+/// on the wire. What this exists for is being able to point a build at a
+/// differently-named application without rebuilding it.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Discord {
+    pub application_id: String,
+}
+
+impl Discord {
+    /// The configured id, or `None` if there is no file, it will not parse, or
+    /// it names nothing.
+    ///
+    /// Infallible on purpose. This is an override of a working default, so
+    /// every way of getting it wrong should land on that default rather than
+    /// on an error in front of a user who never asked for the feature.
+    pub fn application_id() -> Option<String> {
+        let path = dir().ok()?.join(DISCORD_FILE);
+        let discord: Self = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+        let id = discord.application_id.trim();
+        (!id.is_empty()).then(|| id.to_string())
+    }
+}
+
+/// Whether what MTUI is playing may be broadcast to Discord.
+///
+/// Persisted rather than kept for the session, because it is a privacy setting
+/// and a user who switched it off meant it. On by default -- see
+/// [`Presence::load`] -- so that the feature is discoverable at all: the card
+/// is something other people see, and a broadcast nobody knows exists is a
+/// feature nobody ever turns on.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct Presence {
+    pub enabled: bool,
+}
+
+impl Presence {
+    /// Reads the switch, defaulting to on.
+    ///
+    /// The default is the whole reason a missing file and an unparseable one
+    /// are treated alike here. Neither is a state worth a message: the switch
+    /// is one keypress away and the status bar reports where it landed.
+    pub fn load() -> bool {
+        let Ok(path) = dir().map(|dir| dir.join(PRESENCE_FILE)) else {
+            return true;
+        };
+        fs::read(path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Self>(&raw).ok())
+            .is_none_or(|presence| presence.enabled)
+    }
+
+    /// Records where the switch was left.
+    ///
+    /// Best effort at the call site: a read-only config directory should cost
+    /// the user the setting surviving a restart, not the keypress working.
+    pub fn save(enabled: bool) -> Result<()> {
+        let dir = dir()?;
+        fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+        let path = dir.join(PRESENCE_FILE);
+
+        let body = serde_json::to_vec_pretty(&Self { enabled })
+            .context("could not encode the presence setting")?;
+        fs::write(&path, body).with_context(|| format!("could not write {}", path.display()))
     }
 }
 

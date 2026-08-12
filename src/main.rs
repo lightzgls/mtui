@@ -13,6 +13,7 @@
 mod app;
 mod config;
 mod console;
+mod discord;
 mod graphics;
 mod player;
 mod sixel;
@@ -103,6 +104,7 @@ fn run_foreground(app: &mut App) -> Result<()> {
             app.tick_playback();
             app.tick_page();
             app.tick_prefetch();
+            app.tick_presence();
             terminal.draw(|frame| ui::render(frame, app))?;
 
             // Sixel pixels live outside ratatui's buffer, so nothing it draws
@@ -178,6 +180,11 @@ fn run_background(app: &mut App) -> Result<()> {
         app.poll_source();
         app.tick_playback();
         app.tick_prefetch();
+        // Unlike `tick_page` below, this one *is* kept: the Discord card is the
+        // one part of a backgrounded player other people can still see, so
+        // letting go of the terminal must not freeze it on whatever was playing
+        // at the time.
+        app.tick_presence();
         // Not `tick_page`: lyrics and comments are panels of a page nobody can
         // see, and fetching them here would spend a request per track on
         // something that is thrown away when the track changes.

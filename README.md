@@ -308,6 +308,73 @@ schools do, by pointing `www.youtube.com` at `restrictmoderate.youtube.com` —
 the panel will say so, and no request from here can change it. The other three
 tabs are unaffected.
 
+## Showing what you are playing on Discord
+
+If Discord is running, the track shows up on your profile — cover art, title,
+artist, a progress bar that follows a seek, and two buttons: one to open the
+track on YouTube, one pointing back here. It needs an application id first;
+see [below](#giving-it-an-application-id).
+
+`D` turns it off and on. The choice is written to `presence.json` beside the
+other config and survives a restart, because a privacy switch that quietly
+flips back on at the next launch is not one. It keeps working after `B`: the
+card is the one part of a backgrounded player other people can still see.
+
+Discord not running is not an error and never appears as one. MTUI looks for it
+every fifteen seconds and costs one sleeping thread until it finds it, so the
+feature is invisible on a machine that has never had Discord installed.
+
+Nothing is uploaded. The card carries the title, the artist and a link, all of
+which came from YouTube in the first place, and the artwork is the same
+`i.ytimg.com` thumbnail address the terminal draws from — Discord fetches the
+picture itself, so no image leaves this machine either.
+
+Three things are worth knowing about how it is drawn, because Discord decides
+them and MTUI cannot:
+
+- **A pause takes the progress bar away** rather than freezing it. A card holds
+  a start and an end and the client animates between them; there is no value
+  that means "stopped at 1:12". Leaving the last pair up would show a bar
+  advancing through a track nobody is hearing, so the bar goes and the artist
+  line says `(paused)` instead.
+- **Updates are rate-limited.** Discord allows five presence updates in twenty
+  seconds; MTUI holds itself to one every four and never drops an update it has
+  to hold — it sends the newest one when the gap closes.
+- **The card is headed with the application's name**, not with anything MTUI
+  sends. "Listening to MTUI" comes from the Discord application this is
+  published under, which is why a build without one shows nothing at all.
+
+### Giving it an application id
+
+**Not yet filled in.** `APPLICATION_ID` in `src/discord.rs` is empty, so as
+things stand `D` reports that this build has no application id rather than
+silently doing nothing. Everything else is written and tested; this is the one
+value the feature is waiting on.
+
+An application id is public — it travels in every presence payload on the wire —
+so unlike the OAuth client below there is no secret here and nothing to protect.
+Register one at [discord.com/developers/applications](https://discord.com/developers/applications):
+**New Application**, name it `MTUI`, copy the **Application ID**, and paste it
+into `APPLICATION_ID` at the top of `src/discord.rs`. Nothing else on that page
+needs filling in — the artwork this sends is a URL, so there are no assets to
+upload.
+
+To point an existing binary at a different application instead, write it beside
+the other config and it wins over the built-in one:
+
+```
+%APPDATA%\mtui\discord.json          # Windows
+$XDG_CONFIG_HOME/mtui/discord.json   # elsewhere
+```
+
+```json
+{ "application_id": "..." }
+```
+
+This is the one part of the feature that is not Windows-only. Discord's local
+IPC is a named pipe on Windows and a Unix socket elsewhere, and both are
+implemented — including the relocated paths Flatpak and Snap installs use.
+
 ## Keys
 
 | | |
@@ -323,6 +390,7 @@ tabs are unaffected.
 | `n` / `p` | next / previous in the queue |
 | `P` or `p` | back to the player page (in a list; `p` is previous on the page itself) |
 | `B` | keep playing without the terminal (Windows) |
+| `D` | Discord Rich Presence on / off |
 | `s` | stop |
 | `←` / `→` | seek 5s |
 | `+` / `-` | volume |
