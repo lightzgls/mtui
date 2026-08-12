@@ -8,9 +8,19 @@
 //! time the user actually opens that tab. Fetching all of them on every play
 //! would be three round trips spent on panels most plays never look at.
 //!
+//! The queue is also the one panel that is never finished with. A radio has no
+//! last page, only a token for the next one, so [`fetch`] hands back where the
+//! rest of it lives and [`continue_queue`] redeems that as the queue is played
+//! down. When a station finally has nothing left -- a playlist that ends, a
+//! radio out of material -- [`seeded_page`] builds a new one out of the play
+//! journal rather than letting the music stop. Which of the two answered is not
+//! something the caller has to care about: both hand back a [`QueuePage`].
+//!
 //! Same bargain as [`crate::source::home`]: these are internal endpoints, so
 //! everything here degrades to an empty panel rather than an error. A tab that
-//! comes back with nothing says so and the music keeps playing.
+//! comes back with nothing says so and the music keeps playing. The queue holds
+//! to that too -- every way of extending it can fail, and all any failure costs
+//! is a queue that ends where it used to end anyway.
 //!
 //! Comments are the exception to "same corpus": YouTube Music does not serve
 //! them, so they come from youtube.com proper, as its web client asks for them
@@ -24,6 +34,8 @@ use serde_json::Value;
 use super::auth::Http;
 use super::home::{self, Shelf};
 use super::innertube::parse_duration;
+use super::journal::Journal;
+use super::sapisid;
 use super::{Track, UNKNOWN_ARTIST};
 
 /// youtube.com's own watch endpoint. Not the music one: comments live here.
@@ -34,10 +46,25 @@ const YOUTUBE_NEXT_URL: &str = "https://www.youtube.com/youtubei/v1/next";
 const WEB_CLIENT_NAME: &str = "WEB";
 const WEB_CLIENT_VERSION: &str = "2.20241127.01.00";
 
-/// Ceiling on the queue kept in memory. YouTube's radio continues indefinitely
-/// through continuations; one page is around twenty-five tracks and is already
-/// more than a session plays through.
+/// Ceiling on the rows taken from *one* response.
+///
+/// No longer a bound on the queue itself, which is now paged indefinitely and
+/// is bounded by the window [`crate::app`] keeps around the playing track. This
+/// is the narrower job of not letting a single response of an unexpected shape
+/// hand back an unbounded number of rows.
+///
+/// Measured 2026-08-11: a first page is 50 tracks and each continuation after
+/// it around 49, so this sits above what YouTube actually sends rather than
+/// truncating it.
 const MAX_QUEUE: usize = 60;
+
+/// Seeds considered when building a station from the play journal.
+///
+/// More than one because the best-scoring candidate may be a track the user
+/// has just been playing, which is exactly what must not be seeded from. Deep
+/// enough to find one that is not, shallow enough that it is still drawn from
+/// the top of what they listen to. See [`seeded_page`].
+const SEED_CANDIDATES: usize = 8;
 
 /// Comments held for one track. The first page of the API returns twenty; this
 /// is a bound on what a continuation could add rather than a target.
@@ -70,8 +97,11 @@ const TIMED_LYRICS_CLIENT_VERSION: &str = "1.20250122.01.00";
 
 /// The queue a track plays inside, and where to find the rest of its page.
 ///
-/// The two ids are handed back rather than followed, because following them is
-/// a round trip each and neither panel is on screen yet.
+/// The browse ids are handed back rather than followed, because following them
+/// is a round trip each and neither panel is on screen yet. The continuation is
+/// held back for a different reason: there is nothing wrong with the queue that
+/// arrived, and the page after it is not wanted until the queue has been played
+/// most of the way down.
 #[derive(Debug, Clone, Default)]
 pub struct Watch {
     /// What YouTube calls the queue: "Let It Happen Mix", "Currents", or the
@@ -84,6 +114,30 @@ pub struct Watch {
     pub lyrics_id: Option<String>,
     /// Browse id of the "Related" tab.
     pub related_id: Option<String>,
+    /// What to redeem for the rest of the queue. See [`continue_queue`].
+    ///
+    /// `None` for a queue with no more pages -- a short playlist -- and for one
+    /// whose token we no longer recognise, which costs the endless queue and
+    /// nothing else.
+    pub continuation: Option<String>,
+}
+
+/// A further page of a queue, and where the page after it lives.
+#[derive(Debug, Clone, Default)]
+pub struct QueuePage {
+    pub tracks: Vec<Track>,
+    /// `None` at the end of a finite queue. A playlist does run out, even
+    /// though a radio does not.
+    pub continuation: Option<String>,
+    /// What the queue should now call itself, when this page came from a
+    /// different station than the one before it.
+    ///
+    /// `None` for a continuation, which is more of the same station and must
+    /// not rename it. `Some` only for [`seeded_page`], where the tracks after
+    /// this point genuinely belong to something else -- and a panel still
+    /// headed "Never Gonna Give You Up Mix" while playing a station built from
+    /// somebody's listening history is a panel that is lying.
+    pub title: Option<String>,
 }
 
 /// Lyrics, and whoever YouTube licensed them from.
@@ -197,6 +251,7 @@ pub fn fetch(http: &Http, video_id: &str) -> Result<Watch> {
         queue: queue(&json),
         lyrics_id: tab_id(&json, "Lyrics"),
         related_id: tab_id(&json, "Related"),
+        continuation: queue_token(&json),
     };
 
     // A response with no queue at all is one whose shape we no longer
@@ -205,6 +260,113 @@ pub fn fetch(http: &Http, video_id: &str) -> Result<Watch> {
         bail!("YouTube Music returned no queue for this track");
     }
     Ok(watch)
+}
+
+/// The next page of a queue, and the token for the page after it.
+///
+/// This is what lets "Up next" run on indefinitely: a radio has no last page,
+/// only a token for the next one, and redeeming them in turn is how the site
+/// itself never runs out. One round trip buys around fifty tracks -- measured,
+/// not estimated -- so at the rate a queue is consumed this is a single call
+/// every two and a half hours of music.
+///
+/// Asked as the music client, like [`fetch`] and unlike [`comments`]: these are
+/// the same rows [`queue`] parses, and a continuation redeemed under a client
+/// that was not issued it comes back empty rather than refused.
+pub fn continue_queue(http: &Http, token: &str) -> Result<QueuePage> {
+    let json = home::post(
+        http,
+        home::NEXT_URL,
+        None,
+        serde_json::json!({ "continuation": token }),
+    )?;
+
+    let tracks = queue(&json);
+    // Distinguished from "no token" by the caller: a page that came back empty
+    // is the end of the radio, and there is nothing further to ask for either
+    // way. Reported as an error so that a response whose shape we have stopped
+    // recognising does not read as a queue that politely ended.
+    if tracks.is_empty() {
+        bail!("YouTube Music returned no further tracks for this queue");
+    }
+    Ok(QueuePage {
+        continuation: queue_token(&json),
+        tracks,
+        // More of the station already playing, so it keeps its name.
+        title: None,
+    })
+}
+
+/// A fresh station, seeded from what this user actually listens to.
+///
+/// The fallback for when [`continue_queue`] has nothing left to give: a
+/// playlist that genuinely ended, a radio that ran out of material, or a token
+/// YouTube has stopped honouring. Rather than let the music stop, a new station
+/// is started from the play journal and the queue carries on into it.
+///
+/// The seed is a track the user keeps *playing*, not one they once liked --
+/// see [`crate::source::journal::Taste::seeds`], which also drops anything they
+/// skip more often than they finish and keeps each seed to a different artist.
+/// `rotation` steps through those candidates, so a second call after a station
+/// that led nowhere builds a different one instead of the same one again.
+///
+/// Deliberately asked with no like list. Likes need a session and this runs on
+/// the page thread, but that is not the reason: a like is something people do
+/// once and forget, and what should play next is better predicted by what they
+/// keep coming back to. The journal knows that and the like list does not.
+pub fn seeded_page(http: &Http, journal: &Journal, rotation: usize) -> Result<QueuePage> {
+    let taste = journal.taste(&[], sapisid::unix_now());
+    // A first run, or close to it. There is no opinion to build a station from
+    // and inventing one would be worse than the queue ending: the user would
+    // get a station built from the two songs they have tried so far.
+    if !taste.is_informed() {
+        bail!("not enough listening history yet to build a station from");
+    }
+
+    // Something loved but not *just* played. Seeding from a song someone has
+    // had on all morning returns that morning's songs, which is the one way a
+    // station like this reliably looks broken -- the same reason the landing
+    // page holds its radios off what it has recently played.
+    let recent = taste.recent();
+    let Some(seed) = taste
+        .seeds(SEED_CANDIDATES, rotation)
+        .into_iter()
+        .find(|ranked| !recent.contains(&ranked.track.id))
+        .map(|ranked| ranked.track.clone())
+    else {
+        bail!("everything worth building a station from has just been played");
+    };
+
+    let json = home::post(
+        http,
+        home::NEXT_URL,
+        None,
+        serde_json::json!({
+            "videoId": seed.id,
+            "playlistId": format!("RDAMVM{}", seed.id),
+        }),
+    )?;
+
+    // The station's first entry is the seed, which is a track the user already
+    // knows well -- the same exclusion the landing page's radios make.
+    let tracks: Vec<Track> = queue(&json)
+        .into_iter()
+        .filter(|track| track.id != seed.id)
+        .collect();
+    if tracks.is_empty() {
+        bail!("the station seeded from {} came back empty", seed.label());
+    }
+
+    Ok(QueuePage {
+        continuation: queue_token(&json),
+        tracks,
+        // A different station, so it says so. Falls back to naming the seed
+        // when YouTube did not name it, which is still the truth about where
+        // these tracks came from.
+        title: Some(
+            queue_title(&json).unwrap_or_else(|| format!("Station from {}", seed.label())),
+        ),
+    })
 }
 
 /// The lyrics behind the browse id [`fetch`] handed back.
@@ -493,6 +655,51 @@ fn tab_id(json: &Value, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The token that buys the next page of the queue.
+///
+/// Scoped to the panel holding the rows, the way [`comment_token`] is scoped to
+/// the comment section. A watch response carries continuations for several
+/// things it could page -- the comment section, the related shelf -- and the
+/// one that means "more queue" is identified by the panel it sits inside rather
+/// than by being the first token found anywhere in the tree.
+///
+/// Two panels, because the first page and the pages after it are not the same
+/// renderer: [`fetch`] gets a `playlistPanelRenderer`, and what
+/// [`continue_queue`] gets back is a `playlistPanelContinuation` holding the
+/// same rows. Both are searched here so that one parser serves both calls.
+fn queue_token(json: &Value) -> Option<String> {
+    let mut panels = Vec::new();
+    for key in ["playlistPanelRenderer", "playlistPanelContinuation"] {
+        home::collect(json, key, &mut panels);
+    }
+    panels.iter().find_map(|panel| panel_token(panel))
+}
+
+/// The continuation token inside one queue panel, however it is spelled.
+///
+/// Three spellings for one field, all of them live. A radio names its token
+/// `nextRadioContinuationData`, a playlist names it `nextContinuationData`, and
+/// the newer render tree sends a `continuationCommand` beside the rows instead
+/// of either. All three are read: a queue that stops at the end of its first
+/// page is the exact failure this exists to prevent, and which spelling arrived
+/// is not something the caller should have to care about.
+fn panel_token(panel: &Value) -> Option<String> {
+    for key in ["nextRadioContinuationData", "nextContinuationData"] {
+        let mut found = Vec::new();
+        home::collect(panel, key, &mut found);
+        if let Some(token) = found.iter().find_map(|data| data["continuation"].as_str()) {
+            return Some(token.to_string());
+        }
+    }
+
+    let mut commands = Vec::new();
+    home::collect(panel, "continuationCommand", &mut commands);
+    commands
+        .iter()
+        .find_map(|command| command["token"].as_str())
+        .map(str::to_string)
+}
+
 /// The continuation token standing where the comments will go.
 ///
 /// Found by walking rather than by path: the watch page moves its sections
@@ -676,6 +883,80 @@ mod tests {
         let queue = queue(&json);
         assert_eq!(queue.len(), 2);
         assert_eq!(queue[1].id, "b");
+    }
+
+    /// A radio spells its token one way and a playlist another, and the newer
+    /// render tree spells it a third. Whichever arrives, the queue has to be
+    /// able to ask for more -- that is the whole of the endless queue.
+    #[test]
+    fn reads_the_queue_token_in_every_spelling() {
+        let panel = |continuations: Value| {
+            serde_json::json!({ "playlistPanelRenderer": { "continuations": continuations } })
+        };
+
+        let radio = panel(serde_json::json!([
+            { "nextRadioContinuationData": { "continuation": "RADIO_TOKEN" } }
+        ]));
+        assert_eq!(queue_token(&radio).as_deref(), Some("RADIO_TOKEN"));
+
+        let playlist = panel(serde_json::json!([
+            { "nextContinuationData": { "continuation": "LIST_TOKEN" } }
+        ]));
+        assert_eq!(queue_token(&playlist).as_deref(), Some("LIST_TOKEN"));
+
+        let newer = serde_json::json!({ "playlistPanelRenderer": { "contents": [
+            { "continuationItemRenderer": { "continuationEndpoint": {
+                "continuationCommand": { "token": "COMMAND_TOKEN" }
+            } } }
+        ] } });
+        assert_eq!(queue_token(&newer).as_deref(), Some("COMMAND_TOKEN"));
+    }
+
+    /// The page after the first is a different renderer holding the same rows.
+    /// One parser has to serve both, or the queue pages exactly once.
+    #[test]
+    fn reads_a_continuation_page() {
+        let json = serde_json::json!({ "continuationContents": {
+            "playlistPanelContinuation": {
+                "contents": [ row("b", "The Moment", "Tame Impala", "4:16") ],
+                "continuations": [
+                    { "nextRadioContinuationData": { "continuation": "NEXT_PAGE" } }
+                ],
+            }
+        } });
+
+        let tracks = queue(&json);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].id, "b");
+        assert_eq!(queue_token(&json).as_deref(), Some("NEXT_PAGE"));
+    }
+
+    /// A token that belongs to something else on the page is not a queue token.
+    /// The comment section carries one on every watch response, and redeeming
+    /// it as a queue would page the comments into "Up next".
+    #[test]
+    fn ignores_a_token_outside_the_queue_panel() {
+        let json = serde_json::json!({
+            "contents": [ row("a", "Let It Happen", "Tame Impala", "7:48") ],
+            "itemSectionRenderer": {
+                "sectionIdentifier": "comment-item-section",
+                "continuations": [
+                    { "nextContinuationData": { "continuation": "COMMENTS" } }
+                ],
+            },
+        });
+
+        assert_eq!(queue_token(&json), None);
+    }
+
+    /// The end of a finite queue: rows, and nothing to ask for after them.
+    #[test]
+    fn a_queue_with_no_next_page_has_no_token() {
+        let json = serde_json::json!({ "playlistPanelRenderer": {
+            "contents": [ row("a", "Let It Happen", "Tame Impala", "7:48") ]
+        } });
+
+        assert_eq!(queue_token(&json), None);
     }
 
     #[test]
@@ -970,12 +1251,48 @@ mod tests {
         let id = std::env::var("MTUI_VIDEO_ID").unwrap_or_else(|_| "H4tG8jHOxJk".into());
         let http = Http::new().expect("client should build");
 
-        let watch = fetch(&http, &id).expect("no queue came back");
+        // A network that forces Restricted Mode answers with no queue at all
+        // for a flagged track, which looks exactly like a parser that has
+        // stopped working. Naming the way out here saves the next person the
+        // same afternoon: `nslookup www.youtube.com`, and 216.239.38.x means
+        // the track is being withheld rather than the response misread.
+        let watch = fetch(&http, &id).unwrap_or_else(|why| {
+            panic!("no queue came back for {id}: {why:#}\nif this network forces Restricted Mode, try MTUI_VIDEO_ID with an unflagged track")
+        });
         println!("queue: {} ({} tracks)", watch.queue_title, watch.queue.len());
         for track in watch.queue.iter().take(5) {
             println!("  {:<40.38} {:>8}", track.label(), track.duration_str());
         }
         assert!(!watch.queue.is_empty());
+
+        // The endless queue, walked twice. Two pages is what distinguishes a
+        // token that works from one that is merely present: the first page
+        // proves the token on the watch response parses, and the second proves
+        // the token *inside a continuation* does -- which is the one the queue
+        // depends on for every page after this, and the one that arrives under
+        // a different renderer.
+        match watch.continuation.as_deref() {
+            Some(token) => {
+                let page = continue_queue(&http, token).expect("no further page came back");
+                println!("+{} tracks from the continuation", page.tracks.len());
+                for track in page.tracks.iter().take(3) {
+                    println!("  {:<40.38} {:>8}", track.label(), track.duration_str());
+                }
+                assert!(!page.tracks.is_empty());
+
+                match page.continuation.as_deref() {
+                    Some(next) => {
+                        let third = continue_queue(&http, next).expect("no third page came back");
+                        println!("+{} tracks from the page after it", third.tracks.len());
+                        assert!(!third.tracks.is_empty());
+                    }
+                    // A radio should always offer another page. A playlist
+                    // genuinely ends, so this is reported rather than asserted.
+                    None => println!("the second page offered no continuation"),
+                }
+            }
+            None => println!("no queue continuation -- the queue is finite"),
+        }
 
         match watch.lyrics_id.as_deref().map(|id| lyrics(&http, id)) {
             Some(Ok(l)) => println!("lyrics: {} chars, {:?}", l.text.len(), l.source),
@@ -990,6 +1307,61 @@ mod tests {
         match comments(&http, &id) {
             Ok(c) => println!("comments: {} / {} kept", c.total, c.items.len()),
             Err(e) => println!("comments failed: {e:#}"),
+        }
+    }
+
+    /// The fallback, against the live endpoint and this machine's own journal.
+    ///
+    /// Two rotations, because the point of the rotation is that a second
+    /// attempt builds a *different* station -- a fallback that rescues the
+    /// queue with the same tracks every time has not rescued anything.
+    ///
+    /// Reports rather than asserts when there is no history to build from: a
+    /// machine that has not played anything yet is the cold-start case this is
+    /// documented to decline, not a failure.
+    ///
+    /// `cargo test --release live_seeded_station -- --ignored --nocapture`
+    #[test]
+    #[ignore = "hits the live YouTube APIs"]
+    fn live_seeded_station() {
+        let http = Http::new().expect("client should build");
+        let journal = Journal::load();
+
+        let mut first = Vec::new();
+        for rotation in 0..2 {
+            match seeded_page(&http, &journal, rotation) {
+                Ok(page) => {
+                    println!(
+                        "rotation {rotation}: {:?} ({} tracks)",
+                        page.title,
+                        page.tracks.len()
+                    );
+                    for track in page.tracks.iter().take(4) {
+                        println!("  {:<40.38} {:>8}", track.label(), track.duration_str());
+                    }
+                    assert!(!page.tracks.is_empty());
+                    // The station has to be pageable from here, or the queue is
+                    // rescued once and then stops again a page later.
+                    assert!(
+                        page.continuation.is_some(),
+                        "a seeded station must hand back a way to continue it"
+                    );
+
+                    let ids: Vec<String> =
+                        page.tracks.iter().map(|track| track.id.clone()).collect();
+                    if rotation == 0 {
+                        first = ids;
+                    } else {
+                        let shared = ids.iter().filter(|id| first.contains(id)).count();
+                        println!("  {shared} of {} shared with rotation 0", ids.len());
+                        assert!(
+                            shared < ids.len(),
+                            "a second rotation that rebuilds the same station rescues nothing"
+                        );
+                    }
+                }
+                Err(why) => println!("rotation {rotation}: no station -- {why:#}"),
+            }
         }
     }
 }

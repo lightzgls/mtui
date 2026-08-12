@@ -11,6 +11,7 @@
 //! going into the background stops drawing, not playing.
 
 mod app;
+mod art;
 mod config;
 mod console;
 mod discord;

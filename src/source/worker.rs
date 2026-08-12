@@ -22,6 +22,13 @@
 //! anything that somebody is: a comment section costs two round trips, and
 //! sharing the library's queue would put it in front of the playlist the user
 //! just asked to open.
+//!
+//! The landing page's card artwork gets a sixth, which is the same argument at
+//! a different scale. One cover is one request per track; a screenful of cards
+//! is a dozen at once, and a dozen pictures of things the user has not chosen
+//! must not be able to queue in front of the picture of the thing they are
+//! listening to. It is also the one thread that keeps a connection open between
+//! requests -- see [`cover::ArtFetcher`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,6 +88,20 @@ pub enum Request {
     Cover {
         id: String,
     },
+    /// Artwork for one card of the landing page.
+    ///
+    /// A sixth thread rather than the cover one, for the reason that gave the
+    /// cover its own: opening the landing page asks for a dozen of these at
+    /// once, and a burst of decoration must not be able to sit in front of the
+    /// picture of the track that is actually playing.
+    ///
+    /// `key` is what the answer is filed under and `url` is what to fetch --
+    /// two fields because a card's artwork lives at an opaque CDN address that
+    /// nothing can be derived from. See [`crate::source::home::Card::art_key`].
+    Art {
+        key: String,
+        url: String,
+    },
     /// The landing page: YouTube Music's own home feed. Runs on the library
     /// thread, which is where the cookie and the session both live.
     Home,
@@ -122,6 +143,31 @@ pub enum Request {
     /// player page fetched without being asked for.
     Watch {
         video_id: String,
+    },
+    /// The next page of the queue, asked for while there is still some left to
+    /// play. This is what keeps "Up next" from ever running out.
+    ///
+    /// Identified by `epoch` rather than by a video id, unlike every other
+    /// request here. A queue outlives the track it was fetched for -- advancing
+    /// through a radio keeps one queue across many tracks -- so a video id
+    /// would discard a page that arrived one track late even though it belongs
+    /// to the very queue that asked for it. The epoch changes only when the
+    /// queue itself is replaced, which is exactly the case where a page in
+    /// flight has become stale.
+    MoreQueue {
+        epoch: u64,
+        token: String,
+    },
+    /// A fresh station for a queue that has run out of pages, built from the
+    /// play journal rather than from anything YouTube handed back.
+    ///
+    /// Answered with [`Response::MoreQueue`], like the request above: from the
+    /// queue's point of view a page of tracks is a page of tracks, and where it
+    /// was found is this thread's business. `rotation` steps the seed along so
+    /// a second attempt builds a different station.
+    SeedQueue {
+        epoch: u64,
+        rotation: usize,
     },
     /// One panel of the player page, fetched when the user opens that tab. The
     /// video id travels with each so a response that arrives after the user has
@@ -233,6 +279,12 @@ pub enum Response {
         video_id: String,
         watch: Box<Result<crate::source::watch::Watch, String>>,
     },
+    /// More queue, for the queue that asked. See [`Request::MoreQueue`] on why
+    /// this is matched by epoch rather than by video id.
+    MoreQueue {
+        epoch: u64,
+        page: Result<crate::source::watch::QueuePage, String>,
+    },
     Lyrics {
         video_id: String,
         lyrics: Result<crate::source::watch::Lyrics, String>,
@@ -256,6 +308,13 @@ pub enum Response {
     /// response that arrives after the user has moved on can be discarded.
     Cover {
         id: String,
+        art: Option<Cover>,
+    },
+    /// One card's artwork. `art` is `None` when there was no usable picture,
+    /// which the cache records as firmly as a success -- see
+    /// [`crate::art::ArtCache::store`].
+    Art {
+        key: String,
         art: Option<Cover>,
     },
     /// The code the user has to approve, and where to approve it. Sent as soon
@@ -310,6 +369,7 @@ pub struct SourceWorker {
     cover_tx: Sender<Request>,
     library_tx: Sender<Request>,
     page_tx: Sender<Request>,
+    art_tx: Sender<Request>,
     /// Kept so a sign-in thread can be handed somewhere to answer. Sign-in is
     /// spawned on demand rather than kept resident: it runs at most once a
     /// session and would otherwise be a thread asleep for the whole run.
@@ -330,12 +390,14 @@ impl SourceWorker {
         let (cover_req_tx, cover_req_rx) = channel::<Request>();
         let (library_req_tx, library_req_rx) = channel::<Request>();
         let (page_req_tx, page_req_rx) = channel::<Request>();
+        let (art_req_tx, art_req_rx) = channel::<Request>();
         let (res_tx, res_rx) = channel::<Response>();
         let resolves = Arc::new(AtomicU64::new(0));
         let thread_resolves = Arc::clone(&resolves);
         let cover_res_tx = res_tx.clone();
         let library_res_tx = res_tx.clone();
         let page_res_tx = res_tx.clone();
+        let art_res_tx = res_tx.clone();
         let spawn_res_tx = res_tx.clone();
 
         // Cloned rather than moved: it is a path, and the library thread runs
@@ -363,11 +425,17 @@ impl SourceWorker {
             .spawn(move || run_pages(page_req_rx, page_res_tx))
             .context("failed to spawn player page worker")?;
 
+        thread::Builder::new()
+            .name("mtui-art".to_string())
+            .spawn(move || run_art(&art_req_rx, &art_res_tx))
+            .context("failed to spawn artwork worker")?;
+
         Ok(Self {
             tx: req_tx,
             cover_tx: cover_req_tx,
             library_tx: library_req_tx,
             page_tx: page_req_tx,
+            art_tx: art_req_tx,
             res_tx: spawn_res_tx,
             rx: res_rx,
             resolves,
@@ -403,6 +471,7 @@ impl SourceWorker {
     fn route(&self, req: Request) -> Result<()> {
         match req {
             Request::Cover { .. } => self.cover_tx.send(req).context("cover worker is gone"),
+            Request::Art { .. } => self.art_tx.send(req).context("artwork worker is gone"),
             // Not queued anywhere: this one blocks for as long as the user
             // takes to approve a code, so it gets a thread that exists only for
             // the duration of the flow.
@@ -411,6 +480,8 @@ impl SourceWorker {
                 Ok(())
             }
             Request::Watch { .. }
+            | Request::MoreQueue { .. }
+            | Request::SeedQueue { .. }
             | Request::Lyrics { .. }
             | Request::Related { .. }
             | Request::Comments { .. } => {
@@ -460,12 +531,15 @@ fn name(req: &Request) -> &'static str {
         Request::Resolve { .. } => "Resolve",
         Request::Prefetch { .. } => "Prefetch",
         Request::Cover { .. } => "Cover",
+        Request::Art { .. } => "Art",
         Request::Home => "Home",
         Request::PersonalShelves { .. } => "PersonalShelves",
         Request::ImportCookies { .. } => "ImportCookies",
         Request::ReportPlay { .. } => "ReportPlay",
         Request::OpenBrowse { .. } => "OpenBrowse",
         Request::Watch { .. } => "Watch",
+        Request::MoreQueue { .. } => "MoreQueue",
+        Request::SeedQueue { .. } => "SeedQueue",
         Request::Lyrics { .. } => "Lyrics",
         Request::Related { .. } => "Related",
         Request::Comments { .. } => "Comments",
@@ -923,6 +997,24 @@ fn run_pages(rx: Receiver<Request>, tx: Sender<Response>) {
                 watch: Box::new(watch::fetch(&http, &video_id).map_err(|e| format!("{e:#}"))),
                 video_id,
             },
+            Request::MoreQueue { epoch, token } => Response::MoreQueue {
+                page: watch::continue_queue(&http, &token).map_err(|e| format!("{e:#}")),
+                epoch,
+            },
+            Request::SeedQueue { epoch, rotation } => Response::MoreQueue {
+                // Read fresh rather than held: this thread runs one of these
+                // every couple of hours at most, and the authoritative journal
+                // belongs to the library thread, which is appending to it as
+                // plays finish. A copy kept here would be the state of somebody
+                // else's listening at the moment this thread started.
+                //
+                // Safe to read while that thread appends, by the journal's own
+                // design: a record is one line written in one call, and a line
+                // that will not parse is skipped rather than fatal.
+                page: watch::seeded_page(&http, &Journal::load(), rotation)
+                    .map_err(|e| format!("{e:#}")),
+                epoch,
+            },
             Request::Lyrics {
                 video_id,
                 browse_id,
@@ -1040,6 +1132,48 @@ fn run_covers(rx: Receiver<Request>, tx: Sender<Response>) {
             id,
         };
         if tx.send(response).is_err() {
+            break;
+        }
+    }
+}
+
+/// Card artwork for the landing page, one tile at a time.
+///
+/// Serial like every other worker here, and that is the right shape even though
+/// a dozen arrive at once: these are small pictures off a CDN that keeps the
+/// connection open, so they come back in a few hundred milliseconds all told,
+/// and the cards fill in as they land rather than all at the end. Fanning them
+/// out across threads would buy a fraction of a second and cost a connection
+/// pool per thread.
+///
+/// A fetcher that will not start is not fatal. It means this session draws
+/// cards without pictures, which is what the renderer does anyway until they
+/// arrive -- so the thread answers every request with `None` rather than
+/// exiting, which would silently strand the requests in the channel.
+fn run_art(rx: &Receiver<Request>, tx: &Sender<Response>) {
+    let fetcher = cover::ArtFetcher::new();
+    if let Err(e) = &fetcher {
+        debug_assert!(false, "could not start the artwork fetcher: {e:#}");
+    }
+
+    while let Ok(req) = rx.recv() {
+        let (key, url) = match req {
+            Request::Art { key, url } => (key, url),
+            Request::Shutdown => break,
+            other => {
+                debug_assert!(false, "{} was routed to the art thread", name(&other));
+                continue;
+            }
+        };
+
+        // Silent on failure, like the cover thread and for the same reason: a
+        // card without its sleeve is a card, and there is nothing the user
+        // could do with the news that a CDN said 404.
+        let art = fetcher
+            .as_ref()
+            .ok()
+            .and_then(|fetcher| fetcher.fetch(&url, crate::art::EDGE).ok());
+        if tx.send(Response::Art { key, art }).is_err() {
             break;
         }
     }

@@ -256,10 +256,10 @@ async fn serves_byte(client: &reqwest::Client, url: &str, at: u64) -> bool {
 /// This lives here, rather than inside the worker that used to own it, because
 /// it is the definition of "the URL this program would play" and more than one
 /// caller needs exactly that. When the cap check lived inside
-/// [`InnerTube::resolve`], every direct caller got it for free; moving the
-/// check out to cover yt-dlp as well would silently have taken it away from
-/// them. Sharing the cascade is what keeps the tests measuring the URL the app
-/// really streams instead of one nothing ever plays.
+/// [`innertube::InnerTube::resolve`], every direct caller got it for free;
+/// moving the check out to cover yt-dlp as well would silently have taken it
+/// away from them. Sharing the cascade is what keeps the tests measuring the
+/// URL the app really streams instead of one nothing ever plays.
 ///
 /// Returns the URL and whether it is known to serve the whole file. A capped
 /// URL is still returned: it plays its first minute or so, which beats

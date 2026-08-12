@@ -262,7 +262,7 @@ fn clean_artist(artist: &str) -> String {
 
 /// A video title reduced to the song's name.
 ///
-/// Uploads carry a qualifier on the end -- "(Official Video)", "[Lyrics]" --
+/// Uploads carry a qualifier on the end -- "(Official Video)", "\[Lyrics\]" --
 /// which is about the upload rather than the song, and which stops an exact
 /// match dead.
 fn clean_title(title: &str) -> String {

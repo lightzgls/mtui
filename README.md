@@ -120,6 +120,57 @@ It opens on a page of shelves — the same shape YouTube Music's home page has,
 drawn as rows of cards. `hjkl` moves around the grid, `Enter` plays a song or
 opens an album or playlist into a track list, and `H` or `Esc` comes back.
 
+**Cards come in four sizes, and the window picks one.** A cell is about twice as
+tall as it is wide, so a square sleeve costs half as many rows as it does
+columns — which makes the card that looks like a music app an expensive one.
+The page draws the largest shape that still leaves room for two shelves:
+
+| | Sleeve | Wants |
+|---|---|---|
+| **gallery** | 28px, edge to edge | 41 rows |
+| **poster** | 20px, sleeve over text | 33 rows |
+| **tile** | 8px, sleeve beside text | 15 rows |
+| **text** | none | 11 rows |
+
+Add six rows to each if something is playing, since the now-playing strip takes
+them. A 30-row terminal therefore gets tiles; it takes a tall window to be given
+posters or gallery cards unasked.
+
+`v` overrides that and steps through the four by hand — and it is the only way
+to get the roomiest cards on a window that is not tall enough to be handed them,
+since the page will not spend a whole screen on a single shelf without being
+asked to.
+
+**Every card wears its own record's colour.** The border, and the chip saying
+what the card is, are drawn in the dominant colour of that sleeve — worked out
+from the picture rather than assigned, so a page of cards is a page of records
+rather than a grid in one house style. A card still waiting on its artwork is
+grey and changes colour when it lands, which reads as a page filling in.
+
+The line under each title is styled by what its parts are, rather than set as
+one grey run: the artist a step brighter than the year beside it, and the
+bullets between them a step dimmer than either.
+
+## The colour of the song
+
+Everything that is *about playback* takes its colour from whatever is playing —
+the progress bar, the underline beneath the open tab, the row under the cursor,
+and the track marked as playing in the queue. Start a different song and the
+interface shifts hue with it.
+
+The colour is the same one the cards use, pulled from the sleeve, so the player
+page and the card the track was started from agree. Before the first cover
+arrives, and whenever nothing is playing, it is the cyan it always was.
+
+The text written on a filled row is chosen against the colour under it rather
+than fixed — a sleeve whose dominant colour is a deep red gives a fill that is
+bright by one measure and still far too dark to write black on, and the row
+under the cursor is the last row on the page that should be unreadable.
+
+The landing page's shelf headings deliberately stay out of this. That page is
+already many colours, one per record, and giving its headings the playing
+track's hue would put them in competition with the cards underneath.
+
 How personal that page is depends on what you have configured:
 
 | | Shelves |
@@ -282,6 +333,29 @@ A track the queue offers that will not resolve is stepped over rather than
 allowed to end the session — up to three in a row, after which it stops and
 says so.
 
+**The queue does not run out.** A radio has no last page, only a token for the
+next one, and MTUI redeems them as it goes: when five tracks are left ahead of
+you it fetches the next fifty, so the page lands — and the track after it is
+resolved — long before either is needed. Nothing about this is visible while it
+works, which is the point.
+
+Only what is near you is kept. The queue holds a window around the playing
+track, twenty behind and up to fifty ahead, and drops the rest, so a queue left
+running all day costs the same few kilobytes as one just started. Tracks that
+have scrolled out of it are remembered by id, because a radio genuinely repeats
+over hours and an endless queue that loops the same songs is worse than one that
+ends honestly.
+
+When a station finally does run dry — a playlist that ends, or a radio with
+nothing left to offer — the queue builds a new one out of your own listening
+rather than stopping. The seed is a track you keep *playing* rather than one you
+liked once, by an artist you have not just been listening to, and YouTube pages
+that station from there like any other. Each attempt seeds from a different
+track, so two dry queues in a row are rescued by two different stations. It is
+the same journal [the landing page](#the-landing-page) ranks its shelves from,
+and it needs the same five-or-so tracks before it has an opinion — until then
+there is nothing to build a station out of, and the queue ends as it always did.
+
 ## Playing without a window
 
 `B`, while something is playing, hands the terminal back and leaves MTUI running
@@ -395,6 +469,7 @@ implemented — including the relocated paths Flatpak and Snap installs use.
 | `←` / `→` | seek 5s |
 | `+` / `-` | volume |
 | `c` | cover size |
+| `v` | card size on the landing page — text, tile, poster, gallery |
 | `L` or `Ctrl-L` | library |
 | `a` / `d` / `f` | add to playlist / remove / like |
 | `A` | sign in |

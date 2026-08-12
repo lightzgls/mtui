@@ -1,14 +1,23 @@
-//! Cover art: a track's thumbnail, decoded and shrunk to something a terminal
-//! can actually draw.
+//! Cover art: a thumbnail, decoded and shrunk to something a terminal can
+//! actually draw.
 //!
-//! Same containment rule as the rest of this module -- nothing stays resident.
-//! The thumbnail URL is derived from the video id, so this costs no second
-//! yt-dlp invocation, and the decoded image is downscaled here and dropped;
-//! only the few tens of kilobytes the renderer samples from survive the call.
+//! Two callers want different things from that sentence, and both are served
+//! here. [`fetch`] is the cover of the track that is playing: one picture, as
+//! large as YouTube has it, found by video id. [`ArtFetcher`] is the landing
+//! page's card artwork: many small pictures, found by URL because an album
+//! sleeve has no id to derive one from, and kept small enough that a screenful
+//! of them costs less than one cover does.
 //!
-//! What this shows is the *video* thumbnail, which for auto-generated "Topic"
-//! uploads is the album art and for a music video is a frame from it. Real
-//! album art would mean a second metadata source, which is a separate feature.
+//! Same containment rule as the rest of this module, with one stated exception.
+//! The decoded image is downscaled here and dropped, and only the few tens of
+//! kilobytes the renderer samples from survive the call -- but [`ArtFetcher`]
+//! does keep a runtime and a connection resident for as long as the art thread
+//! runs, because a dozen tiles arriving at once is the one case where handshakes
+//! cost more than the pictures. Its doc comment makes that argument in full.
+//!
+//! What [`fetch`] shows is the *video* thumbnail, which for auto-generated
+//! "Topic" uploads is the album art and for a music video is a frame from it.
+//! Card artwork is the real sleeve, because the feed says where it is.
 
 use std::time::{Duration, Instant};
 
@@ -68,10 +77,24 @@ const SIZES: &[&str] = &["maxresdefault", "hq720", "sddefault", "hqdefault"];
 pub struct Cover {
     pub width: u32,
     pub height: u32,
+    /// The colour the picture reads as, for the border and title drawn around
+    /// it. See [`accent_of`].
+    pub accent: (u8, u8, u8),
     rgb: Vec<u8>,
 }
 
 impl Cover {
+    /// The only way a `Cover` is made, so that no picture can exist without the
+    /// accent colour drawn beside it having been worked out from its pixels.
+    fn build(width: u32, height: u32, rgb: Vec<u8>) -> Self {
+        Self {
+            accent: accent_of(&rgb),
+            width,
+            height,
+            rgb,
+        }
+    }
+
     /// The pixel at `(x, y)`, clamped to the image rather than panicking, so
     /// the renderer's integer scaling cannot fall off the edge.
     pub fn pixel(&self, x: u32, y: u32) -> (u8, u8, u8) {
@@ -132,8 +155,89 @@ impl Cover {
     /// up where.
     pub fn from_rgb(width: u32, height: u32, rgb: Vec<u8>) -> Self {
         assert_eq!(rgb.len() as u32, width * height * 3, "pixel count");
-        Self { width, height, rgb }
+        Self::build(width, height, rgb)
     }
+}
+
+/// The colour a picture reads as, for the frame and the title drawn around it.
+///
+/// A landing page whose every card is bordered in the same cyan says nothing
+/// about what is on it; one that takes each card's colour from its own sleeve
+/// is a page of records rather than a page of boxes. That is the whole purpose
+/// of this function, and it is why it looks for a *vivid* colour rather than an
+/// average one -- averaging a sleeve gives the mud halfway between its ink and
+/// its paper, which is the one colour not actually on it.
+///
+/// So: pixels are dropped into a coarse colour cube, each weighted by how
+/// saturated it is, and the heaviest cell wins. Weighting by saturation is what
+/// lets a mostly-black sleeve with one red word on it come back red, while
+/// counting cells rather than scoring pixels one at a time keeps a scatter of
+/// unrelated bright pixels from outvoting the block of colour that dominates
+/// the picture.
+fn accent_of(rgb: &[u8]) -> (u8, u8, u8) {
+    /// Cells per channel in the colour cube. Four bits is fine enough to keep
+    /// two different reds apart and coarse enough that one red does not land in
+    /// eight neighbouring cells.
+    const STEPS: usize = 16;
+    /// Below this a pixel is shadow and above it is paper. Neither is the
+    /// colour of the record, and both are abundant enough to win on volume.
+    const FLOOR: u8 = 24;
+    const CEILING: u8 = 232;
+
+    let mut cells = vec![[0u32; 4]; STEPS * STEPS * STEPS];
+    for px in rgb.chunks_exact(3) {
+        let (r, g, b) = (px[0], px[1], px[2]);
+        let high = r.max(g).max(b);
+        let low = r.min(g).min(b);
+        if high < FLOOR || low > CEILING {
+            continue;
+        }
+        // Plus one so a genuinely grey picture still elects a cell rather than
+        // returning the fallback below with a perfectly good grey to hand.
+        let weight = u32::from(high - low) + 1;
+        let cell = &mut cells[index(r, g, b, STEPS)];
+        cell[0] += u32::from(r) * weight;
+        cell[1] += u32::from(g) * weight;
+        cell[2] += u32::from(b) * weight;
+        cell[3] += weight;
+    }
+
+    let Some(winner) = cells.iter().max_by_key(|cell| cell[3]).filter(|c| c[3] > 0) else {
+        // Every pixel was shadow or paper: a sleeve that is genuinely black or
+        // genuinely white. Neither has an accent, and inventing one would put a
+        // colour on screen that is nowhere in the picture.
+        return (150, 150, 150);
+    };
+    let weight = winner[3];
+    lift((
+        (winner[0] / weight) as u8,
+        (winner[1] / weight) as u8,
+        (winner[2] / weight) as u8,
+    ))
+}
+
+fn index(r: u8, g: u8, b: u8, steps: usize) -> usize {
+    let bucket = |v: u8| (usize::from(v) * steps / 256).min(steps - 1);
+    (bucket(r) * steps + bucket(g)) * steps + bucket(b)
+}
+
+/// Brightens a colour until it is legible as a border on a dark terminal,
+/// keeping its hue.
+///
+/// A sleeve whose dominant colour is a deep navy is honestly represented by
+/// that navy, and a navy line on a black background is a line nobody can see.
+/// Scaling all three channels together lifts it without turning it a different
+/// colour, which is what clamping each channel separately would do.
+fn lift((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
+    /// What the brightest channel is raised to, when it falls short.
+    const TARGET: u32 = 170;
+
+    let high = u32::from(r.max(g).max(b));
+    if high >= TARGET || high == 0 {
+        return (r, g, b);
+    }
+    let scale = |v: u8| (u32::from(v) * TARGET / high).min(255) as u8;
+    (scale(r), scale(g), scale(b))
 }
 
 /// Fetches and decodes the thumbnail for a YouTube video id, taking the largest
@@ -153,7 +257,7 @@ pub fn fetch(video_id: &str) -> Result<Cover> {
         // Decode failures fall through with the fetch failures: a truncated or
         // otherwise unreadable JPEG at one size says nothing about the next,
         // and there is a smaller copy of the same picture right below it.
-        match get(&url(video_id, name), left).and_then(|body| decode(&body)) {
+        match get(&url(video_id, name), left).and_then(|body| decode(&body, MAX_EDGE)) {
             Ok(cover) => return Ok(cover),
             Err(e) => last = Some(e),
         }
@@ -167,6 +271,59 @@ fn url(video_id: &str, name: &str) -> String {
     format!("https://i.ytimg.com/vi/{video_id}/{name}.jpg")
 }
 
+/// The thumbnail to ask for when a card needs a picture and only the video id
+/// is known.
+///
+/// `mqdefault` rather than one of the [`SIZES`] ladder, for two reasons: it is
+/// the one name YouTube generates for every upload ever posted, so a card built
+/// from this never has to fall down a ladder of 404s to find out; and at 320x180
+/// it is a tenth the bytes of the sizes the player's cover pane wants, which is
+/// the right trade when the result is drawn thirty pixels across.
+pub fn thumb_url(video_id: &str) -> String {
+    url(video_id, "mqdefault")
+}
+
+/// Fetches artwork by URL, keeping one connection alive between calls.
+///
+/// Everything else in this module builds a runtime per request and drops it,
+/// which is right when the request is one picture per track. Card artwork is
+/// not that shape: opening the landing page asks for a dozen tiles back to back
+/// off the same two hosts, and a runtime and TLS handshake per tile would cost
+/// several times what the pictures do. So the art thread keeps one of these for
+/// as long as it runs -- an idle current-thread reactor and a warm connection,
+/// which is a few kilobytes standing against a dozen handshakes.
+///
+/// Held by value rather than shared: a `reqwest::Client`'s pool belongs to the
+/// runtime its requests were driven on, so the two have to live and die
+/// together.
+pub struct ArtFetcher {
+    runtime: tokio::runtime::Runtime,
+    client: reqwest::Client,
+}
+
+impl ArtFetcher {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            runtime: tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("could not start a runtime for artwork")?,
+            client: reqwest::Client::new(),
+        })
+    }
+
+    /// Fetches and decodes one artwork URL, shrunk to `edge` on its longest
+    /// side.
+    ///
+    /// Takes a URL where [`fetch`] takes an id, because a card's picture is
+    /// whatever YouTube said it was: an album sleeve lives on Google's image
+    /// CDN under an opaque name, and there is no id to derive it from.
+    pub fn fetch(&self, url: &str, edge: u32) -> Result<Cover> {
+        let body = self.runtime.block_on(read(&self.client, url, TIMEOUT))?;
+        decode(&body, edge).with_context(|| format!("could not decode the artwork at {url}"))
+    }
+}
+
 fn get(url: &str, timeout: Duration) -> Result<Vec<u8>> {
     // A current-thread runtime, built for this one request and dropped with it.
     // The worker thread blocks on the request anyway, so there is nothing for a
@@ -176,29 +333,40 @@ fn get(url: &str, timeout: Duration) -> Result<Vec<u8>> {
         .build()
         .context("could not start a runtime for the thumbnail fetch")?;
 
-    runtime.block_on(async {
-        let response = reqwest::Client::new()
-            .get(url)
-            .timeout(timeout)
-            .send()
-            .await?
-            .error_for_status()?;
-
-        // Checked before and after reading: a server may not send a length, and
-        // one that does may be lying about it.
-        if response.content_length().is_some_and(|n| n > MAX_BYTES) {
-            bail!("thumbnail is implausibly large");
-        }
-        let body = response.bytes().await?;
-        if body.len() as u64 > MAX_BYTES {
-            bail!("thumbnail is implausibly large");
-        }
-
-        anyhow::Ok(body.to_vec())
-    })
+    runtime.block_on(read(&reqwest::Client::new(), url, timeout))
 }
 
-fn decode(jpeg: &[u8]) -> Result<Cover> {
+/// One GET, bounded in both time and size. Shared by the per-track cover and
+/// the per-card artwork so the ceiling on what may be buffered is stated once.
+async fn read(client: &reqwest::Client, url: &str, timeout: Duration) -> Result<Vec<u8>> {
+    let response = client
+        .get(url)
+        .timeout(timeout)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // Checked before and after reading: a server may not send a length, and one
+    // that does may be lying about it.
+    if response.content_length().is_some_and(|n| n > MAX_BYTES) {
+        bail!("thumbnail is implausibly large");
+    }
+    let body = response.bytes().await?;
+    if body.len() as u64 > MAX_BYTES {
+        bail!("thumbnail is implausibly large");
+    }
+
+    Ok(body.to_vec())
+}
+
+/// Decodes a JPEG, trims the padding YouTube fitted it into, and shrinks what
+/// is left to `edge` on its longest side.
+///
+/// `edge` is a parameter rather than [`MAX_EDGE`] because the two callers want
+/// different pictures from the same code: the cover pane wants every pixel
+/// YouTube has, and a card tile drawn thirty pixels across wants a fraction of
+/// one -- see [`crate::art::EDGE`].
+fn decode(jpeg: &[u8], edge: u32) -> Result<Cover> {
     let mut decoder = jpeg_decoder::Decoder::new(jpeg);
     let pixels = decoder
         .decode()
@@ -228,7 +396,7 @@ fn decode(jpeg: &[u8]) -> Result<Cover> {
 
     let (x, y, w, h) = trim_bars(width, height, &rgb);
     let cropped = crop(width, &rgb, x, y, w, h);
-    Ok(shrink(w, h, &cropped))
+    Ok(shrink(w, h, &cropped, edge))
 }
 
 /// Finds the picture inside YouTube's padding, as an `(x, y, width, height)`
@@ -309,24 +477,20 @@ fn crop(width: u32, rgb: &[u8], x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-/// Box-averaging downscale to fit [`MAX_EDGE`], or a passthrough if it already
-/// does.
+/// Box-averaging downscale to fit `edge` on the longest side, or a passthrough
+/// if it already does.
 ///
 /// Averaging rather than nearest-neighbour because this reduction is roughly
 /// 2:1, where dropping pixels visibly aliases. It runs once per track on a
 /// background thread, so the cost is irrelevant.
-fn shrink(width: u32, height: u32, src: &[u8]) -> Cover {
+fn shrink(width: u32, height: u32, src: &[u8], edge: u32) -> Cover {
     let longest = width.max(height);
-    if longest <= MAX_EDGE {
-        return Cover {
-            width,
-            height,
-            rgb: src.to_vec(),
-        };
+    if longest <= edge {
+        return Cover::build(width, height, src.to_vec());
     }
 
-    let dst_w = (width * MAX_EDGE / longest).max(1);
-    let dst_h = (height * MAX_EDGE / longest).max(1);
+    let dst_w = (width * edge / longest).max(1);
+    let dst_h = (height * edge / longest).max(1);
     let mut rgb = Vec::with_capacity((dst_w * dst_h * 3) as usize);
 
     for y in 0..dst_h {
@@ -352,11 +516,7 @@ fn shrink(width: u32, height: u32, src: &[u8]) -> Cover {
         }
     }
 
-    Cover {
-        width: dst_w,
-        height: dst_h,
-        rgb,
-    }
+    Cover::build(dst_w, dst_h, rgb)
 }
 
 #[cfg(test)]
@@ -375,7 +535,7 @@ mod tests {
 
     #[test]
     fn small_images_pass_through_unscaled() {
-        let cover = shrink(2, 2, &quad());
+        let cover = shrink(2, 2, &quad(), MAX_EDGE);
         assert_eq!((cover.width, cover.height), (2, 2));
         assert_eq!(cover.pixel(0, 0), (255, 0, 0));
         assert_eq!(cover.pixel(1, 1), (255, 255, 255));
@@ -386,7 +546,7 @@ mod tests {
         // Twice the ceiling on the long edge, so this actually shrinks.
         let (w, h) = (MAX_EDGE * 2, MAX_EDGE * 2 * 9 / 16);
         let src = vec![128; (w * h * 3) as usize];
-        let cover = shrink(w, h, &src);
+        let cover = shrink(w, h, &src, MAX_EDGE);
         assert_eq!((cover.width, cover.height), (MAX_EDGE, MAX_EDGE * 9 / 16));
     }
 
@@ -395,7 +555,7 @@ mod tests {
         // 1280x720 is maxresdefault, and nothing about it may be thrown away
         // before the renderer has said what size pane it has.
         let src = vec![128; (1280 * 720 * 3) as usize];
-        let cover = shrink(1280, 720, &src);
+        let cover = shrink(1280, 720, &src, MAX_EDGE);
         assert_eq!((cover.width, cover.height), (1280, 720));
     }
 
@@ -443,14 +603,14 @@ mod tests {
                 src.extend_from_slice(&[v, v, v]);
             }
         }
-        let cover = shrink(w, h, &src);
+        let cover = shrink(w, h, &src, MAX_EDGE);
         assert_eq!(cover.width, MAX_EDGE);
         assert_eq!(cover.pixel(0, 0), (127, 127, 127));
     }
 
     #[test]
     fn pixel_clamps_out_of_range_coordinates() {
-        let cover = shrink(2, 2, &quad());
+        let cover = shrink(2, 2, &quad(), MAX_EDGE);
         assert_eq!(cover.pixel(99, 99), cover.pixel(1, 1));
     }
 
@@ -512,16 +672,82 @@ mod tests {
     fn cropping_keeps_the_art_pixels() {
         let rgb = pillarboxed(20, 10, 5);
         let (x, y, w, h) = trim_bars(20, 10, &rgb);
-        let cover = shrink(w, h, &crop(20, &rgb, x, y, w, h));
+        let cover = shrink(w, h, &crop(20, &rgb, x, y, w, h), MAX_EDGE);
         assert_eq!((cover.width, cover.height), (10, 10));
         // Every surviving pixel is art, none of the black padding.
         assert_eq!(cover.pixel(0, 0), (200, 30, 90));
         assert_eq!(cover.pixel(9, 9), (200, 30, 90));
     }
 
+    /// The point of weighting by saturation: a sleeve that is mostly black with
+    /// one coloured mark on it reads as that colour, not as black. Averaging
+    /// would answer "very dark grey", which is no accent at all.
+    #[test]
+    fn a_mark_on_a_dark_sleeve_is_the_accent() {
+        let (w, h) = (40u32, 40u32);
+        let mut rgb = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                // A crimson square over an eighth of the picture.
+                let mark = (4..14).contains(&x) && (4..14).contains(&y);
+                rgb.extend_from_slice(if mark { &[200, 30, 60] } else { &[6, 6, 8] });
+            }
+        }
+        let (r, g, b) = accent_of(&rgb);
+        assert!(r > g && r > b, "expected a red accent, got {r},{g},{b}");
+        assert!(r > 150, "and a visible one: {r},{g},{b}");
+    }
+
+    /// The larger of two colours wins, so an accent is the colour the sleeve is
+    /// rather than the brightest thing anywhere on it.
+    #[test]
+    fn the_dominant_colour_wins_over_a_scattering() {
+        let (w, h) = (40u32, 40u32);
+        let mut rgb = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                // Two pixels of vivid yellow against a field of teal.
+                let fleck = y == 0 && x < 2;
+                rgb.extend_from_slice(if fleck { &[255, 255, 0] } else { &[20, 140, 140] });
+            }
+        }
+        let (r, g, b) = accent_of(&rgb);
+        assert!(g > r && b > r, "expected the teal field, got {r},{g},{b}");
+    }
+
+    /// A sleeve with no colour on it has no accent, and one must not be
+    /// invented -- a colour on the border that is nowhere in the picture is a
+    /// lie about the record.
+    #[test]
+    fn a_black_sleeve_gets_a_neutral_accent() {
+        let (r, g, b) = accent_of(&[2; 40 * 40 * 3]);
+        assert_eq!(r, g, "{r},{g},{b}");
+        assert_eq!(g, b, "{r},{g},{b}");
+        assert!(r > 100, "and still legible on a dark terminal: {r}");
+    }
+
+    /// A deep navy is honestly navy, and a navy line on a black terminal is a
+    /// line nobody can see. Lifting keeps the hue and raises the brightness.
+    #[test]
+    fn a_dark_accent_is_lifted_without_changing_hue() {
+        let (r, g, b) = lift((10, 20, 40));
+        assert!(b > 150, "lifted to legible: {r},{g},{b}");
+        // The ratios that make it navy rather than teal are preserved.
+        assert_eq!(b / r, 4, "{r},{g},{b}");
+        assert_eq!(b / g, 2, "{r},{g},{b}");
+    }
+
+    #[test]
+    fn an_already_bright_accent_is_left_alone() {
+        assert_eq!(lift((240, 30, 90)), (240, 30, 90));
+        // Black has no hue to preserve, so scaling it would be division by
+        // zero rather than a brightening.
+        assert_eq!(lift((0, 0, 0)), (0, 0, 0));
+    }
+
     #[test]
     fn decode_rejects_non_jpeg_input() {
-        assert!(decode(b"this is not a jpeg").is_err());
+        assert!(decode(b"this is not a jpeg", MAX_EDGE).is_err());
     }
 
     /// Exercises the whole live path -- URL shape, TLS, decode, downscale --

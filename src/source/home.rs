@@ -26,6 +26,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use super::auth::Http;
+use super::cover;
 use super::innertube::{MUSIC_CLIENT_NAME, MUSIC_CLIENT_VERSION, flex_column, parse_duration};
 use super::journal::Journal;
 use super::sapisid;
@@ -86,6 +87,24 @@ pub struct Card {
     /// split into fields, because what the fields mean varies by card and a
     /// guess that is wrong looks worse than the string YouTube chose.
     pub subtitle: String,
+    /// Where the card's artwork lives, exactly as YouTube gave it.
+    ///
+    /// Held as the URL rather than the picture: a feed is twelve shelves of
+    /// twenty-four, and fetching three hundred images to draw a dozen of them
+    /// is the opposite of what this program is for. [`crate::art`] fetches the
+    /// ones actually on screen and forgets them again.
+    ///
+    /// `None` for a card YouTube sent no thumbnail with, which the renderer
+    /// draws as a card without a picture rather than as a gap.
+    pub art: Option<String>,
+    /// How long the track runs, when the card is a list row and YouTube sent
+    /// the column that says so.
+    ///
+    /// Absent on every picture card, and that is not a gap to be filled: a
+    /// two-row item can be an album or a playlist, and there is no single
+    /// duration for one. The renderer draws this when it is there and drops the
+    /// badge when it is not, rather than printing a guess.
+    pub duration: Option<std::time::Duration>,
     pub target: Target,
 }
 
@@ -103,12 +122,55 @@ impl Card {
         matches!(self.target, Target::Play { .. })
     }
 
+    /// What the card stands for, as the word YouTube prefixed its subtitle with
+    /// -- "Song", "Album", "Playlist".
+    ///
+    /// Read off the subtitle rather than inferred from the target, because the
+    /// target only says play-or-browse and every browsable card would come back
+    /// the same word. Absent when YouTube wrote no marker, which is common on
+    /// list rows and is why this is drawn as a badge that can be missing rather
+    /// than a column that must be filled.
+    pub fn kind(&self) -> Option<&str> {
+        self.subtitle
+            .split('•')
+            .map(str::trim)
+            .find(|field| TYPES.contains(field))
+    }
+
+    /// What the subtitle says once the type marker has been taken out of it, so
+    /// a card drawing the marker as its own badge does not also print it in the
+    /// line underneath.
+    pub fn detail(&self) -> String {
+        let Some(kind) = self.kind() else {
+            return self.subtitle.clone();
+        };
+        self.subtitle
+            .split('•')
+            .map(str::trim)
+            .filter(|field| !field.is_empty() && *field != kind)
+            .collect::<Vec<_>>()
+            .join(" • ")
+    }
+
+    /// Identifies the card's artwork in the art cache.
+    ///
+    /// The target rather than the URL: the same picture is served under URLs
+    /// that differ in their size suffix, and the same song appearing on two
+    /// shelves should cost one fetch rather than two.
+    pub fn art_key(&self) -> &str {
+        match &self.target {
+            Target::Play { video_id } => video_id,
+            Target::Open { browse_id } => browse_id,
+        }
+    }
+
     /// The card as a track, when it stands for one.
     ///
     /// Thinner than a track from a listing: a card carries a display subtitle
-    /// rather than fields, so the album and the length are simply not knowable
-    /// from here. Both are `None` rather than guessed at -- the player page
-    /// fills them in from the watch queue a moment later.
+    /// rather than fields, so the album is simply not knowable from here, and
+    /// the length only when the card came from a list row that named one.
+    /// Neither is guessed at -- the player page fills them in from the watch
+    /// queue a moment later.
     pub fn track(&self) -> Option<Track> {
         let Target::Play { video_id } = &self.target else {
             return None;
@@ -117,7 +179,7 @@ impl Card {
             id: video_id.clone(),
             title: self.title.clone(),
             uploader: artist(&self.subtitle).unwrap_or(UNKNOWN_ARTIST).to_string(),
-            duration: None,
+            duration: self.duration,
             album: None,
             playlist_item_id: None,
         })
@@ -134,6 +196,12 @@ impl Card {
                 Some(album) => format!("{} • {album}", track.uploader),
                 None => track.uploader.clone(),
             },
+            // No JSON to read a thumbnail out of -- these shelves are built from
+            // the play journal, which stores what was played and not what it
+            // looked like. A video's thumbnail is derivable from its id, so a
+            // built card is no poorer than a fetched one.
+            art: Some(cover::thumb_url(&track.id)),
+            duration: track.duration,
             target: Target::Play {
                 video_id: track.id.clone(),
             },
@@ -528,6 +596,7 @@ fn queue(json: &Value) -> Vec<Card> {
 
     rows.into_iter()
         .filter_map(|row| {
+            let video_id = row["videoId"].as_str()?.to_string();
             Some(Card {
                 title: row.pointer("/title/runs").and_then(runs_text)?,
                 // "Artist • Album • Year", already joined for display.
@@ -535,9 +604,14 @@ fn queue(json: &Value) -> Vec<Card> {
                     .pointer("/longBylineText/runs")
                     .and_then(runs_text)
                     .unwrap_or_default(),
-                target: Target::Play {
-                    video_id: row["videoId"].as_str()?.to_string(),
-                },
+                art: art_url(row.pointer("/thumbnail"))
+                    .or_else(|| Some(cover::thumb_url(&video_id))),
+                duration: row
+                    .pointer("/lengthText/runs")
+                    .and_then(runs_text)
+                    .as_deref()
+                    .and_then(parse_duration),
+                target: Target::Play { video_id },
             })
         })
         .collect()
@@ -585,22 +659,63 @@ fn parse_card(item: &Value) -> Option<Card> {
                 .pointer("/subtitle/runs")
                 .and_then(runs_text)
                 .unwrap_or_default(),
+            art: art_url(two_row.pointer("/thumbnailRenderer")),
+            duration: None,
             target: target(&two_row["navigationEndpoint"])?,
         });
     }
 
     let row = &item["musicResponsiveListItemRenderer"];
     if row.is_object() {
+        let video_id = video_id(row)?;
         return Some(Card {
             title: flex_column(row, 0)?,
             subtitle: flex_column(row, 1).unwrap_or_default(),
-            target: Target::Play {
-                video_id: video_id(row)?,
-            },
+            // A list row carries a thumbnail too, but not always: falling back
+            // to the video's own means a "Quick picks" row is never the one
+            // card on the page drawn without a picture.
+            art: art_url(row.pointer("/thumbnail"))
+                .or_else(|| Some(cover::thumb_url(&video_id))),
+            duration: fixed_column(row, 0).as_deref().and_then(parse_duration),
+            target: Target::Play { video_id },
         });
     }
 
     None
+}
+
+/// The artwork URL to fetch out of a thumbnail renderer, taking the smallest
+/// size big enough for the tiles the landing page draws.
+///
+/// Smallest-that-fits rather than largest, and the URL is taken exactly as
+/// YouTube wrote it. Both matter. A card is drawn a few dozen pixels across, so
+/// the 544px copy is a quarter of a megabyte spent to throw 95% of it away --
+/// and rewriting the size suffix to ask for a different one is not the shortcut
+/// it appears to be: Google's image CDN answers an invented size with a 500,
+/// and takes half a minute to do it.
+fn art_url(renderer: Option<&Value>) -> Option<String> {
+    /// Longest edge worth fetching, in image pixels. Comfortably above the
+    /// biggest tile a terminal cell grid can draw -- see [`crate::art::EDGE`].
+    const WANTED: u64 = 256;
+
+    let mut sizes: Vec<(u64, &str)> = renderer?
+        .pointer("/musicThumbnailRenderer/thumbnail/thumbnails")?
+        .as_array()?
+        .iter()
+        .filter_map(|thumb| {
+            let width = thumb["width"].as_u64()?;
+            Some((width, thumb["url"].as_str()?))
+        })
+        .collect();
+
+    sizes.sort_by_key(|(width, _)| *width);
+    // The largest is the fallback rather than the smallest: when every copy is
+    // under `WANTED`, the one closest to it is the one with the most detail.
+    let (_, url) = sizes
+        .iter()
+        .find(|(width, _)| *width >= WANTED)
+        .or_else(|| sizes.last())?;
+    Some((*url).to_string())
 }
 
 /// What a card's endpoint does, if it does either.
@@ -942,6 +1057,8 @@ mod tests {
         Card {
             title: format!("song {id}"),
             subtitle: "Song • Someone".to_string(),
+            art: None,
+            duration: None,
             target: Target::Play {
                 video_id: id.to_string(),
             },
@@ -1010,6 +1127,8 @@ mod tests {
         let album = || Card {
             title: "Currents".to_string(),
             subtitle: "Album • Tame Impala".to_string(),
+            art: None,
+            duration: None,
             target: Target::Open {
                 browse_id: "MPREb_abc".to_string(),
             },

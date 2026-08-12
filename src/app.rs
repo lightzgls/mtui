@@ -5,11 +5,13 @@
 //! [`Player`]. Key handling only mutates state and dispatches messages, so the
 //! event loop never stalls.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::art::ArtCache;
 use crate::config::{self, Tokens};
 use crate::discord::{Activity, Clock, Presence};
 use crate::graphics::Graphics;
@@ -20,7 +22,7 @@ use crate::source::home::{Card, Shelf, Target};
 use crate::source::journal;
 use crate::source::library::Playlist;
 use crate::source::lrclib;
-use crate::source::watch::{Comments, Lyrics, Watch};
+use crate::source::watch::{Comments, Lyrics, QueuePage, Watch};
 use crate::source::worker::{Request, Response, SourceWorker};
 use crate::source::youtube::{MAX_RESULTS, extract_video_id};
 use crate::tray::TrayCommand;
@@ -41,6 +43,52 @@ impl CoverSize {
         match self {
             Self::Side => Self::Full,
             Self::Full => Self::Side,
+        }
+    }
+}
+
+/// How a landing-page card is drawn.
+///
+/// Three shapes rather than one because a terminal is not one size. A cell is
+/// twice as tall as it is wide, so a square picture `n` columns across costs
+/// `n / 2` rows -- which means a card with its sleeve above the title, the way
+/// every music app draws one, is a dozen rows tall before a word is written.
+/// That is the best-looking card and it does not fit on a short window, so it
+/// is what a tall window gets and not what every window is forced into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CardShape {
+    /// Title and subtitle only, no picture. The narrowest and shortest card,
+    /// and the one every terminal can draw.
+    Text,
+    /// A small square sleeve to the left of the text. Costs one row over
+    /// [`Self::Text`] and is what most windows end up showing.
+    Tile,
+    /// The sleeve across the top of the card with the text beneath it, as a
+    /// music app draws it. Wants a tall window -- the renderer only chooses it
+    /// on its own when two shelves of them fit.
+    Poster,
+    /// [`Self::Poster`] with room to breathe: half again the sleeve, and few
+    /// enough across a row that the page reads as a shelf of records rather
+    /// than a grid of thumbnails.
+    ///
+    /// Only ever chosen on a genuinely tall window, because it is the shape
+    /// that costs the most rows -- but `v` pins it anywhere, which is the point
+    /// of the key. A window that cannot give it two shelves gets a poster
+    /// instead, so nothing that fits today is made smaller by this existing.
+    Gallery,
+}
+
+impl CardShape {
+    /// Largest first, which is the order the renderer tries them in.
+    pub const ALL: [Self; 4] = [Self::Gallery, Self::Poster, Self::Tile, Self::Text];
+
+    /// The next shape up, wrapping. What `v` steps through.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Text => Self::Tile,
+            Self::Tile => Self::Poster,
+            Self::Poster => Self::Gallery,
+            Self::Gallery => Self::Text,
         }
     }
 }
@@ -77,9 +125,53 @@ const VOLUME_STEP: f32 = 0.05;
 /// A radio queue is built by YouTube, not by the user, and some of what it
 /// offers cannot be resolved from here at all -- so one dead track must not end
 /// the session. A run of them, though, is a signal that something is wrong with
-/// resolving rather than with the tracks, and silently walking a queue of sixty
-/// looking for one that works is not a thing to do on the user's behalf.
+/// resolving rather than with the tracks, and silently walking the queue looking
+/// for one that works is not a thing to do on the user's behalf.
+///
+/// This matters more now than when the queue was one page. A queue that pages
+/// itself indefinitely has no natural end to stop a broken resolver at, so
+/// without this bound a program that could no longer play anything would walk
+/// forward through stations for as long as it was left running.
 const MAX_AUTO_SKIPS: u8 = 3;
+
+/// Tracks kept behind the one playing when the queue is trimmed.
+///
+/// A radio queue has no end, so it cannot simply be accumulated: a session left
+/// running would grow the heap by a page every hour and a half, which is the
+/// one thing this program is built not to do. What is kept instead is a window
+/// around the playing track -- deep enough behind that `p` still walks back
+/// through an evening's listening, and shallow enough that the queue costs a
+/// few kilobytes however long the session runs.
+const QUEUE_BEHIND: usize = 20;
+
+/// Tracks kept ahead of the one playing. Two pages' worth, so a top-up lands
+/// well before the window needs it and the panel has something to scroll.
+const QUEUE_AHEAD: usize = 50;
+
+/// Tracks remaining ahead at which the next page is asked for.
+///
+/// Not zero, which is the whole point. At zero the user hears silence for a
+/// round trip *plus* a cold resolve -- seconds of it -- where five tracks of
+/// warning means the page lands, and the track after it is prefetched, long
+/// before either is needed. The same argument that puts the prefetch behind the
+/// watch response rather than behind the track ending.
+const QUEUE_LOW: usize = 5;
+
+/// Ids remembered after they leave the window, so a radio that comes back round
+/// to a track does not replay it.
+///
+/// A radio legitimately repeats over hours; an endless queue that loops the
+/// same eight songs is worse than one that ends honestly. Bounded because this
+/// outlives everything else here: at eleven characters an id, this is a couple
+/// of kilobytes.
+const QUEUE_MEMORY: usize = 200;
+
+/// Failed top-ups in a row before the queue stops asking.
+///
+/// One failure is a passing network blip and must not end an endless queue for
+/// the session; a run of them is YouTube declining to page this queue, and
+/// asking again on every track would be a request per song for nothing.
+const MAX_TOPUP_FAILURES: u8 = 3;
 
 /// Which pane owns keyboard input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,9 +284,40 @@ pub struct NowPlaying {
     /// only a clock.
     pub duration: Option<Duration>,
     /// What YouTube calls the queue: "Let It Happen Mix", or the playlist the
-    /// track was started from. Empty until the queue arrives.
+    /// track was started from. Empty until the queue arrives, and rewritten if
+    /// the queue is later carried on into a station built from the journal --
+    /// at which point the old name would be describing different music.
     pub queue_title: String,
+    /// A window onto the queue rather than the whole of it: [`QUEUE_BEHIND`]
+    /// tracks back from the playing one and up to [`QUEUE_AHEAD`] forward. The
+    /// queue itself has no end -- see [`NowPlaying::continuation`] -- so this is
+    /// what keeps a session left running all day from growing the heap.
     pub queue: Vec<Track>,
+    /// Identifies the queue itself, as opposed to the track playing inside it.
+    ///
+    /// A queue outlives the page around it: advancing through a radio replaces
+    /// this whole struct on every track while carrying the same queue across,
+    /// so `video_id` cannot say whether a page of tracks still belongs here.
+    /// This changes only when the queue is genuinely replaced, which is exactly
+    /// when a top-up in flight has become stale. See [`Request::MoreQueue`].
+    queue_epoch: u64,
+    /// What to redeem for the next page of the queue.
+    ///
+    /// `None` in three different cases the queue does not need to tell apart:
+    /// no queue yet, a finite queue that has run out, and a queue that has
+    /// given up paging itself. All three mean the same thing here -- there is
+    /// nothing more to ask for -- and the queue simply ends as it always did.
+    continuation: Option<String>,
+    /// Set while a page is in flight, so the low-water check fires once rather
+    /// than on every track for as long as the round trip takes.
+    topping_up: bool,
+    /// Consecutive failed top-ups. See [`MAX_TOPUP_FAILURES`].
+    topup_failures: u8,
+    /// Ids that have been in this queue and have since left the window.
+    ///
+    /// Oldest first, bounded at [`QUEUE_MEMORY`]. What stops a radio that comes
+    /// back round to a track from queueing it again behind itself.
+    dropped: VecDeque<String>,
     /// Where in `queue` the playing track is. `None` until the queue lands, or
     /// when what is playing is not in it.
     pub playing: Option<usize>,
@@ -240,6 +363,14 @@ impl NowPlaying {
             duration: track.duration,
             queue_title: String::new(),
             queue: Vec::new(),
+            // Replaced along with the queue itself the moment one arrives. Zero
+            // is never minted by `App`, so a page that somehow answered a page
+            // with no queue cannot be applied to it.
+            queue_epoch: 0,
+            continuation: None,
+            topping_up: false,
+            topup_failures: 0,
+            dropped: VecDeque::new(),
             playing: None,
             tab: Tab::UpNext,
             cursor: [0; Tab::ALL.len()],
@@ -322,6 +453,106 @@ impl NowPlaying {
     /// The track the queue would play next, if there is one.
     fn next_in_queue(&self) -> Option<&Track> {
         self.queue.get(self.playing? + 1)
+    }
+
+    /// How many tracks are left ahead of the one playing.
+    ///
+    /// Zero when nothing here is playing inside this queue, rather than the
+    /// whole length: a queue nothing is being consumed from has no low-water
+    /// mark to cross, and reporting its length would top up a queue that is
+    /// standing still.
+    fn remaining(&self) -> usize {
+        match self.playing {
+            Some(playing) => self.queue.len().saturating_sub(playing + 1),
+            None => 0,
+        }
+    }
+
+    /// Drops what has fallen out of the window behind the playing track,
+    /// remembering the ids so the radio cannot offer them back.
+    ///
+    /// Both indices move with the tracks, or they stop meaning anything:
+    /// `playing` is what every advance counts from and the Up-next cursor is
+    /// what the user is looking at. Taking five rows off the front without
+    /// subtracting five from both is a queue that silently jumps.
+    fn trim(&mut self) {
+        let Some(playing) = self.playing else {
+            return;
+        };
+        let Some(excess) = playing.checked_sub(QUEUE_BEHIND) else {
+            return;
+        };
+
+        for track in self.queue.drain(..excess) {
+            if self.dropped.len() >= QUEUE_MEMORY {
+                self.dropped.pop_front();
+            }
+            self.dropped.push_back(track.id);
+        }
+        self.playing = Some(playing - excess);
+        let cursor = &mut self.cursor[Tab::UpNext.index()];
+        *cursor = cursor.saturating_sub(excess);
+    }
+
+    /// Appends a page of tracks, and reports how many were new.
+    ///
+    /// Anything already in the window or recently dropped out of it is
+    /// discarded: a radio repeats over hours, and a queue that grows by
+    /// re-appending what it just played is a loop rather than an endless queue.
+    /// The count is what tells the caller a page of nothing but repeats has
+    /// arrived -- the radio has run out of material, and the queue should stop
+    /// asking rather than spend a round trip per track discovering it again.
+    fn absorb(&mut self, tracks: Vec<Track>) -> usize {
+        let ceiling = self.playing.map_or(QUEUE_AHEAD, |at| at + 1 + QUEUE_AHEAD);
+        let mut added = 0;
+        for track in tracks {
+            if self.queue.len() >= ceiling {
+                break;
+            }
+            if self.queue.iter().any(|held| held.id == track.id)
+                || self.dropped.contains(&track.id)
+            {
+                continue;
+            }
+            self.queue.push(track);
+            added += 1;
+        }
+        added
+    }
+
+    /// Takes a page onto the queue and settles what to do about the next one.
+    ///
+    /// The policy for both kinds of page, held in one place because they only
+    /// differ in where the tracks came from: a page that carried the queue
+    /// forward is trusted to say where the page after it lives, and a page that
+    /// carried it nowhere gives up the token that bought it.
+    ///
+    /// Returns how many tracks were new, which is the only part the caller
+    /// still has a decision to make about.
+    fn take_page(&mut self, page: QueuePage) -> usize {
+        let added = self.absorb(page.tracks);
+        if added == 0 {
+            // Every track was one already held or already played. The station
+            // has run out of material rather than out of pages, so its token
+            // goes: asking again would buy this same page, where letting the
+            // next top-up fall through to the journal builds somewhere new.
+            //
+            // Counted against the same budget as a refusal. Without that, a run
+            // of stations that each turn out to be material already heard would
+            // be a round trip per track, forever.
+            self.continuation = None;
+            self.topup_failures += 1;
+            return 0;
+        }
+
+        self.topup_failures = 0;
+        self.continuation = page.continuation;
+        // A station built by the journal renames the queue; a continuation of
+        // the one already playing leaves the name alone.
+        if let Some(title) = page.title {
+            self.queue_title = title;
+        }
+        added
     }
 
     /// The Related tab flattened into rows.
@@ -487,6 +718,21 @@ pub struct App {
     /// than for the focused one alone so that scrolling a shelf, moving away
     /// and coming back returns to where the user left it.
     pub home_scroll: Vec<usize>,
+    /// Sleeves for the cards on screen. See [`crate::art`] for what is kept and
+    /// for how long.
+    pub art: ArtCache,
+    /// The card shape the user has pinned with `v`, if they have pinned one.
+    ///
+    /// `None` -- the default -- means the renderer picks the largest shape the
+    /// window can hold, which is the right answer often enough that most users
+    /// will never press the key. It is here for the two cases the geometry
+    /// cannot know about: a user who wants more of the feed on screen than the
+    /// pictures allow, and a terminal whose cells are not the two-to-one the
+    /// arithmetic assumes.
+    pub card_shape: Option<CardShape>,
+    /// The shape actually drawn on the last frame, which is what `v` steps on
+    /// from. Written by the renderer; read by nothing else.
+    pub drawn_shape: CardShape,
     /// True between asking for the landing page and hearing back.
     ///
     /// Its own flag rather than [`Self::busy`]: this is set before the first
@@ -538,6 +784,15 @@ pub struct App {
     /// Consecutive tracks the queue has skipped past for failing to resolve.
     /// Reset by anything that plays.
     skips: u8,
+    /// The last queue epoch handed out. Incremented for every queue that
+    /// arrives, so no two queues in one session share one and a page of tracks
+    /// can only ever be applied to the queue that asked for it.
+    queue_epoch: u64,
+    /// Steps the seed the journal builds a station from, so a station that led
+    /// nowhere is not the one built again. Kept here rather than on the queue
+    /// because it outlives any one of them: two queues in a row that both run
+    /// dry should be rescued by two different stations.
+    seed_rotation: usize,
     /// The track being listened to, and the furthest into it playback has got.
     ///
     /// Held here rather than read off the snapshot when it is needed, because by
@@ -626,6 +881,9 @@ impl App {
             home_card: 0,
             home_top: 0,
             home_scroll: Vec::new(),
+            art: ArtCache::default(),
+            card_shape: None,
+            drawn_shape: CardShape::Text,
             home_pending: false,
             browsing: None,
             playlists: Vec::new(),
@@ -644,6 +902,8 @@ impl App {
             auto: false,
             skips: 0,
             listening: None,
+            queue_epoch: 0,
+            seed_rotation: 0,
             rotation: 0,
             imported: false,
             resuming: None,
@@ -795,9 +1055,11 @@ impl App {
         if !matches!(
             response,
             Response::Cover { .. }
+                | Response::Art { .. }
                 | Response::Prefetched { .. }
                 | Response::Resolved { .. }
                 | Response::Watch { .. }
+                | Response::MoreQueue { .. }
                 | Response::Lyrics { .. }
                 | Response::Related { .. }
                 | Response::Comments { .. }
@@ -893,6 +1155,7 @@ impl App {
             }
             Response::Resolved { id, title, stream } => self.apply_resolved(&id, title, stream),
             Response::Watch { video_id, watch } => self.apply_watch(&video_id, *watch),
+            Response::MoreQueue { epoch, page } => self.apply_more_queue(epoch, page),
             Response::Lyrics { video_id, lyrics } => {
                 if let Some(now) = self.for_track(&video_id) {
                     now.lyrics = panel(lyrics);
@@ -923,6 +1186,7 @@ impl App {
                     self.ready = None;
                 }
             }
+            Response::Art { key, art } => self.art.store(key, art),
             Response::Cover { id, art } => {
                 // Stale unless it is still the track we asked about.
                 if self.cover_id.as_deref() == Some(id.as_str()) {
@@ -1122,8 +1386,9 @@ impl App {
 
         // A queue that cannot resolve its next track steps over it rather than
         // falling silent -- YouTube's radio offers plenty that this program
-        // cannot play, and one of them must not end the session. Bounded, so a
-        // queue of sixty is not walked in silence looking for one that works.
+        // cannot play, and one of them must not end the session. Bounded, and
+        // now that the queue pages itself there is no end to reach that would
+        // stop it otherwise: see [`MAX_AUTO_SKIPS`].
         if self.auto && self.skips < MAX_AUTO_SKIPS {
             self.skips += 1;
             // First line only: a failure with instructions in it runs to a
@@ -1170,6 +1435,13 @@ impl App {
     /// track. Playing something from outside the queue does replace it, which
     /// is what makes a search result start a new mix.
     fn apply_watch(&mut self, video_id: &str, watch: Result<Watch, String>) {
+        // Minted before the borrow below, which holds the whole of `self`.
+        // Unconditionally, because a number spent on a response that turns out
+        // to carry no new queue costs nothing: all this has to do is differ
+        // from the epoch of the queue it replaces.
+        self.queue_epoch += 1;
+        let epoch = self.queue_epoch;
+
         let Some(now) = self.for_track(video_id) else {
             return;
         };
@@ -1217,11 +1489,23 @@ impl App {
         }
 
         match now.queue.iter().position(|track| track.id == video_id) {
+            // The queue carried over, so this response describes a queue we are
+            // already inside. Its continuation is deliberately not adopted: the
+            // token already held pages the radio the user has been listening
+            // to, and this one would page a fresh radio seeded on the track
+            // that happens to be playing now.
             Some(index) => now.playing = Some(index),
             None => {
                 now.playing = watch.queue.iter().position(|track| track.id == video_id);
                 now.queue_title = watch.queue_title;
                 now.queue = watch.queue;
+                // A different queue, so everything the old one had learned
+                // about paging itself is about somebody else's radio now.
+                now.queue_epoch = epoch;
+                now.continuation = watch.continuation;
+                now.topping_up = false;
+                now.topup_failures = 0;
+                now.dropped.clear();
                 // Follow the track that is playing rather than leaving the
                 // cursor on whatever row a previous queue had under it.
                 now.cursor[Tab::UpNext.index()] = now.playing.unwrap_or(0);
@@ -1246,6 +1530,128 @@ impl App {
         // one spends seconds of silence between tracks.
         if let Some(next) = now.next_in_queue().map(|track| track.id.clone()) {
             let _ = self.source.send(Request::Prefetch { id: next });
+        }
+
+        // A queue short enough to need topping up the moment it lands -- the
+        // tail of a playlist, or a radio that answered with one page. Asking
+        // here as well as on every play is what covers it: `play_track` runs
+        // before this response and saw a queue that was still empty.
+        self.top_up_queue();
+    }
+
+    /// Asks for the next page of the queue, if one is wanted.
+    ///
+    /// Called on every play and whenever a queue arrives, and cheap to call
+    /// when there is nothing to do -- which is most of the time.
+    ///
+    /// Two ways to answer, tried in that order. YouTube's own continuation is
+    /// always preferred: it is the station the user chose, and it is one round
+    /// trip. Only once that has nothing left does the journal build a new
+    /// station -- which is the difference between a queue that ends when the
+    /// radio does and one that plays for as long as anybody wants it to.
+    fn top_up_queue(&mut self) {
+        let Some(now) = self.now.as_mut() else {
+            return;
+        };
+        // Nothing is playing inside this queue, so nothing is walking towards
+        // its end and a page appended here would be tracks nobody reaches.
+        // `advance` declines to move for the same reason. This covers the
+        // empty queue before the first watch response too, which must not be
+        // seeded from the journal on top of the station already on its way.
+        if now.playing.is_none() {
+            return;
+        }
+        // Still deep enough, already asking, or given up asking.
+        if now.remaining() >= QUEUE_LOW
+            || now.topping_up
+            || now.topup_failures >= MAX_TOPUP_FAILURES
+        {
+            return;
+        }
+
+        let epoch = now.queue_epoch;
+        let request = match now.continuation.clone() {
+            Some(token) => Request::MoreQueue { epoch, token },
+            None => {
+                // Stepped after being read, so the first fallback of a session
+                // is built from the best-scoring seed rather than the second.
+                // Stepped per attempt rather than per queue, so a station that
+                // turns out to be a dead end is not the one built again next
+                // time -- which is why this is kept on `App`, where it outlives
+                // any one queue.
+                let rotation = self.seed_rotation;
+                self.seed_rotation += 1;
+                Request::SeedQueue { epoch, rotation }
+            }
+        };
+
+        // Re-borrowed: minting the rotation above needed `self`, which ended
+        // the borrow this was taken through.
+        if let Some(now) = self.now.as_mut() {
+            now.topping_up = true;
+        }
+        if self.source.send(request).is_err()
+            && let Some(now) = self.now.as_mut()
+        {
+            // Nothing is coming, so the flag would otherwise stand for a
+            // request in flight for the rest of the session and stop the queue
+            // ever asking again.
+            now.topping_up = false;
+        }
+    }
+
+    /// Takes a page of tracks onto the end of the queue it was asked for.
+    ///
+    /// Nothing here reaches the status bar. The user did not ask for this and
+    /// is listening to music; a queue that quietly stops growing ends exactly
+    /// as it did before any of this existed, which is a queue that runs out.
+    fn apply_more_queue(&mut self, epoch: u64, page: Result<QueuePage, String>) {
+        // The queue that asked has since been replaced -- the user played
+        // something from outside it. There is nothing to apply this to, and the
+        // queue that took its place has its own token.
+        let Some(now) = self.now.as_mut().filter(|now| now.queue_epoch == epoch) else {
+            return;
+        };
+        now.topping_up = false;
+
+        let page = match page {
+            Ok(page) => page,
+            Err(_) => {
+                // Whatever was going to be tried is still going to be tried:
+                // a token that failed is kept for the next play, and a journal
+                // that could not build a station will be asked again for a
+                // different one. One failure is a blip. A run of them is
+                // YouTube declining to page this queue, or a journal with
+                // nothing left to seed from, and [`MAX_TOPUP_FAILURES`] is what
+                // stops either becoming a request per track for the session.
+                now.topup_failures += 1;
+                return;
+            }
+        };
+
+        if now.take_page(page) == 0 {
+            return;
+        }
+
+        // The queue may have been down to its last track when this landed, in
+        // which case the track now after it has never been warmed -- and it is
+        // about to be the one playing. Cheap when it was already prefetched:
+        // the worker answers a warm id out of its cache.
+        if let Some(next) = now.next_in_queue().map(|track| track.id.clone()) {
+            let _ = self.source.send(Request::Prefetch { id: next });
+        }
+
+        // The queue ran dry before this page arrived: the last track ended, the
+        // advance found nothing to move to, and the player has been sitting in
+        // silence since. There is something to play now, so it starts -- which
+        // is what makes a queue that ran out mid-session recover on its own
+        // rather than needing the user to press a key.
+        //
+        // A stop is not this case and cannot reach here: it clears the page,
+        // and there is nothing left for a continuation to be applied to. A
+        // paused track is not it either -- `Paused` is its own state.
+        if self.pending.is_none() && self.snapshot().state == PlayState::Idle {
+            self.advance(1, true);
         }
     }
 
@@ -1317,6 +1723,19 @@ impl App {
             page.queue = old.queue;
             page.playing = Some(index);
             page.cursor[Tab::UpNext.index()] = index;
+            // Everything the queue knows about paging itself travels with it,
+            // or the endless queue would end on the first track: the token is
+            // what buys the next page, and the epoch is what proves a page that
+            // arrives two tracks later still belongs here.
+            page.queue_epoch = old.queue_epoch;
+            page.continuation = old.continuation;
+            page.topping_up = old.topping_up;
+            page.topup_failures = old.topup_failures;
+            page.dropped = old.dropped;
+            // Now that the queue has moved forward, whatever has fallen out of
+            // the window behind it can go. This is the only place the queue
+            // grows a position, so it is the only place that has to shrink.
+            page.trim();
         }
         self.now = Some(page);
         self.view = View::Playing;
@@ -1350,6 +1769,11 @@ impl App {
         // A tab the user is already on has to be fetched now; the switch that
         // would otherwise have done it is not going to happen again.
         self.request_tab();
+        // Every play moves the queue forward by one, so every play is a place
+        // the tail can have got short enough to want another page. This is the
+        // one funnel they all pass through, which is why the check lives here
+        // rather than beside the advance that started most of them.
+        self.top_up_queue();
     }
 
     /// Fetches the panel behind the open tab, if it has not been asked for.
@@ -1535,8 +1959,12 @@ impl App {
 
     /// Moves `delta` tracks through the queue and plays what it lands on.
     ///
-    /// Silent at either end: there is nothing before the first track, and the
-    /// end of a radio queue is the end of the session rather than a failure.
+    /// Silent at either end: there is nothing before the first track, and a
+    /// queue with nothing after the last one is not a failure either. Reaching
+    /// that end is now rare rather than routine -- the queue tops itself up
+    /// several tracks before it gets there -- so the two cases left are a queue
+    /// still waiting on a page and one that has genuinely nothing left to
+    /// offer, which say different things and are told apart below.
     ///
     /// `auto` distinguishes the queue advancing itself from `n` and `p`. Only
     /// the former steps over a track that will not resolve -- a user who
@@ -1553,7 +1981,15 @@ impl App {
         };
         let Some(track) = now.queue.get(index).cloned() else {
             if delta > 0 {
-                self.status = "end of the queue".to_string();
+                // A page is on its way, so this is not the end -- only the gap
+                // between running out and hearing back. `apply_more_queue`
+                // starts playing again when it lands, so the user is told to
+                // expect that rather than told the session is over.
+                self.status = if now.topping_up {
+                    "waiting for more of the queue ...".to_string()
+                } else {
+                    "end of the queue".to_string()
+                };
             }
             return;
         };
@@ -1637,6 +2073,21 @@ impl App {
         if !self.imported {
             self.imported = true;
             let _ = self.source.send(Request::ImportCookies { force: false });
+        }
+    }
+
+    /// Asks for the artwork of the cards the renderer has just drawn.
+    ///
+    /// Driven from the render pass rather than from the feed arriving, because
+    /// "which cards are on screen" is a fact about the window and the scroll
+    /// position, and both are things only the renderer knows. The cache filters
+    /// out everything already held or already asked for, so this is a no-op on
+    /// all but the first frame after the view moves.
+    pub fn want_art(&mut self, cards: Vec<(String, String)>) {
+        for (key, url) in cards {
+            if self.art.want(&key) {
+                let _ = self.source.send(Request::Art { key, url });
+            }
         }
     }
 
@@ -1951,6 +2402,18 @@ impl App {
             KeyCode::Char('P') | KeyCode::Char('p') => self.open_player(),
             KeyCode::Char('B') => self.background(),
             KeyCode::Char('D') => self.toggle_presence(),
+            // Steps the cards through their four shapes. Starts from whatever
+            // the window chose for itself, so the first press is a change the
+            // user can see rather than one that lands on the shape already up.
+            //
+            // This is also the only way to reach the roomiest shape on a window
+            // that is not tall enough to be given it: the renderer will not
+            // spend a whole screen on one shelf unasked, but a user who presses
+            // the key has asked.
+            KeyCode::Char('v') => {
+                let shape = self.card_shape.unwrap_or(self.drawn_shape).next();
+                self.card_shape = Some(shape);
+            }
             // Back to whatever the track list was showing, when there is one.
             KeyCode::Esc if !self.results.is_empty() => self.view = View::Tracks,
             KeyCode::Char('c') => self.cover_size = self.cover_size.toggled(),
@@ -2728,5 +3191,255 @@ mod tests {
             20,
             "the lyrics cursor is where it was left"
         );
+    }
+
+    /// One numbered track, so a queue and the pages appended to it can be
+    /// built out of ids that never accidentally collide.
+    fn numbered(i: usize) -> Track {
+        Track {
+            id: i.to_string(),
+            title: format!("track {i}"),
+            uploader: "Tame Impala".to_string(),
+            duration: Some(Duration::from_secs(180)),
+            album: None,
+            playlist_item_id: None,
+        }
+    }
+
+    /// A queue of `count` tracks, ids "0", "1", ...
+    fn queued(count: usize) -> Vec<Track> {
+        (0..count).map(numbered).collect()
+    }
+
+    #[test]
+    fn a_page_of_tracks_lands_on_the_end_of_the_queue() {
+        let mut now = playing();
+        now.queue = queued(3);
+        now.playing = Some(0);
+
+        assert_eq!(now.remaining(), 2);
+        assert_eq!(now.absorb(queued(6).split_off(3)), 3);
+        assert_eq!(now.queue.len(), 6);
+        assert_eq!(now.remaining(), 5, "the new tracks are ahead of the playing one");
+        assert_eq!(now.playing, Some(0), "appending must not move the cursor");
+    }
+
+    /// A radio repeats over hours. An endless queue that re-appends what it just
+    /// played is a loop, which is worse than a queue that ends honestly.
+    #[test]
+    fn a_page_of_tracks_already_held_is_not_appended_twice() {
+        let mut now = playing();
+        now.queue = queued(3);
+        now.playing = Some(0);
+
+        assert_eq!(now.absorb(queued(3)), 0, "every track was already held");
+        assert_eq!(now.queue.len(), 3);
+
+        // Half repeats, half new: only the new half lands.
+        let mut page = queued(5);
+        page.drain(..2);
+        assert_eq!(now.absorb(page), 2);
+        assert_eq!(now.queue.len(), 5);
+    }
+
+    /// The window is what keeps an endless queue from being an endless `Vec`.
+    /// Both indices have to move with it, or the queue silently jumps.
+    #[test]
+    fn the_queue_trims_behind_the_playing_track() {
+        let mut now = playing();
+        now.queue = queued(QUEUE_BEHIND + 10);
+        now.playing = Some(QUEUE_BEHIND + 5);
+        now.cursor[Tab::UpNext.index()] = QUEUE_BEHIND + 5;
+
+        now.trim();
+
+        assert_eq!(now.queue.len(), QUEUE_BEHIND + 5);
+        assert_eq!(now.playing, Some(QUEUE_BEHIND));
+        assert_eq!(now.cursor[Tab::UpNext.index()], QUEUE_BEHIND);
+        assert_eq!(
+            now.queue[QUEUE_BEHIND].id, "25",
+            "the playing track is still the one under the index"
+        );
+        assert_eq!(now.remaining(), 4, "and what was ahead is untouched");
+    }
+
+    /// Trimming is what makes a track eligible to be offered again, so what
+    /// leaves the window has to be remembered or the radio simply re-queues it.
+    #[test]
+    fn a_track_trimmed_away_is_not_offered_back() {
+        let mut now = playing();
+        now.queue = queued(QUEUE_BEHIND + 2);
+        now.playing = Some(QUEUE_BEHIND + 1);
+        now.trim();
+
+        assert!(now.dropped.contains(&"0".to_string()));
+        assert_eq!(now.absorb(queued(1)), 0, "track 0 has already been played");
+        assert_eq!(now.queue.len(), QUEUE_BEHIND + 1);
+    }
+
+    #[test]
+    fn a_short_queue_is_left_alone_by_the_trim() {
+        let mut now = playing();
+        now.queue = queued(5);
+        now.playing = Some(4);
+        now.cursor[Tab::UpNext.index()] = 4;
+
+        now.trim();
+
+        assert_eq!(now.queue.len(), 5, "nothing has fallen out of the window yet");
+        assert_eq!(now.playing, Some(4));
+        assert!(now.dropped.is_empty());
+    }
+
+    /// The whole claim of an endless queue: it can be played through for as
+    /// long as anyone likes without growing. Walked here the way a session
+    /// walks it -- top up when the tail runs low, advance one, trim behind --
+    /// for far more tracks than either bound holds.
+    #[test]
+    fn playing_through_an_endless_queue_does_not_grow_it() {
+        let mut now = playing();
+        now.queue = queued(1);
+        now.playing = Some(0);
+
+        let mut next = 1;
+        for _ in 0..(QUEUE_MEMORY * 4) {
+            if now.remaining() < QUEUE_LOW {
+                // A page, as a continuation delivers one.
+                let page: Vec<Track> = (next..next + 25).map(numbered).collect();
+                next += 25;
+                assert!(now.absorb(page) > 0, "a page of new tracks must land");
+            }
+            now.playing = Some(now.playing.unwrap() + 1);
+            now.trim();
+        }
+
+        assert!(
+            now.dropped.len() <= QUEUE_MEMORY,
+            "remembered {} ids, over the {QUEUE_MEMORY} bound",
+            now.dropped.len()
+        );
+        assert!(
+            now.queue.len() <= QUEUE_BEHIND + 1 + QUEUE_AHEAD,
+            "held {} tracks, wider than the window",
+            now.queue.len()
+        );
+        assert_eq!(
+            now.playing,
+            Some(QUEUE_BEHIND),
+            "the window settles with the playing track a fixed way into it"
+        );
+    }
+
+    /// Nothing playing inside the queue is not the same as a queue with plenty
+    /// left: reporting its length would top up a queue standing still.
+    #[test]
+    fn a_queue_nothing_is_playing_in_has_nothing_remaining() {
+        let mut now = playing();
+        now.queue = queued(30);
+        now.playing = None;
+
+        assert_eq!(now.remaining(), 0);
+    }
+
+    /// A continuation that carried the queue forward is trusted about where the
+    /// next page lives, and leaves the station's name alone.
+    #[test]
+    fn a_page_that_carried_the_queue_forward_is_paged_again() {
+        let mut now = playing();
+        now.queue = queued(3);
+        now.playing = Some(0);
+        now.queue_title = "Let It Happen Mix".to_string();
+        now.continuation = Some("FIRST".to_string());
+        now.topup_failures = 2;
+
+        let added = now.take_page(QueuePage {
+            tracks: queued(8).split_off(3),
+            continuation: Some("SECOND".to_string()),
+            title: None,
+        });
+
+        assert_eq!(added, 5);
+        assert_eq!(now.continuation.as_deref(), Some("SECOND"));
+        assert_eq!(
+            now.topup_failures, 0,
+            "a page that worked clears what earlier failures had counted up"
+        );
+        assert_eq!(
+            now.queue_title, "Let It Happen Mix",
+            "more of the same station must not rename it"
+        );
+    }
+
+    /// A page whose every track is already held teaches the queue nothing, and
+    /// the token that bought it will buy the same page again. Giving it up is
+    /// what lets the next top-up fall through to the journal instead of
+    /// spending a round trip per track re-learning the same thing.
+    #[test]
+    fn a_page_of_nothing_new_gives_up_the_token() {
+        let mut now = playing();
+        now.queue = queued(3);
+        now.playing = Some(0);
+        now.continuation = Some("TOKEN".to_string());
+
+        let added = now.take_page(QueuePage {
+            tracks: queued(3),
+            continuation: Some("WOULD_BUY_THE_SAME_AGAIN".to_string()),
+            title: None,
+        });
+
+        assert_eq!(added, 0);
+        assert_eq!(now.queue.len(), 3, "nothing was appended");
+        assert!(
+            now.continuation.is_none(),
+            "the offered token would buy this same page again"
+        );
+        assert_eq!(
+            now.topup_failures, 1,
+            "a station repeating itself has to count against the budget too"
+        );
+    }
+
+    /// The handover to the journal: a station built locally is a different
+    /// station, and the panel has to say so rather than keep the old name over
+    /// entirely different music.
+    #[test]
+    fn a_seeded_station_renames_the_queue_and_is_paged_from_there() {
+        let mut now = playing();
+        now.queue = queued(2);
+        now.playing = Some(1);
+        now.queue_title = "Let It Happen Mix".to_string();
+        // Tier one has already given up: this is the fallback landing.
+        now.continuation = None;
+        now.topup_failures = 1;
+
+        let added = now.take_page(QueuePage {
+            tracks: queued(20).split_off(2),
+            continuation: Some("STATION_PAGE_TWO".to_string()),
+            title: Some("Station from Currents".to_string()),
+        });
+
+        assert_eq!(added, 18);
+        assert_eq!(now.queue_title, "Station from Currents");
+        assert_eq!(
+            now.continuation.as_deref(),
+            Some("STATION_PAGE_TWO"),
+            "the new station is YouTube's to page from here on"
+        );
+        assert_eq!(now.topup_failures, 0);
+    }
+
+    /// The window has a ceiling as well as a floor. A page that would overshoot
+    /// it is taken as far as it fits, and the rest is bought again later.
+    #[test]
+    fn the_queue_does_not_grow_past_the_window() {
+        let mut now = playing();
+        now.queue = queued(2);
+        now.playing = Some(0);
+
+        let page: Vec<Track> = queued(QUEUE_AHEAD + 20).split_off(2);
+        now.absorb(page);
+
+        assert_eq!(now.queue.len(), QUEUE_AHEAD + 1);
+        assert_eq!(now.remaining(), QUEUE_AHEAD);
     }
 }
