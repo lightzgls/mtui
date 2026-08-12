@@ -708,7 +708,11 @@ mod tests {
             for x in 0..w {
                 // Two pixels of vivid yellow against a field of teal.
                 let fleck = y == 0 && x < 2;
-                rgb.extend_from_slice(if fleck { &[255, 255, 0] } else { &[20, 140, 140] });
+                rgb.extend_from_slice(if fleck {
+                    &[255, 255, 0]
+                } else {
+                    &[20, 140, 140]
+                });
             }
         }
         let (r, g, b) = accent_of(&rgb);

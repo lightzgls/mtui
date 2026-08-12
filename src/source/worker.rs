@@ -44,10 +44,11 @@ use super::home::{self, Shelf};
 use super::innertube::InnerTube;
 use super::journal::{Journal, Play};
 use super::library::{self, Library, Playlist};
-use super::{StreamUrl, Track, UrlCache};
+use super::{StreamUrl, Track};
 use super::{browser, lrclib, sapisid, stats, watch};
 use crate::config::{Cookies, Credentials, Import, Tokens};
 use crate::source::youtube::YouTube;
+use mtui_resolver::{PlaybackSession, ResolveRequest, Resolver};
 
 /// Ceiling on how much of a playlist is loaded.
 ///
@@ -79,8 +80,8 @@ pub enum Request {
         /// back exactly what is being recovered from.
         bypass_cache: bool,
     },
-    /// Resolve into the cache before the user has committed to anything, so the
-    /// Enter that follows costs a channel round trip instead of a process spawn.
+    /// Resolve through the fast player API before the user has committed to
+    /// anything, so Enter can use a warm URL without speculative yt-dlp work.
     Prefetch {
         id: String,
     },
@@ -582,9 +583,16 @@ impl Drop for SourceWorker {
 /// run is worth doing, and a speculative prefetch queued in front of one is
 /// worth nothing at all.
 fn run(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>, asked: &AtomicU64) {
-    // Owned outright by this thread, so it needs no lock: every resolve in the
-    // program funnels through here.
-    let mut cache = UrlCache::new();
+    // Owned outright by this thread, so its bounded cache and pooled playback
+    // client need no locks. Search keeps the older shared client below because
+    // it also serves the home and queue parsers.
+    let mut resolver = match Resolver::new(yt.bin()) {
+        Ok(resolver) => resolver,
+        Err(error) => {
+            let _ = tx.send(Response::Failed(error.to_string()));
+            return;
+        }
+    };
     // Resolves taken off the queue. Behind `asked` exactly when the queue holds
     // one the user asked for more recently than the one in hand.
     let mut taken = 0u64;
@@ -604,6 +612,7 @@ fn run(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>, asked: &AtomicU
                 title,
                 bypass_cache,
             } => {
+                resolver.set_session(playback_session());
                 taken += 1;
                 // A newer play is already queued behind this one, so nobody is
                 // waiting on it any more. Spending seconds of yt-dlp on it
@@ -614,18 +623,23 @@ fn run(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>, asked: &AtomicU
                 if taken < asked.load(Ordering::SeqCst) {
                     continue;
                 }
-                let stream = resolve(&yt, tube.as_ref(), &mut cache, &id, bypass_cache)
-                    .map_err(|e| format!("{e:#}"));
+                let stream = resolver
+                    .resolve(ResolveRequest {
+                        video_id: &id,
+                        bypass_cache,
+                    })
+                    .map_err(|error| error.to_string());
                 Response::Resolved { id, title, stream }
             }
             Request::Prefetch { id } => {
+                resolver.set_session(playback_session());
                 // Nothing speculative may run in front of a play. The cache is
                 // still worth consulting -- it is a scan of 32 entries -- so an
                 // already-warm track is still reported as warm.
                 let ready = if taken < asked.load(Ordering::SeqCst) {
-                    cache.get(&id).is_some()
+                    resolver.is_cached(&id)
                 } else {
-                    resolve(&yt, tube.as_ref(), &mut cache, &id, false).is_ok()
+                    resolver.prefetch_fast(&id)
                 };
                 Response::Prefetched { id, ready }
             }
@@ -665,43 +679,13 @@ fn search(yt: &YouTube, tube: Option<&InnerTube>, query: &str, limit: usize) -> 
     }
 }
 
-/// Resolves `id` by the cheapest route that works, filling the cache.
-///
-/// The cache (free) in front of [`super::resolve_stream`], which is the rest of
-/// the cascade. A hit is what keeps a replay -- or a play the user was
-/// prefetched into -- from paying anything at all.
-///
-/// Two things here are not the cascade's business. A capped URL is never
-/// cached: it is returned and played, because a first minute beats nothing, but
-/// recovering from it depends on being able to ask for a *different* URL next
-/// time and a cache hit would hand back this one.
-///
-/// And `bypass_cache` is set when the player is recovering a track whose stream
-/// died, where the cached URL is precisely the one that just failed. Answering
-/// with it again is how a track that broke once stayed broken for the six hours
-/// until its signature lapsed.
-fn resolve(
-    yt: &YouTube,
-    tube: Option<&InnerTube>,
-    cache: &mut UrlCache,
-    id: &str,
-    bypass_cache: bool,
-) -> Result<StreamUrl> {
-    if bypass_cache {
-        cache.invalidate(id);
-    } else if let Some(hit) = cache.get(id) {
-        return Ok(hit);
-    }
-
-    // The same cascade either way, cap check included. Skipping the check to
-    // answer a recovery faster was tried and is wrong: the capped URL is what
-    // is being recovered *from*, and a cascade that does not check hands back
-    // another one just like it.
-    let (stream, whole) = super::resolve_stream(yt, tube, id)?;
-    if whole {
-        cache.insert(id.to_string(), stream.clone());
-    }
-    Ok(stream)
+/// The account session available to playback right now. Read immediately before
+/// resolving so a browser import, manual cookie change, or stale-session removal
+/// takes effect without copying credentials into worker requests.
+fn playback_session() -> Option<PlaybackSession> {
+    Cookies::available().ok().flatten().map(|cookies| {
+        PlaybackSession::new(cookies.header().to_string(), cookies.sapisid().to_string())
+    })
 }
 
 /// Runs the Google device flow to completion on a thread of its own.
@@ -830,7 +814,7 @@ fn handle_library(
             // worth telling them about, but not at the price of the landing
             // page, which loads perfectly well without one. The request queued
             // right behind this one is the one that reports it.
-            let cookies = Cookies::load().ok().flatten();
+            let cookies = Cookies::available().ok().flatten();
             Response::Home(home::fetch(library.http(), cookies.as_ref())?)
         }
         Request::PersonalShelves { rotation } => {
@@ -838,13 +822,17 @@ fn handle_library(
             // this runs the landing page is already on screen, so the message
             // lands in the status bar next to a working program rather than
             // instead of one.
-            let cookies = Cookies::load()?;
+            let cookies = Cookies::available()?;
             // With a cookie the feed already carries the real shelves, built by
             // YouTube from listening history -- including, once reporting has
-            // been running, the plays that happened here. Nothing local can
-            // improve on that, so nothing local is built.
+            // been running, the plays that happened here. The community shelf
+            // is still useful: it turns MTUI's own current listening into public
+            // playlists rather than duplicating YouTube's song shelves.
+            let community = home::community_playlists(library.http(), journal, rotation);
             if cookies.is_some() {
-                return Ok(Some(Response::PersonalShelves(Vec::new())));
+                return Ok(Some(Response::PersonalShelves(
+                    community.into_iter().collect(),
+                )));
             }
             // Signed out the like list is simply empty, which the shelf builder
             // handles: with a journal behind it there is still a page to build,
@@ -854,12 +842,13 @@ fn handle_library(
             } else {
                 Vec::new()
             };
-            Response::PersonalShelves(home::personal(
-                library.http(),
-                &likes,
-                journal,
-                rotation,
-            ))
+            let mut shelves = home::personal(library.http(), &likes, journal, rotation);
+            if let Some(community) = community {
+                // The UI applies the final cross-feed section order after this
+                // local shelf is merged with YouTube's own shelves.
+                shelves.insert(2.min(shelves.len()), community);
+            }
+            Response::PersonalShelves(shelves)
         }
         Request::ImportCookies { force } => {
             // Nothing to do when a session is already in hand. `force` is what

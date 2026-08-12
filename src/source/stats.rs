@@ -73,12 +73,7 @@ const CPN_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 ///
 /// Two round trips on top of the play itself, which is why this is called from
 /// the worker after the fact rather than anywhere near the audio path.
-pub fn report(
-    http: &Http,
-    cookies: &Cookies,
-    video_id: &str,
-    listened: Duration,
-) -> Result<()> {
+pub fn report(http: &Http, cookies: &Cookies, video_id: &str, listened: Duration) -> Result<()> {
     if listened < MIN_REPORTABLE {
         return Ok(());
     }
@@ -157,9 +152,10 @@ fn tracking_urls(http: &Http, cookies: &Cookies, video_id: &str, cpn: &str) -> R
     // Absent rather than malformed is the ordinary failure here: it is what a
     // cookie YouTube no longer honours looks like, since an anonymous player
     // response carries no tracking to report against.
-    let (Some(playback), Some(watchtime)) =
-        (base("videostatsPlaybackUrl"), base("videostatsWatchtimeUrl"))
-    else {
+    let (Some(playback), Some(watchtime)) = (
+        base("videostatsPlaybackUrl"),
+        base("videostatsWatchtimeUrl"),
+    ) else {
         bail!("{STALE} -- the player response carried no playback tracking");
     };
 
@@ -183,9 +179,8 @@ fn ping(
     // The base URL already carries its own query string -- `docid`, `ei` and a
     // signature among them -- so ours is appended to it rather than started.
     let separator = if base.contains('?') { '&' } else { '?' };
-    let mut url = format!(
-        "{base}{separator}ver={TRACKING_VERSION}&cpn={cpn}&cver={MUSIC_CLIENT_VERSION}"
-    );
+    let mut url =
+        format!("{base}{separator}ver={TRACKING_VERSION}&cpn={cpn}&cver={MUSIC_CLIENT_VERSION}");
 
     if let Some(listened) = listened {
         let secs = listened.as_secs();

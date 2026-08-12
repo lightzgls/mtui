@@ -117,11 +117,16 @@ fn find_rc() -> Option<PathBuf> {
         .iter()
         .filter_map(env::var_os)
         .flat_map(|root| {
-            std::fs::read_dir(PathBuf::from(root).join("Windows Kits").join("10").join("bin"))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|entry| entry.path())
+            std::fs::read_dir(
+                PathBuf::from(root)
+                    .join("Windows Kits")
+                    .join("10")
+                    .join("bin"),
+            )
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
         })
         .collect();
     versions.sort();

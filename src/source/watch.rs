@@ -26,6 +26,7 @@
 //! them, so they come from youtube.com proper, as its web client asks for them
 //! -- one call for a continuation token and a second to redeem it.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -327,11 +328,10 @@ pub fn seeded_page(http: &Http, journal: &Journal, rotation: usize) -> Result<Qu
     // had on all morning returns that morning's songs, which is the one way a
     // station like this reliably looks broken -- the same reason the landing
     // page holds its radios off what it has recently played.
-    let recent = taste.recent();
     let Some(seed) = taste
-        .seeds(SEED_CANDIDATES, rotation)
+        .seeds(SEED_CANDIDATES, rotation, &HashSet::new())
         .into_iter()
-        .find(|ranked| !recent.contains(&ranked.track.id))
+        .next()
         .map(|ranked| ranked.track.clone())
     else {
         bail!("everything worth building a station from has just been played");
@@ -363,9 +363,7 @@ pub fn seeded_page(http: &Http, journal: &Journal, rotation: usize) -> Result<Qu
         // A different station, so it says so. Falls back to naming the seed
         // when YouTube did not name it, which is still the truth about where
         // these tracks came from.
-        title: Some(
-            queue_title(&json).unwrap_or_else(|| format!("Station from {}", seed.label())),
-        ),
+        title: Some(queue_title(&json).unwrap_or_else(|| format!("Station from {}", seed.label()))),
     })
 }
 
@@ -625,7 +623,11 @@ fn parse_queue_row(row: &Value) -> Option<Track> {
     Some(Track {
         id: row["videoId"].as_str()?.to_string(),
         title: row.pointer("/title/runs").and_then(home::runs_text)?,
-        uploader: fields.first().copied().unwrap_or(UNKNOWN_ARTIST).to_string(),
+        uploader: fields
+            .first()
+            .copied()
+            .unwrap_or(UNKNOWN_ARTIST)
+            .to_string(),
         // The queue states a length of its own; there is nothing to fall back
         // to here, and a row without one is a livestream.
         duration: row
@@ -890,9 +892,7 @@ mod tests {
     /// able to ask for more -- that is the whole of the endless queue.
     #[test]
     fn reads_the_queue_token_in_every_spelling() {
-        let panel = |continuations: Value| {
-            serde_json::json!({ "playlistPanelRenderer": { "continuations": continuations } })
-        };
+        let panel = |continuations: Value| serde_json::json!({ "playlistPanelRenderer": { "continuations": continuations } });
 
         let radio = panel(serde_json::json!([
             { "nextRadioContinuationData": { "continuation": "RADIO_TOKEN" } }
@@ -1259,7 +1259,11 @@ mod tests {
         let watch = fetch(&http, &id).unwrap_or_else(|why| {
             panic!("no queue came back for {id}: {why:#}\nif this network forces Restricted Mode, try MTUI_VIDEO_ID with an unflagged track")
         });
-        println!("queue: {} ({} tracks)", watch.queue_title, watch.queue.len());
+        println!(
+            "queue: {} ({} tracks)",
+            watch.queue_title,
+            watch.queue.len()
+        );
         for track in watch.queue.iter().take(5) {
             println!("  {:<40.38} {:>8}", track.label(), track.duration_str());
         }
@@ -1365,4 +1369,3 @@ mod tests {
         }
     }
 }
-

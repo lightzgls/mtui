@@ -26,13 +26,13 @@ use stream_download::{Settings, StreamDownload};
 
 use super::chunked::{ChunkedClient, StreamLink};
 
-/// Ring buffer size. At itag 140's ~130 kbps this is roughly 30 seconds of
-/// audio -- ample to ride out network jitter, small enough to stay negligible
-/// against our total budget.
+/// Ring buffer size. At high-quality itag 141's ~256 kbps this is roughly 32
+/// seconds of audio, preserving the recovery cushion the old 512 KiB buffer had
+/// at itag 140 while still keeping memory bounded and small.
 ///
 /// Raising this trades RAM for jitter tolerance one-for-one; it is the single
 /// biggest tunable in the whole program.
-pub const BUFFER_BYTES: usize = 512 * 1024;
+pub const BUFFER_BYTES: usize = 1024 * 1024;
 
 /// How much must arrive before the decoder is handed the stream.
 ///
@@ -112,8 +112,9 @@ pub async fn open(url: &str) -> Result<(AudioStream, StreamLink)> {
 
 /// Hands an open stream to symphonia.
 ///
-/// `Decoder::new_mp4` rather than the probing `Decoder::new`: we always request
-/// itag 140, so format sniffing would only waste a seek and a read.
+/// `Decoder::new_mp4` rather than the probing `Decoder::new`: every selected
+/// quality is AAC in an MP4/M4A container, so probing would only waste a seek
+/// and a read.
 ///
 /// It also leaves rodio's `is_seekable` at `false`, and that has to stay false
 /// however much the decoder would like to seek, because the two costs of
@@ -275,7 +276,11 @@ mod tests {
         // A second to compare against, and half a second more to compare
         // against wrongly.
         let played: Vec<_> = decoder.by_ref().take(per_second + shift).collect();
-        assert_eq!(played.len(), per_second + shift, "the played stream ran short");
+        assert_eq!(
+            played.len(),
+            per_second + shift,
+            "the played stream ran short"
+        );
 
         // Mean absolute difference against the window's own mean level, so the
         // verdict does not depend on how loud this passage happens to be.
@@ -377,10 +382,7 @@ mod tests {
                         match crate::source::resolve_stream(&yt, tube.as_ref(), &id) {
                             Ok((fresh, _whole)) => {
                                 refreshes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                println!(
-                                    "--- fresh URL in {:.2}s",
-                                    at.elapsed().as_secs_f64()
-                                );
+                                println!("--- fresh URL in {:.2}s", at.elapsed().as_secs_f64());
                                 link.supply_url(&fresh.url);
                             }
                             Err(e) => {
@@ -395,8 +397,7 @@ mod tests {
         });
 
         let mut decoder = super::decoder(stream).expect("decoder failed");
-        let per_second =
-            decoder.sample_rate().get() as u64 * decoder.channels().get() as u64;
+        let per_second = decoder.sample_rate().get() as u64 * decoder.channels().get() as u64;
         // What the player itself compares against to tell a track that ended
         // from a stream that died, so the verdict here is the one it would give.
         let total = decoder.total_duration();
@@ -492,7 +493,10 @@ mod tests {
             let at_resolve = Instant::now();
             let tube = crate::source::innertube::InnerTube::new().expect("client should build");
             let resolved = tube.resolve("dQw4w9WgXcQ").expect("resolve failed");
-            println!("resolve (InnerTube)   : {:.2}s", at_resolve.elapsed().as_secs_f64());
+            println!(
+                "resolve (InnerTube)   : {:.2}s",
+                at_resolve.elapsed().as_secs_f64()
+            );
             resolved.url
         });
 
@@ -512,7 +516,10 @@ mod tests {
 
         let at_decoder = Instant::now();
         let mut decoder = super::decoder(stream).expect("decoder failed");
-        println!("Decoder::new_mp4      : {:.2}s", at_decoder.elapsed().as_secs_f64());
+        println!(
+            "Decoder::new_mp4      : {:.2}s",
+            at_decoder.elapsed().as_secs_f64()
+        );
 
         let at_first = Instant::now();
         let first = decoder.next();
@@ -531,6 +538,9 @@ mod tests {
             "1s of audio ({got}/{wanted}): {:.2}s",
             at_second.elapsed().as_secs_f64()
         );
-        println!("TOTAL to first sound  : {:.2}s", start.elapsed().as_secs_f64());
+        println!(
+            "TOTAL to first sound  : {:.2}s",
+            start.elapsed().as_secs_f64()
+        );
     }
 }

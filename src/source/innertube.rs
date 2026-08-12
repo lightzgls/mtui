@@ -7,8 +7,8 @@
 //! challenge. Measured end to end at ~4.2 s.
 //!
 //! Asking YouTube's own client API the same question takes ~0.2 s, because it
-//! is one HTTPS POST on a pooled connection. The clients in [`CLIENTS`] are
-//! chosen because they are served plain `url` fields rather than
+//! is one HTTPS POST on a pooled connection. The resolver's client identities
+//! are chosen because they are served plain `url` fields rather than
 //! `signatureCipher`, so nothing has to be deciphered and no JS runtime is
 //! involved.
 //!
@@ -22,29 +22,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::youtube::parse_expiry;
-use super::{StreamUrl, Track};
-
-/// itag 140 -- AAC-LC in MP4, the same format the yt-dlp path requests.
-const AUDIO_ITAG: u32 = 140;
+#[cfg(test)]
+use super::StreamUrl;
+use super::Track;
 
 /// Kept short on purpose. This is a speculative fast path; if it is not clearly
 /// winning, the fallback is right there and will do the job properly.
 const TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The player API, asked on YouTube Music's host rather than YouTube's own.
-///
-/// It is the same endpoint either way: the host is a front end, and the client
-/// identity in the request body is what decides the answer. What differs is
-/// what a network can do to it. Restricted Mode is enforced by pointing
-/// `www.youtube.com` at `restrict.youtube.com`, and that front end refuses
-/// anything flagged as mature with `This video is restricted` -- for a music
-/// player, the odd explicit track, on a machine where everything else works.
-/// `music.youtube.com` carries no such mapping. Measured on a network that
-/// applies it: a track `www` answered `ERROR` for resolved here with an
-/// ordinary itag 140 URL, and an unrestricted video answered identically on
-/// both.
-const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player";
 
 /// YouTube *Music*'s search, which is a different corpus to YouTube's.
 ///
@@ -64,84 +48,6 @@ const SONGS_FILTER: &str = "EgWKAQIIAWoKEAoQCRADEAQQBQ%3D%3D";
 /// getting refused for reasons the other cannot reproduce.
 pub(super) const MUSIC_CLIENT_NAME: &str = "WEB_REMIX";
 pub(super) const MUSIC_CLIENT_VERSION: &str = "1.20241127.01.00";
-
-/// A player client identity. These values travel together -- mismatching a
-/// name, version and user agent is how a request starts getting refused.
-struct PlayerClient {
-    name: &'static str,
-    version: &'static str,
-    user_agent: &'static str,
-    device_model: Option<&'static str>,
-    android_sdk: Option<u32>,
-}
-
-/// Clients to try, in order, before giving up and letting yt-dlp answer.
-///
-/// Order is not arbitrary and is worth keeping measured. YouTube Music serves
-/// most songs as "art track" uploads, and those are refused with
-/// `LOGIN_REQUIRED` by every client tried except `IOS` -- which also handles
-/// ordinary videos, so it goes first. Since our search returns exactly those
-/// art tracks, getting this wrong sends every single play down the slow path
-/// without anything appearing to be broken.
-const CLIENTS: &[PlayerClient] = &[
-    PlayerClient {
-        name: "IOS",
-        version: "20.10.4",
-        user_agent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
-        device_model: Some("iPhone16,2"),
-        android_sdk: None,
-    },
-    // A cheap second try: it cannot play art tracks, but it costs one round
-    // trip and is a different code path at YouTube's end if IOS starts being
-    // refused.
-    PlayerClient {
-        name: "ANDROID_VR",
-        version: "1.62.27",
-        user_agent: "com.google.android.apps.youtube.vr.oculus/1.62.27 \
-                     (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-        device_model: None,
-        android_sdk: Some(32),
-    },
-];
-
-/// Fields consumed from the player response. YouTube returns far more; serde
-/// drops the rest rather than allocating it.
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PlayerResponse {
-    #[serde(default)]
-    playability_status: PlayabilityStatus,
-    #[serde(default)]
-    streaming_data: StreamingData,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct PlayabilityStatus {
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    reason: Option<String>,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct StreamingData {
-    #[serde(default)]
-    adaptive_formats: Vec<Format>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Format {
-    itag: u32,
-    /// Absent when YouTube ciphered the URL instead. Such a format is unusable
-    /// here by definition -- deciphering is the expensive thing being avoided.
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    mime_type: Option<String>,
-}
 
 pub struct InnerTube {
     client: reqwest::Client,
@@ -164,99 +70,13 @@ impl InnerTube {
         Ok(Self { client, runtime })
     }
 
-    /// Whether googlevideo will serve all of `url`. See
-    /// [`super::serves_whole_file`], which this lends its client and runtime.
-    ///
-    /// Lent rather than duplicated so the probe rides the pooled connection and
-    /// warm TLS session this already holds -- the check costs a few tens of
-    /// milliseconds that way, and a fresh client would cost a handshake. The
-    /// probe applies to any googlevideo URL, whichever tier produced it.
-    pub fn serves_whole_file(&self, url: &str) -> bool {
-        super::serves_whole_file(&self.runtime, &self.client, url)
-    }
-
     /// Resolves a video id to a directly streamable audio URL.
     ///
     /// Errors are ordinary here rather than exceptional: callers are expected
     /// to fall back to yt-dlp, not to report this to the user.
+    #[cfg(test)]
     pub fn resolve(&self, video_id: &str) -> Result<StreamUrl> {
-        let mut last = None;
-        for client in CLIENTS {
-            match self.resolve_with(client, video_id) {
-                Ok(stream) => return Ok(stream),
-                // Keep going: a refusal from one client says nothing about the
-                // next, and the whole cascade is still far cheaper than yt-dlp.
-                Err(e) => last = Some(e),
-            }
-        }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("no player clients are configured")))
-    }
-
-    fn resolve_with(&self, client: &PlayerClient, video_id: &str) -> Result<StreamUrl> {
-        let mut context = serde_json::json!({
-            "clientName": client.name,
-            "clientVersion": client.version,
-            "hl": "en",
-        });
-        // Only sent when the client actually has one. An Android SDK level on
-        // an iPhone is the kind of mismatch that gets a request refused.
-        if let Some(model) = client.device_model {
-            context["deviceModel"] = model.into();
-        }
-        if let Some(sdk) = client.android_sdk {
-            context["androidSdkVersion"] = sdk.into();
-        }
-
-        let body = serde_json::json!({
-            "videoId": video_id,
-            "context": { "client": context },
-        });
-
-        // Serialised here rather than via `RequestBuilder::json`, which would
-        // mean turning on reqwest's `json` feature for a convenience this file
-        // needs exactly once. serde_json is already a direct dependency.
-        let body = serde_json::to_vec(&body).context("could not encode the player API request")?;
-
-        let raw = self.runtime.block_on(async {
-            self.client
-                .post(PLAYER_URL)
-                .header(reqwest::header::USER_AGENT, client.user_agent)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await?
-                .error_for_status()?
-                .bytes()
-                .await
-        })?;
-
-        let response: PlayerResponse =
-            serde_json::from_slice(&raw).context("player API returned unexpected JSON")?;
-
-        // "OK" is the only status that carries playable formats. Anything else
-        // (LOGIN_REQUIRED, UNPLAYABLE, AGE_VERIFICATION_REQUIRED) is precisely
-        // the case the yt-dlp fallback exists for.
-        if response.playability_status.status != "OK" {
-            bail!(
-                "{} refused {video_id}: {} ({})",
-                client.name,
-                response.playability_status.status,
-                response.playability_status.reason.as_deref().unwrap_or("no reason given")
-            );
-        }
-
-        let (url, _itag) = pick_audio(&response.streaming_data.adaptive_formats)
-            .with_context(|| format!("player API returned no usable audio for {video_id}"))?;
-
-        // The cap check itself now lives in [`super::serves_whole_file`] and is
-        // applied by the caller to whatever tier answers -- the cap is a
-        // property of a signed googlevideo URL, not of the route that produced
-        // one, and guarding only this route let yt-dlp's answers through
-        // unchecked.
-        Ok(StreamUrl {
-            expires_at: parse_expiry(url),
-            url: url.to_string(),
-        })
+        mtui_resolver::resolve_player(&self.runtime, &self.client, None, video_id)
     }
 
     /// Searches YouTube Music for songs.
@@ -336,7 +156,10 @@ fn parse_search(json: &serde_json::Value, limit: usize) -> Vec<Track> {
 fn parse_track(item: &serde_json::Value) -> Option<Track> {
     // Absent on rows that are not playable individually, such as an album
     // header that shares the shelf.
-    let id = item.pointer("/playlistItemData/videoId")?.as_str()?.to_string();
+    let id = item
+        .pointer("/playlistItemData/videoId")?
+        .as_str()?
+        .to_string();
 
     let title = flex_column(item, 0)?;
     // Second column is "Artist • Album • Duration", already joined for display
@@ -376,10 +199,7 @@ pub(super) fn flex_column(item: &serde_json::Value, index: usize) -> Option<Stri
         ))?
         .as_array()?;
 
-    let text: String = runs
-        .iter()
-        .filter_map(|run| run["text"].as_str())
-        .collect();
+    let text: String = runs.iter().filter_map(|run| run["text"].as_str()).collect();
     (!text.is_empty()).then_some(text)
 }
 
@@ -389,123 +209,17 @@ pub(super) fn parse_duration(text: &str) -> Option<Duration> {
     let mut secs: u64 = 0;
     let mut fields = 0;
     for field in text.trim().split(':') {
-        secs = secs.checked_mul(60)?.checked_add(field.trim().parse().ok()?)?;
+        secs = secs
+            .checked_mul(60)?
+            .checked_add(field.trim().parse().ok()?)?;
         fields += 1;
     }
     (2..=3).contains(&fields).then(|| Duration::from_secs(secs))
 }
 
-/// Audio-only MP4 itags, cheapest first.
-///
-/// Order is by bitrate, and that is not a preference about sound quality -- it
-/// is the byte budget. Every one of these decodes identically here, but a
-/// capped URL is capped in *bytes*, so the same one-mebibyte ceiling is about
-/// sixty-five seconds of itag 140 and half that of itag 141. Picking the
-/// smallest stream that works buys the most music per byte served, and the most
-/// jitter tolerance out of a fixed ring buffer.
-///
-/// 140 is AAC-LC ~128 kbps, 139 is HE-AAC ~48 kbps, 141 is AAC-LC ~256 kbps.
-const AUDIO_ITAGS: &[u32] = &[AUDIO_ITAG, 139, 141];
-
-/// Picks the audio stream to play: a known audio-only MP4 itag by preference,
-/// otherwise any unciphered one.
-///
-/// The fallback matters because the itag on offer varies by client and video;
-/// insisting on 140 alone would send perfectly playable videos down the slow
-/// path. Anything chosen here must still be AAC in MP4, since that is the only
-/// decoder compiled in.
-///
-/// Returns the itag alongside the URL so a failure can name the format it was
-/// playing. A track that dies early on itag 141 and a track that dies early on
-/// itag 140 are the same symptom with twice the byte rate between them, and
-/// without this there is no way to tell them apart after the fact.
-fn pick_audio(formats: &[Format]) -> Option<(&str, u32)> {
-    let usable = |f: &&Format| {
-        f.url.is_some()
-            && f.mime_type
-                .as_deref()
-                .is_some_and(|m| m.starts_with("audio/mp4"))
-    };
-
-    let preferred = AUDIO_ITAGS
-        .iter()
-        .find_map(|itag| formats.iter().find(|f| f.itag == *itag && f.url.is_some()));
-
-    preferred
-        .or_else(|| formats.iter().find(usable))
-        .and_then(|f| Some((f.url.as_deref()?, f.itag)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn format(itag: u32, url: Option<&str>, mime: &str) -> Format {
-        Format {
-            itag,
-            url: url.map(str::to_string),
-            mime_type: Some(mime.to_string()),
-        }
-    }
-
-    #[test]
-    fn prefers_itag_140() {
-        let formats = vec![
-            format(251, Some("opus"), "audio/webm; codecs=\"opus\""),
-            format(140, Some("aac"), "audio/mp4; codecs=\"mp4a.40.2\""),
-        ];
-        assert_eq!(pick_audio(&formats), Some(("aac", 140)));
-    }
-
-    #[test]
-    fn falls_back_to_any_unciphered_mp4_audio() {
-        let formats = vec![format(139, Some("aac-low"), "audio/mp4; codecs=\"mp4a.40.5\"")];
-        assert_eq!(pick_audio(&formats), Some(("aac-low", 139)));
-    }
-
-    /// The byte budget, not the sound: a capped URL is capped in bytes, so the
-    /// same one-mebibyte ceiling is twice as much music at 128 kbps as at 256.
-    /// Choosing the fatter stream when a leaner one is on offer halves how far
-    /// a capped track gets before it stops.
-    #[test]
-    fn prefers_the_leaner_stream_over_a_fatter_one() {
-        let formats = vec![
-            format(141, Some("aac-256"), "audio/mp4; codecs=\"mp4a.40.2\""),
-            format(139, Some("aac-48"), "audio/mp4; codecs=\"mp4a.40.5\""),
-        ];
-        assert_eq!(pick_audio(&formats), Some(("aac-48", 139)));
-
-        // 140 still wins outright when it is offered: it is the format the
-        // decoder is compiled for and the one every measurement here assumes.
-        let formats = vec![
-            format(141, Some("aac-256"), "audio/mp4; codecs=\"mp4a.40.2\""),
-            format(140, Some("aac-128"), "audio/mp4; codecs=\"mp4a.40.2\""),
-            format(139, Some("aac-48"), "audio/mp4; codecs=\"mp4a.40.5\""),
-        ];
-        assert_eq!(pick_audio(&formats), Some(("aac-128", 140)));
-    }
-
-    #[test]
-    fn skips_ciphered_formats() {
-        // No `url` means YouTube sent a signatureCipher instead; deciphering is
-        // the whole cost this path exists to avoid.
-        let formats = vec![format(140, None, "audio/mp4")];
-        assert_eq!(pick_audio(&formats), None);
-    }
-
-    #[test]
-    fn rejects_formats_we_cannot_decode() {
-        // Opus is not compiled in, so an Opus-only response must fall through
-        // to yt-dlp rather than be handed to the decoder.
-        let formats = vec![format(251, Some("opus"), "audio/webm; codecs=\"opus\"")];
-        assert_eq!(pick_audio(&formats), None);
-    }
-
-    #[test]
-    fn ignores_video_formats() {
-        let formats = vec![format(137, Some("video"), "video/mp4; codecs=\"avc1\"")];
-        assert_eq!(pick_audio(&formats), None);
-    }
 
     #[test]
     fn parses_durations() {
@@ -623,7 +337,10 @@ mod tests {
         // is what our own search returns and which most player clients refuse
         // outright -- so a regression here would quietly send every play from
         // the search results back to the 4 s yt-dlp path.
-        for (id, kind) in [("dQw4w9WgXcQ", "ordinary video"), ("JhulBGMA7G4", "art track")] {
+        for (id, kind) in [
+            ("dQw4w9WgXcQ", "ordinary video"),
+            ("JhulBGMA7G4", "art track"),
+        ] {
             let start = Instant::now();
             match tube.resolve(id) {
                 Ok(stream) => {
@@ -649,7 +366,11 @@ mod tests {
         let tube = InnerTube::new().expect("client should build");
         let start = Instant::now();
         let tracks = tube.search("daft punk", 10).expect("search failed");
-        println!("search: {:.2}s, {} tracks", start.elapsed().as_secs_f64(), tracks.len());
+        println!(
+            "search: {:.2}s, {} tracks",
+            start.elapsed().as_secs_f64(),
+            tracks.len()
+        );
 
         assert!(!tracks.is_empty(), "expected some songs");
         for track in &tracks {
@@ -668,77 +389,5 @@ mod tests {
             // the songs filter should have excluded.
             assert!(track.duration.is_some(), "{} has no duration", track.title);
         }
-    }
-}
-
-
-#[cfg(test)]
-mod capped_urls {
-    use super::*;
-    // The cap check moved to `crate::source`, where it can guard every resolve
-    // tier rather than only this one. These tests followed it as far as the
-    // import: what they assert is about the cascade, which is still rooted
-    // here.
-    use crate::source::content_length;
-
-    #[test]
-    fn reads_the_file_size_the_url_states() {
-        assert_eq!(
-            content_length("https://x.googlevideo.com/videoplayback?itag=140&clen=3474230&dur=214"),
-            Some(3_474_230)
-        );
-        // A livestream states no length, and neither does a malformed one.
-        assert_eq!(content_length("https://x.googlevideo.com/videoplayback?itag=140"), None);
-        assert_eq!(content_length("https://x.googlevideo.com/videoplayback?clen=soon"), None);
-    }
-
-    /// Whatever the app ends up playing must serve its last byte, not just its
-    /// first mebibyte.
-    ///
-    /// The default track is the one that was reported as stopping mid-song. The
-    /// player API answers for it with a URL capped at a mebibyte, so it has to
-    /// come back refused and be picked up by yt-dlp -- which is the whole
-    /// cascade, and why this asserts against the URL the app would really
-    /// stream rather than against either path alone.
-    ///
-    /// `cargo test --release serves_the_whole_file -- --ignored --nocapture`
-    #[test]
-    #[ignore = "hits the network"]
-    fn serves_the_whole_file() {
-        let id = std::env::var("MTUI_VIDEO_ID").unwrap_or_else(|_| "nNN88hijp-o".into());
-        let tube = InnerTube::new().ok();
-        let yt = crate::source::youtube::YouTube::default();
-        // The shared cascade, which is the point of the test: what must serve
-        // its last byte is the URL the app would really stream, and that is
-        // decided by which tier's answer survives the cap check -- not by
-        // whichever tier happened to respond first.
-        let (stream, whole) = crate::source::resolve_stream(&yt, tube.as_ref(), &id)
-            .expect("neither the player API nor yt-dlp resolved the track");
-        assert!(
-            whole,
-            "the cascade knew this URL was capped and handed it over anyway"
-        );
-
-        let clen = content_length(&stream.url).expect("a signed URL states its length");
-        let last = clen - 1;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-
-        let status = runtime.block_on(async {
-            reqwest::Client::new()
-                .get(&stream.url)
-                .header(reqwest::header::RANGE, format!("bytes={last}-{last}"))
-                .send()
-                .await
-                .expect("request failed")
-                .status()
-        });
-
-        assert!(
-            status.is_success(),
-            "resolved URL will not serve its last byte: HTTP {status}"
-        );
     }
 }

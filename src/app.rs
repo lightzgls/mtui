@@ -16,15 +16,15 @@ use crate::config::{self, Tokens};
 use crate::discord::{Activity, Clock, Presence};
 use crate::graphics::Graphics;
 use crate::player::{Command, PlayState, Player, PlayerEvent, Snapshot};
-use crate::source::{StreamUrl, Track, UNKNOWN_ARTIST};
 use crate::source::cover::Cover;
-use crate::source::home::{Card, Shelf, Target};
+use crate::source::home::{self, Card, Shelf, Target};
 use crate::source::journal;
 use crate::source::library::Playlist;
 use crate::source::lrclib;
 use crate::source::watch::{Comments, Lyrics, QueuePage, Watch};
 use crate::source::worker::{Request, Response, SourceWorker};
 use crate::source::youtube::{MAX_RESULTS, extract_video_id};
+use crate::source::{StreamUrl, Track, UNKNOWN_ARTIST};
 use crate::tray::TrayCommand;
 
 /// How much of the window the cover is allowed.
@@ -49,7 +49,7 @@ impl CoverSize {
 
 /// How a landing-page card is drawn.
 ///
-/// Three shapes rather than one because a terminal is not one size. A cell is
+/// Four shapes rather than one because a terminal is not one size. A cell is
 /// twice as tall as it is wide, so a square picture `n` columns across costs
 /// `n / 2` rows -- which means a card with its sleeve above the title, the way
 /// every music app draws one, is a dozen rows tall before a word is written.
@@ -71,26 +71,13 @@ pub enum CardShape {
     /// enough across a row that the page reads as a shelf of records rather
     /// than a grid of thumbnails.
     ///
-    /// Only ever chosen on a genuinely tall window, because it is the shape
-    /// that costs the most rows -- but `v` pins it anywhere, which is the point
-    /// of the key. A window that cannot give it two shelves gets a poster
-    /// instead, so nothing that fits today is made smaller by this existing.
+    /// Chosen for the lead shelf whenever one complete gallery card fits.
     Gallery,
 }
 
 impl CardShape {
     /// Largest first, which is the order the renderer tries them in.
     pub const ALL: [Self; 4] = [Self::Gallery, Self::Poster, Self::Tile, Self::Text];
-
-    /// The next shape up, wrapping. What `v` steps through.
-    pub fn next(self) -> Self {
-        match self {
-            Self::Text => Self::Tile,
-            Self::Tile => Self::Poster,
-            Self::Poster => Self::Gallery,
-            Self::Gallery => Self::Text,
-        }
-    }
 }
 
 /// Where and how large the cover should be painted, in cells and pixels.
@@ -144,9 +131,10 @@ const MAX_AUTO_SKIPS: u8 = 3;
 /// few kilobytes however long the session runs.
 const QUEUE_BEHIND: usize = 20;
 
-/// Tracks kept ahead of the one playing. Two pages' worth, so a top-up lands
-/// well before the window needs it and the panel has something to scroll.
-const QUEUE_AHEAD: usize = 50;
+/// Tracks kept ahead of the one playing. Large enough for the five-track
+/// low-water mark plus a complete 60-row continuation page: advancing the
+/// continuation token after retaining only part of that page loses its tail.
+const QUEUE_AHEAD: usize = 65;
 
 /// Tracks remaining ahead at which the next page is asked for.
 ///
@@ -509,8 +497,7 @@ impl NowPlaying {
             if self.queue.len() >= ceiling {
                 break;
             }
-            if self.queue.iter().any(|held| held.id == track.id)
-                || self.dropped.contains(&track.id)
+            if self.queue.iter().any(|held| held.id == track.id) || self.dropped.contains(&track.id)
             {
                 continue;
             }
@@ -603,7 +590,9 @@ pub enum Overlay {
     /// setup procedure, which is the single most important thing this feature
     /// ever has to say and is ten lines long -- the status bar would show the
     /// user the first of them and hide the rest.
-    Message { body: String },
+    Message {
+        body: String,
+    },
 }
 
 impl Overlay {
@@ -721,18 +710,6 @@ pub struct App {
     /// Sleeves for the cards on screen. See [`crate::art`] for what is kept and
     /// for how long.
     pub art: ArtCache,
-    /// The card shape the user has pinned with `v`, if they have pinned one.
-    ///
-    /// `None` -- the default -- means the renderer picks the largest shape the
-    /// window can hold, which is the right answer often enough that most users
-    /// will never press the key. It is here for the two cases the geometry
-    /// cannot know about: a user who wants more of the feed on screen than the
-    /// pictures allow, and a terminal whose cells are not the two-to-one the
-    /// arithmetic assumes.
-    pub card_shape: Option<CardShape>,
-    /// The shape actually drawn on the last frame, which is what `v` steps on
-    /// from. Written by the renderer; read by nothing else.
-    pub drawn_shape: CardShape,
     /// True between asking for the landing page and hearing back.
     ///
     /// Its own flag rather than [`Self::busy`]: this is set before the first
@@ -882,8 +859,6 @@ impl App {
             home_top: 0,
             home_scroll: Vec::new(),
             art: ArtCache::default(),
-            card_shape: None,
-            drawn_shape: CardShape::Text,
             home_pending: false,
             browsing: None,
             playlists: Vec::new(),
@@ -1091,7 +1066,7 @@ impl App {
                     self.mode = Mode::Browse;
                 }
             }
-            Response::Home(shelves) => {
+            Response::Home(mut shelves) => {
                 self.home_pending = false;
                 self.status = if shelves.is_empty() {
                     "nothing came back from YouTube Music".to_string()
@@ -1101,6 +1076,7 @@ impl App {
                     // what it has on the keys that move the cursor.
                     "Enter to play, / to search, L for your library".to_string()
                 };
+                home::order_shelves(&mut shelves);
                 self.home_scroll = vec![0; shelves.len()];
                 self.home = shelves;
                 self.home_shelf = 0;
@@ -1123,21 +1099,42 @@ impl App {
                 if shelves.is_empty() {
                     return;
                 }
-                // In front of the feed: these are the shelves built from what
-                // this account actually listens to, and they are what the page
-                // is worth opening for.
-                let added = shelves.len();
-                self.home_scroll.splice(0..0, vec![0; added]);
+                // Preserve the semantic cursor while the local shelves merge
+                // into YouTube's feed and the combined page takes its canonical
+                // Quick picks -> Listen again -> Forgotten -> Playlists order.
+                let focused = (self.home_shelf > 0 || self.home_card > 0)
+                    .then(|| {
+                        self.home.get(self.home_shelf).and_then(|shelf| {
+                            shelf
+                                .cards
+                                .get(self.home_card)
+                                .map(|card| (shelf.title.clone(), card.art_key().to_string()))
+                        })
+                    })
+                    .flatten();
                 self.home.splice(0..0, shelves);
+                home::order_shelves(&mut self.home);
+                self.home_scroll = vec![0; self.home.len()];
 
-                // The cursor is on a shelf, not at an index -- so it moves down
-                // with the shelf it was on rather than staying put and pointing
-                // at something the user was not looking at. Except at the very
-                // top, where a user who has not moved yet should be shown the
-                // new first shelf rather than pushed off it.
-                if self.home_shelf > 0 || self.home_card > 0 {
-                    self.home_shelf += added;
-                    self.home_top += added;
+                if let Some((title, key)) = focused
+                    && let Some((shelf, card)) =
+                        self.home.iter().enumerate().find_map(|(i, shelf)| {
+                            (shelf.title == title).then(|| {
+                                shelf
+                                    .cards
+                                    .iter()
+                                    .position(|card| card.art_key() == key)
+                                    .map(|j| (i, j))
+                            })?
+                        })
+                {
+                    self.home_shelf = shelf;
+                    self.home_card = card;
+                    self.home_top = self.home_top.min(shelf);
+                } else {
+                    self.home_shelf = 0;
+                    self.home_card = 0;
+                    self.home_top = 0;
                 }
                 self.status = format!("{} shelves", self.home.len());
             }
@@ -1345,6 +1342,7 @@ impl App {
                     self.status = format!("playing {title}");
                     Command::Resume {
                         url: stream.url,
+                        format: stream.format,
                         from,
                     }
                 }
@@ -1376,6 +1374,7 @@ impl App {
                 self.auto = false;
                 let _ = self.player.send(Command::Play {
                     url: stream.url,
+                    format: stream.format,
                     title,
                     id: id.to_string(),
                 });
@@ -1916,7 +1915,8 @@ impl App {
         // position is zero and a bar would jump backwards the moment audio
         // started.
         let clock = (!paused && snap.state != PlayState::Buffering).then(|| {
-            let start_ms = crate::discord::now_ms().saturating_sub(snap.position.as_millis() as u64);
+            let start_ms =
+                crate::discord::now_ms().saturating_sub(snap.position.as_millis() as u64);
             Clock {
                 start_ms,
                 // A livestream has no length, so it gets a clock that counts up
@@ -2104,9 +2104,9 @@ impl App {
     /// Speculatively resolves the selected track once the selection has sat
     /// still for [`PREFETCH_IDLE`]. Called once per frame.
     ///
-    /// This is where the latency actually goes. A resolve costs a yt-dlp spawn
-    /// of a few seconds; doing it while the user is still reading the list
-    /// means the Enter that follows hits a warm cache instead of paying for it.
+    /// This removes the pooled player-API round trip from Enter when possible.
+    /// Difficult tracks are deliberately not sent through yt-dlp here: a child
+    /// process already running cannot be superseded by a later selection.
     pub fn tick_prefetch(&mut self) {
         // Never compete for the serial worker with a request the user is
         // waiting on, and never stack two speculative resolves.
@@ -2133,7 +2133,11 @@ impl App {
         if self.ready.as_deref() == Some(id.as_str()) {
             return;
         }
-        if self.source.send(Request::Prefetch { id: id.clone() }).is_ok() {
+        if self
+            .source
+            .send(Request::Prefetch { id: id.clone() })
+            .is_ok()
+        {
             self.prefetching = Some(id);
         }
     }
@@ -2233,13 +2237,8 @@ impl App {
         self.playlist_offset = self.playlist_offset.min(max_offset);
     }
 
-    /// Keeps the selected card on screen, in both directions at once.
-    ///
-    /// Called by the renderer, which is the only thing that knows how many
-    /// shelves fit down the pane and how many cards fit across it -- both of
-    /// which change with the terminal size and neither of which the key
-    /// handler could have known when it moved the cursor.
-    pub fn clamp_home(&mut self, shelves: usize, cards: usize) {
+    /// Keeps the semantic home cursor valid after a feed replacement.
+    pub fn clamp_home_selection(&mut self) {
         // The two lists are kept in step here rather than at every point that
         // could change either: a shelf list that arrives while the cursor is
         // deep in the previous one is the case that would otherwise index out
@@ -2247,20 +2246,20 @@ impl App {
         self.home_scroll.resize(self.home.len(), 0);
         self.home_shelf = self.home_shelf.min(self.home.len().saturating_sub(1));
 
-        if shelves == 0 || self.home.is_empty() {
+        if self.home.is_empty() {
             self.home_top = 0;
             return;
         }
-
-        if self.home_shelf < self.home_top {
-            self.home_top = self.home_shelf;
-        } else if self.home_shelf >= self.home_top + shelves {
-            self.home_top = self.home_shelf + 1 - shelves;
-        }
-        self.home_top = self.home_top.min(self.home.len().saturating_sub(shelves));
-
         let len = self.home[self.home_shelf].cards.len();
         self.home_card = self.home_card.min(len.saturating_sub(1));
+    }
+
+    /// Keeps the selected card visible using its shelf's own card capacity.
+    pub fn clamp_home_cards(&mut self, cards: usize) {
+        if self.home.is_empty() || cards == 0 {
+            return;
+        }
+        let len = self.home[self.home_shelf].cards.len();
         if cards == 0 {
             return;
         }
@@ -2374,9 +2373,13 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('l') | KeyCode::Right => self.home_card = (self.home_card + 1).min(last_card),
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.home_card = (self.home_card + 1).min(last_card)
+            }
             KeyCode::Char('h') | KeyCode::Left => self.home_card = self.home_card.saturating_sub(1),
-            KeyCode::Char('j') | KeyCode::Down => self.home_shelf = (self.home_shelf + 1).min(last_shelf),
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.home_shelf = (self.home_shelf + 1).min(last_shelf)
+            }
             KeyCode::Char('k') | KeyCode::Up => self.home_shelf = self.home_shelf.saturating_sub(1),
             KeyCode::Char('g') | KeyCode::Home => (self.home_shelf, self.home_card) = (0, 0),
             KeyCode::Char('G') | KeyCode::End => self.home_shelf = last_shelf,
@@ -2384,10 +2387,8 @@ impl App {
             KeyCode::PageUp => self.home_shelf = self.home_shelf.saturating_sub(3),
             KeyCode::Enter => self.open_card(),
             KeyCode::Char('r') => {
-                // Steps the radio seeds on, so this is a genuine refresh rather
-                // than a re-fetch of the page already on screen. The old feed
-                // rotated itself once an hour and had no way to be asked; this
-                // is the same idea put under the key that was already reloading.
+                // Steps both the rotating half of Listen Again and the radio
+                // seeds, so this is a genuine refresh rather than a re-fetch.
                 self.rotation += 1;
                 self.status = "refreshing the home feed ...".to_string();
                 self.request_home();
@@ -2402,18 +2403,6 @@ impl App {
             KeyCode::Char('P') | KeyCode::Char('p') => self.open_player(),
             KeyCode::Char('B') => self.background(),
             KeyCode::Char('D') => self.toggle_presence(),
-            // Steps the cards through their four shapes. Starts from whatever
-            // the window chose for itself, so the first press is a change the
-            // user can see rather than one that lands on the shape already up.
-            //
-            // This is also the only way to reach the roomiest shape on a window
-            // that is not tall enough to be given it: the renderer will not
-            // spend a whole screen on one shelf unasked, but a user who presses
-            // the key has asked.
-            KeyCode::Char('v') => {
-                let shape = self.card_shape.unwrap_or(self.drawn_shape).next();
-                self.card_shape = Some(shape);
-            }
             // Back to whatever the track list was showing, when there is one.
             KeyCode::Esc if !self.results.is_empty() => self.view = View::Tracks,
             KeyCode::Char('c') => self.cover_size = self.cover_size.toggled(),
@@ -2786,14 +2775,17 @@ impl App {
         // as an address bar. Everything the page needs beyond the id -- the
         // real title, the artist, the queue -- arrives with the watch response.
         if let Some(id) = extract_video_id(&query) {
-            return self.play_track(Track {
-                id,
-                title: query,
-                uploader: String::new(),
-                duration: None,
-                album: None,
-                playlist_item_id: None,
-            }, false);
+            return self.play_track(
+                Track {
+                    id,
+                    title: query,
+                    uploader: String::new(),
+                    duration: None,
+                    album: None,
+                    playlist_item_id: None,
+                },
+                false,
+            );
         }
 
         self.status = format!("searching for {query} ...");
@@ -3220,7 +3212,11 @@ mod tests {
         assert_eq!(now.remaining(), 2);
         assert_eq!(now.absorb(queued(6).split_off(3)), 3);
         assert_eq!(now.queue.len(), 6);
-        assert_eq!(now.remaining(), 5, "the new tracks are ahead of the playing one");
+        assert_eq!(
+            now.remaining(),
+            5,
+            "the new tracks are ahead of the playing one"
+        );
         assert_eq!(now.playing, Some(0), "appending must not move the cursor");
     }
 
@@ -3286,7 +3282,11 @@ mod tests {
 
         now.trim();
 
-        assert_eq!(now.queue.len(), 5, "nothing has fallen out of the window yet");
+        assert_eq!(
+            now.queue.len(),
+            5,
+            "nothing has fallen out of the window yet"
+        );
         assert_eq!(now.playing, Some(4));
         assert!(now.dropped.is_empty());
     }
@@ -3428,8 +3428,7 @@ mod tests {
         assert_eq!(now.topup_failures, 0);
     }
 
-    /// The window has a ceiling as well as a floor. A page that would overshoot
-    /// it is taken as far as it fits, and the rest is bought again later.
+    /// The window has a ceiling as well as a floor.
     #[test]
     fn the_queue_does_not_grow_past_the_window() {
         let mut now = playing();
@@ -3441,5 +3440,19 @@ mod tests {
 
         assert_eq!(now.queue.len(), QUEUE_AHEAD + 1);
         assert_eq!(now.remaining(), QUEUE_AHEAD);
+    }
+
+    /// A top-up arrives below the low-water mark and may contain sixty rows.
+    /// The continuation it carries starts after all sixty, so all must fit or
+    /// the omitted tail can never be requested again.
+    #[test]
+    fn a_complete_continuation_page_fits_at_the_low_water_mark() {
+        let mut now = playing();
+        now.queue = queued(QUEUE_LOW);
+        now.playing = Some(0);
+
+        let page: Vec<Track> = (QUEUE_LOW..QUEUE_LOW + 60).map(numbered).collect();
+        assert_eq!(now.absorb(page), 60);
+        assert_eq!(now.remaining(), QUEUE_LOW - 1 + 60);
     }
 }

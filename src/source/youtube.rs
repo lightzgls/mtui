@@ -7,29 +7,15 @@
 //! subsequent streaming and decoding happens in-process.
 
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::{StreamUrl, Track, UNKNOWN_ARTIST};
-
-/// itag 140: AAC-LC in an MP4 container, ~130 kbps.
-///
-/// Chosen over itag 251 (Opus/WebM) because symphonia has no Opus decoder --
-/// `symphonia-codec-opus` is an unimplemented stub. Opus would mean linking
-/// libopus through `audiopus`, reintroducing a C toolchain dependency on both
-/// platforms. AAC-LC decodes with pure Rust and is rated "Great" upstream.
-const AUDIO_FORMAT: &str = "140/bestaudio[ext=m4a]";
+use super::{Track, UNKNOWN_ARTIST};
 
 /// Hard ceiling on search results. Bounded by construction so a long session
 /// cannot grow the heap.
 pub const MAX_RESULTS: usize = 200;
-
-/// What YouTube answers when Restricted Mode, rather than the video, is the
-/// problem. Matched on the phrase that is stable across the wordings: the
-/// sentence after it varies with whether a Workspace policy or a network is
-/// named as the source.
-const RESTRICTED: &str = "This video is restricted";
 
 /// Flags for a search: list the results without visiting each video page.
 const SEARCH_FLAGS: &[&str] = &[
@@ -38,39 +24,6 @@ const SEARCH_FLAGS: &[&str] = &[
     "--no-warnings",
     "--ignore-config",
 ];
-
-/// Flags for resolving one video to a stream URL.
-///
-/// `--print urls` rather than the shorter `-g`: `-g` is an undocumented
-/// youtube-dl legacy alias that does not appear in `yt-dlp --help` at all, so
-/// it could be dropped without notice. `--print` is documented and produces an
-/// identical URL. `--format` is passed separately since it takes an argument.
-const RESOLVE_FLAGS: &[&str] = &["--print", "urls", "--no-warnings", "--ignore-config"];
-
-/// The retry that gets past Restricted Mode.
-///
-/// `web_music` is the one client yt-dlp routes to `music.youtube.com`, and that
-/// host is not remapped by the DNS entry Restricted Mode is enforced with --
-/// see [`restricted_mode`]. `player_skip=webpage,configs` keeps the rest of the
-/// extraction off `www.youtube.com` too, which is the whole point: one request
-/// to the restricted host and the answer is `Video unavailable` again.
-///
-/// Measured against a track www refuses: this returns a URL that serves every
-/// byte of the file, where the player API's own answer for it stops after a
-/// mebibyte. yt-dlp solves the JS challenge that the cap is the absence of.
-const MUSIC_CLIENT_FLAGS: &[&str] = &[
-    "--extractor-args",
-    "youtube:player_client=web_music;player_skip=webpage,configs",
-];
-
-/// What the retry above will take, in order of preference.
-///
-/// `web_music` offers exactly one format for these tracks: 18, the progressive
-/// mp4 -- AAC-LC at ~96 kbps beside a 360p video track nothing here decodes.
-/// Worse than [`AUDIO_FORMAT`], which is why it is only ever reached after the
-/// normal attempt has failed, and much better than a track that will not play.
-/// The audio-only itags stay ahead of it in case a future client offers one.
-const MUSIC_FORMAT: &str = "140/bestaudio[ext=m4a]/18";
 
 /// Shape of the `--dump-json` fields we consume. yt-dlp emits far more; serde
 /// drops the rest rather than allocating it.
@@ -184,67 +137,6 @@ impl YouTube {
 
         Ok(tracks)
     }
-
-    /// Resolves a video id to a signed, directly streamable audio URL.
-    ///
-    /// This is the expensive call (~2-4 s, ~80 MB transient). Callers should
-    /// consult the URL cache first and prefetch the next queue item during
-    /// playback so this cost lands off the critical path.
-    ///
-    /// A track Restricted Mode is hiding costs a second invocation on top of
-    /// that, through YouTube Music's client -- which is the only way this
-    /// program has of playing one at all. Paid only by the tracks that need it:
-    /// the retry is reached from a failure, never speculatively.
-    pub fn resolve(&self, video_id: &str) -> Result<StreamUrl> {
-        let why = match self.resolve_as(video_id, AUDIO_FORMAT, &[]) {
-            Ok(stream) => return Ok(stream),
-            Err(why) => why,
-        };
-
-        // Anything else -- a private video, a dead id, a missing binary -- is
-        // reported as it stands. There is nothing another client would know
-        // about it that this one did not.
-        if !format!("{why:#}").contains(RESTRICTED) {
-            return Err(why);
-        }
-
-        self.resolve_as(video_id, MUSIC_FORMAT, MUSIC_CLIENT_FLAGS)
-            // The retry's own failure is not what is worth reporting. Whatever
-            // it says, the thing standing in the way is the one the first
-            // attempt already named, and it is the one with a fix attached.
-            .map_err(|_| anyhow::anyhow!("{}", restricted_mode(video_id)))
-    }
-
-    /// One yt-dlp invocation, for a given format and extra flags.
-    fn resolve_as(&self, video_id: &str, format: &str, extra: &[&str]) -> Result<StreamUrl> {
-        let out = Command::new(&self.bin)
-            .arg("--format")
-            .arg(format)
-            .args(RESOLVE_FLAGS)
-            .args(extra)
-            .arg(format!("https://www.youtube.com/watch?v={video_id}"))
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("failed to run `{}` to resolve {video_id}", self.bin))?;
-
-        if !out.status.success() {
-            bail!(
-                "could not resolve {video_id}: {}",
-                first_error_line(&out.stderr)
-            );
-        }
-
-        let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if url.is_empty() {
-            bail!("yt-dlp returned no stream URL for {video_id}");
-        }
-
-        Ok(StreamUrl {
-            expires_at: parse_expiry(&url),
-            url,
-        })
-    }
 }
 
 /// Pulls an 11-character video id out of a YouTube URL, or accepts a bare id.
@@ -282,18 +174,6 @@ fn is_video_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Extracts the `expire=<unix_ts>` query parameter YouTube signs into playback
-/// URLs. Absent or unparseable means "unknown", which the cache treats as
-/// always-valid; a stale URL then surfaces as an ordinary playback error.
-pub(super) fn parse_expiry(url: &str) -> Option<SystemTime> {
-    let secs: u64 = url
-        .split(['?', '&'])
-        .find_map(|kv| kv.strip_prefix("expire="))?
-        .parse()
-        .ok()?;
-    Some(UNIX_EPOCH + Duration::from_secs(secs))
-}
-
 /// yt-dlp writes multi-line diagnostics; the first ERROR line is the useful
 /// one. Falls back to the last non-empty line so we never report nothing.
 fn first_error_line(stderr: &[u8]) -> String {
@@ -329,78 +209,9 @@ fn strip_preamble(line: &str) -> &str {
     }
 }
 
-/// What to say about a track Restricted Mode is hiding.
-///
-/// Reached only once the YouTube Music retry has failed as well, so it is the
-/// end of the road rather than the first sign of trouble.
-///
-/// Spelled out rather than passing YouTube's own sentence through, which asks
-/// the user to "check the ... network administrator restrictions" without
-/// saying what to check or how. The failure is otherwise invisible from inside
-/// the program: the session works, search works, most tracks play, and the
-/// ones something flagged as mature come back as though they did not exist.
-///
-/// Deliberately several lines, which is what routes it to an overlay instead
-/// of a status bar that would clip it mid-word.
-fn restricted_mode(video_id: &str) -> String {
-    format!(
-        "{video_id} is blocked by YouTube's Restricted Mode, and the retry \
-         through YouTube Music could not reach it either.\n\n\
-         Restricted Mode is applied by the network, not by this program. It \
-         points www.youtube.com at restrictmoderate.youtube.com \
-         (216.239.38.119) or restrict.youtube.com (216.239.38.120), and that \
-         front end refuses whatever it treats as mature -- which for a music \
-         player is the occasional explicit track.\n\n\
-         `nslookup www.youtube.com` tells you whether this is it: an answer in \
-         216.239.38.x is Restricted Mode. Turning on DNS-over-HTTPS, or using \
-         a network without the policy, lifts it for every track at once."
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_expiry_from_signed_url() {
-        let url = "https://rr11.googlevideo.com/videoplayback?expire=1785600392&ei=abc";
-        let ts = parse_expiry(url).expect("expire= should parse");
-        assert_eq!(ts, UNIX_EPOCH + Duration::from_secs(1785600392));
-    }
-
-    #[test]
-    fn missing_expiry_is_none() {
-        assert!(parse_expiry("https://example.com/a.m4a").is_none());
-        // `expire` must be the whole key, not a suffix of another one.
-        assert!(parse_expiry("https://example.com/a?noexpire=123").is_none());
-    }
-
-    #[test]
-    fn url_without_expiry_is_valid() {
-        let s = StreamUrl {
-            url: "https://example.com/a.m4a".into(),
-            expires_at: None,
-        };
-        assert!(s.is_valid());
-    }
-
-    #[test]
-    fn url_inside_safety_margin_is_invalid() {
-        // Expires in one minute: inside the 5-minute margin, so unusable.
-        let soon = SystemTime::now() + Duration::from_secs(60);
-        let s = StreamUrl {
-            url: "https://example.com/a.m4a".into(),
-            expires_at: Some(soon),
-        };
-        assert!(!s.is_valid());
-
-        let later = SystemTime::now() + Duration::from_secs(3600);
-        let s = StreamUrl {
-            url: "https://example.com/a.m4a".into(),
-            expires_at: Some(later),
-        };
-        assert!(s.is_valid());
-    }
 
     /// Guards against passing a flag yt-dlp does not have.
     ///
@@ -419,12 +230,7 @@ mod tests {
 
         // Non-flag arguments (values like "urls", or the extractor-args
         // string itself) are skipped.
-        let flags = SEARCH_FLAGS
-            .iter()
-            .chain(RESOLVE_FLAGS)
-            .chain(MUSIC_CLIENT_FLAGS)
-            .chain(["--format"].iter())
-            .filter(|a| a.starts_with("--"));
+        let flags = SEARCH_FLAGS.iter().filter(|a| a.starts_with("--"));
 
         for flag in flags {
             assert!(
@@ -487,59 +293,6 @@ mod tests {
     #[test]
     fn nothing_on_stderr_still_reports_something() {
         assert_eq!(first_error_line(b""), "no error output");
-    }
-
-    #[test]
-    fn restricted_mode_is_answered_rather_than_repeated() {
-        // The trigger phrase, as YouTube's restricted front end sends it.
-        let stderr = b"ERROR: [youtube] GwSSrwryxN0: Video unavailable. This video is restricted. \
-                       Please check the Google Workspace administrator and/or the network \
-                       administrator restrictions.\n" as &[u8];
-        assert!(first_error_line(stderr).contains(RESTRICTED));
-
-        let said = restricted_mode("GwSSrwryxN0");
-        assert!(said.contains("GwSSrwryxN0"));
-        assert!(said.contains("Restricted Mode"));
-        // Multi-line is what routes it to an overlay instead of the status bar,
-        // where a paragraph of instructions would be cut after a few words.
-        assert!(said.contains('\n'));
-    }
-
-    /// The Restricted Mode fallback, end to end.
-    ///
-    /// On a network that does not apply Restricted Mode the first attempt
-    /// simply succeeds, so this prints which path answered rather than
-    /// insisting on one. Behind Restricted Mode it is the whole difference
-    /// between a track that plays and one that appears not to exist.
-    ///
-    /// Needs yt-dlp on PATH; the app itself uses the copy it fetched into its
-    /// own directory, which is not the same thing.
-    ///
-    /// `cargo test --release past_restricted_mode -- --ignored --nocapture`
-    #[test]
-    #[ignore = "hits the network; only means anything behind Restricted Mode"]
-    fn resolves_past_restricted_mode() {
-        if Command::new("yt-dlp").arg("--version").output().is_err() {
-            eprintln!("skipping: yt-dlp is not on PATH");
-            return;
-        }
-
-        let id = std::env::var("MTUI_VIDEO_ID").unwrap_or_else(|_| "GwSSrwryxN0".into());
-        let yt = YouTube::default();
-
-        let Err(why) = yt.resolve_as(&id, AUDIO_FORMAT, &[]) else {
-            println!("{id} is not restricted on this network");
-            return;
-        };
-
-        let why = format!("{why:#}");
-        assert!(why.contains(RESTRICTED), "{id} failed for another reason: {why}");
-
-        let stream = yt
-            .resolve(&id)
-            .expect("the YouTube Music retry should reach a restricted track");
-        println!("{id}: restricted on www, recovered through music.youtube.com");
-        assert!(stream.url.starts_with("https://"));
     }
 
     #[test]

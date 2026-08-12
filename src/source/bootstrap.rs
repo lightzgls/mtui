@@ -48,14 +48,12 @@ const DOWNLOAD_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/dow
 #[cfg(target_os = "macos")]
 const ASSET: &str = "yt-dlp_macos";
 #[cfg(target_os = "macos")]
-const DOWNLOAD_URL: &str =
-    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos";
+const DOWNLOAD_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos";
 
 #[cfg(all(unix, not(target_os = "macos")))]
 const ASSET: &str = "yt-dlp_linux";
 #[cfg(all(unix, not(target_os = "macos")))]
-const DOWNLOAD_URL: &str =
-    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux";
+const DOWNLOAD_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux";
 
 /// Generous next to the player API's 5 s: this is a ~17 MB transfer over
 /// whatever connection the user has, and it happens once. The timeout is per
@@ -122,8 +120,7 @@ pub fn locate() -> Result<YouTube> {
 /// Downloads the asset to `dest`, atomically and verifiably or not at all.
 fn install(dest: &Path) -> Result<()> {
     let dir = dest.parent().expect("asset path always has a parent");
-    fs::create_dir_all(dir)
-        .with_context(|| format!("could not create {}", dir.display()))?;
+    fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
 
     // Alongside the destination rather than in the system temp directory, so
     // the rename below is within one filesystem and therefore atomic. A rename
@@ -158,8 +155,12 @@ fn download(part: &Path, dest: &Path) -> Result<()> {
         .build()
         .context("could not build an HTTP client to download yt-dlp")?;
 
-    eprintln!("mtui: yt-dlp not found, fetching it once into {}",
-        dest.parent().expect("asset path always has a parent").display());
+    eprintln!(
+        "mtui: yt-dlp not found, fetching it once into {}",
+        dest.parent()
+            .expect("asset path always has a parent")
+            .display()
+    );
 
     runtime.block_on(async {
         let response = client
@@ -194,7 +195,8 @@ fn download(part: &Path, dest: &Path) -> Result<()> {
         // renamed while a handle is open, and a buffered tail that never
         // reached the disk would produce exactly the truncated binary this
         // whole path exists to avoid.
-        file.flush().context("could not flush the yt-dlp download")?;
+        file.flush()
+            .context("could not flush the yt-dlp download")?;
         drop(file);
 
         if written < MIN_PLAUSIBLE_BYTES {
@@ -218,13 +220,15 @@ fn finish(part: &Path, dest: &Path, written: u64) -> Result<()> {
     // Windows refuses a rename onto an existing file. Only reachable when the
     // copy already there failed to run, which is why replacing it is the point.
     if dest.exists() {
-        fs::remove_file(dest)
-            .with_context(|| format!("could not replace {}", dest.display()))?;
+        fs::remove_file(dest).with_context(|| format!("could not replace {}", dest.display()))?;
     }
     fs::rename(part, dest)
         .with_context(|| format!("could not move the download into {}", dest.display()))?;
 
-    eprintln!("mtui: fetched yt-dlp ({:.1} MB)", written as f64 / 1_048_576.0);
+    eprintln!(
+        "mtui: fetched yt-dlp ({:.1} MB)",
+        written as f64 / 1_048_576.0
+    );
     Ok(())
 }
 
@@ -241,7 +245,11 @@ fn report(written: u64, total: Option<u64>) {
     match total {
         Some(total) if total > 0 => {
             let pct = written as f64 / total as f64 * 100.0;
-            let _ = write!(err, "\r  {mb:.1} MB / {:.1} MB ({pct:.0}%)", total as f64 / 1_048_576.0);
+            let _ = write!(
+                err,
+                "\r  {mb:.1} MB / {:.1} MB ({pct:.0}%)",
+                total as f64 / 1_048_576.0
+            );
         }
         _ => {
             let _ = write!(err, "\r  {mb:.1} MB");

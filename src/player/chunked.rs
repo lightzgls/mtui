@@ -31,8 +31,8 @@ use stream_download::source::DecodeError;
 
 /// Bytes per range request.
 ///
-/// Half the ring buffer, so a chunk can never arrive larger than the space
-/// waiting for it. Large enough that per-request overhead is irrelevant at the
+/// A quarter of the ring buffer, so a chunk lands quickly even at the larger
+/// high-quality buffer size. Large enough that per-request overhead is irrelevant at the
 /// speeds this unlocks, small enough that the first one lands quickly -- which
 /// is the number that decides time-to-first-sound.
 const CHUNK_BYTES: u64 = 256 * 1024;
@@ -136,7 +136,7 @@ const REFRESH_POLL: Duration = Duration::from_millis(100);
 /// Measured on one: every freshly signed URL *from the same client* refuses
 /// `bytes=1048576-` just the same, so this only helps because whoever answers
 /// runs the full resolve cascade and can come back from a different client
-/// entirely. The first line is `crate::source::serves_whole_file`, which
+/// entirely. The first line is `mtui_resolver::serves_whole_file`, which
 /// rejects a capped URL before a note is played; this is what stops a track
 /// dying silently when that probe is wrong.
 #[derive(Debug, Clone, Default)]
@@ -603,12 +603,7 @@ enum Chunk {
 /// is googlevideo declining to serve this range to this URL, and no number of
 /// retries changes that -- it needs a different URL, which is a decision made
 /// well above here.
-async fn fetch_chunk(
-    client: &reqwest::Client,
-    url: &reqwest::Url,
-    start: u64,
-    end: u64,
-) -> Chunk {
+async fn fetch_chunk(client: &reqwest::Client, url: &reqwest::Url, start: u64, end: u64) -> Chunk {
     let mut backoff = RETRY_BACKOFF;
 
     for attempt in 0..CHUNK_ATTEMPTS {
@@ -794,7 +789,9 @@ mod tests {
         // The downloader hits its refusal only now, after the answer landed.
         link.request_url(1024 * 1024);
 
-        let url = link.take_url().expect("the armed URL should still be there");
+        let url = link
+            .take_url()
+            .expect("the armed URL should still be there");
         assert_eq!(url.as_str(), "https://example.com/ready.m4a");
         assert_eq!(link.wants_url(), None);
     }
@@ -926,4 +923,3 @@ mod probe {
         });
     }
 }
-

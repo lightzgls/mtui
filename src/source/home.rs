@@ -35,6 +35,12 @@ use crate::config::Cookies;
 
 const ORIGIN: &str = "https://music.youtube.com";
 const BROWSE_URL: &str = "https://music.youtube.com/youtubei/v1/browse";
+const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search";
+
+/// YouTube Music's filtered-search token for community-created playlists.
+/// This is the filter used by its web client, rather than a text suffix that
+/// merely hopes ordinary search will rank playlists first.
+const COMMUNITY_PLAYLISTS_FILTER: &str = "EgeKAQQoAEABagwQDhAKEAMQBBAJEAU%3D";
 
 /// The watch queue. One call returns a whole radio station seeded from a single
 /// song, which is what "Quick picks" is built out of -- and, in
@@ -66,6 +72,9 @@ const MAX_TRACKS: usize = 200;
 /// Cards put on a shelf built here. A screenful is three or four; this is deep
 /// enough to scroll through and shallow enough that a shelf is not a list.
 const SHELF_DEPTH: usize = 16;
+/// A tighter shelf leaves familiar history for Quick Picks instead of putting
+/// every known track above it and leaving only strangers to recommend.
+const LISTEN_AGAIN_DEPTH: usize = 12;
 
 /// Likes below which the built shelves stop being worth showing. "Forgotten
 /// favorites" taken from a library of six is the same six as "Listen again".
@@ -141,13 +150,13 @@ impl Card {
     /// a card drawing the marker as its own badge does not also print it in the
     /// line underneath.
     pub fn detail(&self) -> String {
-        let Some(kind) = self.kind() else {
-            return self.subtitle.clone();
-        };
+        let kind = self.kind();
         self.subtitle
             .split('•')
             .map(str::trim)
-            .filter(|field| !field.is_empty() && *field != kind)
+            .filter(|field| {
+                !field.is_empty() && Some(*field) != kind && parse_duration(field).is_none()
+            })
             .collect::<Vec<_>>()
             .join(" • ")
     }
@@ -266,7 +275,11 @@ pub fn tracks(http: &Http, browse_id: &str) -> Result<Vec<Track>> {
     let mut rows = Vec::new();
     collect(&json, "musicResponsiveListItemRenderer", &mut rows);
 
-    let tracks: Vec<Track> = rows.into_iter().filter_map(parse_row).take(MAX_TRACKS).collect();
+    let tracks: Vec<Track> = rows
+        .into_iter()
+        .filter_map(parse_row)
+        .take(MAX_TRACKS)
+        .collect();
     if tracks.is_empty() {
         bail!("nothing playable came back for this one");
     }
@@ -303,7 +316,12 @@ pub(super) fn browse_as(
 ///
 /// The context travels with every request and has to match what a real client
 /// would send; `extra` is whatever the particular endpoint wants on top.
-pub(super) fn post(http: &Http, url: &str, cookies: Option<&Cookies>, extra: Value) -> Result<Value> {
+pub(super) fn post(
+    http: &Http,
+    url: &str,
+    cookies: Option<&Cookies>,
+    extra: Value,
+) -> Result<Value> {
     post_as(http, url, cookies, MUSIC_CLIENT_VERSION, extra)
 }
 
@@ -389,11 +407,15 @@ pub fn personal(http: &Http, likes: &[Track], journal: &Journal, rotation: usize
     let now = sapisid::unix_now();
     let taste = journal.taste(likes, now);
     let informed = taste.is_informed();
+    let has_plays = taste.has_plays();
+    // Change the initial page daily as well as on explicit refresh, without
+    // persisting another counter solely to vary recommendations.
+    let rotation = rotation.wrapping_add((now / 86_400) as usize);
 
     let mut shelves = Vec::new();
     // Nothing played and nothing liked: there is genuinely no user here to
     // build a page for, and the generic feed behind this is the right answer.
-    if likes.is_empty() && !informed {
+    if likes.is_empty() && !has_plays {
         return shelves;
     }
 
@@ -408,27 +430,36 @@ pub fn personal(http: &Http, likes: &[Track], journal: &Journal, rotation: usize
     // thing that makes a shelf look like it is not paying attention.
     let mut seen: HashSet<String> = taste.recent().clone();
 
-    let listen_again: Vec<Card> = if informed {
+    let listen_again: Vec<Card> = if has_plays {
         taste
-            .listen_again(SHELF_DEPTH)
+            .listen_again(LISTEN_AGAIN_DEPTH, rotation)
             .into_iter()
             .map(|ranked| Card::from_track(&ranked.track))
             .collect()
     } else {
-        likes.iter().take(SHELF_DEPTH).map(Card::from_track).collect()
+        likes
+            .iter()
+            .take(SHELF_DEPTH)
+            .map(Card::from_track)
+            .collect()
     };
-    push(&mut shelves, &mut seen, "Listen again", listen_again);
+    let listen_title = if has_plays {
+        "Listen again"
+    } else {
+        "Liked songs"
+    };
+    push(&mut shelves, &mut seen, listen_title, listen_again);
 
     // The radios. Seeds come from the ranking when there is one and from the
     // likes when there is not, but the shelf is built the same way either way.
-    let seeds: Vec<Track> = if informed {
+    let seeds: Vec<Track> = if has_plays {
         taste
-            .seeds(SEEDS, rotation)
+            .seeds(SEEDS, rotation, &seen)
             .into_iter()
             .map(|ranked| ranked.track.clone())
             .collect()
     } else {
-        distinct_by_artist(likes, SEEDS, rotation)
+        Vec::new()
     };
 
     let mut picks: Vec<Vec<Card>> = Vec::new();
@@ -447,11 +478,13 @@ pub fn personal(http: &Http, likes: &[Track], journal: &Journal, rotation: usize
         };
 
         picks.push(
-            queue(&json)
+            std::iter::once(Card::from_track(seed))
+                .chain(queue(&json)
                 .into_iter()
-                // The station's first entry is the seed itself, which the user
-                // already knows about.
+                // The station repeats the seed. We add the richer local card
+                // once ourselves so every recommendation has visible context.
                 .filter(|card| !matches!(&card.target, Target::Play { video_id } if *video_id == seed.id))
+                .take(3))
                 .collect(),
         );
 
@@ -481,13 +514,59 @@ pub fn personal(http: &Http, likes: &[Track], journal: &Journal, rotation: usize
         // The old approximation, kept for the cold-start path only: with no
         // journal there is no way to tell what has gone cold, and the far end
         // of the like list is the least-bad guess at it.
-        likes.iter().rev().take(SHELF_DEPTH).map(Card::from_track).collect()
+        likes
+            .iter()
+            .rev()
+            .take(SHELF_DEPTH)
+            .map(Card::from_track)
+            .collect()
     } else {
         Vec::new()
     };
     push(&mut shelves, &mut seen, "Forgotten favorites", forgotten);
 
     shelves
+}
+
+/// Public playlists matching one strong track from the user's listening.
+///
+/// One filtered search per refresh is enough: the seed rotates among the best
+/// non-skipped tracks, while YouTube does the broader musical matching. Failure
+/// is deliberately an absent shelf; the rest of Home is already useful and a
+/// recommendation request should never turn it into an error page.
+pub fn community_playlists(http: &Http, journal: &Journal, rotation: usize) -> Option<Shelf> {
+    let now = sapisid::unix_now();
+    let taste = journal.taste(&[], now);
+    let rotation = rotation.wrapping_add((now / 86_400) as usize);
+    let seed = &taste.community_seed(rotation)?.track;
+    let query = if seed.uploader == UNKNOWN_ARTIST {
+        seed.title.clone()
+    } else {
+        format!("{} {}", seed.uploader, seed.title)
+    };
+    let json = post(
+        http,
+        SEARCH_URL,
+        None,
+        serde_json::json!({
+            "query": query,
+            "params": COMMUNITY_PLAYLISTS_FILTER,
+        }),
+    )
+    .ok()?;
+    parse_community_playlists(&json)
+}
+
+/// Puts the four primary Home sections first without disturbing YouTube's
+/// ordering among everything else it returned.
+pub fn order_shelves(shelves: &mut [Shelf]) {
+    shelves.sort_by_key(|shelf| match shelf.title.as_str() {
+        "Quick picks" | "From your listening" => 0,
+        "Listen again" | "Liked songs" => 1,
+        "Forgotten favorites" => 2,
+        "Community playlists for you" => 3,
+        _ => 4,
+    });
 }
 
 /// Adds a shelf, dropping the cards already used above it.
@@ -501,10 +580,13 @@ fn push(shelves: &mut Vec<Shelf>, seen: &mut HashSet<String>, title: &str, cards
     // Filtered against `seen` without writing to it, because a shelf that turns
     // out to be too thin is not shown -- and marking its cards as used would
     // then withhold them from the shelf below, which might have had room.
+    let mut within = HashSet::new();
     let cards: Vec<Card> = cards
         .into_iter()
         .filter(|card| match &card.target {
-            Target::Play { video_id } => !seen.contains(video_id),
+            Target::Play { video_id } => {
+                !seen.contains(video_id) && within.insert(video_id.clone())
+            }
             // Albums and artists are not songs and cannot collide with them.
             Target::Open { .. } => true,
         })
@@ -546,8 +628,9 @@ fn interleave(stations: Vec<Vec<Card>>) -> Vec<Card> {
 
 /// Up to `count` tracks by different artists, starting `rotation` in.
 ///
-/// The cold-start counterpart to [`crate::source::journal::Taste::seeds`], for
-/// a first run with likes but no plays behind it.
+/// Kept for tests and possible library-only views. Local radio shelves no longer
+/// use likes as seeds: a YouTube like is not evidence MTUI's user knows a song.
+#[cfg(test)]
 fn distinct_by_artist(tracks: &[Track], count: usize, rotation: usize) -> Vec<Track> {
     let mut artists = HashSet::new();
     let candidates: Vec<&Track> = tracks
@@ -650,34 +733,95 @@ pub(super) fn parse_shelves(json: &Value) -> Vec<Shelf> {
         .collect()
 }
 
+/// The filtered search response is a vertical music shelf rather than one of
+/// Home's carousels. Keep only its public playlist rows: YouTube occasionally
+/// pads a filtered response with another category, and treating those rows as
+/// playlists would make Enter open the wrong kind of page.
+fn parse_community_playlists(json: &Value) -> Option<Shelf> {
+    const TITLE: &str = "Community playlists for you";
+    const MIN_CARDS: usize = 3;
+
+    let mut shelves = Vec::new();
+    collect(json, "musicShelfRenderer", &mut shelves);
+    let shelf = shelves.into_iter().find(|shelf| {
+        shelf
+            .pointer("/title/runs")
+            .and_then(runs_text)
+            .is_some_and(|title| title.to_ascii_lowercase().contains("community playlist"))
+    })?;
+
+    let mut seen = HashSet::new();
+    let cards: Vec<Card> = shelf
+        .pointer("/contents")?
+        .as_array()?
+        .iter()
+        .filter_map(parse_card)
+        .filter_map(|mut card| match &card.target {
+            Target::Open { browse_id }
+                if browse_id.starts_with("VL") && seen.insert(browse_id.clone()) =>
+            {
+                if card.kind().is_none() {
+                    card.subtitle = if card.subtitle.is_empty() {
+                        "Playlist".to_string()
+                    } else {
+                        format!("Playlist • {}", card.subtitle)
+                    };
+                }
+                Some(card)
+            }
+            _ => None,
+        })
+        .take(SHELF_DEPTH)
+        .collect();
+
+    (cards.len() >= MIN_CARDS).then(|| Shelf {
+        title: TITLE.to_string(),
+        cards,
+    })
+}
+
 fn parse_card(item: &Value) -> Option<Card> {
     let two_row = &item["musicTwoRowItemRenderer"];
     if two_row.is_object() {
+        let subtitle = two_row
+            .pointer("/subtitle/runs")
+            .and_then(runs_text)
+            .unwrap_or_default();
         return Some(Card {
             title: two_row.pointer("/title/runs").and_then(runs_text)?,
-            subtitle: two_row
-                .pointer("/subtitle/runs")
-                .and_then(runs_text)
-                .unwrap_or_default(),
+            duration: subtitle.split('•').map(str::trim).find_map(parse_duration),
+            subtitle,
             art: art_url(two_row.pointer("/thumbnailRenderer")),
-            duration: None,
             target: target(&two_row["navigationEndpoint"])?,
         });
     }
 
     let row = &item["musicResponsiveListItemRenderer"];
     if row.is_object() {
-        let video_id = video_id(row)?;
+        let target = target(&row["navigationEndpoint"])
+            .or_else(|| {
+                row.pointer(
+                    "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint",
+                )
+                .and_then(target)
+            })
+            .or_else(|| video_id(row).map(|video_id| Target::Play { video_id }))?;
+        let subtitle = flex_column(row, 1).unwrap_or_default();
         return Some(Card {
             title: flex_column(row, 0)?,
-            subtitle: flex_column(row, 1).unwrap_or_default(),
+            duration: fixed_column(row, 0)
+                .as_deref()
+                .and_then(parse_duration)
+                .or_else(|| subtitle.split('•').map(str::trim).find_map(parse_duration)),
+            subtitle,
             // A list row carries a thumbnail too, but not always: falling back
             // to the video's own means a "Quick picks" row is never the one
             // card on the page drawn without a picture.
-            art: art_url(row.pointer("/thumbnail"))
-                .or_else(|| Some(cover::thumb_url(&video_id))),
-            duration: fixed_column(row, 0).as_deref().and_then(parse_duration),
-            target: Target::Play { video_id },
+            art: art_url(row.pointer("/thumbnail")).or_else(|| match &target {
+                Target::Play { video_id } => Some(cover::thumb_url(video_id)),
+                Target::Open { .. } => None,
+            }),
+            target,
         });
     }
 
@@ -720,7 +864,10 @@ fn art_url(renderer: Option<&Value>) -> Option<String> {
 
 /// What a card's endpoint does, if it does either.
 fn target(endpoint: &Value) -> Option<Target> {
-    if let Some(id) = endpoint.pointer("/watchEndpoint/videoId").and_then(Value::as_str) {
+    if let Some(id) = endpoint
+        .pointer("/watchEndpoint/videoId")
+        .and_then(Value::as_str)
+    {
         return Some(Target::Play {
             video_id: id.to_string(),
         });
@@ -772,7 +919,11 @@ fn parse_row(row: &Value) -> Option<Track> {
     Some(Track {
         id,
         title,
-        uploader: fields.first().copied().unwrap_or(UNKNOWN_ARTIST).to_string(),
+        uploader: fields
+            .first()
+            .copied()
+            .unwrap_or(UNKNOWN_ARTIST)
+            .to_string(),
         // The fixed column is where a playlist listing puts the length. Falling
         // back to the last joined field covers the rows that carry no fixed
         // column at all; a field that is a view count simply fails to parse,
@@ -820,16 +971,13 @@ const TYPES: [&str; 10] = [
 /// artist, and leaves nothing at all for a subtitle that never named one --
 /// which is the honest answer for a playlist described by its view count.
 fn artist(subtitle: &str) -> Option<&str> {
-    subtitle
-        .split('•')
-        .map(str::trim)
-        .find(|field| {
-            !field.is_empty()
-                && !TYPES.contains(field)
-                && !field.ends_with(" views")
-                && !field.ends_with(" plays")
-                && !field.ends_with(" songs")
-        })
+    subtitle.split('•').map(str::trim).find(|field| {
+        !field.is_empty()
+            && !TYPES.contains(field)
+            && !field.ends_with(" views")
+            && !field.ends_with(" plays")
+            && !field.ends_with(" songs")
+    })
 }
 
 /// Collects every value stored under `key`, at any depth.
@@ -903,6 +1051,40 @@ mod tests {
     }
 
     #[test]
+    fn a_picture_card_keeps_its_timer_out_of_the_subtitle() {
+        let json = shelf(
+            "Listen again",
+            vec![card(
+                "Creep",
+                "Song • Radiohead • 3:58",
+                serde_json::json!({ "watchEndpoint": { "videoId": "XFkzRNyygfk" } }),
+            )],
+        );
+
+        let card = &parse_shelves(&json)[0].cards[0];
+        assert_eq!(card.duration, Some(Duration::from_secs(238)));
+        assert_eq!(card.detail(), "Radiohead");
+    }
+
+    #[test]
+    fn a_responsive_card_falls_back_to_a_timer_in_its_subtitle() {
+        let wrapped = shelf(
+            "Quick picks",
+            vec![serde_json::json!({
+                "musicResponsiveListItemRenderer": row(
+                    "JhulBGMA7G4",
+                    &["Harder, Better, Faster, Stronger", "Daft Punk • 3:47"],
+                    None,
+                )
+            })],
+        );
+
+        let card = &parse_shelves(&wrapped)[0].cards[0];
+        assert_eq!(card.duration, Some(Duration::from_secs(227)));
+        assert_eq!(card.detail(), "Daft Punk");
+    }
+
+    #[test]
     fn an_album_card_browses_rather_than_plays() {
         let json = shelf(
             "Albums for you",
@@ -919,6 +1101,132 @@ mod tests {
             Target::Open { browse_id } => assert_eq!(browse_id, "MPREb_abc"),
             Target::Play { .. } => panic!("an album is not a video"),
         }
+    }
+
+    fn community_row(id: &str, title: &str, subtitle: &str) -> Value {
+        let mut item = row("unused", &[title, subtitle], None);
+        item["playlistItemData"] = Value::Null;
+        item["navigationEndpoint"] = serde_json::json!({ "browseEndpoint": { "browseId": id } });
+        serde_json::json!({ "musicResponsiveListItemRenderer": item })
+    }
+
+    #[test]
+    fn reads_filtered_community_playlists_as_open_cards() {
+        let json = serde_json::json!({
+            "contents": { "sectionListRenderer": { "contents": [ {
+                "musicShelfRenderer": {
+                    "title": { "runs": [ { "text": "Community playlists" } ] },
+                    "contents": [
+                        community_row("VLone", "Night drive", "Alex • 42 songs"),
+                        community_row("VLtwo", "Soft focus", "Mina • 31 songs"),
+                        community_row("VLthree", "After hours", "Sam • 67 songs")
+                    ]
+                }
+            } ] } }
+        });
+
+        let shelf = parse_community_playlists(&json).expect("community shelf should parse");
+        assert_eq!(shelf.title, "Community playlists for you");
+        assert_eq!(shelf.cards.len(), 3);
+        assert_eq!(shelf.cards[0].title, "Night drive");
+        assert_eq!(shelf.cards[0].kind(), Some("Playlist"));
+        assert_eq!(shelf.cards[0].detail(), "Alex • 42 songs");
+        match &shelf.cards[0].target {
+            Target::Open { browse_id } => assert_eq!(browse_id, "VLone"),
+            Target::Play { .. } => panic!("a community playlist must browse"),
+        }
+    }
+
+    #[test]
+    fn community_playlist_results_are_filtered_deduplicated_and_need_a_row() {
+        let json = serde_json::json!({
+            "contents": [
+                { "musicShelfRenderer": {
+                    "title": { "runs": [ { "text": "Songs" } ] },
+                    "contents": [
+                        community_row("VLpadding", "Not the filtered shelf", "Somebody"),
+                        community_row("VLpadding2", "Still padding", "Somebody"),
+                        community_row("VLpadding3", "More padding", "Somebody")
+                    ]
+                } },
+                { "musicShelfRenderer": {
+                    "title": { "runs": [ { "text": "Community playlists" } ] },
+                    "contents": [
+                        community_row("VLone", "One", "A"),
+                        community_row("VLone", "One again", "A"),
+                        community_row("MPREalbum", "Not a playlist", "Album"),
+                        community_row("VLtwo", "Two", "B")
+                    ]
+                } }
+            ]
+        });
+
+        assert!(
+            parse_community_playlists(&json).is_none(),
+            "duplicates, albums, and padded shelves must not make a full row"
+        );
+    }
+
+    #[test]
+    fn primary_home_sections_have_one_stable_order() {
+        let make = |title: &str| Shelf {
+            title: title.to_string(),
+            cards: vec![playable(title)],
+        };
+        let mut shelves = vec![
+            make("New releases"),
+            make("Community playlists for you"),
+            make("Forgotten favorites"),
+            make("Listen again"),
+            make("Quick picks"),
+            make("Albums for you"),
+        ];
+
+        order_shelves(&mut shelves);
+
+        assert_eq!(
+            shelves
+                .iter()
+                .map(|shelf| shelf.title.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Quick picks",
+                "Listen again",
+                "Forgotten favorites",
+                "Community playlists for you",
+                "New releases",
+                "Albums for you",
+            ]
+        );
+    }
+
+    /// Checks the filter token and the full search-to-browse path against the
+    /// live catalogue without depending on a saved account.
+    #[test]
+    #[ignore = "hits the live YouTube Music API"]
+    fn community_playlist_search_against_the_live_api() {
+        let http = Http::new().expect("client should build");
+        let json = post(
+            &http,
+            SEARCH_URL,
+            None,
+            serde_json::json!({
+                "query": "Tame Impala The Less I Know the Better",
+                "params": COMMUNITY_PLAYLISTS_FILTER,
+            }),
+        )
+        .expect("community playlist search should answer");
+        let shelf = parse_community_playlists(&json).expect("community playlists should parse");
+        let Target::Open { browse_id } = &shelf.cards[0].target else {
+            panic!("a community result should open a playlist");
+        };
+
+        assert!(browse_id.starts_with("VL"));
+        assert!(
+            !tracks(&http, browse_id)
+                .expect("the first community playlist should open")
+                .is_empty()
+        );
     }
 
     /// The layout is walked for rather than pointed at, because YouTube serves
@@ -1024,8 +1332,12 @@ mod tests {
         // The trending shelf carries "Channel • 2.6M views" and no fixed
         // column. Neither field is a length, so the row is honestly LIVE-less
         // rather than three million seconds long.
-        let track = parse_row(&row("abcdefghijk", &["Some video", "Vie Channel • 2.6M views"], None))
-            .expect("row should parse");
+        let track = parse_row(&row(
+            "abcdefghijk",
+            &["Some video", "Vie Channel • 2.6M views"],
+            None,
+        ))
+        .expect("row should parse");
         assert_eq!(track.duration, None);
         assert_eq!(track.uploader, "Vie Channel");
     }
@@ -1119,6 +1431,21 @@ mod tests {
     }
 
     #[test]
+    fn a_radio_song_is_only_kept_once_within_its_shelf() {
+        let mut shelves = Vec::new();
+        let mut seen = HashSet::new();
+        push(
+            &mut shelves,
+            &mut seen,
+            "From your listening",
+            vec![playable("a"), playable("a"), playable("b"), playable("c")],
+        );
+
+        assert_eq!(shelves.len(), 1);
+        assert_eq!(shelves[0].cards.len(), 3);
+    }
+
+    #[test]
     fn albums_never_collide_with_songs() {
         // Two cards can carry the same id in different senses -- a browse id is
         // not a video id -- so only playable cards are deduplicated.
@@ -1134,7 +1461,12 @@ mod tests {
             },
         };
 
-        push(&mut shelves, &mut seen, "Albums", vec![album(), album(), album()]);
+        push(
+            &mut shelves,
+            &mut seen,
+            "Albums",
+            vec![album(), album(), album()],
+        );
         assert_eq!(shelves[0].cards.len(), 3);
     }
 
@@ -1175,7 +1507,10 @@ mod tests {
     fn a_label_drops_the_type_marker_and_the_counts() {
         assert_eq!(artist("Song • Radiohead"), Some("Radiohead"));
         assert_eq!(artist("Album • TEMPOREX"), Some("TEMPOREX"));
-        assert_eq!(artist("Tame Impala • 68M plays • The Slow Rush"), Some("Tame Impala"));
+        assert_eq!(
+            artist("Tame Impala • 68M plays • The Slow Rush"),
+            Some("Tame Impala")
+        );
         // A playlist described only by how many people played it names nobody,
         // and "Creep — 37K views" would be worse than a bare title.
         assert_eq!(artist("37K views"), None);
@@ -1342,8 +1677,8 @@ mod tests {
             code.verification_url, code.user_code
         );
 
-        let tokens = auth::wait_for_approval(&http, &creds, &code)
-            .expect("the code should be approved");
+        let tokens =
+            auth::wait_for_approval(&http, &creds, &code).expect("the code should be approved");
         println!("  approved\n");
 
         // Both identities, because a token issued to the living-room client may
@@ -1434,7 +1769,11 @@ mod tests {
         let http = Http::new().expect("client should build");
         let start = Instant::now();
         let shelves = fetch(&http, None).expect("the home feed should come back");
-        println!("home: {:.2}s, {} shelves", start.elapsed().as_secs_f64(), shelves.len());
+        println!(
+            "home: {:.2}s, {} shelves",
+            start.elapsed().as_secs_f64(),
+            shelves.len()
+        );
 
         assert!(!shelves.is_empty());
         for shelf in &shelves {
@@ -1452,7 +1791,9 @@ mod tests {
 
         // A landing page that cannot be played from is not one.
         assert!(
-            shelves.iter().any(|s| s.cards.iter().any(Card::is_playable)),
+            shelves
+                .iter()
+                .any(|s| s.cards.iter().any(Card::is_playable)),
             "no shelf carried anything playable"
         );
     }
@@ -1484,8 +1825,14 @@ mod live_personal {
 
         let likes = if library.is_signed_in() {
             let start = Instant::now();
-            let likes = library.tracks(LIKED_ID, 100).expect("liked songs should load");
-            println!("{} liked songs in {:.2}s", likes.len(), start.elapsed().as_secs_f64());
+            let likes = library
+                .tracks(LIKED_ID, 100)
+                .expect("liked songs should load");
+            println!(
+                "{} liked songs in {:.2}s",
+                likes.len(),
+                start.elapsed().as_secs_f64()
+            );
             likes
         } else {
             println!("not signed in -- building from the journal alone");
@@ -1529,7 +1876,10 @@ mod live_personal {
             println!("\nno likes and an empty journal -- there is nothing to build a page from");
             return;
         }
-        assert!(!pages[0].is_empty(), "the page came back with nothing playable");
+        assert!(
+            !pages[0].is_empty(),
+            "the page came back with nothing playable"
+        );
 
         // Not an assert: with one artist in the journal there is only one seed
         // to rotate through, and that is a thin history rather than a bug.

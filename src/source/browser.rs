@@ -47,15 +47,7 @@ use crate::config::Cookies;
 /// family will mostly fail, and fails fast enough that having tried costs
 /// little.
 pub const BROWSERS: [&str; 9] = [
-    "firefox",
-    "chrome",
-    "edge",
-    "brave",
-    "chromium",
-    "vivaldi",
-    "opera",
-    "safari",
-    "whale",
+    "firefox", "chrome", "edge", "brave", "chromium", "vivaldi", "opera", "safari", "whale",
 ];
 
 /// yt-dlp insists on a URL even when the only thing wanted is the cookie jar.
@@ -147,8 +139,9 @@ pub fn extract(yt: &YouTube, browser: &str) -> Result<Cookies> {
 
     let header = header_from(&text)
         .context("the jar held no youtube.com cookies -- not signed in to YouTube there")?;
-    Cookies::from_header(&header)
-        .context("the jar has youtube.com cookies but no SAPISID -- signed out, or a partial session")
+    Cookies::from_header(&header).context(
+        "the jar has youtube.com cookies but no SAPISID -- signed out, or a partial session",
+    )
 }
 
 /// Where the jar is written while it is being read.
@@ -214,12 +207,7 @@ fn explain(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
         .find(|line| line.contains("ERROR") || line.contains("error"))
-        .map(|line| {
-            line.trim()
-                .trim_start_matches("ERROR:")
-                .trim()
-                .to_string()
-        })
+        .map(|line| line.trim().trim_start_matches("ERROR:").trim().to_string())
         .unwrap_or_else(|| "gave nothing back".to_string())
 }
 
@@ -244,7 +232,10 @@ mod tests {
         let header = header_from(JAR).expect("the jar holds youtube cookies");
         assert!(header.contains("SAPISID=secret-value"));
         assert!(header.contains("SID=sid-value"));
-        assert!(header.contains("PREF=f6=40000000"), "a value containing = must survive");
+        assert!(
+            header.contains("PREF=f6=40000000"),
+            "a value containing = must survive"
+        );
 
         // And it is a header a signing path can actually use.
         let cookies = Cookies::from_header(&header).expect("SAPISID should be found");
@@ -263,8 +254,14 @@ mod tests {
     #[test]
     fn only_youtube_cookies_travel() {
         let header = header_from(JAR).unwrap();
-        assert!(!header.contains("NID"), "a google.com cookie leaked into the header");
-        assert!(!header.contains("nothing-to-do-with-us"), "an unrelated site leaked");
+        assert!(
+            !header.contains("NID"),
+            "a google.com cookie leaked into the header"
+        );
+        assert!(
+            !header.contains("nothing-to-do-with-us"),
+            "an unrelated site leaked"
+        );
     }
 
     #[test]
@@ -303,7 +300,8 @@ mod tests {
 
     #[test]
     fn yt_dlp_errors_are_reduced_to_one_line() {
-        let stderr = b"WARNING: something\nERROR: could not find firefox cookies database\n  hint: blah";
+        let stderr =
+            b"WARNING: something\nERROR: could not find firefox cookies database\n  hint: blah";
         assert_eq!(explain(stderr), "could not find firefox cookies database");
         assert_eq!(explain(b""), "gave nothing back");
     }
@@ -358,9 +356,14 @@ mod tests {
         // built from this account's own listening is the proof that the cookie
         // was not merely well-formed but recognised.
         let personal = shelves.iter().any(|shelf| {
-            ["Listen again", "Quick picks", "Heard in Shorts", "Mixed for you"]
-                .iter()
-                .any(|name| shelf.title.starts_with(name))
+            [
+                "Listen again",
+                "Quick picks",
+                "Heard in Shorts",
+                "Mixed for you",
+            ]
+            .iter()
+            .any(|name| shelf.title.starts_with(name))
         });
         assert!(
             personal,

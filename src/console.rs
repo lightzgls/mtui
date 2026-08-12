@@ -85,11 +85,15 @@ mod imp {
     /// no notification area to put the result in. Refused rather than
     /// half-implemented.
     pub fn detach() -> Result<()> {
-        Err(anyhow!("running in the background is only implemented on Windows"))
+        Err(anyhow!(
+            "running in the background is only implemented on Windows"
+        ))
     }
 
     pub fn attach() -> Result<()> {
-        Err(anyhow!("running in the background is only implemented on Windows"))
+        Err(anyhow!(
+            "running in the background is only implemented on Windows"
+        ))
     }
 }
 

@@ -15,8 +15,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph};
 
 use crate::app::{
-    App, CardShape, CoverSize, ImagePlan, Mode, NowPlaying, Overlay, Panel, RelatedRow, SignIn, Tab,
-    View,
+    App, CardShape, CoverSize, ImagePlan, Mode, NowPlaying, Overlay, Panel, RelatedRow, SignIn,
+    Tab, View,
 };
 use crate::art::ArtCache;
 use crate::graphics::Graphics;
@@ -113,11 +113,7 @@ const HINTS_TRACKS: &str = "/ search  L library  a add  f like  q quit";
 /// room for it: it rebuilds the page from different seeds rather than merely
 /// re-fetching it, which is not something a user would think to try unprompted.
 ///
-/// `v` cost this line its `q quit`, which is the one hint on it that is also on
-/// every other line in the program. It is worth the trade: the page sizes its
-/// own cards, and a user who wants more of the feed on screen than the pictures
-/// allow has no way at all to guess that a key for it exists.
-const HINTS_HOME: &str = "Enter play  hjkl move  v cards  r refresh  / search";
+const HINTS_HOME: &str = "Enter play  hjkl move  r refresh  / search  q quit";
 /// The player page. `n`, `p` and the tab keys are what it is for; `Esc` is
 /// named because the view is entered without being asked for and the way out of
 /// it is the first thing a user looks for. `+-` is named beside the volume bar
@@ -215,15 +211,13 @@ const CARD_TEXT_ROWS: u16 = 3;
 /// for the label, the title, the artist and the progress bar.
 const HERO_HEIGHT: u16 = 6;
 
-/// Shelves that must still fit under the hero strip for it to be drawn at all.
-///
-/// One would leave a landing page that is mostly a picture of the track already
-/// playing -- which is the one thing on it the user does not need to be shown.
-const HERO_MIN_SHELVES: u16 = 2;
-
 /// Below this a card holds nothing but borders and an ellipsis, so the page
 /// stands down and says so rather than drawing a column of empty boxes.
 const MIN_HOME_WIDTH: u16 = 24;
+
+/// Shelves kept together on the landing page before later sections are allowed
+/// to spend the remaining height on larger cards.
+const MIN_VISIBLE_HOME_SECTIONS: usize = 3;
 
 /// Colour of a card with no artwork -- either because none arrived, or because
 /// it has not arrived yet. Grey rather than a guessed hue: a made-up colour on
@@ -439,7 +433,10 @@ fn render_connecting(frame: &mut Frame, elapsed: Duration) {
             Style::default().fg(Color::White),
         )),
         Line::from(""),
-        Line::from(Span::styled(HINT_HIDE, Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            HINT_HIDE,
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -452,7 +449,9 @@ fn render_connecting(frame: &mut Frame, elapsed: Duration) {
 fn render_waiting(frame: &mut Frame, user_code: &str, url: &str, deadline: Instant) {
     // Wide enough for the verification URL, which is the one line that must not
     // wrap -- a user cannot type half a URL.
-    let width = (display_width(url) as u16).saturating_add(10).max(SIGN_IN_MIN_WIDTH);
+    let width = (display_width(url) as u16)
+        .saturating_add(10)
+        .max(SIGN_IN_MIN_WIDTH);
     let left = deadline.saturating_duration_since(Instant::now());
 
     // Short terminals get the same content without the framing. Dropping the
@@ -476,7 +475,10 @@ fn render_waiting(frame: &mut Frame, user_code: &str, url: &str, deadline: Insta
     ])
     .areas(inner);
 
-    frame.render_widget(Paragraph::new(step("1", "open this page in a browser")), step_1);
+    frame.render_widget(
+        Paragraph::new(step("1", "open this page in a browser")),
+        step_1,
+    );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!("{INDENT}{url}"),
@@ -540,7 +542,11 @@ fn render_waiting_compact(
             ),
         ]),
         Line::from(Span::styled(
-            format!(" waiting for approval{} ({} left)", ellipsis(left), countdown(left)),
+            format!(
+                " waiting for approval{} ({} left)",
+                ellipsis(left),
+                countdown(left)
+            ),
             Style::default().fg(Color::Yellow),
         )),
     ];
@@ -696,7 +702,10 @@ fn render_add_to(frame: &mut Frame, app: &App, title: &str, selected: usize) {
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!(" {}", truncate(title, inner.width.saturating_sub(2) as usize)),
+            format!(
+                " {}",
+                truncate(title, inner.width.saturating_sub(2) as usize)
+            ),
             Style::default().add_modifier(Modifier::BOLD),
         ))),
         header,
@@ -940,13 +949,13 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let plan = plan_home(inner, app.card_shape, app.now.is_some());
-    app.drawn_shape = plan.shape;
+    let plan = plan_home(inner, app.now.is_some());
 
     let shelves = match (plan.hero, app.now.as_ref()) {
         (true, Some(now)) => {
             let [strip, shelves] =
-                Layout::vertical([Constraint::Length(HERO_HEIGHT), Constraint::Min(0)]).areas(inner);
+                Layout::vertical([Constraint::Length(HERO_HEIGHT), Constraint::Min(0)])
+                    .areas(inner);
             render_hero(
                 frame,
                 &Hero {
@@ -963,13 +972,20 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
         _ => inner,
     };
 
-    let (width, _) = card_size(plan.shape);
-    let across = (shelves.width / width).max(1);
-    let down = (shelves.height / shelf_height(plan.shape)).max(1);
-    app.clamp_home(down as usize, across as usize);
+    app.clamp_home_selection();
+    app.home_top = app.home_top.min(app.home_shelf);
+    let mut layouts = shelf_layouts(&app.home, shelves, app.home_top, plan.max_shape);
+    while !layouts.iter().any(|layout| layout.index == app.home_shelf)
+        && app.home_top < app.home_shelf
+    {
+        app.home_top += 1;
+        layouts = shelf_layouts(&app.home, shelves, app.home_top, plan.max_shape);
+    }
+    if let Some(focused) = layouts.iter().find(|layout| layout.index == app.home_shelf) {
+        app.clamp_home_cards(focused.across as usize);
+    }
 
     let cursor = HomeCursor {
-        top: app.home_top,
         shelf: app.home_shelf,
         card: app.home_card,
     };
@@ -980,11 +996,11 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
     render_feed(
         frame,
         &app.home,
-        shelves,
+        &layouts,
         cursor,
         &app.home_scroll,
         Tiles {
-            shape: plan.shape,
+            shape: CardShape::Text,
             art: &app.art,
             wanted: &mut wanted,
         },
@@ -996,7 +1012,7 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
 /// and whether there is room left over for the now-playing strip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HomePlan {
-    shape: CardShape,
+    max_shape: CardShape,
     hero: bool,
 }
 
@@ -1009,34 +1025,13 @@ struct HomePlan {
 /// pushed every sleeve off the page to show them what they can already hear
 /// would be a worse page than one without it.
 ///
-/// `forced` is the user's own answer via `v`, and it is honoured for the shape
-/// while the hero is still decided by what fits -- pinning poster cards on a
-/// short window means poster cards, not poster cards and no room to draw them.
-fn plan_home(area: Rect, forced: Option<CardShape>, playing: bool) -> HomePlan {
-    let shapes: Vec<CardShape> = match forced {
-        Some(shape) => vec![shape],
-        None => CardShape::ALL.to_vec(),
-    };
-
-    // Two passes over the same list. The first insists on a page worth
-    // scrolling, the second settles for a single shelf on a window that cannot
-    // give two -- taking the smaller cards before it gives up the second shelf.
-    for least in [HERO_MIN_SHELVES, 1] {
-        for &shape in &shapes {
-            if playing && fits(area.height.saturating_sub(HERO_HEIGHT), shape, least) {
-                return HomePlan { shape, hero: true };
-            }
-            if fits(area.height, shape, least) {
-                return HomePlan { shape, hero: false };
-            }
-        }
-    }
-    // Nothing fits, including the shape the user pinned. Text cards are what
-    // the pane checked for before drawing anything at all.
-    HomePlan {
-        shape: CardShape::Text,
-        hero: false,
-    }
+fn plan_home(area: Rect, playing: bool) -> HomePlan {
+    let max_shape = CardShape::ALL
+        .into_iter()
+        .find(|shape| fits(area.height, *shape, 1))
+        .unwrap_or(CardShape::Text);
+    let hero = playing && fits(area.height.saturating_sub(HERO_HEIGHT), max_shape, 1);
+    HomePlan { max_shape, hero }
 }
 
 /// Whether `count` shelves of `shape` fit in `height` rows.
@@ -1068,10 +1063,90 @@ fn shelf_height(shape: CardShape) -> u16 {
 /// Where the cursor stands on the landing page as a whole.
 #[derive(Debug, Clone, Copy)]
 struct HomeCursor {
-    /// First visible shelf.
-    top: usize,
     shelf: usize,
     card: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShelfLayout {
+    index: usize,
+    shape: CardShape,
+    area: Rect,
+    across: u16,
+    slot: u16,
+}
+
+fn section_shape(shelf: &Shelf, index: usize, max_shape: CardShape) -> CardShape {
+    let playable = shelf.cards.iter().filter(|card| card.is_playable()).count();
+    let browsable = shelf.cards.len().saturating_sub(playable);
+    let desired = if index == 0 {
+        CardShape::Gallery
+    } else if matches!(shelf.title.as_str(), "From your listening" | "Quick picks") {
+        CardShape::Tile
+    } else if browsable > playable {
+        CardShape::Poster
+    } else {
+        match index % 3 {
+            0 => CardShape::Gallery,
+            1 => CardShape::Tile,
+            _ => CardShape::Poster,
+        }
+    };
+    desired.min(max_shape)
+}
+
+fn shelf_layouts(
+    shelves: &[Shelf],
+    area: Rect,
+    top: usize,
+    max_shape: CardShape,
+) -> Vec<ShelfLayout> {
+    let mut layouts = Vec::new();
+    let mut y = area.y;
+    let bottom = area.y + area.height;
+    let visible_goal = shelves
+        .len()
+        .saturating_sub(top)
+        .min(MIN_VISIBLE_HOME_SECTIONS);
+    for (index, shelf) in shelves.iter().enumerate().skip(top) {
+        let desired = section_shape(shelf, index, max_shape);
+        let position = index - top;
+        let remaining = visible_goal.saturating_sub(position + 1) as u16;
+        let available = bottom.saturating_sub(y);
+        // Keep the first three section headings and card rows on screen
+        // together. Earlier shelves retain their preferred shape; a later one
+        // steps down only when doing so is what makes room for the sections
+        // still owed below it.
+        let shape = if position < visible_goal {
+            CardShape::ALL
+                .into_iter()
+                .find(|shape| {
+                    *shape <= desired
+                        && available
+                            >= shelf_height(*shape)
+                                .saturating_add(shelf_height(CardShape::Text) * remaining)
+                                .saturating_sub(1)
+                })
+                .unwrap_or(CardShape::Text)
+        } else {
+            desired
+        };
+        let (width, height) = card_size(shape);
+        let row_height = height + 1;
+        if y + row_height > bottom {
+            break;
+        }
+        let across = (area.width / width).max(1);
+        layouts.push(ShelfLayout {
+            index,
+            shape,
+            area: Rect::new(area.x, y, area.width, row_height),
+            across,
+            slot: area.width / across,
+        });
+        y += shelf_height(shape);
+    }
+    layouts
 }
 
 /// The artwork side of drawing a shelf: what shape to draw, what pictures are
@@ -1108,42 +1183,29 @@ impl Tiles<'_> {
 fn render_feed(
     frame: &mut Frame,
     shelves: &[Shelf],
-    area: Rect,
+    layouts: &[ShelfLayout],
     cursor: HomeCursor,
     scroll: &[usize],
     mut tiles: Tiles,
 ) {
-    let (width, height) = card_size(tiles.shape);
-    let across = (area.width / width).max(1);
-    let slot = area.width / across;
-
-    let mut y = area.y;
-    for (index, shelf) in shelves.iter().enumerate().skip(cursor.top) {
-        // A shelf that would be cut off halfway is not drawn at all: half a
-        // card reads as a rendering fault, where a blank row reads as the end
-        // of the page.
-        if y + height + 1 > area.y + area.height {
-            break;
-        }
-        let row = Rect {
-            x: area.x,
-            y,
-            width: area.width,
-            height: height + 1,
+    for layout in layouts {
+        let index = layout.index;
+        let Some(shelf) = shelves.get(index) else {
+            continue;
         };
+        tiles.shape = layout.shape;
         render_shelf(
             frame,
             shelf,
-            row,
+            layout.area,
             ShelfCursor {
                 focused: index == cursor.shelf,
                 selected: cursor.card,
                 offset: scroll.get(index).copied().unwrap_or(0),
             },
-            (across, slot),
+            (layout.across, layout.slot),
             &mut tiles,
         );
-        y += shelf_height(tiles.shape);
     }
 }
 
@@ -1297,7 +1359,14 @@ fn render_card(frame: &mut Frame, card: &Card, area: Rect, selected: bool, tiles
         CardShape::Tile => {
             let rows = inner.height;
             let cols = (rows * 2).min(inner.width);
-            render_tile(frame, art, Rect { width: cols, ..inner });
+            render_tile(
+                frame,
+                art,
+                Rect {
+                    width: cols,
+                    ..inner
+                },
+            );
             Rect {
                 x: inner.x + cols + 1,
                 width: inner.width.saturating_sub(cols + 1),
@@ -1335,7 +1404,13 @@ fn render_card(frame: &mut Frame, card: &Card, area: Rect, selected: bool, tiles
         return;
     }
     frame.render_widget(
-        Paragraph::new(card_lines(card, text.width as usize, selected, accent, shape)),
+        Paragraph::new(card_lines(
+            card,
+            text.width as usize,
+            selected,
+            accent,
+            shape,
+        )),
         text,
     );
 }
@@ -1352,7 +1427,9 @@ fn card_lines(
     shape: CardShape,
 ) -> Vec<Line<'static>> {
     let title = if selected {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Gray)
     };
@@ -1440,19 +1517,18 @@ fn detail_spans(detail: &str, room: usize) -> Vec<Span<'static>> {
 /// as music rather than as a list.
 fn badge_spans(card: &Card, accent: Color) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    if let Some(kind) = card.kind() {
-        spans.push(Span::styled(
-            format!(" {} ", kind.to_uppercase()),
-            Style::default()
-                .fg(Color::Black)
-                .bg(accent)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
+    // The clock is the actionable metadata and is never sacrificed to the tag
+    // on a narrow tile.
     if let Some(duration) = card.duration {
         spans.push(Span::styled(
-            format!(" {} ", clock(duration)),
+            format!("{} ", clock(duration)),
             Style::default().fg(Color::Gray),
+        ));
+    }
+    if let Some(kind) = card.kind() {
+        spans.push(Span::styled(
+            kind.to_lowercase(),
+            Style::default().fg(Color::Black).bg(accent),
         ));
     }
     // Nothing known about the card beyond its name, which is most of a
@@ -1461,11 +1537,13 @@ fn badge_spans(card: &Card, accent: Color) -> Vec<Span<'static>> {
     // difference is only discoverable by pressing Enter and seeing.
     if spans.is_empty() {
         spans.push(Span::styled(
-            if card.is_playable() { "▶ play " } else { "≡ open " },
+            if card.is_playable() {
+                "▶ play "
+            } else {
+                "≡ open "
+            },
             Style::default().fg(Color::DarkGray),
         ));
-    } else {
-        spans.push(Span::raw(" "));
     }
     spans
 }
@@ -1619,7 +1697,14 @@ fn render_hero(frame: &mut Frame, hero: &Hero, area: Rect) {
 
     // The sleeve, square, as tall as the strip is inside.
     let cols = (inner.height * 2).min(inner.width);
-    render_tile(frame, hero.art, Rect { width: cols, ..inner });
+    render_tile(
+        frame,
+        hero.art,
+        Rect {
+            width: cols,
+            ..inner
+        },
+    );
 
     let text = Rect {
         x: inner.x + cols + 1,
@@ -1990,7 +2075,9 @@ fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Color) {
     for tab in Tab::ALL {
         let selected = tab == open;
         let style = if selected {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -2005,7 +2092,10 @@ fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Color) {
         ));
     }
 
-    frame.render_widget(Paragraph::new(vec![Line::from(labels), Line::from(rule)]), area);
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(labels), Line::from(rule)]),
+        area,
+    );
 }
 
 /// The queue, headed by what it is a queue of. Returns its length in rows.
@@ -2075,7 +2165,13 @@ fn queue_line<'a>(
     } else {
         Style::default()
     };
-    let dim = |colour: Color| if selected { style } else { Style::default().fg(colour) };
+    let dim = |colour: Color| {
+        if selected {
+            style
+        } else {
+            Style::default().fg(colour)
+        }
+    };
 
     let duration = track.duration_str();
     // The marker, and the length with a space after it.
@@ -2098,7 +2194,10 @@ fn queue_line<'a>(
         Span::styled(cell(&track.title, title_width), style),
     ];
     if artist_width > 0 {
-        spans.push(Span::styled(cell(&track.uploader, artist_width), dim(Color::Gray)));
+        spans.push(Span::styled(
+            cell(&track.uploader, artist_width),
+            dim(Color::Gray),
+        ));
     }
     spans.push(Span::styled(format!("{duration} "), dim(Color::DarkGray)));
 
@@ -2313,7 +2412,13 @@ fn render_comments(frame: &mut Frame, now: &NowPlaying, area: Rect) -> usize {
     let offset = now.cursor().min(total.saturating_sub(viewport));
 
     frame.render_widget(
-        Paragraph::new(lines.into_iter().skip(offset).take(viewport).collect::<Vec<_>>()),
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(offset)
+                .take(viewport)
+                .collect::<Vec<_>>(),
+        ),
         area,
     );
     total
@@ -2383,7 +2488,12 @@ fn related_line<'a>(card: &Card, selected: bool, width: usize, ambient: Color) -
 fn message(frame: &mut Frame, text: &str, area: Rect) {
     let lines: Vec<Line> = wrap(text, (area.width as usize).saturating_sub(2))
         .into_iter()
-        .map(|line| Line::from(Span::styled(format!(" {line}"), Style::default().fg(Color::DarkGray))))
+        .map(|line| {
+            Line::from(Span::styled(
+                format!(" {line}"),
+                Style::default().fg(Color::DarkGray),
+            ))
+        })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -2409,9 +2519,7 @@ fn centred_offset(cursor: usize, viewport: usize, total: usize) -> usize {
     if viewport == 0 || total <= viewport {
         return 0;
     }
-    cursor
-        .saturating_sub(viewport / 2)
-        .min(total - viewport)
+    cursor.saturating_sub(viewport / 2).min(total - viewport)
 }
 
 /// `H:MM:SS` / `M:SS`, matching how the results list writes a length.
@@ -2772,11 +2880,7 @@ fn columns(width: usize) -> (usize, usize, usize) {
         0
     };
 
-    (
-        width.saturating_sub(fixed + artist + album),
-        artist,
-        album,
-    )
+    (width.saturating_sub(fixed + artist + album), artist, album)
 }
 
 /// Renders one fixed-width column: truncated to fit, padded out to `width`, and
@@ -2829,7 +2933,9 @@ fn display_width(s: &str) -> usize {
 /// Control characters and other zero-width oddities are treated as one column
 /// so that a hostile title cannot make a row measure less than it draws.
 fn char_width(c: char) -> usize {
-    unicode_width::UnicodeWidthChar::width(c).unwrap_or(1).max(1)
+    unicode_width::UnicodeWidthChar::width(c)
+        .unwrap_or(1)
+        .max(1)
 }
 
 #[cfg(test)]
@@ -3092,19 +3198,40 @@ mod tests {
     #[ignore = "prints a layout preview rather than asserting"]
     fn preview_layout() {
         let rows = [
-            ("Harder, Better, Faster, Stronger", "Daft Punk", "Discovery", "3:47"),
-            ("Get Lucky (feat. Pharrell Williams and Nile Rodgers)", "Daft Punk, Pharrell Williams & Nile Rodgers", "Random Access Memories", "6:10"),
+            (
+                "Harder, Better, Faster, Stronger",
+                "Daft Punk",
+                "Discovery",
+                "3:47",
+            ),
+            (
+                "Get Lucky (feat. Pharrell Williams and Nile Rodgers)",
+                "Daft Punk, Pharrell Williams & Nile Rodgers",
+                "Random Access Memories",
+                "6:10",
+            ),
             ("Da Funk", "Daft Punk", "", "5:35"),
             ("日本語のタイトル", "アーティスト", "アルバム", "4:02"),
         ];
         for width in [96usize, 72, 44] {
             let (t, ar, al) = columns(width);
             println!("\n--- {width} cols (title {t}, artist {ar}, album {al}) ---");
-            println!("|{}|", header_line(t, ar, al).spans.iter().map(|s| s.content.as_ref()).collect::<String>());
+            println!(
+                "|{}|",
+                header_line(t, ar, al)
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            );
             for (title, artist, album, duration) in rows {
                 let mut line = format!(" {}", cell(title, t));
-                if ar > 0 { line += &cell(artist, ar); }
-                if al > 0 { line += &cell(album, al); }
+                if ar > 0 {
+                    line += &cell(artist, ar);
+                }
+                if al > 0 {
+                    line += &cell(album, al);
+                }
                 line += &format!("{duration:>DURATION_WIDTH$} ");
                 println!("|{line}|");
             }
@@ -3184,12 +3311,22 @@ mod tests {
     #[test]
     fn a_narrow_playlist_row_drops_the_count_before_the_name() {
         // Wide enough for both.
-        let wide = text_of(&playlist_line(&playlist("Discovery", Some(14)), false, 40, Color::Cyan));
+        let wide = text_of(&playlist_line(
+            &playlist("Discovery", Some(14)),
+            false,
+            40,
+            Color::Cyan,
+        ));
         assert!(wide.contains("Discovery") && wide.contains("14"));
 
         // Not wide enough: the name is what identifies the row, so the count
         // is what goes.
-        let narrow = text_of(&playlist_line(&playlist("Discovery", Some(14)), false, 12, Color::Cyan));
+        let narrow = text_of(&playlist_line(
+            &playlist("Discovery", Some(14)),
+            false,
+            12,
+            Color::Cyan,
+        ));
         assert!(!narrow.contains("14"));
     }
 
@@ -3211,7 +3348,12 @@ mod tests {
         assert!(text.contains('♥'));
         assert!(text.contains("Liked songs"));
 
-        let impostor = text_of(&playlist_line(&playlist("Liked songs", Some(7)), false, 40, Color::Cyan));
+        let impostor = text_of(&playlist_line(
+            &playlist("Liked songs", Some(7)),
+            false,
+            40,
+            Color::Cyan,
+        ));
         assert!(!impostor.contains('♥'));
         assert!(impostor.contains('7'));
     }
@@ -3310,8 +3452,10 @@ mod tests {
             (CardShape::Tile, 100, 22),
             (CardShape::Text, 64, 16),
         ] {
-            println!("
---- {shape:?} at {width}x{height} ---");
+            println!(
+                "
+--- {shape:?} at {width}x{height} ---"
+            );
             let mut wanted = Vec::new();
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
@@ -3320,15 +3464,12 @@ mod tests {
                     let area = Rect::new(0, 0, width, height);
                     let inner = block.inner(area);
                     frame.render_widget(block, area);
-                    let cursor = HomeCursor {
-                        top: 0,
-                        shelf: 1,
-                        card: 1,
-                    };
+                    let cursor = HomeCursor { shelf: 1, card: 1 };
+                    let layouts = shelf_layouts(&shelves, inner, 0, shape);
                     render_feed(
                         frame,
                         &shelves,
-                        inner,
+                        &layouts,
                         cursor,
                         &[0, 0, 0],
                         Tiles {
@@ -3367,8 +3508,10 @@ mod tests {
         };
 
         for width in [70u16, 40] {
-            println!("
---- hero at {width} ---");
+            println!(
+                "
+--- hero at {width} ---"
+            );
             let mut terminal = Terminal::new(TestBackend::new(width, HERO_HEIGHT)).unwrap();
             terminal
                 .draw(|frame| render_hero(frame, &hero, Rect::new(0, 0, width, HERO_HEIGHT)))
@@ -3405,8 +3548,10 @@ mod tests {
         let text: String = (0..HERO_HEIGHT)
             .map(|y| (0..60).map(|x| buf[(x, y)].symbol()).collect::<String>())
             .collect::<Vec<_>>()
-            .join("
-");
+            .join(
+                "
+",
+            );
 
         assert!(text.contains("NOW PLAYING"), "{text}");
         assert!(text.contains("Feather"), "{text}");
@@ -3437,8 +3582,10 @@ mod tests {
         let text: String = (0..HERO_HEIGHT)
             .map(|y| (0..60).map(|x| buf[(x, y)].symbol()).collect::<String>())
             .collect::<Vec<_>>()
-            .join("
-");
+            .join(
+                "
+",
+            );
 
         assert!(text.contains("PAUSED"), "{text}");
         assert!(!text.contains("NOW PLAYING"), "{text}");
@@ -3559,7 +3706,11 @@ mod tests {
         now.tab = Tab::Comments;
         let rows = drawn_panel(&now, 44, 6);
 
-        assert!(rows[0].contains("COMMENTS"), "every tab is named: {:?}", rows[0]);
+        assert!(
+            rows[0].contains("COMMENTS"),
+            "every tab is named: {:?}",
+            rows[0]
+        );
         // The rule sits under the open tab and nothing else, which is the only
         // thing on the row that says which panel is showing.
         let rule = &rows[1];
@@ -3581,7 +3732,11 @@ mod tests {
         let marked: Vec<&String> = rows.iter().filter(|row| row.contains('▶')).collect();
         assert_eq!(marked.len(), 1, "exactly one row plays: {rows:#?}");
         assert!(marked[0].contains("Let It Happen"));
-        assert!(marked[0].contains("7:48"), "and states its length: {:?}", marked[0]);
+        assert!(
+            marked[0].contains("7:48"),
+            "and states its length: {:?}",
+            marked[0]
+        );
     }
 
     #[test]
@@ -3899,7 +4054,10 @@ mod tests {
         assert!(rows[3].contains("Eventually"));
         assert!(rows[3].contains("Tame Impala"));
         assert!(rows.iter().any(|row| row.contains("Recommended playlists")));
-        assert!(rows.iter().any(|row| row.contains("one step, another step")));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("one step, another step"))
+        );
     }
 
     #[test]
@@ -3918,12 +4076,18 @@ mod tests {
         let total = Some(Duration::from_secs(100));
         // 40 columns less the " 0:00 / 1:40" clock and its space leaves 27.
         assert_eq!(filled(progress_line(&snap(0), total, 40, Color::Cyan)), 0);
-        assert_eq!(filled(progress_line(&snap(100), total, 40, Color::Cyan)), 27);
+        assert_eq!(
+            filled(progress_line(&snap(100), total, 40, Color::Cyan)),
+            27
+        );
         assert_eq!(filled(progress_line(&snap(50), total, 40, Color::Cyan)), 14);
 
         // Past the end, which happens for a moment on every track: the
         // container's length and what the decoder yields never quite agree.
-        assert_eq!(filled(progress_line(&snap(105), total, 40, Color::Cyan)), 27);
+        assert_eq!(
+            filled(progress_line(&snap(105), total, 40, Color::Cyan)),
+            27
+        );
     }
 
     #[test]
@@ -3965,7 +4129,13 @@ mod tests {
                     volume: 0.8,
                     ..Default::default()
                 };
-                render_track_info(frame, &now, snap, Rect::new(0, 0, 40, INFO_HEIGHT), Color::Cyan);
+                render_track_info(
+                    frame,
+                    &now,
+                    snap,
+                    Rect::new(0, 0, 40, INFO_HEIGHT),
+                    Color::Cyan,
+                );
             })
             .unwrap();
 
@@ -4062,7 +4232,13 @@ mod tests {
                     volume: 0.8,
                     ..Default::default()
                 };
-                render_track_info(frame, &now, snap, Rect::new(0, 0, 46, INFO_HEIGHT), Color::Cyan);
+                render_track_info(
+                    frame,
+                    &now,
+                    snap,
+                    Rect::new(0, 0, 46, INFO_HEIGHT),
+                    Color::Cyan,
+                );
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -4073,7 +4249,12 @@ mod tests {
     }
 
     /// A shelf of `shape` drawn on its own, as one string per row.
-    fn drawn_shelf(width: u16, shelf: &Shelf, cursor: ShelfCursor, shape: CardShape) -> Vec<String> {
+    fn drawn_shelf(
+        width: u16,
+        shelf: &Shelf,
+        cursor: ShelfCursor,
+        shape: CardShape,
+    ) -> Vec<String> {
         let (card_width, card_height) = card_size(shape);
         let height = card_height + 1;
         let across = (width / card_width).max(1);
@@ -4158,8 +4339,16 @@ mod tests {
         let ink = |r, g, b| highlight(Color::Rgb(r, g, b)).fg;
 
         // Bright fills take black, as the highlight always did.
-        assert_eq!(ink(255, 220, 90), Some(Color::Black), "a pale yellow sleeve");
-        assert_eq!(ink(170, 200, 170), Some(Color::Black), "a soft green sleeve");
+        assert_eq!(
+            ink(255, 220, 90),
+            Some(Color::Black),
+            "a pale yellow sleeve"
+        );
+        assert_eq!(
+            ink(170, 200, 170),
+            Some(Color::Black),
+            "a soft green sleeve"
+        );
 
         // Dark fills flip, which is the case that used to be illegible.
         assert_eq!(ink(170, 0, 0), Some(Color::White), "a deep red sleeve");
@@ -4288,8 +4477,8 @@ mod tests {
             ],
         };
         let text = drawn_shelf(80, &shelf, cursor(0, 0), CardShape::Text).join("\n");
-        assert!(text.contains("SONG"), "{text}");
-        assert!(text.contains("ALBUM"), "{text}");
+        assert!(text.contains("song"), "{text}");
+        assert!(text.contains("album"), "{text}");
         // The marker is drawn as the badge, so it must not also be repeated in
         // the words beside it.
         assert!(!text.contains("Song •"), "{text}");
@@ -4400,36 +4589,85 @@ mod tests {
         );
     }
 
-    /// The window decides the cards, and the rule is "the biggest sleeve that
-    /// fits". A short window has to come down the shapes rather than draw half
-    /// a poster.
+    /// The lead shelf always gets the biggest complete card the window fits.
     #[test]
     fn the_window_picks_the_biggest_cards_that_fit() {
-        let at = |height| plan_home(Rect::new(0, 0, 100, height), None, false).shape;
+        let at = |height| plan_home(Rect::new(0, 0, 100, height), false).max_shape;
 
         assert_eq!(at(80), CardShape::Gallery, "room for a page of galleries");
         // Two shelves of gallery cards need 41 rows and two of posters 33, so
         // this is the window that has to step down one rather than two -- the
         // case that would regress if the new shape were merely the old one made
         // taller.
-        assert_eq!(at(36), CardShape::Poster, "room for posters but not gallery");
-        assert_eq!(at(20), CardShape::Tile);
-        assert_eq!(at(12), CardShape::Text);
+        assert_eq!(at(36), CardShape::Gallery);
+        assert_eq!(at(20), CardShape::Gallery);
+        assert_eq!(at(16), CardShape::Poster);
+        assert_eq!(at(8), CardShape::Tile);
         // Narrower than one shelf of anything. The pane refuses to draw the
         // feed at all well before this, so all that matters is that it settles
         // rather than looping or panicking.
         assert_eq!(at(1), CardShape::Text);
     }
 
-    /// `v` is the user overruling that, and it has to actually overrule it --
-    /// including upwards, onto a shape the window would not have chosen.
     #[test]
-    fn a_pinned_shape_beats_what_the_window_would_choose() {
-        let area = Rect::new(0, 0, 100, 20);
-        assert_eq!(plan_home(area, None, false).shape, CardShape::Tile);
-        for shape in CardShape::ALL {
-            assert_eq!(plan_home(area, Some(shape), false).shape, shape);
-        }
+    fn sections_receive_distinct_layouts() {
+        let shelves = [
+            quick_picks(),
+            Shelf {
+                title: "From your listening".to_string(),
+                cards: quick_picks().cards,
+            },
+            Shelf {
+                title: "Albums for you".to_string(),
+                cards: vec![
+                    album("Currents", "Tame Impala"),
+                    album("Discovery", "Daft Punk"),
+                    album("Modal Soul", "Nujabes"),
+                ],
+            },
+        ];
+
+        assert_eq!(
+            section_shape(&shelves[0], 0, CardShape::Gallery),
+            CardShape::Gallery
+        );
+        assert_eq!(
+            section_shape(&shelves[1], 1, CardShape::Gallery),
+            CardShape::Tile
+        );
+        assert_eq!(
+            section_shape(&shelves[2], 2, CardShape::Gallery),
+            CardShape::Poster
+        );
+        assert_eq!(
+            section_shape(&shelves[0], 0, CardShape::Tile),
+            CardShape::Tile,
+            "a short terminal must clamp every section"
+        );
+    }
+
+    #[test]
+    fn three_home_sections_stay_visible_in_a_normal_window() {
+        let shelves = [
+            quick_picks(),
+            Shelf {
+                title: "From your listening".to_string(),
+                cards: quick_picks().cards,
+            },
+            Shelf {
+                title: "Albums for you".to_string(),
+                cards: vec![album("Currents", "Tame Impala")],
+            },
+        ];
+
+        // A 48-row terminal leaves 34 rows for shelves when the search bar,
+        // status bar, home border and now-playing strip have taken their room.
+        let layouts = shelf_layouts(&shelves, Rect::new(0, 0, 100, 34), 0, CardShape::Gallery);
+
+        assert_eq!(layouts.len(), 3);
+        assert_eq!(layouts[0].shape, CardShape::Gallery);
+        assert_eq!(layouts[1].shape, CardShape::Tile);
+        assert_eq!(layouts[2].shape, CardShape::Text);
     }
 
     /// The strip is drawn when the shelves under it still make a page, and
@@ -4437,15 +4675,15 @@ mod tests {
     /// already playing is the one thing on it the user does not need shown.
     #[test]
     fn the_hero_gives_way_to_the_shelves_on_a_short_window() {
-        let plan = |height, playing| plan_home(Rect::new(0, 0, 100, height), None, playing);
+        let plan = |height, playing| plan_home(Rect::new(0, 0, 100, height), playing);
 
         assert!(!plan(80, false).hero, "nothing is playing");
         assert!(plan(80, true).hero, "room for both");
 
         // Just enough for two shelves of cards and not for the strip as well:
         // the cards win, and the strip stands down rather than costing a shelf.
-        let tight = plan(2 * shelf_height(CardShape::Tile) - 1, true);
-        assert_eq!(tight.shape, CardShape::Tile);
+        let tight = plan(shelf_height(CardShape::Tile) - 1, true);
+        assert_eq!(tight.max_shape, CardShape::Tile);
         assert!(!tight.hero, "{tight:?}");
     }
 
@@ -4465,12 +4703,8 @@ mod tests {
                 render_feed(
                     frame,
                     &shelves,
-                    Rect::new(0, 0, width, height),
-                    HomeCursor {
-                        top: 0,
-                        shelf: 0,
-                        card: 0,
-                    },
+                    &shelf_layouts(&shelves, Rect::new(0, 0, width, height), 0, CardShape::Text),
+                    HomeCursor { shelf: 0, card: 0 },
                     &[0, 0, 0],
                     Tiles {
                         shape: CardShape::Text,
@@ -4501,12 +4735,8 @@ mod tests {
                 render_feed(
                     frame,
                     &shelves,
-                    Rect::new(0, 0, width, height),
-                    HomeCursor {
-                        top: 0,
-                        shelf: 0,
-                        card: 0,
-                    },
+                    &shelf_layouts(&shelves, Rect::new(0, 0, width, height), 0, CardShape::Text),
+                    HomeCursor { shelf: 0, card: 0 },
                     &[0],
                     Tiles {
                         shape: CardShape::Text,
@@ -4606,9 +4836,7 @@ mod tests {
     /// meant to -- or fit at all.
     fn drawn(width: u16, height: u16, phase: &SignIn) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| render_sign_in(frame, phase))
-            .unwrap();
+        terminal.draw(|frame| render_sign_in(frame, phase)).unwrap();
         let buf = terminal.backend().buffer();
         (0..height)
             .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect())
@@ -4745,7 +4973,10 @@ mod tests {
             panel.trim(),
             display_width(panel.trim())
         );
-        assert!(rows.iter().filter(|r| r.contains('│')).count() > 4, "wrapped onto several rows");
+        assert!(
+            rows.iter().filter(|r| r.contains('│')).count() > 4,
+            "wrapped onto several rows"
+        );
     }
 
     #[test]
@@ -4818,7 +5049,10 @@ mod tests {
         // offer it -- a key that answers "nothing is playing" is worse than no
         // key at all.
         for hint in [HINTS_PLAYLISTS, HINTS_TRACKS, HINTS_HOME, HINTS_SIGNED_OUT] {
-            assert!(!hint.contains("B tray"), "{hint:?} offers B with nothing playing");
+            assert!(
+                !hint.contains("B tray"),
+                "{hint:?} offers B with nothing playing"
+            );
         }
     }
 

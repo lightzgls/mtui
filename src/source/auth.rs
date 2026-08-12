@@ -150,7 +150,10 @@ pub fn start(http: &Http, creds: &Credentials) -> Result<DeviceCode> {
         &[("client_id", creds.client_id.as_str()), ("scope", SCOPE)],
     )?;
     if status != 200 {
-        bail!("Google refused the sign-in request: {}", describe(&body, status));
+        bail!(
+            "Google refused the sign-in request: {}",
+            describe(&body, status)
+        );
     }
 
     let response: Response =
@@ -210,8 +213,8 @@ fn poll_once(http: &Http, creds: &Credentials, code: &DeviceCode) -> Result<Poll
     )?;
 
     if status == 200 {
-        let granted: Granted =
-            serde_json::from_slice(&body).context("Google returned an unexpected token response")?;
+        let granted: Granted = serde_json::from_slice(&body)
+            .context("Google returned an unexpected token response")?;
         let refresh = granted.refresh_token.context(
             "Google granted access but no refresh token. Remove this app at \
              myaccount.google.com/permissions and sign in again",
@@ -305,8 +308,8 @@ impl Session {
             bail!("could not refresh the sign-in: {}", describe(&body, status));
         }
 
-        let granted: Granted =
-            serde_json::from_slice(&body).context("Google returned an unexpected refresh response")?;
+        let granted: Granted = serde_json::from_slice(&body)
+            .context("Google returned an unexpected refresh response")?;
         self.tokens = self.tokens.refreshed_with(
             granted.access_token,
             granted.refresh_token,
@@ -364,7 +367,8 @@ mod tests {
     fn reads_a_google_api_error() {
         // A different shape entirely to the OAuth one above, and the shape the
         // Data API returns. Both have to format into something readable.
-        let body = br#"{"error":{"code":403,"message":"Quota exceeded","status":"RESOURCE_EXHAUSTED"}}"#;
+        let body =
+            br#"{"error":{"code":403,"message":"Quota exceeded","status":"RESOURCE_EXHAUSTED"}}"#;
         assert_eq!(describe(body, 403), "Quota exceeded");
         assert_eq!(error_code(body).as_deref(), Some("RESOURCE_EXHAUSTED"));
     }
@@ -407,6 +411,9 @@ mod tests {
         // Google currently sends 5, but a smaller value would only earn a
         // `slow_down` and delay the sign-in it was meant to speed up.
         assert_eq!(Duration::from_secs(1).max(MIN_INTERVAL), MIN_INTERVAL);
-        assert_eq!(Duration::from_secs(10).max(MIN_INTERVAL), Duration::from_secs(10));
+        assert_eq!(
+            Duration::from_secs(10).max(MIN_INTERVAL),
+            Duration::from_secs(10)
+        );
     }
 }

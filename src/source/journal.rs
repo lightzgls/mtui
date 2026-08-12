@@ -86,6 +86,11 @@ const MAX_RECORDS: usize = 5_000;
 /// once per song.
 const COMPACT_AT: usize = 7_500;
 
+/// Strong candidates considered when choosing the seed for community playlist
+/// discovery. Bounded so refreshes vary the recommendation without eventually
+/// reaching tracks the score has already said are weak fits.
+const COMMUNITY_SEEDS: usize = 8;
+
 /// One finished play.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Play {
@@ -148,6 +153,9 @@ pub struct Ranked {
     /// Unix seconds of the most recent play, or 0 for something only liked.
     pub last: u64,
     pub liked: bool,
+    /// Completed plays after each event's own age has been discounted.
+    /// Kept separate from the raw count, which is still useful for skip rates.
+    weighted_plays: f64,
 }
 
 impl Ranked {
@@ -172,6 +180,11 @@ pub struct Taste {
 }
 
 impl Taste {
+    /// Whether MTUI has heard enough of any track to call it listening history.
+    pub fn has_plays(&self) -> bool {
+        self.ranked.iter().any(|ranked| ranked.plays > 0)
+    }
+
     /// Whether there is enough here to build shelves from.
     ///
     /// False on a first run, and the caller falls back to the like list. This
@@ -183,11 +196,28 @@ impl Taste {
 
     /// The "Listen again" shelf: best-scoring tracks actually played before,
     /// minus anything played in the last few hours.
-    pub fn listen_again(&self, depth: usize) -> Vec<&Ranked> {
-        self.ranked
+    pub fn listen_again(&self, depth: usize, rotation: usize) -> Vec<&Ranked> {
+        let eligible: Vec<&Ranked> = self
+            .ranked
             .iter()
             .filter(|r| r.plays > 0 && !self.recent.contains(&r.track.id))
-            .take(depth)
+            .collect();
+        if eligible.len() <= depth {
+            return eligible;
+        }
+
+        // Keep half the shelf recognisably theirs, and rotate the other half
+        // through the broader history. A wholly random shelf feels wrong; a
+        // wholly ranked one is the same sixteen tracks forever.
+        let stable = (depth / 2).max(1).min(eligible.len());
+        let rotating = depth.saturating_sub(stable);
+        let tail = &eligible[stable..];
+        let offset = rotation.saturating_mul(rotating) % tail.len();
+
+        eligible[..stable]
+            .iter()
+            .copied()
+            .chain((0..rotating).map(|index| tail[(offset + index) % tail.len()]))
             .collect()
     }
 
@@ -201,6 +231,23 @@ impl Taste {
             .collect()
     }
 
+    /// One strong, actually-played track to describe the user's current vibe.
+    ///
+    /// Unlike radio seeds, this deliberately includes recent listening: the
+    /// point is to find a longer playlist around what the user wants now, not to
+    /// suggest the same song back to them. Refresh rotates within the strongest
+    /// bounded candidates and never chooses a track rejected more often than it
+    /// was completed.
+    pub fn community_seed(&self, rotation: usize) -> Option<&Ranked> {
+        let candidates: Vec<&Ranked> = self
+            .ranked
+            .iter()
+            .filter(|ranked| ranked.plays > 0 && ranked.skips <= ranked.plays)
+            .take(COMMUNITY_SEEDS)
+            .collect();
+        (!candidates.is_empty()).then(|| candidates[rotation % candidates.len()])
+    }
+
     /// Seeds for the radio shelves: high-scoring tracks by *different* artists.
     ///
     /// The distinct-artist rule is the whole fix for a page that reads the same
@@ -210,7 +257,7 @@ impl Taste {
     ///
     /// `rotation` steps the window through the candidates, so asking again
     /// gives different seeds from the same ranking.
-    pub fn seeds(&self, count: usize, rotation: usize) -> Vec<&Ranked> {
+    pub fn seeds(&self, count: usize, rotation: usize, excluded: &HashSet<String>) -> Vec<&Ranked> {
         let mut artists = HashSet::new();
         let candidates: Vec<&Ranked> = self
             .ranked
@@ -218,7 +265,12 @@ impl Taste {
             // A track the user skips is a bad thing to build a station on even
             // when its play count is high -- that combination is exactly what
             // an album track sitting in front of a favourite looks like.
-            .filter(|r| r.skips <= r.plays)
+            .filter(|r| {
+                r.plays > 0
+                    && r.skips <= r.plays
+                    && !self.recent.contains(&r.track.id)
+                    && !excluded.contains(&r.track.id)
+            })
             .filter(|r| {
                 let artist = r.track.uploader.to_lowercase();
                 artist != UNKNOWN_ARTIST && artists.insert(artist)
@@ -231,7 +283,7 @@ impl Taste {
         // Wraps rather than running off the end, so a rotation past the last
         // candidate comes back round instead of returning nothing.
         (0..count.min(candidates.len()))
-            .map(|i| candidates[(rotation + i) % candidates.len()])
+            .map(|i| candidates[(rotation.saturating_mul(count) + i) % candidates.len()])
             .collect()
     }
 
@@ -365,10 +417,12 @@ impl Journal {
                 skips: 0,
                 last: 0,
                 liked: false,
+                weighted_plays: 0.0,
             });
 
             if play.counts() {
                 entry.plays += 1;
+                entry.weighted_plays += recency(play.at, now);
                 // Only a real play advances recency. A skip should not keep a
                 // track feeling fresh, or a song someone keeps rejecting would
                 // hold its place at the top of "Listen again" by being rejected.
@@ -388,6 +442,7 @@ impl Journal {
                 skips: 0,
                 last: 0,
                 liked: false,
+                weighted_plays: 0.0,
             });
             entry.liked = true;
             // Carried in the score below via `liked`, weighted by how recent
@@ -398,7 +453,7 @@ impl Journal {
 
         let mut ranked: Vec<Ranked> = stats.into_values().collect();
         for entry in &mut ranked {
-            entry.score = score(entry, now);
+            entry.score = score(entry);
         }
         // Total order: `f64` is only partially ordered, and a NaN slipping in
         // would make this panic rather than merely sort oddly.
@@ -408,7 +463,7 @@ impl Journal {
         let recent = self
             .plays
             .iter()
-            .filter(|play| play.at >= cutoff)
+            .filter(|play| play.counts() && play.at >= cutoff)
             .map(|play| play.id.clone())
             .collect();
 
@@ -472,15 +527,8 @@ pub fn record_final(track: &Track, listened: Duration) {
 /// - Skips subtract in proportion to the *rate*, not the count, so a track
 ///   played fifty times and skipped twice is barely touched while one skipped
 ///   two times out of three is buried.
-fn score(entry: &Ranked, now: u64) -> f64 {
-    let decay = if entry.last == 0 {
-        0.0
-    } else {
-        let age_days = now.saturating_sub(entry.last) as f64 / 86_400.0;
-        0.5f64.powf(age_days / HALF_LIFE_DAYS)
-    };
-
-    let plays = PLAY_WEIGHT * (1.0 + entry.plays as f64).ln() * decay;
+fn score(entry: &Ranked) -> f64 {
+    let plays = PLAY_WEIGHT * (1.0 + entry.weighted_plays).ln();
     // `entry.score` holds the like recency written in `taste`, 0.0 when unliked.
     let liked = if entry.liked {
         LIKED_WEIGHT * entry.score
@@ -496,6 +544,11 @@ fn score(entry: &Ranked, now: u64) -> f64 {
     };
 
     plays + liked - skips
+}
+
+fn recency(at: u64, now: u64) -> f64 {
+    let age_days = now.saturating_sub(at) as f64 / 86_400.0;
+    0.5f64.powf(age_days / HALF_LIFE_DAYS)
 }
 
 #[cfg(test)]
@@ -570,12 +623,17 @@ mod tests {
         ]);
 
         let taste = journal.taste(&[], now);
-        let best = taste.listen_again(10);
+        let best = taste.listen_again(10, 0);
         assert_eq!(best[0].track.id, "keeper");
         assert_eq!(best[0].skips, 0);
         // Recorded, and it cost the track its place.
         assert_eq!(
-            taste.ranked.iter().find(|r| r.track.id == "rejected").unwrap().skips,
+            taste
+                .ranked
+                .iter()
+                .find(|r| r.track.id == "rejected")
+                .unwrap()
+                .skips,
             2
         );
     }
@@ -590,16 +648,65 @@ mod tests {
 
         let taste = journal.taste(&[], now);
         let ids: Vec<&str> = taste
-            .listen_again(10)
+            .listen_again(10, 0)
             .iter()
             .map(|r| r.track.id.as_str())
             .collect();
 
         // Played ten minutes ago: suggesting it back is what makes a shelf
         // look broken, even though it scores highest.
-        assert!(!ids.contains(&"fresh"), "just-played track was suggested back");
+        assert!(
+            !ids.contains(&"fresh"),
+            "just-played track was suggested back"
+        );
         assert_eq!(ids, vec!["older"]);
         assert!(taste.recent().contains("fresh"));
+    }
+
+    #[test]
+    fn a_recent_skip_does_not_hide_a_track_that_was_really_played() {
+        let now = 100 * DAY;
+        let taste = journal(vec![
+            play("track", "A", 180, now - 10 * DAY),
+            play("track", "A", 5, now - 600),
+        ])
+        .taste(&[], now);
+
+        assert!(!taste.recent().contains("track"));
+        assert_eq!(taste.listen_again(1, 0)[0].track.id, "track");
+    }
+
+    #[test]
+    fn refreshing_keeps_a_core_and_rotates_the_rest_of_listen_again() {
+        let now = 100 * DAY;
+        let plays: Vec<Play> = (0..20)
+            .map(|index| {
+                play(
+                    &format!("track-{index}"),
+                    &format!("artist-{index}"),
+                    180,
+                    now - (index as u64 + 1) * DAY,
+                )
+            })
+            .collect();
+        let taste = journal(plays).taste(&[], now);
+        let first: Vec<&str> = taste
+            .listen_again(12, 0)
+            .into_iter()
+            .map(|ranked| ranked.track.id.as_str())
+            .collect();
+        let refreshed: Vec<&str> = taste
+            .listen_again(12, 1)
+            .into_iter()
+            .map(|ranked| ranked.track.id.as_str())
+            .collect();
+
+        assert_eq!(&first[..6], &refreshed[..6], "the familiar core moved");
+        assert_ne!(
+            &first[6..],
+            &refreshed[6..],
+            "the rotating half did not move"
+        );
     }
 
     #[test]
@@ -617,7 +724,7 @@ mod tests {
 
         let taste = journal(plays).taste(&[], now);
         assert_eq!(
-            taste.listen_again(1)[0].track.id,
+            taste.listen_again(1, 0)[0].track.id,
             "current",
             "an old obsession outranked what is in rotation now"
         );
@@ -635,7 +742,7 @@ mod tests {
         plays.push(play("c", "Third", 180, now - DAY));
 
         let taste = journal(plays).taste(&[], now);
-        let seeds = taste.seeds(3, 0);
+        let seeds = taste.seeds(3, 0, &HashSet::new());
 
         let artists: HashSet<&str> = seeds.iter().map(|r| r.track.uploader.as_str()).collect();
         assert_eq!(artists.len(), 3, "one artist took more than one seed");
@@ -645,16 +752,84 @@ mod tests {
     fn rotation_moves_the_seeds_along() {
         let now = 100 * DAY;
         let plays: Vec<Play> = (0..4)
-            .map(|i| play(&format!("t{i}"), &format!("artist{i}"), 180, now - (i + 1) * DAY))
+            .map(|i| {
+                play(
+                    &format!("t{i}"),
+                    &format!("artist{i}"),
+                    180,
+                    now - (i + 1) * DAY,
+                )
+            })
             .collect();
 
         let taste = journal(plays).taste(&[], now);
-        let first = taste.seeds(2, 0)[0].track.id.clone();
-        let second = taste.seeds(2, 1)[0].track.id.clone();
+        let first = taste.seeds(2, 0, &HashSet::new())[0].track.id.clone();
+        let second = taste.seeds(2, 1, &HashSet::new())[0].track.id.clone();
         assert_ne!(first, second, "refreshing gave back the same seed");
 
         // Past the end it wraps rather than coming back empty.
-        assert_eq!(taste.seeds(2, 9).len(), 2);
+        assert_eq!(taste.seeds(2, 9, &HashSet::new()).len(), 2);
+    }
+
+    #[test]
+    fn likes_that_were_never_played_cannot_seed_a_station() {
+        let now = 100 * DAY;
+        let likes = vec![track("unknown-like", "Unknown"), track("known", "Known")];
+        let taste = journal(vec![play("known", "Known", 180, now - DAY)]).taste(&likes, now);
+        let seeds = taste.seeds(4, 0, &HashSet::new());
+
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].track.id, "known");
+    }
+
+    #[test]
+    fn seeds_exclude_tracks_already_shown_above() {
+        let now = 100 * DAY;
+        let plays = vec![
+            play("shown", "A", 180, now - DAY),
+            play("available", "B", 180, now - 2 * DAY),
+        ];
+        let taste = journal(plays).taste(&[], now);
+        let excluded = HashSet::from(["shown".to_string()]);
+
+        assert_eq!(taste.seeds(1, 0, &excluded)[0].track.id, "available");
+    }
+
+    #[test]
+    fn community_playlists_can_follow_what_was_just_played() {
+        let now = 100 * DAY;
+        let taste = journal(vec![
+            play("fresh", "A", 180, now - 60),
+            play("older", "B", 180, now - 4 * DAY),
+        ])
+        .taste(&[], now);
+
+        assert_eq!(taste.community_seed(0).unwrap().track.id, "fresh");
+        assert!(
+            !taste
+                .seeds(2, 0, &HashSet::new())
+                .iter()
+                .any(|seed| seed.track.id == "fresh")
+        );
+    }
+
+    #[test]
+    fn community_playlist_seeds_rotate_and_reject_skipped_tracks() {
+        let now = 100 * DAY;
+        let mut plays = vec![
+            play("first", "A", 180, now - DAY),
+            play("second", "B", 180, now - 2 * DAY),
+            play("rejected", "C", 180, now - DAY),
+            play("rejected", "C", 5, now - DAY),
+            play("rejected", "C", 5, now - DAY),
+        ];
+        // A like without a completed play must not become the vibe seed.
+        let likes = [track("liked", "D")];
+        let taste = journal(std::mem::take(&mut plays)).taste(&likes, now);
+
+        assert_eq!(taste.community_seed(0).unwrap().track.id, "first");
+        assert_eq!(taste.community_seed(1).unwrap().track.id, "second");
+        assert_eq!(taste.community_seed(2).unwrap().track.id, "first");
     }
 
     #[test]
@@ -692,7 +867,10 @@ mod tests {
         // Cold start: nothing played, so the caller is told to fall back.
         let cold = journal(Vec::new()).taste(&likes, now);
         assert!(!cold.is_informed());
-        assert!(cold.listen_again(10).is_empty(), "nothing has been played");
+        assert!(
+            cold.listen_again(10, 0).is_empty(),
+            "nothing has been played"
+        );
 
         // Enough plays and it takes over.
         let plays: Vec<Play> = (0..5)

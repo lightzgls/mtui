@@ -144,7 +144,10 @@ mod tests {
         cache.want("a");
         cache.store("a".to_string(), None);
         assert!(cache.get("a").is_none());
-        assert!(!cache.want("a"), "a known-missing picture is not re-requested");
+        assert!(
+            !cache.want("a"),
+            "a known-missing picture is not re-requested"
+        );
     }
 
     #[test]

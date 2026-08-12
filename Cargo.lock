@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "mtui"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1238,6 +1238,7 @@ dependencies = [
  "form_urlencoded",
  "futures-util",
  "jpeg-decoder",
+ "mtui-resolver",
  "ratatui",
  "reqwest",
  "rodio",
@@ -1247,6 +1248,17 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "unicode-width",
+]
+
+[[package]]
+name = "mtui-resolver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

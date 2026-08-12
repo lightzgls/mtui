@@ -100,8 +100,12 @@ impl Credentials {
             Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
         };
 
-        let creds: Self = serde_json::from_slice(&raw)
-            .with_context(|| format!("{} is not valid JSON with the expected keys", path.display()))?;
+        let creds: Self = serde_json::from_slice(&raw).with_context(|| {
+            format!(
+                "{} is not valid JSON with the expected keys",
+                path.display()
+            )
+        })?;
         if creds.client_id.trim().is_empty() || creds.client_secret.trim().is_empty() {
             bail!("{} has an empty client_id or client_secret", path.display());
         }
@@ -222,8 +226,7 @@ impl Import {
 
     pub fn save(&self) -> Result<()> {
         let dir = dir()?;
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("could not create {}", dir.display()))?;
+        fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
         let path = dir.join(IMPORT_FILE);
 
         let body = serde_json::to_vec_pretty(self).context("could not encode the import")?;
@@ -366,7 +369,12 @@ impl Tokens {
 
     /// Applies a refresh response, keeping the existing refresh token when the
     /// response did not carry a new one -- which is the normal case.
-    pub fn refreshed_with(&self, access_token: String, refresh: Option<String>, expires_in: u64) -> Self {
+    pub fn refreshed_with(
+        &self,
+        access_token: String,
+        refresh: Option<String>,
+        expires_in: u64,
+    ) -> Self {
         Self {
             access_token,
             refresh_token: refresh.unwrap_or_else(|| self.refresh_token.clone()),
@@ -390,8 +398,7 @@ impl Tokens {
     /// "signed out" and forces the whole consent flow again.
     pub fn save(&self) -> Result<()> {
         let dir = dir()?;
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("could not create {}", dir.display()))?;
+        fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
 
         let path = dir.join(TOKEN_FILE);
         let tmp = dir.join(format!("{TOKEN_FILE}.new"));
@@ -525,7 +532,10 @@ mod tests {
     fn the_setup_help_names_the_file_it_wants() {
         let rendered = SETUP_HELP.replace("{path}", "C:/somewhere/client.json");
         assert!(rendered.contains("C:/somewhere/client.json"));
-        assert!(!rendered.contains("{path}"), "placeholder was left unfilled");
+        assert!(
+            !rendered.contains("{path}"),
+            "placeholder was left unfilled"
+        );
         // `App::report` routes on this: a multi-line message goes to an overlay
         // rather than the one-line status bar, which would hide all but the
         // first instruction.

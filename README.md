@@ -2,6 +2,13 @@
 
 A terminal music player, written in Rust, built to stay small in memory.
 
+Playback prefers YouTube's 256 kbps AAC stream when available and falls back to
+its widely available 128 kbps AAC stream. Both use the same in-process decoder;
+audio remains bounded to a 1 MiB streaming buffer rather than downloaded whole.
+When MTUI has imported a YouTube Music Premium browser session, the native
+player request uses it in memory so YouTube can expose the High-quality stream.
+The cookie is never placed in yt-dlp arguments or environment variables.
+
 Search YouTube, hit Enter, and audio starts before the track has finished
 downloading. Cover art renders as sixel pixels in terminals that support it.
 Signing in with a Google account is optional and adds your playlists and
@@ -15,8 +22,9 @@ Nothing that can block ever sits on the render path:
 - a player thread owns audio — [rodio](https://github.com/RustAudio/rodio)
   decoding AAC-LC over a chunked HTTP `Read + Seek` source, so playback starts
   on the first chunk rather than the last
-- a source worker shells out to `yt-dlp` to turn a video id into a signed
-  stream URL, then exits
+- a source worker owns the reusable `mtui-resolver` crate: it tries a pooled
+  native player API first, validates the final byte of every candidate, and
+  starts short-lived `yt-dlp` fallbacks only for difficult tracks
 - cover art, the library, and the player page's panels each get a thread of
   their own, so a slow thumbnail or a two-request comment fetch can never sit
   in front of the resolve that actually produces audio
@@ -120,10 +128,11 @@ It opens on a page of shelves — the same shape YouTube Music's home page has,
 drawn as rows of cards. `hjkl` moves around the grid, `Enter` plays a song or
 opens an album or playlist into a track list, and `H` or `Esc` comes back.
 
-**Cards come in four sizes, and the window picks one.** A cell is about twice as
-tall as it is wide, so a square sleeve costs half as many rows as it does
-columns — which makes the card that looks like a music app an expensive one.
-The page draws the largest shape that still leaves room for two shelves:
+**Each shelf gets its own layout.** A cell is about twice as tall as it is wide,
+so a square sleeve costs half as many rows as columns. The first shelf uses the
+largest complete cards the window can hold; recommendation rows become compact
+tiles, browse-heavy album and playlist rows use posters, and later shelves vary
+between those rhythms. Short terminals step every section down automatically:
 
 | | Sleeve | Wants |
 |---|---|---|
@@ -132,14 +141,9 @@ The page draws the largest shape that still leaves room for two shelves:
 | **tile** | 8px, sleeve beside text | 15 rows |
 | **text** | none | 11 rows |
 
-Add six rows to each if something is playing, since the now-playing strip takes
-them. A 30-row terminal therefore gets tiles; it takes a tall window to be given
-posters or gallery cards unasked.
-
-`v` overrides that and steps through the four by hand — and it is the only way
-to get the roomiest cards on a window that is not tall enough to be handed them,
-since the page will not spend a whole screen on a single shelf without being
-asked to.
+The type tag is a compact lowercase chip. When YouTube provides a duration, the
+clock is shown before the tag so a narrow card keeps the timer rather than
+clipping it.
 
 **Every card wears its own record's colour.** The border, and the chip saying
 what the card is, are drawn in the dominant colour of that sleeve — worked out
@@ -150,6 +154,11 @@ grey and changes colour when it lands, which reads as a page filling in.
 The line under each title is styled by what its parts are, rather than set as
 one grey run: the artist a step brighter than the year beside it, and the
 bullets between them a step dimmer than either.
+
+After MTUI has heard a few tracks, Home also searches YouTube Music's public
+community playlists around one strong, non-skipped part of that listening. The
+seed rotates daily and when Home is refreshed; opening a recommendation shows
+its tracks through the same playlist browser as every other playlist card.
 
 ## The colour of the song
 
@@ -180,7 +189,8 @@ How personal that page is depends on what you have configured:
 | cookie saved | your real feed, exactly as the web player shows it — including **Heard in Shorts** |
 
 Without a cookie the shelves are built here rather than fetched, and they are
-ranked from what you have actually played. MTUI keeps a journal of its own plays
+ranked from what you have actually played. Before the first completed play, the
+static fallback is labeled **Liked songs**, not **Listen again**. MTUI keeps a journal of its own plays
 — what, when, and how far through — and scores each track on how often it comes
 up, how recently, and how often you skip it. Likes count too, but as a prior
 rather than as the whole answer.
@@ -189,12 +199,12 @@ That distinction is the point. YouTube's own shelves come from watch history,
 which no API this program can reach exposes — the Data API's history playlist
 has returned empty since 2016. The history it *can* reach is the one it makes.
 
-- **Listen again** — best-scoring tracks you have played before, minus anything
-  from the last six hours. Suggesting back a song you played twenty minutes ago
-  is what makes a shelf look like it is not paying attention.
-- **Quick picks** — four radio stations seeded from four *different* artists and
-  interleaved, so the first screenful carries all four. One seed is one mood;
-  this is why the shelf no longer reads the same every launch.
+- **Listen again** — six stable favorites plus six tracks rotated through the
+  rest of your completed listening history, minus anything from the last six
+  hours. It changes daily and each time you press `r` without becoming random.
+- **Quick picks** — familiar tracks you actually completed, by different
+  artists, shown beside a few related radio picks. Likes you never played are
+  not used as radio seeds.
 - **Forgotten favorites** — genuinely loved, genuinely stale: played properly,
   then untouched for two months.
 - Nothing appears on the page twice, and `r` rebuilds it from different seeds.
@@ -469,7 +479,6 @@ implemented — including the relocated paths Flatpak and Snap installs use.
 | `←` / `→` | seek 5s |
 | `+` / `-` | volume |
 | `c` | cover size |
-| `v` | card size on the landing page — text, tile, poster, gallery |
 | `L` or `Ctrl-L` | library |
 | `a` / `d` / `f` | add to playlist / remove / like |
 | `A` | sign in |

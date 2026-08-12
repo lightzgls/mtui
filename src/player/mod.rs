@@ -15,6 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use mtui_resolver::AudioFormat;
 use rodio::Source;
 
 use chunked::{StreamFault, StreamLink};
@@ -59,6 +60,7 @@ pub enum Command {
     /// see [`PlayerEvent::NeedsUrl`].
     Play {
         url: String,
+        format: AudioFormat,
         title: String,
         id: String,
     },
@@ -69,6 +71,7 @@ pub enum Command {
     /// track continuing, not a new one starting.
     Resume {
         url: String,
+        format: AudioFormat,
         from: Duration,
     },
     /// A requested URL could not be produced, so the track cannot go on.
@@ -204,6 +207,9 @@ impl Drop for Player {
 /// the track is, and how far it got, is what separates them.
 struct Track {
     url: String,
+    /// Representation behind `url`. Byte offsets are interchangeable only when
+    /// this identity matches a refreshed URL.
+    format: AudioFormat,
     /// The video this is, so a dead stream can be re-resolved rather than
     /// reopened at the URL that just refused us.
     id: String,
@@ -416,7 +422,12 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
                         s.error = None;
                     });
                 }
-                Command::Play { url, title, id } => {
+                Command::Play {
+                    url,
+                    format,
+                    title,
+                    id,
+                } => {
                     update(&snapshot, |s| {
                         s.state = PlayState::Buffering;
                         s.title = title.clone();
@@ -439,6 +450,7 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
                             play_source(&player, decoder, Duration::ZERO);
                             track = Some(Track {
                                 url,
+                                format,
                                 id,
                                 link,
                                 total,
@@ -457,7 +469,7 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
                         }
                     }
                 }
-                Command::Resume { url, from } => {
+                Command::Resume { url, format, from } => {
                     // Nothing to carry on: the track was stopped or replaced
                     // while the app was resolving. The URL just fetched is
                     // simply dropped -- starting it would play a song the user
@@ -476,9 +488,18 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
                     // forward from byte zero to get back to where it already
                     // was -- audible, and pointless when the bytes are simply
                     // waiting behind a URL that has been replaced.
-                    if cur.link.wants_url().is_some() && cur.link.supply_url(&cur.url) {
+                    if same_representation(cur.format, format)
+                        && cur.link.wants_url().is_some()
+                        && cur.link.supply_url(&cur.url)
+                    {
                         continue;
                     }
+
+                    // A byte offset in one AAC representation is unrelated to
+                    // the same offset in another. End the downloader's wait and
+                    // rebuild from track time instead of splicing the files.
+                    cur.link.decline();
+                    cur.format = format;
 
                     let url = cur.url.clone();
                     match start_stream(&runtime, &player, &url, from) {
@@ -576,9 +597,7 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
                             // the time it takes to open one and lands where it
                             // was sent.
                             _ => {
-                                state = rebuild(
-                                    &runtime, &player, &snapshot, &mut track, target,
-                                );
+                                state = rebuild(&runtime, &player, &snapshot, &mut track, target);
                             }
                         }
                     }
@@ -629,7 +648,10 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
         }
         // The request was answered, or the downloader gave up on it. Either way
         // the next refusal is a new question.
-        if track.as_ref().is_none_or(|cur| cur.link.wants_url().is_none()) {
+        if track
+            .as_ref()
+            .is_none_or(|cur| cur.link.wants_url().is_none())
+        {
             asked_for_url = false;
         }
 
@@ -672,6 +694,13 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
     player.stop();
 }
 
+/// Whether byte offsets in two resolved URLs name the same media bytes.
+/// Unknown identities are rebuilt by track time; guessing here can splice two
+/// different AAC encodes at the same numeric byte offset.
+fn same_representation(current: AudioFormat, fresh: AudioFormat) -> bool {
+    current.itag.is_some() && current == fresh
+}
+
 /// Names where playback stopped, and why when the reason was recorded.
 ///
 /// The position alone was all this could ever say before, because by the time
@@ -679,11 +708,7 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
 /// "stopped at 0:31 of 3:44" tells the user what they can already hear;
 /// "(HTTP 403 at 1.0 MiB)" tells them, and a bug report, which of several very
 /// different faults it was.
-fn stopped_message(
-    at: Duration,
-    total: Option<Duration>,
-    fault: Option<StreamFault>,
-) -> String {
+fn stopped_message(at: Duration, total: Option<Duration>, fault: Option<StreamFault>) -> String {
     let mut msg = match total {
         Some(total) => format!("stream stopped at {} of {}", clock(at), clock(total)),
         None => format!("stream stopped at {}", clock(at)),
@@ -781,7 +806,10 @@ fn rebuild(
         Err(e) => {
             player.stop();
             *track = None;
-            set_error(snapshot, format!("stream stopped at {}: {e:#}", clock(from)));
+            set_error(
+                snapshot,
+                format!("stream stopped at {}: {e:#}", clock(from)),
+            );
             PlayState::Idle
         }
     }
@@ -821,7 +849,11 @@ fn drain(rx: &Receiver<Command>, queued: &mut VecDeque<Command>) -> bool {
 fn open_stream(
     runtime: &tokio::runtime::Runtime,
     url: &str,
-) -> Result<(rodio::Decoder<backend::AudioStream>, Option<Duration>, StreamLink)> {
+) -> Result<(
+    rodio::Decoder<backend::AudioStream>,
+    Option<Duration>,
+    StreamLink,
+)> {
     let (stream, link) = runtime.block_on(backend::open(url))?;
     let decoder = backend::decoder(stream)?;
     let total = decoder.total_duration();
@@ -890,6 +922,7 @@ mod tests {
     fn track(position: u64, total: Option<u64>) -> Track {
         Track {
             url: "https://example.com/a.m4a".into(),
+            format: AudioFormat { itag: Some(140) },
             id: "dQw4w9WgXcQ".into(),
             link: StreamLink::default(),
             total: total.map(Duration::from_secs),
@@ -898,6 +931,17 @@ mod tests {
             seeking_to: None,
             rebuilds: 0,
         }
+    }
+
+    #[test]
+    fn only_the_same_known_format_can_resume_at_a_byte_offset() {
+        let known = AudioFormat { itag: Some(141) };
+        assert!(same_representation(known, known));
+        assert!(!same_representation(known, AudioFormat { itag: Some(140) }));
+        assert!(!same_representation(
+            AudioFormat { itag: None },
+            AudioFormat { itag: None }
+        ));
     }
 
     /// The same track, whose downloader recorded a refusal at `offset`.
@@ -935,7 +979,11 @@ mod tests {
         let Ending::Stalled(from) = track(80, Some(213)).ending() else {
             panic!("a source that stopped 2 minutes early has not finished");
         };
-        assert_eq!(from, Duration::from_secs(80), "rebuild picks up where it died");
+        assert_eq!(
+            from,
+            Duration::from_secs(80),
+            "rebuild picks up where it died"
+        );
     }
 
     #[test]

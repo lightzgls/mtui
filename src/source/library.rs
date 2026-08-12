@@ -98,7 +98,6 @@ impl Library {
         &self.http
     }
 
-
     /// The user's playlists, with "Liked songs" in front.
     ///
     /// Liked songs lead because they are the list a music player is actually
@@ -293,7 +292,12 @@ impl Library {
                 "resourceId": { "kind": "youtube#video", "videoId": video_id },
             }
         });
-        self.write(reqwest::Method::POST, "playlistItems", &[("part", "snippet")], Some(body))?;
+        self.write(
+            reqwest::Method::POST,
+            "playlistItems",
+            &[("part", "snippet")],
+            Some(body),
+        )?;
         Ok(())
     }
 
@@ -499,12 +503,21 @@ mod tests {
 
     #[test]
     fn parses_the_durations_the_api_sends() {
-        assert_eq!(parse_iso_duration("PT3M47S"), Some(Duration::from_secs(227)));
-        assert_eq!(parse_iso_duration("PT1H2M5S"), Some(Duration::from_secs(3725)));
+        assert_eq!(
+            parse_iso_duration("PT3M47S"),
+            Some(Duration::from_secs(227))
+        );
+        assert_eq!(
+            parse_iso_duration("PT1H2M5S"),
+            Some(Duration::from_secs(3725))
+        );
         assert_eq!(parse_iso_duration("PT45S"), Some(Duration::from_secs(45)));
         assert_eq!(parse_iso_duration("PT2H"), Some(Duration::from_secs(7200)));
         // A DJ set long enough to cross a day boundary.
-        assert_eq!(parse_iso_duration("P1DT1H"), Some(Duration::from_secs(90_000)));
+        assert_eq!(
+            parse_iso_duration("P1DT1H"),
+            Some(Duration::from_secs(90_000))
+        );
     }
 
     #[test]
