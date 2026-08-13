@@ -10,7 +10,7 @@ A small terminal music player for YouTube Music, written in Rust.
 
 ## Windows
 
-Download `mtui.exe` from the [latest release](https://github.com/lightzgls/mtui/releases/latest), then run:
+Download the Windows release folder from the [latest release](https://github.com/lightzgls/mtui/releases/latest). Keep `mtui.exe` and `WebView2Loader.dll` together, then run:
 
 ```powershell
 .\mtui.exe
@@ -59,6 +59,8 @@ Ensure `~/.local/bin` is on your `PATH`.
 | `H` or `Esc` | Back/Home |
 | `L` | Library |
 | `A` | Sign in |
+| `M` | Sign in to YouTube Music Home (Windows) |
+| `S` or `Ctrl-S` | Settings |
 | `B` | Background tray mode (Windows only) |
 | `q` | Quit |
 
@@ -66,9 +68,10 @@ Ensure `~/.local/bin` is on your `PATH`.
 
 - MTUI downloads `yt-dlp` on first run when it is not already on `PATH`.
 - If no JavaScript runtime is found, MTUI installs Deno privately without administrator access. Existing Deno, Node.js, or Bun installations are reused.
-- Signing in is optional. Press `A` for setup instructions.
+- On Windows, press `S` and enable **Keep notification-area icon** to leave the tray icon available while the terminal UI is open. Windows may place the icon under the `^` hidden-icons menu.
+- Signing in is optional. Press `A` for OAuth library access. On Windows, press `M` to sign in to personalized YouTube Music Home in MTUI's WebView2 window; Google owns the credential form and MTUI saves only the resulting YouTube session.
 - Configuration is stored in `%APPDATA%\mtui` on Windows and `$XDG_CONFIG_HOME/mtui` or `~/.config/mtui` on Linux.
-- Firefox cookie import works on both platforms. Chromium cookie import may fail on Windows due to App-Bound Encryption.
+- Personalized Home requires a YouTube Music web session. Windows setup uses MTUI's private WebView2 profile and does not inspect installed browser profiles.
 
 ## Development
 

@@ -22,6 +22,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use futures_util::stream::{self, StreamExt};
 use jpeg_decoder::PixelFormat;
 
 /// Longest edge kept after downscaling, in image pixels.
@@ -57,6 +58,11 @@ const MAX_TRIM_PERCENT: u32 = 45;
 /// real request while a slow CDN edge thinks about it, and a ladder that spent
 /// this much per rung could sit on the cover thread for four times as long.
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Card tiles are requested in a burst and are never worth holding the whole
+/// visible page behind one slow CDN edge.
+const ART_TIMEOUT: Duration = Duration::from_secs(5);
+const ART_CONCURRENCY: usize = 16;
 
 /// Thumbnail names to try, largest first.
 ///
@@ -312,15 +318,29 @@ impl ArtFetcher {
         })
     }
 
-    /// Fetches and decodes one artwork URL, shrunk to `edge` on its longest
-    /// side.
-    ///
-    /// Takes a URL where [`fetch`] takes an id, because a card's picture is
-    /// whatever YouTube said it was: an album sleeve lives on Google's image
-    /// CDN under an opaque name, and there is no id to derive it from.
-    pub fn fetch(&self, url: &str, edge: u32) -> Result<Cover> {
-        let body = self.runtime.block_on(read(&self.client, url, TIMEOUT))?;
-        decode(&body, edge).with_context(|| format!("could not decode the artwork at {url}"))
+    /// Fetches one visible batch concurrently on the shared connection pool.
+    pub fn fetch_many(
+        &self,
+        requests: Vec<(String, String)>,
+        edge: u32,
+        mut receive: impl FnMut(String, Option<Cover>) -> bool,
+    ) {
+        self.runtime.block_on(async {
+            let mut fetches = stream::iter(requests)
+                .map(|(key, url)| async move {
+                    let art = read(&self.client, &url, ART_TIMEOUT)
+                        .await
+                        .ok()
+                        .and_then(|body| decode(&body, edge).ok());
+                    (key, art)
+                })
+                .buffer_unordered(ART_CONCURRENCY);
+            while let Some((key, art)) = fetches.next().await {
+                if !receive(key, art) {
+                    break;
+                }
+            }
+        });
     }
 }
 

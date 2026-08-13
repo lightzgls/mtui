@@ -61,6 +61,7 @@ const RECENT_HOURS: u64 = 6;
 /// what "Forgotten favorites" should have meant all along -- the old shelf was
 /// the like list reversed, which on a small library is the same songs as
 /// "Listen again" in the other order.
+#[cfg(test)]
 const FORGOTTEN_DAYS: f64 = 60.0;
 
 /// Weight on how often something is played, against [`LIKED_WEIGHT`] on whether
@@ -89,6 +90,7 @@ const COMPACT_AT: usize = 7_500;
 /// Strong candidates considered when choosing the seed for community playlist
 /// discovery. Bounded so refreshes vary the recommendation without eventually
 /// reaching tracks the score has already said are weak fits.
+#[cfg(test)]
 const COMMUNITY_SEEDS: usize = 8;
 
 /// One finished play.
@@ -162,6 +164,7 @@ impl Ranked {
     /// Days since this was last played. Infinite for a track that never was,
     /// which is what keeps a like the user never listened to out of
     /// [`Taste::forgotten`] rather than at the top of it.
+    #[cfg(test)]
     fn idle_days(&self, now: u64) -> f64 {
         if self.last == 0 {
             return f64::INFINITY;
@@ -181,8 +184,33 @@ pub struct Taste {
 
 impl Taste {
     /// Whether MTUI has heard enough of any track to call it listening history.
+    #[cfg(test)]
     pub fn has_plays(&self) -> bool {
         self.ranked.iter().any(|ranked| ranked.plays > 0)
+    }
+
+    /// Strongest tracks actually heard, including recent ones.
+    #[cfg(test)]
+    pub fn played(&self, depth: usize) -> Vec<&Ranked> {
+        self.ranked
+            .iter()
+            .filter(|ranked| ranked.plays > 0)
+            .take(depth)
+            .collect()
+    }
+
+    /// Least recently heard tracks, for a new history where nothing has crossed
+    /// the strict forgotten threshold yet.
+    #[cfg(test)]
+    pub fn least_recent(&self, depth: usize) -> Vec<&Ranked> {
+        let mut played: Vec<&Ranked> = self
+            .ranked
+            .iter()
+            .filter(|ranked| ranked.plays > 0)
+            .collect();
+        played.sort_by_key(|ranked| ranked.last);
+        played.truncate(depth);
+        played
     }
 
     /// Whether there is enough here to build shelves from.
@@ -196,6 +224,7 @@ impl Taste {
 
     /// The "Listen again" shelf: best-scoring tracks actually played before,
     /// minus anything played in the last few hours.
+    #[cfg(test)]
     pub fn listen_again(&self, depth: usize, rotation: usize) -> Vec<&Ranked> {
         let eligible: Vec<&Ranked> = self
             .ranked
@@ -223,6 +252,7 @@ impl Taste {
 
     /// Loved once, untouched for [`FORGOTTEN_DAYS`]. Ordered by score so this
     /// is the best of what has gone cold rather than merely the oldest.
+    #[cfg(test)]
     pub fn forgotten(&self, depth: usize, now: u64) -> Vec<&Ranked> {
         self.ranked
             .iter()
@@ -238,6 +268,7 @@ impl Taste {
     /// suggest the same song back to them. Refresh rotates within the strongest
     /// bounded candidates and never chooses a track rejected more often than it
     /// was completed.
+    #[cfg(test)]
     pub fn community_seed(&self, rotation: usize) -> Option<&Ranked> {
         let candidates: Vec<&Ranked> = self
             .ranked
@@ -288,6 +319,7 @@ impl Taste {
     }
 
     /// Ids to keep off the page, because they were just played.
+    #[cfg(test)]
     pub fn recent(&self) -> &HashSet<String> {
         &self.recent
     }

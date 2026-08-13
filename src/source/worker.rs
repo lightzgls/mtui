@@ -13,9 +13,8 @@
 //!
 //! Library calls get a third thread by the same argument: they are pure HTTPS
 //! against Google's API, and queueing one behind a four-second resolve would
-//! make browsing a playlist feel broken. Signing in gets a fourth, transient
-//! one, because it blocks for as long as the user takes to approve a code in a
-//! browser -- minutes, potentially -- and no shared queue can absorb that.
+//! make browsing a playlist feel broken. Sign-ins get transient threads because
+//! they block for as long as the user takes to finish with Google.
 //!
 //! The player page gets a fifth. Its panels are fetched while music is already
 //! playing and nobody is waiting on them, so they must not be able to delay
@@ -32,7 +31,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::Duration;
 
@@ -43,9 +42,9 @@ use super::cover::{self, Cover};
 use super::home::{self, Shelf};
 use super::innertube::InnerTube;
 use super::journal::{Journal, Play};
-use super::library::{self, Library, Playlist};
+use super::library::{Library, Playlist};
 use super::{StreamUrl, Track};
-use super::{browser, lrclib, sapisid, stats, watch};
+use super::{lrclib, stats, watch};
 use crate::config::{Cookies, Credentials, Import, Tokens};
 use crate::source::youtube::YouTube;
 use mtui_resolver::{PlaybackSession, ResolveRequest, Resolver};
@@ -56,14 +55,6 @@ use mtui_resolver::{PlaybackSession, ResolveRequest, Resolver};
 /// long session must not be able to grow the heap without limit. Beyond this,
 /// each further fifty rows is two more round trips for lines nobody scrolls to.
 const MAX_LIBRARY_TRACKS: usize = 200;
-
-/// Likes read to build the shelves on the landing page.
-///
-/// Two pages of the Data API, so two of its 10,000 daily quota units. Deep
-/// enough that the oldest of them are genuinely older than the newest -- which
-/// is the whole of what separates "Forgotten favorites" from "Listen again" --
-/// and shallow enough not to spend a page request per shelf card.
-const MAX_PERSONAL_LIKES: usize = 100;
 
 pub enum Request {
     Search {
@@ -103,24 +94,13 @@ pub enum Request {
         key: String,
         url: String,
     },
-    /// The landing page: YouTube Music's own home feed. Runs on the library
-    /// thread, which is where the cookie and the session both live.
-    Home,
-    /// The shelves built from this account's listening, which arrive after the
-    /// feed rather than with it -- see [`Response::PersonalShelves`].
-    ///
-    /// `rotation` steps the radio seeds along, so asking again gives a
-    /// different page rather than the one already on screen.
-    PersonalShelves {
-        rotation: usize,
+    /// The authenticated form of the same FEmusic_home route. Queued after the
+    /// public response so a slow session cannot leave the pane blank.
+    PersonalHome {
+        generation: u64,
     },
-    /// Reads a YouTube session out of whichever browser has one.
-    ///
-    /// The cookie is the only credential InnerTube accepts, and having the user
-    /// fetch one by hand every few weeks is the thing this avoids. `force`
-    /// re-reads even when there is already a usable cookie, which is what makes
-    /// this a recovery for one that has expired as well as a first-run step.
-    ImportCookies {
+    /// Opens MTUI's WebView2 profile so Google can establish a Music session.
+    MusicSignIn {
         force: bool,
     },
     /// A finished play: how far the user actually got through a track.
@@ -230,22 +210,26 @@ pub enum Request {
 pub enum Response {
     Results(Vec<Track>),
     /// The landing page.
-    Home(Vec<Shelf>),
-    /// A browser session was read successfully. Names the browser it came from,
-    /// because that is the part worth telling the user: it is the difference
-    /// between "it worked" and "it worked, and here is what it read".
+    Home {
+        generation: u64,
+        shelves: Vec<Shelf>,
+    },
+    /// One of the concurrent Home requests failed transiently. Kept separate
+    /// from `Failed` so the other attempt can still fill the page without a raw
+    /// HTTP error replacing the status line.
+    HomeFailed {
+        generation: u64,
+    },
+    HomeSessionStale {
+        generation: u64,
+    },
+    /// A YouTube Music web session was established successfully.
     ///
     /// The UI answers this by asking for the landing page again -- the page on
     /// screen was built without a cookie, and there is now a better one to be
     /// had.
     CookiesImported(String),
-    /// Shelves built from the user's liked songs, to go in front of the feed.
-    ///
-    /// A second response rather than part of [`Self::Home`] because it costs
-    /// three more round trips: sending them together would hold a landing page
-    /// that is ready back behind one that is not. Empty when signed out, or
-    /// when a cookie already bought the real shelves.
-    PersonalShelves(Vec<Shelf>),
+    MusicSignInFailed(String),
     /// Contents of something opened from the landing page. Distinct from
     /// [`Self::PlaylistTracks`] because these rows are not the user's: they
     /// belong to a YouTube Music album or a stranger's playlist, so there is
@@ -401,10 +385,6 @@ impl SourceWorker {
         let art_res_tx = res_tx.clone();
         let spawn_res_tx = res_tx.clone();
 
-        // Cloned rather than moved: it is a path, and the library thread runs
-        // the same binary to read browser cookies.
-        let library_yt = yt.clone();
-
         let handle = thread::Builder::new()
             .name("mtui-source".to_string())
             .spawn(move || run(yt, req_rx, res_tx, &thread_resolves))
@@ -418,7 +398,7 @@ impl SourceWorker {
 
         thread::Builder::new()
             .name("mtui-library".to_string())
-            .spawn(move || run_library(library_yt, library_req_rx, library_res_tx))
+            .spawn(move || run_library(library_req_rx, library_res_tx))
             .context("failed to spawn library worker")?;
 
         thread::Builder::new()
@@ -480,6 +460,14 @@ impl SourceWorker {
                 spawn_sign_in(self.res_tx.clone());
                 Ok(())
             }
+            Request::PersonalHome { generation } => {
+                spawn_personal_home(self.res_tx.clone(), generation);
+                Ok(())
+            }
+            Request::MusicSignIn { force } => {
+                spawn_music_sign_in(self.res_tx.clone(), force);
+                Ok(())
+            }
             Request::Watch { .. }
             | Request::MoreQueue { .. }
             | Request::SeedQueue { .. }
@@ -489,10 +477,7 @@ impl SourceWorker {
                 self.page_tx.send(req).context("player page worker is gone")
             }
             Request::SignOut
-            | Request::Home
-            | Request::PersonalShelves { .. }
             | Request::ReportPlay { .. }
-            | Request::ImportCookies { .. }
             | Request::OpenBrowse { .. }
             | Request::Playlists
             | Request::OpenPlaylist { .. }
@@ -533,9 +518,8 @@ fn name(req: &Request) -> &'static str {
         Request::Prefetch { .. } => "Prefetch",
         Request::Cover { .. } => "Cover",
         Request::Art { .. } => "Art",
-        Request::Home => "Home",
-        Request::PersonalShelves { .. } => "PersonalShelves",
-        Request::ImportCookies { .. } => "ImportCookies",
+        Request::PersonalHome { .. } => "PersonalHome",
+        Request::MusicSignIn { .. } => "MusicSignIn",
         Request::ReportPlay { .. } => "ReportPlay",
         Request::OpenBrowse { .. } => "OpenBrowse",
         Request::Watch { .. } => "Watch",
@@ -681,7 +665,7 @@ fn search(yt: &YouTube, tube: Option<&InnerTube>, query: &str, limit: usize) -> 
 }
 
 /// The account session available to playback right now. Read immediately before
-/// resolving so a browser import, manual cookie change, or stale-session removal
+/// resolving so Music sign-in, manual cookie change, or stale-session removal
 /// takes effect without copying credentials into worker requests.
 fn playback_session() -> Option<PlaybackSession> {
     Cookies::available().ok().flatten().map(|cookies| {
@@ -716,6 +700,53 @@ fn spawn_sign_in(tx: Sender<Response>) {
     }
 }
 
+fn spawn_personal_home(tx: Sender<Response>, generation: u64) {
+    let report = tx.clone();
+    if thread::Builder::new()
+        .name("mtui-personal-home".to_string())
+        .spawn(move || {
+            let response = (|| -> Result<Response> {
+                let Some(cookies) = Cookies::available().ok().flatten() else {
+                    return Ok(Response::HomeFailed { generation });
+                };
+                let http = Http::new()?;
+                Ok(match home::fetch_personalised(&http, &cookies) {
+                    Ok(Some(shelves)) => Response::Home {
+                        generation,
+                        shelves,
+                    },
+                    Ok(None) => Response::HomeSessionStale { generation },
+                    Err(_) => Response::HomeFailed { generation },
+                })
+            })()
+            .unwrap_or(Response::HomeFailed { generation });
+            let _ = tx.send(response);
+        })
+        .is_err()
+    {
+        let _ = report.send(Response::HomeFailed { generation });
+    }
+}
+
+fn spawn_music_sign_in(tx: Sender<Response>, force: bool) {
+    let report = tx.clone();
+    if thread::Builder::new()
+        .name("mtui-music-signin".to_string())
+        .spawn(move || {
+            let response = match crate::session::sign_in(force) {
+                Ok(()) => Response::CookiesImported("MTUI WebView2".to_string()),
+                Err(err) => Response::MusicSignInFailed(format!("{err:#}")),
+            };
+            let _ = tx.send(response);
+        })
+        .is_err()
+    {
+        let _ = report.send(Response::MusicSignInFailed(
+            "could not start the YouTube Music sign-in window".to_string(),
+        ));
+    }
+}
+
 fn sign_in(tx: &Sender<Response>) -> Result<()> {
     let http = Http::new()?;
     let creds = Credentials::load()?;
@@ -733,7 +764,7 @@ fn sign_in(tx: &Sender<Response>) -> Result<()> {
     tokens.save()
 }
 
-fn run_library(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>) {
+fn run_library(rx: Receiver<Request>, tx: Sender<Response>) {
     // Built once so the connection pool and TLS session outlive a single call,
     // for the same reason `InnerTube` holds its own.
     let mut library = Library::new();
@@ -767,7 +798,7 @@ fn run_library(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>) {
             let _ = library.reload();
         }
 
-        let response = match handle_library(library, &mut journal, &yt, req) {
+        let response = match handle_library(library, &mut journal, req) {
             Ok(Some(response)) => response,
             // Nothing to report: a shutdown, or a request that answered itself.
             Ok(None) => continue,
@@ -783,7 +814,6 @@ fn run_library(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>) {
 fn handle_library(
     library: &mut Library,
     journal: &mut Journal,
-    yt: &YouTube,
     req: Request,
 ) -> Result<Option<Response>> {
     // Most of what follows needs a session, so the check is made once here
@@ -794,15 +824,12 @@ fn handle_library(
     let exempt = matches!(
         req,
         Request::SignOut
-            | Request::Home
-            | Request::PersonalShelves { .. }
+            | Request::PersonalHome { .. }
             // Journalling needs no session at all, and reporting needs a cookie
             // rather than a sign-in. Demanding one would mean a user who never
             // signs in gets no shelves built from their own listening, which is
             // the one part of this that works without Google's permission.
             | Request::ReportPlay { .. }
-            // Reading a browser is not a Google call at all.
-            | Request::ImportCookies { .. }
             | Request::OpenBrowse { .. }
     );
     if !library.is_signed_in() && !exempt {
@@ -810,77 +837,6 @@ fn handle_library(
     }
 
     let response = match req {
-        Request::Home => {
-            // Deliberately tolerant: a cookie file the user has mistyped is
-            // worth telling them about, but not at the price of the landing
-            // page, which loads perfectly well without one. The request queued
-            // right behind this one is the one that reports it.
-            let cookies = Cookies::available().ok().flatten();
-            Response::Home(home::fetch(library.http(), cookies.as_ref())?)
-        }
-        Request::PersonalShelves { rotation } => {
-            // Where a broken cookie file is reported, by the `?`. By the time
-            // this runs the landing page is already on screen, so the message
-            // lands in the status bar next to a working program rather than
-            // instead of one.
-            let cookies = Cookies::available()?;
-            // With a cookie the feed already carries the real shelves, built by
-            // YouTube from listening history -- including, once reporting has
-            // been running, the plays that happened here. The community shelf
-            // is still useful: it turns MTUI's own current listening into public
-            // playlists rather than duplicating YouTube's song shelves.
-            let community = home::community_playlists(library.http(), journal, rotation);
-            if cookies.is_some() {
-                return Ok(Some(Response::PersonalShelves(
-                    community.into_iter().collect(),
-                )));
-            }
-            // Signed out the like list is simply empty, which the shelf builder
-            // handles: with a journal behind it there is still a page to build,
-            // and without one there is nothing to build from either way.
-            let likes = if library.is_signed_in() {
-                library.tracks(library::LIKED_ID, MAX_PERSONAL_LIKES)?
-            } else {
-                Vec::new()
-            };
-            let mut shelves = home::personal(library.http(), &likes, journal, rotation);
-            if let Some(community) = community {
-                // The UI applies the final cross-feed section order after this
-                // local shelf is merged with YouTube's own shelves.
-                shelves.insert(2.min(shelves.len()), community);
-            }
-            Response::PersonalShelves(shelves)
-        }
-        Request::ImportCookies { force } => {
-            // Nothing to do when a session is already in hand. `force` is what
-            // the recovery path sets, after YouTube has refused the one we had.
-            if !force && Cookies::available()?.is_some() {
-                return Ok(None);
-            }
-
-            // Straight back to whichever browser worked last time, when there
-            // is one: probing the whole list costs a process spawn each, and
-            // yt-dlp's start-up is the dominant cost in this program.
-            let last = Import::load().map(|import| import.browser);
-            let (browser, cookies) = match last {
-                Some(browser) => match browser::extract(yt, &browser) {
-                    Ok(cookies) => (browser, cookies),
-                    // It stopped working -- the user switched browsers, or
-                    // signed out of that one. Worth the full sweep rather than
-                    // reporting a failure that a different browser would answer.
-                    Err(_) => browser::detect(yt)?,
-                },
-                None => browser::detect(yt)?,
-            };
-
-            Import {
-                browser: browser.clone(),
-                header: cookies.header().to_string(),
-                at: sapisid::unix_now(),
-            }
-            .save()?;
-            Response::CookiesImported(browser)
-        }
         Request::ReportPlay { track, listened } => {
             // Local first, and unconditionally: this is the half that needs no
             // account, no cookie and no network, and it is what MTUI's own
@@ -904,8 +860,8 @@ fn handle_library(
                 // reporting: a player response with no tracking in it means
                 // YouTube did not recognise the session. An imported cookie
                 // that has expired is exactly what that looks like, and the
-                // fix -- read the browser again -- needs no user involvement.
-                // Forgetting it here is what makes the next launch do so.
+                // fix is a fresh Music session. Forgetting it here makes the
+                // next launch open interactive setup.
                 if let Err(why) = stats::report(library.http(), &cookies, &track.id, listened)
                     && format!("{why:#}").contains(stats::STALE)
                 {
@@ -1147,23 +1103,44 @@ fn run_art(rx: &Receiver<Request>, tx: &Sender<Response>) {
     }
 
     while let Ok(req) = rx.recv() {
-        let (key, url) = match req {
-            Request::Art { key, url } => (key, url),
+        let mut batch = Vec::new();
+        match req {
+            Request::Art { key, url } => batch.push((key, url)),
             Request::Shutdown => break,
             other => {
                 debug_assert!(false, "{} was routed to the art thread", name(&other));
                 continue;
             }
-        };
+        }
 
-        // Silent on failure, like the cover thread and for the same reason: a
-        // card without its sleeve is a card, and there is nothing the user
-        // could do with the news that a CDN said 404.
-        let art = fetcher
-            .as_ref()
-            .ok()
-            .and_then(|fetcher| fetcher.fetch(&url, crate::art::EDGE).ok());
-        if tx.send(Response::Art { key, art }).is_err() {
+        // The renderer sends one bounded visible screen at a time. Drain that
+        // burst so one slow image cannot sit in front of every card after it.
+        let mut shutting_down = false;
+        while batch.len() < crate::art::CAPACITY {
+            match rx.recv_timeout(Duration::from_millis(2)) {
+                Ok(Request::Art { key, url }) => batch.push((key, url)),
+                Ok(Request::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
+                    shutting_down = true;
+                    break;
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Ok(other) => debug_assert!(false, "{} was routed to the art thread", name(&other)),
+            }
+        }
+
+        match fetcher.as_ref() {
+            Ok(fetcher) => fetcher.fetch_many(batch, crate::art::EDGE, |key, art| {
+                tx.send(Response::Art { key, art }).is_ok()
+            }),
+            Err(_) => {
+                for (key, _) in batch {
+                    if tx.send(Response::Art { key, art: None }).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        if shutting_down {
             break;
         }
     }

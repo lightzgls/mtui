@@ -17,7 +17,7 @@ use crate::discord::{Activity, Clock, Presence};
 use crate::graphics::Graphics;
 use crate::player::{Command, PlayState, Player, PlayerEvent, Snapshot};
 use crate::source::cover::Cover;
-use crate::source::home::{self, Card, Shelf, Target};
+use crate::source::home::{Card, Shelf, Target};
 use crate::source::journal;
 use crate::source::library::Playlist;
 use crate::source::lrclib;
@@ -571,9 +571,8 @@ pub enum RelatedRow<'a> {
 
 /// A modal that owns keyboard input for as long as it is up.
 ///
-/// Deliberately a single value rather than a stack: neither of these can
-/// meaningfully sit on top of the other, and a stack would only add states that
-/// cannot be reached.
+/// Deliberately a single value rather than a stack: none can meaningfully sit on
+/// top of another, and a stack would only add states that cannot be reached.
 pub enum Overlay {
     None,
     /// The sign-in panel. Dismissing this hides it but does not cancel the
@@ -593,6 +592,8 @@ pub enum Overlay {
     Message {
         body: String,
     },
+    /// Small persisted preferences changed without leaving the current page.
+    Settings,
 }
 
 impl Overlay {
@@ -629,6 +630,8 @@ pub enum SignIn {
     /// bar: the user is looking here, and the next thing they need is the retry
     /// key -- which this is the only place that offers.
     Failed { reason: String },
+    /// A separate WebView2 window owns Google's Music-session sign-in.
+    Music { started: Instant },
 }
 
 pub struct App {
@@ -653,6 +656,8 @@ pub struct App {
     pub wants_background: bool,
     /// The same in reverse, set by the tray's "Show the player".
     pub wants_foreground: bool,
+    /// Whether the notification-area icon stays available while the UI is open.
+    pub start_in_tray: bool,
     /// Thumbnail for the track being played, once it has arrived. Exactly one
     /// is ever held: covers are decoration, not a cache worth growing.
     pub cover: Option<Cover>,
@@ -718,6 +723,11 @@ pub struct App {
     /// waiting on. What it is actually for is the difference between "loading"
     /// and "there is no feed", which are the same empty pane.
     pub home_pending: bool,
+    /// Public and authenticated FEmusic_home run concurrently. Fail the pane
+    /// only after both have answered without shelves.
+    home_attempts: u8,
+    /// Identifies the latest refresh so late responses cannot mutate it.
+    home_generation: u64,
     /// Title of whatever was opened from the landing page, when the track list
     /// is showing one. Not [`Self::open_playlist`]: these rows belong to a
     /// YouTube Music album or a stranger's playlist, so there is nothing here
@@ -781,13 +791,13 @@ pub struct App {
     /// The *furthest*, not the latest: seeking backwards must not shorten what
     /// the user is recorded as having heard.
     listening: Option<(Track, Duration)>,
-    /// Steps the radio seeds on the landing page along, so asking for it again
-    /// gives a different page rather than the one already on screen.
-    rotation: usize,
-    /// Whether the browser import has been asked for this session. Once only:
-    /// a successful import asks for the landing page again, and without this
-    /// that second request would ask for another import behind it, forever.
+    /// Whether interactive Music sign-in has been opened this process. Once
+    /// only automatically; `M` can still open it explicitly.
     imported: bool,
+    /// Whether a stale InnerTube session already triggered interactive setup.
+    cookie_refresh_attempted: bool,
+    /// Prevents repeated `M` presses from opening duplicate WebView2 windows.
+    music_signing_in: bool,
 
     /// A track whose stream died, waiting on a fresh URL to carry on with.
     ///
@@ -842,6 +852,7 @@ impl App {
             should_quit: false,
             wants_background: false,
             wants_foreground: false,
+            start_in_tray: config::Settings::load().start_in_tray,
             cover: None,
             cover_id: None,
             graphics,
@@ -860,6 +871,8 @@ impl App {
             home_scroll: Vec::new(),
             art: ArtCache::default(),
             home_pending: false,
+            home_attempts: 0,
+            home_generation: 0,
             browsing: None,
             playlists: Vec::new(),
             playlist_selected: 0,
@@ -879,8 +892,9 @@ impl App {
             listening: None,
             queue_epoch: 0,
             seed_rotation: 0,
-            rotation: 0,
             imported: false,
+            cookie_refresh_attempted: false,
+            music_signing_in: false,
             resuming: None,
             // Started whether or not Discord is running and whether or not the
             // switch is on: what this costs while idle is one sleeping thread,
@@ -1038,6 +1052,10 @@ impl App {
                 | Response::Lyrics { .. }
                 | Response::Related { .. }
                 | Response::Comments { .. }
+                | Response::Home { .. }
+                | Response::HomeFailed { .. }
+                | Response::HomeSessionStale { .. }
+                | Response::CookiesImported(_)
         ) {
             self.busy = false;
         }
@@ -1066,25 +1084,38 @@ impl App {
                     self.mode = Mode::Browse;
                 }
             }
-            Response::Home(mut shelves) => {
-                self.home_pending = false;
-                self.status = if shelves.is_empty() {
-                    "nothing came back from YouTube Music".to_string()
-                } else {
-                    // Names the library here rather than in the hints column,
-                    // which has no room left for it and is already spending
-                    // what it has on the keys that move the cursor.
-                    "Enter to play, / to search, L for your library".to_string()
-                };
-                home::order_shelves(&mut shelves);
-                self.home_scroll = vec![0; shelves.len()];
-                self.home = shelves;
-                self.home_shelf = 0;
-                self.home_card = 0;
-                self.home_top = 0;
-                // Warm the first card while the user is still reading the page,
-                // the same bargain the results list makes.
-                self.selection_settled = Some(Instant::now());
+            Response::Home {
+                generation,
+                shelves,
+            } => {
+                if generation != self.home_generation {
+                    return;
+                }
+                self.home_attempts = self.home_attempts.saturating_sub(1);
+                self.home_pending = self.home_attempts != 0;
+                self.apply_home(shelves);
+            }
+            Response::HomeFailed { generation } => {
+                if generation != self.home_generation {
+                    return;
+                }
+                self.home_attempts = self.home_attempts.saturating_sub(1);
+                self.finish_home_attempts();
+            }
+            Response::HomeSessionStale { generation }
+                if generation == self.home_generation && !self.cookie_refresh_attempted =>
+            {
+                self.home_attempts = self.home_attempts.saturating_sub(1);
+                self.cookie_refresh_attempted = true;
+                self.finish_home_attempts();
+                self.begin_music_sign_in(true);
+            }
+            Response::HomeSessionStale { generation } => {
+                if generation != self.home_generation {
+                    return;
+                }
+                self.home_attempts = self.home_attempts.saturating_sub(1);
+                self.finish_home_attempts();
             }
             Response::CookiesImported(browser) => {
                 // The page on screen was built without a session. There is a
@@ -1092,51 +1123,14 @@ impl App {
                 // the whole point of doing the import in the background rather
                 // than holding the first frame back behind it.
                 self.status = format!("read your YouTube session from {browser}");
+                self.music_signing_in = false;
+                self.overlay = Overlay::None;
                 self.request_home();
             }
-            Response::PersonalShelves(shelves) => {
-                self.home_pending = false;
-                if shelves.is_empty() {
-                    return;
-                }
-                // Preserve the semantic cursor while the local shelves merge
-                // into YouTube's feed and the combined page takes its canonical
-                // Quick picks -> Listen again -> Forgotten -> Playlists order.
-                let focused = (self.home_shelf > 0 || self.home_card > 0)
-                    .then(|| {
-                        self.home.get(self.home_shelf).and_then(|shelf| {
-                            shelf
-                                .cards
-                                .get(self.home_card)
-                                .map(|card| (shelf.title.clone(), card.art_key().to_string()))
-                        })
-                    })
-                    .flatten();
-                self.home.splice(0..0, shelves);
-                home::order_shelves(&mut self.home);
-                self.home_scroll = vec![0; self.home.len()];
-
-                if let Some((title, key)) = focused
-                    && let Some((shelf, card)) =
-                        self.home.iter().enumerate().find_map(|(i, shelf)| {
-                            (shelf.title == title).then(|| {
-                                shelf
-                                    .cards
-                                    .iter()
-                                    .position(|card| card.art_key() == key)
-                                    .map(|j| (i, j))
-                            })?
-                        })
-                {
-                    self.home_shelf = shelf;
-                    self.home_card = card;
-                    self.home_top = self.home_top.min(shelf);
-                } else {
-                    self.home_shelf = 0;
-                    self.home_card = 0;
-                    self.home_top = 0;
-                }
-                self.status = format!("{} shelves", self.home.len());
+            Response::MusicSignInFailed(msg) => {
+                self.music_signing_in = false;
+                self.status = msg.clone();
+                self.overlay = Overlay::SignIn(SignIn::Failed { reason: msg });
             }
             Response::Browsed { title, tracks } => {
                 self.status = format!("{} tracks in {title}", tracks.len());
@@ -1957,6 +1951,29 @@ impl App {
         let _ = config::Presence::save(enabled);
     }
 
+    fn toggle_start_in_tray(&mut self) {
+        if !cfg!(windows) {
+            self.status = "start in tray is only available on Windows".to_string();
+            return;
+        }
+        let enabled = !self.start_in_tray;
+        match (config::Settings {
+            start_in_tray: enabled,
+        })
+        .save()
+        {
+            Ok(()) => {
+                self.start_in_tray = enabled;
+                self.status = if enabled {
+                    "MTUI will keep a notification-area icon".to_string()
+                } else {
+                    "MTUI will show a tray icon only while backgrounded".to_string()
+                };
+            }
+            Err(err) => self.status = format!("could not save settings: {err:#}"),
+        }
+    }
+
     /// Moves `delta` tracks through the queue and plays what it lands on.
     ///
     /// Silent at either end: there is nothing before the first track, and a
@@ -2056,24 +2073,75 @@ impl App {
     /// what stands in for it, and says only what the pane needs -- the
     /// difference between "loading" and "there is no feed".
     fn request_home(&mut self) {
-        self.home_pending = self.source.send(Request::Home).is_ok();
-        if !self.home_pending {
-            self.status = "source worker is not running".to_string();
+        self.home_generation = self.home_generation.wrapping_add(1);
+        let generation = self.home_generation;
+        self.home_attempts = 0;
+        if config::Cookies::available().ok().flatten().is_none() && !self.imported {
+            self.imported = true;
+            self.home_pending = false;
+            self.begin_music_sign_in(false);
             return;
         }
-        // Queued behind the feed on the same serial thread, which is the order
-        // that matters: the feed is one round trip and puts a page on screen,
-        // where these are four and go in front of it when they land.
-        let _ = self.source.send(Request::PersonalShelves {
-            rotation: self.rotation,
-        });
-        // Last of the three, because it is the slowest and the only one that
-        // spawns a process. It answers with nothing at all when a session is
-        // already in hand, which is every launch after the first.
-        if !self.imported {
-            self.imported = true;
-            let _ = self.source.send(Request::ImportCookies { force: false });
+        if self
+            .source
+            .send(Request::PersonalHome { generation })
+            .is_ok()
+        {
+            self.home_attempts += 1;
         }
+        self.home_pending = self.home_attempts > 0;
+        if !self.home_pending {
+            self.status = "source worker is not running".to_string();
+        }
+    }
+
+    fn finish_home_attempts(&mut self) {
+        if self.home_attempts != 0 {
+            return;
+        }
+        self.home_pending = false;
+        if self.home.is_empty() {
+            self.status = "YouTube Music is taking too long -- press r to try again".to_string();
+        } else if self.status == "refreshing the home feed ..." {
+            self.status =
+                "YouTube Music is taking too long -- showing the previous Home".to_string();
+        }
+    }
+
+    fn apply_home(&mut self, shelves: Vec<Shelf>) {
+        let focused = self.home.get(self.home_shelf).and_then(|shelf| {
+            shelf
+                .cards
+                .get(self.home_card)
+                .map(|card| (shelf.title.clone(), card.art_key().to_string()))
+        });
+        self.status = if shelves.is_empty() {
+            "nothing came back from YouTube Music".to_string()
+        } else {
+            "Enter to play, / to search, L for your library".to_string()
+        };
+        self.home_scroll = vec![0; shelves.len()];
+        self.home = shelves;
+        if let Some((title, key)) = focused
+            && let Some((shelf, card)) = self.home.iter().enumerate().find_map(|(i, shelf)| {
+                (shelf.title == title).then(|| {
+                    shelf
+                        .cards
+                        .iter()
+                        .position(|card| card.art_key() == key)
+                        .map(|j| (i, j))
+                })?
+            })
+        {
+            self.home_shelf = shelf;
+            self.home_card = card;
+            self.home_top = self.home_top.min(shelf);
+        } else {
+            self.home_shelf = 0;
+            self.home_card = 0;
+            self.home_top = 0;
+        }
+        self.selection_settled = Some(Instant::now());
     }
 
     /// Asks for the artwork of the cards the renderer has just drawn.
@@ -2274,7 +2342,10 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // Ctrl-C quits from any mode.
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && key.code == KeyCode::Char('c')
+        {
             self.should_quit = true;
             return Ok(());
         }
@@ -2285,9 +2356,18 @@ impl App {
         // the library would only be reachable after a search had already
         // returned something, which is not a precondition it actually has.
         if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
             && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
         {
             self.open_library();
+            return Ok(());
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+        {
+            self.overlay = Overlay::Settings;
             return Ok(());
         }
 
@@ -2316,6 +2396,7 @@ impl App {
             // making the user dismiss the panel and find the key again.
             Overlay::SignIn(SignIn::Failed { .. }) => match key.code {
                 KeyCode::Char('A') | KeyCode::Char('a') => self.begin_sign_in(),
+                KeyCode::Char('M') | KeyCode::Char('m') => self.begin_music_sign_in(false),
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                     self.overlay = Overlay::None;
                     self.status = "press A to try signing in again".to_string();
@@ -2337,6 +2418,13 @@ impl App {
                     self.status = String::new();
                 }
             }
+            Overlay::Settings => match key.code {
+                KeyCode::Char(' ') | KeyCode::Enter => self.toggle_start_in_tray(),
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => {
+                    self.overlay = Overlay::None;
+                }
+                _ => {}
+            },
             Overlay::AddTo { selected, .. } => {
                 let last = self.playlists.len().saturating_sub(1);
                 match key.code {
@@ -2387,9 +2475,9 @@ impl App {
             KeyCode::PageUp => self.home_shelf = self.home_shelf.saturating_sub(3),
             KeyCode::Enter => self.open_card(),
             KeyCode::Char('r') => {
-                // Steps both the rotating half of Listen Again and the radio
-                // seeds, so this is a genuine refresh rather than a re-fetch.
-                self.rotation += 1;
+                if self.home_pending {
+                    return Ok(());
+                }
                 self.status = "refreshing the home feed ...".to_string();
                 self.request_home();
             }
@@ -2400,9 +2488,11 @@ impl App {
             }
             KeyCode::Char('L') => self.open_library(),
             KeyCode::Char('A') => self.begin_sign_in(),
+            KeyCode::Char('M') => self.begin_music_sign_in(false),
             KeyCode::Char('P') | KeyCode::Char('p') => self.open_player(),
             KeyCode::Char('B') => self.background(),
             KeyCode::Char('D') => self.toggle_presence(),
+            KeyCode::Char('S') => self.overlay = Overlay::Settings,
             // Back to whatever the track list was showing, when there is one.
             KeyCode::Esc if !self.results.is_empty() => self.view = View::Tracks,
             KeyCode::Char('c') => self.cover_size = self.cover_size.toggled(),
@@ -2506,8 +2596,10 @@ impl App {
             KeyCode::Char('f') => self.toggle_like(),
             KeyCode::Char('L') => self.open_library(),
             KeyCode::Char('A') => self.begin_sign_in(),
+            KeyCode::Char('M') => self.begin_music_sign_in(false),
             KeyCode::Char('B') => self.background(),
             KeyCode::Char('D') => self.toggle_presence(),
+            KeyCode::Char('S') => self.overlay = Overlay::Settings,
             KeyCode::Char('/') | KeyCode::Char('i') => {
                 self.view = View::Tracks;
                 self.mode = Mode::Editing;
@@ -2633,9 +2725,11 @@ impl App {
             KeyCode::Enter => self.open_selected_playlist(),
             KeyCode::Char('r') => self.request_playlists(),
             KeyCode::Char('A') => self.begin_sign_in(),
+            KeyCode::Char('M') => self.begin_music_sign_in(false),
             KeyCode::Char('P') | KeyCode::Char('p') => self.open_player(),
             KeyCode::Char('B') => self.background(),
             KeyCode::Char('D') => self.toggle_presence(),
+            KeyCode::Char('S') => self.overlay = Overlay::Settings,
             KeyCode::Char('x') => self.sign_out(),
             // Back to whatever the track list was showing before, or to the
             // landing page when it was showing nothing.
@@ -2724,6 +2818,7 @@ impl App {
             // an icon in the notification area. `P` costs a keypress to undo.
             KeyCode::Char('B') => self.background(),
             KeyCode::Char('D') => self.toggle_presence(),
+            KeyCode::Char('S') => self.overlay = Overlay::Settings,
             KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_volume(VOLUME_STEP),
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_volume(-VOLUME_STEP),
             KeyCode::Right => self.seek_relative(5),
@@ -2737,6 +2832,7 @@ impl App {
             // away. Signing in by mistake is a browser tab the user did not ask
             // for; adding to a playlist by mistake edits their account.
             KeyCode::Char('A') => self.begin_sign_in(),
+            KeyCode::Char('M') => self.begin_music_sign_in(false),
             KeyCode::Char('a') => self.begin_add(),
             KeyCode::Char('d') => self.remove_selected(),
             KeyCode::Char('f') => self.toggle_like(),
@@ -2936,6 +3032,24 @@ impl App {
             self.overlay = Overlay::SignIn(SignIn::Failed {
                 reason: "source worker is not running".to_string(),
             });
+        }
+    }
+
+    fn begin_music_sign_in(&mut self, force: bool) {
+        if self.music_signing_in {
+            self.status = "the YouTube Music sign-in window is already open".to_string();
+            return;
+        }
+        self.music_signing_in = true;
+        self.status = "finish signing in in the YouTube Music window ...".to_string();
+        self.overlay = Overlay::SignIn(SignIn::Music {
+            started: Instant::now(),
+        });
+        if self.source.send(Request::MusicSignIn { force }).is_err() {
+            self.music_signing_in = false;
+            let reason = "source worker is not running".to_string();
+            self.status = reason.clone();
+            self.overlay = Overlay::SignIn(SignIn::Failed { reason });
         }
     }
 

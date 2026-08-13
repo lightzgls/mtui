@@ -9,9 +9,8 @@
 //! Signed in, the feed is the user's own: "Listen again", "Quick picks", the
 //! mixes built from their history. That needs the access token to travel with
 //! the request, which is why this runs on the library thread rather than the
-//! source thread -- the session lives there. Signed out, YouTube answers with a
-//! generic feed of two shelves, which is too thin to open a program on, so
-//! `explore` is folded in behind it.
+//! source thread -- the session lives there. Signed out, YouTube answers with
+//! the generic form of the same `FEmusic_home` feed.
 //!
 //! Two shapes of card come back and both are kept:
 //!
@@ -20,7 +19,9 @@
 //! - `musicResponsiveListItemRenderer` -- the list rows ("Quick picks",
 //!   "Trending"). Always playable.
 
+#[cfg(test)]
 use std::collections::HashSet;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -28,6 +29,7 @@ use serde_json::Value;
 use super::auth::Http;
 use super::cover;
 use super::innertube::{MUSIC_CLIENT_NAME, MUSIC_CLIENT_VERSION, flex_column, parse_duration};
+#[cfg(test)]
 use super::journal::Journal;
 use super::sapisid;
 use super::{Track, UNKNOWN_ARTIST};
@@ -35,11 +37,13 @@ use crate::config::Cookies;
 
 const ORIGIN: &str = "https://music.youtube.com";
 const BROWSE_URL: &str = "https://music.youtube.com/youtubei/v1/browse";
+#[cfg(test)]
 const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search";
 
 /// YouTube Music's filtered-search token for community-created playlists.
 /// This is the filter used by its web client, rather than a text suffix that
 /// merely hopes ordinary search will rank playlists first.
+#[cfg(test)]
 const COMMUNITY_PLAYLISTS_FILTER: &str = "EgeKAQQoAEABagwQDhAKEAMQBBAJEAU%3D";
 
 /// The watch queue. One call returns a whole radio station seeded from a single
@@ -50,19 +54,12 @@ pub(super) const NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next";
 /// The home feed, personalised when the request carries a session.
 const HOME_ID: &str = "FEmusic_home";
 
-/// Trending songs and new music videos. Only fetched to pad a thin home feed;
-/// see [`MIN_SHELVES`].
-const EXPLORE_ID: &str = "FEmusic_explore";
+/// Home is startup work, unlike OAuth's user-paced device flow. A dead endpoint
+/// must yield to the anonymous fallback promptly.
+const HOME_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Below this the feed is not worth showing on its own. A signed-out home is
-/// two shelves of playlists and no songs at all, which is a landing page that
-/// cannot be played from.
-const MIN_SHELVES: usize = 3;
-
-/// Bounds on what is kept. The explore response alone is over a megabyte of
-/// JSON; these are what keep a landing page from holding more of it than fits
-/// on any screen it will be drawn on.
-const MAX_SHELVES: usize = 12;
+/// Every shelf is kept in YouTube's order. Cards remain bounded so one unusually
+/// deep carousel cannot grow the session indefinitely.
 const MAX_CARDS: usize = 24;
 
 /// Ceiling on the rows taken from an opened playlist or album, matching the
@@ -71,13 +68,16 @@ const MAX_TRACKS: usize = 200;
 
 /// Cards put on a shelf built here. A screenful is three or four; this is deep
 /// enough to scroll through and shallow enough that a shelf is not a list.
+#[cfg(test)]
 const SHELF_DEPTH: usize = 16;
 /// A tighter shelf leaves familiar history for Quick Picks instead of putting
 /// every known track above it and leaving only strangers to recommend.
+#[cfg(test)]
 const LISTEN_AGAIN_DEPTH: usize = 12;
 
 /// Likes below which the built shelves stop being worth showing. "Forgotten
 /// favorites" taken from a library of six is the same six as "Listen again".
+#[cfg(test)]
 const MIN_LIKES_FOR_OLD: usize = 24;
 
 /// One horizontal row of the landing page.
@@ -196,6 +196,7 @@ impl Card {
 
     /// A card for a track we already hold, for the shelves built from the
     /// user's own library rather than from a feed.
+    #[cfg(test)]
     fn from_track(track: &Track) -> Self {
         Self {
             title: track.title.clone(),
@@ -220,46 +221,48 @@ impl Card {
 
 /// The landing page, in whatever shape YouTube will give us.
 ///
-/// Three tiers, and every one of them falls through rather than failing: the
-/// user's real feed if a cookie is saved and YouTube still honours it, the
-/// anonymous feed otherwise, and `explore` folded in when what came back is too
-/// thin to open the program on.
+/// The personalised and anonymous feeds race each other. The first usable one
+/// wins, so a stale session cannot sit in front of a perfectly good public page.
 ///
 /// Only the first tier returns "Listen again", "Heard in Shorts" and the rest
 /// of the shelves built from what this account has actually listened to.
 /// Without a cookie those are approximated instead, from the liked songs the
 /// Data API will still hand over -- see [`personal`].
-pub fn fetch(http: &Http, cookies: Option<&Cookies>) -> Result<Vec<Shelf>> {
-    // Swallowed on purpose. A cookie YouTube no longer honours is worth
-    // reporting once the user asks for something that needs it, not on the
-    // launch of a program that has a perfectly good generic feed to show.
-    let mut shelves = cookies
-        .and_then(|cookies| browse(http, Some(cookies), HOME_ID).ok())
-        .map(|json| parse_shelves(&json))
-        .unwrap_or_default();
-
-    if shelves.is_empty() {
-        shelves = parse_shelves(&browse(http, None, HOME_ID)?);
-    }
-
-    if shelves.len() < MIN_SHELVES
-        && let Ok(json) = browse(http, None, EXPLORE_ID)
+#[cfg(test)]
+pub fn fetch(http: &Http, cookies: Option<&Cookies>) -> Result<(Vec<Shelf>, bool)> {
+    if let Some(cookies) = cookies
+        && let Some(shelves) = fetch_personalised(http, cookies)?
     {
-        // Titles rather than ids: the two endpoints can return the same shelf,
-        // and a landing page that lists "Trending" twice looks broken.
-        let seen: Vec<String> = shelves.iter().map(|s| s.title.clone()).collect();
-        shelves.extend(
-            parse_shelves(&json)
-                .into_iter()
-                .filter(|shelf| !seen.contains(&shelf.title)),
-        );
+        return Ok((shelves, true));
     }
 
+    Ok((fetch_public(http)?, false))
+}
+
+#[cfg(test)]
+pub fn fetch_public(http: &Http) -> Result<Vec<Shelf>> {
+    let shelves = parse_shelves(&browse(http, None, HOME_ID)?);
     if shelves.is_empty() {
         bail!("YouTube Music returned no home feed");
     }
-    shelves.truncate(MAX_SHELVES);
     Ok(shelves)
+}
+
+pub fn fetch_personalised(http: &Http, cookies: &Cookies) -> Result<Option<Vec<Shelf>>> {
+    let shelves = parse_shelves(&browse(http, Some(cookies), HOME_ID)?);
+    Ok(is_personalised(&shelves).then_some(shelves))
+}
+
+pub fn is_personalised(shelves: &[Shelf]) -> bool {
+    const PERSONAL: [&str; 4] = [
+        "Quick picks",
+        "Listen again",
+        "Heard in Shorts",
+        "Similar to",
+    ];
+    PERSONAL
+        .iter()
+        .any(|name| shelves.iter().any(|shelf| shelf.title.starts_with(name)))
 }
 
 /// Tracks behind a card that browses rather than plays: an album, a playlist,
@@ -302,14 +305,28 @@ pub(super) fn browse_as(
     browse_id: &str,
     client_version: &str,
 ) -> Result<Value> {
-    post_as(
+    let request = browse_request(http, cookies, browse_id, client_version)?;
+    let (status, raw) = http.send(request)?;
+    if !(200..300).contains(&status) {
+        bail!("YouTube Music refused the request: HTTP {status}");
+    }
+    Ok(serde_json::from_slice(&raw)?)
+}
+
+fn browse_request(
+    http: &Http,
+    cookies: Option<&Cookies>,
+    browse_id: &str,
+    client_version: &str,
+) -> Result<reqwest::RequestBuilder> {
+    post_request_as(
         http,
         BROWSE_URL,
         cookies,
         client_version,
         serde_json::json!({ "browseId": browse_id }),
     )
-    .with_context(|| format!("could not load {browse_id}"))
+    .with_context(|| format!("could not prepare {browse_id}"))
 }
 
 /// One InnerTube call, signed with the user's cookie when there is one.
@@ -333,6 +350,21 @@ fn post_as(
     client_version: &str,
     extra: Value,
 ) -> Result<Value> {
+    let request = post_request_as(http, url, cookies, client_version, extra)?;
+    let (status, raw) = http.send(request)?;
+    if !(200..300).contains(&status) {
+        bail!("YouTube Music refused the request: HTTP {status}");
+    }
+    Ok(serde_json::from_slice(&raw)?)
+}
+
+fn post_request_as(
+    http: &Http,
+    url: &str,
+    cookies: Option<&Cookies>,
+    client_version: &str,
+    extra: Value,
+) -> Result<reqwest::RequestBuilder> {
     let mut body = serde_json::json!({
         "context": {
             "client": {
@@ -354,6 +386,9 @@ fn post_as(
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body);
+    if extra["browseId"].as_str() == Some(HOME_ID) {
+        request = request.timeout(HOME_TIMEOUT);
+    }
 
     // All three headers or none: Google checks the signature against the origin
     // it was signed for, and a signed request with no cookie behind it is
@@ -369,11 +404,7 @@ fn post_as(
             );
     }
 
-    let (status, raw) = http.send(request)?;
-    if !(200..300).contains(&status) {
-        bail!("YouTube Music refused the request: HTTP {status}");
-    }
-    Ok(serde_json::from_slice(&raw)?)
+    Ok(request)
 }
 
 /// Radio stations blended into "Quick picks".
@@ -383,6 +414,7 @@ fn post_as(
 /// however much the user's taste varied. Four seeds by four different artists
 /// cost four round trips -- they run while a landing page is already on screen,
 /// so nobody is waiting on them -- and produce a shelf that looks like a person.
+#[cfg(test)]
 const SEEDS: usize = 4;
 
 /// Shelves built from this account's listening, for when there is no cookie to
@@ -403,6 +435,7 @@ const SEEDS: usize = 4;
 /// `likes` is expected most-recently-liked first, which is the order the Data
 /// API returns them in; `rotation` steps the seeds along so a refresh gives a
 /// different page.
+#[cfg(test)]
 pub fn personal(http: &Http, likes: &[Track], journal: &Journal, rotation: usize) -> Vec<Shelf> {
     let now = sapisid::unix_now();
     let taste = journal.taste(likes, now);
@@ -431,11 +464,20 @@ pub fn personal(http: &Http, likes: &[Track], journal: &Journal, rotation: usize
     let mut seen: HashSet<String> = taste.recent().clone();
 
     let listen_again: Vec<Card> = if has_plays {
-        taste
+        let fresh: Vec<Card> = taste
             .listen_again(LISTEN_AGAIN_DEPTH, rotation)
             .into_iter()
             .map(|ranked| Card::from_track(&ranked.track))
-            .collect()
+            .collect();
+        if fresh.is_empty() {
+            taste
+                .played(LISTEN_AGAIN_DEPTH)
+                .into_iter()
+                .map(|ranked| Card::from_track(&ranked.track))
+                .collect()
+        } else {
+            fresh
+        }
     } else {
         likes
             .iter()
@@ -453,11 +495,20 @@ pub fn personal(http: &Http, likes: &[Track], journal: &Journal, rotation: usize
     // The radios. Seeds come from the ranking when there is one and from the
     // likes when there is not, but the shelf is built the same way either way.
     let seeds: Vec<Track> = if has_plays {
-        taste
+        let ranked: Vec<Track> = taste
             .seeds(SEEDS, rotation, &seen)
             .into_iter()
             .map(|ranked| ranked.track.clone())
-            .collect()
+            .collect();
+        if ranked.is_empty() {
+            taste
+                .played(SEEDS)
+                .into_iter()
+                .map(|ranked| ranked.track.clone())
+                .collect()
+        } else {
+            ranked
+        }
     } else {
         Vec::new()
     };
@@ -465,7 +516,7 @@ pub fn personal(http: &Http, likes: &[Track], journal: &Journal, rotation: usize
     let mut picks: Vec<Vec<Card>> = Vec::new();
     let mut similar: Option<Shelf> = None;
     for seed in &seeds {
-        let Ok(json) = post(
+        let response = post(
             http,
             NEXT_URL,
             None,
@@ -473,29 +524,29 @@ pub fn personal(http: &Http, likes: &[Track], journal: &Journal, rotation: usize
                 "videoId": seed.id,
                 "playlistId": format!("RDAMVM{}", seed.id),
             }),
-        ) else {
-            continue;
-        };
+        );
 
-        picks.push(
-            std::iter::once(Card::from_track(seed))
-                .chain(queue(&json)
+        let mut cards = vec![Card::from_track(seed)];
+        if let Ok(json) = response {
+            cards.extend(
+                queue(&json)
                 .into_iter()
                 // The station repeats the seed. We add the richer local card
                 // once ourselves so every recommendation has visible context.
                 .filter(|card| !matches!(&card.target, Target::Play { video_id } if *video_id == seed.id))
-                .take(3))
-                .collect(),
-        );
+                .take(3),
+            );
 
-        // "Similar to X" is built from the first seed that offers a Related
-        // tab, and only from one: it names a song, and a shelf named after four
-        // of them would be named after none.
-        if similar.is_none()
-            && let Some(id) = related_id(&json)
-        {
-            similar = similar_to(http, &id, &seed.title);
+            // "Similar to X" is built from the first seed that offers a Related
+            // tab, and only from one: it names a song, and a shelf named after four
+            // of them would be named after none.
+            if similar.is_none()
+                && let Some(id) = related_id(&json)
+            {
+                similar = similar_to(http, &id, &seed.title);
+            }
         }
+        picks.push(cards);
     }
 
     push(&mut shelves, &mut seen, "Quick picks", interleave(picks));
@@ -505,11 +556,27 @@ pub fn personal(http: &Http, likes: &[Track], journal: &Journal, rotation: usize
     }
 
     let forgotten: Vec<Card> = if informed {
-        taste
+        let from_history: Vec<Card> = taste
             .forgotten(SHELF_DEPTH, now)
             .into_iter()
             .map(|ranked| Card::from_track(&ranked.track))
-            .collect()
+            .collect();
+        if from_history.is_empty() && likes.len() >= MIN_LIKES_FOR_OLD {
+            likes
+                .iter()
+                .rev()
+                .take(SHELF_DEPTH)
+                .map(Card::from_track)
+                .collect()
+        } else if from_history.is_empty() {
+            taste
+                .least_recent(SHELF_DEPTH)
+                .into_iter()
+                .map(|ranked| Card::from_track(&ranked.track))
+                .collect()
+        } else {
+            from_history
+        }
     } else if likes.len() >= MIN_LIKES_FOR_OLD {
         // The old approximation, kept for the cold-start path only: with no
         // journal there is no way to tell what has gone cold, and the far end
@@ -528,37 +595,9 @@ pub fn personal(http: &Http, likes: &[Track], journal: &Journal, rotation: usize
     shelves
 }
 
-/// Public playlists matching one strong track from the user's listening.
-///
-/// One filtered search per refresh is enough: the seed rotates among the best
-/// non-skipped tracks, while YouTube does the broader musical matching. Failure
-/// is deliberately an absent shelf; the rest of Home is already useful and a
-/// recommendation request should never turn it into an error page.
-pub fn community_playlists(http: &Http, journal: &Journal, rotation: usize) -> Option<Shelf> {
-    let now = sapisid::unix_now();
-    let taste = journal.taste(&[], now);
-    let rotation = rotation.wrapping_add((now / 86_400) as usize);
-    let seed = &taste.community_seed(rotation)?.track;
-    let query = if seed.uploader == UNKNOWN_ARTIST {
-        seed.title.clone()
-    } else {
-        format!("{} {}", seed.uploader, seed.title)
-    };
-    let json = post(
-        http,
-        SEARCH_URL,
-        None,
-        serde_json::json!({
-            "query": query,
-            "params": COMMUNITY_PLAYLISTS_FILTER,
-        }),
-    )
-    .ok()?;
-    parse_community_playlists(&json)
-}
-
 /// Puts the four primary Home sections first without disturbing YouTube's
 /// ordering among everything else it returned.
+#[cfg(test)]
 pub fn order_shelves(shelves: &mut [Shelf]) {
     shelves.sort_by_key(|shelf| match shelf.title.as_str() {
         "Quick picks" | "From your listening" => 0,
@@ -574,6 +613,7 @@ pub fn order_shelves(shelves: &mut [Shelf]) {
 /// A shelf that is left with too little to be worth a row is dropped entirely
 /// rather than shown short -- two cards under a heading looks like something
 /// failed, which on this page it has not.
+#[cfg(test)]
 fn push(shelves: &mut Vec<Shelf>, seen: &mut HashSet<String>, title: &str, cards: Vec<Card>) {
     const MIN_CARDS: usize = 3;
 
@@ -613,6 +653,7 @@ fn push(shelves: &mut Vec<Shelf>, seen: &mut HashSet<String>, title: &str, cards
 /// the front, which is the same shelf as before with three more hidden off the
 /// right-hand edge. Interleaving is what makes the first screenful -- the only
 /// part most people see -- carry all four.
+#[cfg(test)]
 fn interleave(stations: Vec<Vec<Card>>) -> Vec<Card> {
     let deepest = stations.iter().map(Vec::len).max().unwrap_or(0);
     let mut cards = Vec::new();
@@ -647,6 +688,7 @@ fn distinct_by_artist(tracks: &[Track], count: usize, rotation: usize) -> Vec<Tr
 }
 
 /// The "Similar to X" shelf, from the related page of a seed track.
+#[cfg(test)]
 fn similar_to(http: &Http, browse_id: &str, seed: &str) -> Option<Shelf> {
     let json = browse(http, None, browse_id).ok()?;
     let shelf = parse_shelves(&json)
@@ -662,6 +704,7 @@ fn similar_to(http: &Http, browse_id: &str, seed: &str) -> Option<Shelf> {
 }
 
 /// The browse id of the "Related" tab of a watch response.
+#[cfg(test)]
 fn related_id(json: &Value) -> Option<String> {
     let mut tabs = Vec::new();
     collect(json, "tabRenderer", &mut tabs);
@@ -673,6 +716,7 @@ fn related_id(json: &Value) -> Option<String> {
 }
 
 /// The tracks of a watch queue, as cards.
+#[cfg(test)]
 fn queue(json: &Value) -> Vec<Card> {
     let mut rows = Vec::new();
     collect(json, "playlistPanelVideoRenderer", &mut rows);
@@ -737,6 +781,7 @@ pub(super) fn parse_shelves(json: &Value) -> Vec<Shelf> {
 /// Home's carousels. Keep only its public playlist rows: YouTube occasionally
 /// pads a filtered response with another category, and treating those rows as
 /// playlists would make Enter open the wrong kind of page.
+#[cfg(test)]
 fn parse_community_playlists(json: &Value) -> Option<Shelf> {
     const TITLE: &str = "Community playlists for you";
     const MIN_CARDS: usize = 3;
@@ -840,7 +885,7 @@ fn parse_card(item: &Value) -> Option<Card> {
 fn art_url(renderer: Option<&Value>) -> Option<String> {
     /// Longest edge worth fetching, in image pixels. Comfortably above the
     /// biggest tile a terminal cell grid can draw -- see [`crate::art::EDGE`].
-    const WANTED: u64 = 256;
+    const WANTED: u64 = crate::art::EDGE as u64;
 
     let mut sizes: Vec<(u64, &str)> = renderer?
         .pointer("/musicThumbnailRenderer/thumbnail/thumbnails")?
@@ -1260,6 +1305,28 @@ mod tests {
     }
 
     #[test]
+    fn only_personal_inner_tube_sections_authenticate_home() {
+        let generic = vec![Shelf {
+            title: "Featured playlists for you".to_string(),
+            cards: vec![playable("generic")],
+        }];
+        assert!(!is_personalised(&generic));
+
+        for title in [
+            "Quick picks",
+            "Listen again",
+            "Heard in Shorts",
+            "Similar to A",
+        ] {
+            let shelves = vec![Shelf {
+                title: title.to_string(),
+                cards: vec![playable("personal")],
+            }];
+            assert!(is_personalised(&shelves), "{title} was not recognised");
+        }
+    }
+
+    #[test]
     fn a_shelf_with_nothing_playable_is_dropped() {
         // "Moods & genres" is a row of filter buttons, not of cards.
         let json = shelf(
@@ -1574,6 +1641,40 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "hits the live YouTube Music API and image CDN"]
+    fn visible_home_artwork_batch() {
+        use std::time::Instant;
+
+        let http = Http::new().expect("client should build");
+        let cookies = Cookies::available()
+            .expect("the saved cookies should parse")
+            .expect("a saved browser session should exist");
+        let shelves = fetch_personalised(&http, &cookies)
+            .expect("home should answer")
+            .unwrap_or_else(|| fetch_public(&http).expect("public home should answer"));
+        let requests: Vec<(String, String)> = shelves
+            .iter()
+            .take(3)
+            .flat_map(|shelf| shelf.cards.iter().take(4))
+            .filter_map(|card| Some((card.art_key().to_string(), card.art.as_ref()?.clone())))
+            .collect();
+
+        let fetcher = cover::ArtFetcher::new().expect("art fetcher should build");
+        let start = Instant::now();
+        let total = requests.len();
+        let mut loaded = 0;
+        fetcher.fetch_many(requests, crate::art::EDGE, |_, art| {
+            loaded += usize::from(art.is_some());
+            true
+        });
+        println!(
+            "art: {loaded}/{total} in {:.2}s",
+            start.elapsed().as_secs_f64()
+        );
+        assert!(loaded > 0);
+    }
+
     /// Records what OAuth does here, so nobody spends an afternoon rediscovering
     /// it. The tokens work perfectly against the Data API and are refused by
     /// InnerTube, which is not a distinction any documentation draws.
@@ -1768,7 +1869,8 @@ mod tests {
 
         let http = Http::new().expect("client should build");
         let start = Instant::now();
-        let shelves = fetch(&http, None).expect("the home feed should come back");
+        let (shelves, personalised) = fetch(&http, None).expect("the home feed should come back");
+        assert!(!personalised);
         println!(
             "home: {:.2}s, {} shelves",
             start.elapsed().as_secs_f64(),
@@ -1789,12 +1891,10 @@ mod tests {
             assert!(!shelf.cards.is_empty(), "{} is empty", shelf.title);
         }
 
-        // A landing page that cannot be played from is not one.
+        // Signed-out Home can consist entirely of browsable playlists.
         assert!(
-            shelves
-                .iter()
-                .any(|s| s.cards.iter().any(Card::is_playable)),
-            "no shelf carried anything playable"
+            shelves.iter().any(|shelf| !shelf.cards.is_empty()),
+            "no shelf carried any cards"
         );
     }
 }

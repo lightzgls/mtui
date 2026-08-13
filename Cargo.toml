@@ -50,11 +50,12 @@ tokio = { version = "1.53.1", default-features = false, features = [
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 
-# Cover art fetch. reqwest is already in the tree as stream-download's HTTP
-# client, so declaring it directly compiles nothing new. Features must stay a
-# subset of what stream-download turns on -- adding `default` would pull rustls
-# and link a second TLS stack next to SChannel.
+# Shared HTTP client. Compression matters for Home: YouTube's feed JSON exceeds
+# a megabyte, and downloading it uncompressed dominated startup. `default` stays
+# off because it would pull rustls beside the native TLS stack.
 reqwest = { version = "0.13.4", default-features = false, features = [
+    "brotli",
+    "gzip",
     "native-tls",
 ] }
 
@@ -90,6 +91,13 @@ form_urlencoded = { version = "1", default-features = false }
 # per glyph but two terminal columns, so counting chars silently overflows the
 # row and pushes every column out of line.
 unicode-width = { version = "0.2", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+# A first-party sign-in surface for YouTube Music Home. WebView2 uses the Edge
+# runtime included with current Windows installations; no browser profile is
+# inspected and Google owns every credential field.
+tao = { version = "0.36.0", default-features = false, features = ["rwh_06"] }
+wry = { version = "0.56.1", default-features = false }
 
 # Test-only. `stream-download` reports every reconnect, gap re-request and
 # download failure through `tracing`, and those events are the only account of

@@ -346,7 +346,8 @@ mod tests {
         println!("  saved");
 
         let http = Http::new().expect("client should build");
-        let shelves = home::fetch(&http, Some(&cookies)).expect("the feed should come back");
+        let (shelves, personalised) =
+            home::fetch(&http, Some(&cookies)).expect("the feed should come back");
         println!("\n  {} shelves:", shelves.len());
         for shelf in &shelves {
             println!("    {}", shelf.title);
@@ -355,16 +356,17 @@ mod tests {
         // The signed-out feed is two shelves of playlists. Anything YouTube
         // built from this account's own listening is the proof that the cookie
         // was not merely well-formed but recognised.
-        let personal = shelves.iter().any(|shelf| {
-            [
-                "Listen again",
-                "Quick picks",
-                "Heard in Shorts",
-                "Mixed for you",
-            ]
-            .iter()
-            .any(|name| shelf.title.starts_with(name))
-        });
+        let personal = personalised
+            && shelves.iter().any(|shelf| {
+                [
+                    "Listen again",
+                    "Quick picks",
+                    "Heard in Shorts",
+                    "Mixed for you",
+                ]
+                .iter()
+                .any(|name| shelf.title.starts_with(name))
+            });
         assert!(
             personal,
             "the cookie was read and accepted but the feed is not personalised -- \

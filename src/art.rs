@@ -36,7 +36,7 @@ pub const EDGE: u32 = 64;
 /// Two or three screenfuls of a wide terminal: enough that scrolling down a
 /// page and back finds the tiles still there, and far short of the whole feed.
 /// At [`EDGE`] that is about 800 KB.
-const CAPACITY: usize = 64;
+pub(crate) const CAPACITY: usize = 64;
 
 #[derive(Default)]
 pub struct ArtCache {

@@ -31,7 +31,7 @@ const TOKEN_FILE: &str = "tokens.json";
 /// browser signed in to YouTube Music.
 const COOKIE_FILE: &str = "cookies.txt";
 
-/// Ours: written by the browser import and replaced whenever it runs again.
+/// Ours: written by interactive Music-session setup.
 ///
 /// Kept apart from [`COOKIE_FILE`] for the same reason [`TOKEN_FILE`] is kept
 /// apart from [`CLIENT_FILE`] -- a file the user wrote by hand must never be
@@ -51,6 +51,9 @@ const DISCORD_FILE: &str = "discord.json";
 /// rewritten by a keypress -- and folding them together would mean a toggle
 /// serialising over an id the user typed.
 const PRESENCE_FILE: &str = "presence.json";
+
+/// Ours: general application preferences changed from the settings panel.
+const SETTINGS_FILE: &str = "settings.json";
 
 /// Shown when there is no client to read. Long because it is the entire setup
 /// procedure, and a user hitting this has no other documentation to hand.
@@ -113,7 +116,7 @@ impl Credentials {
     }
 }
 
-/// A browser session, copied out of a browser by hand.
+/// A YouTube Music web session, optionally copied by hand.
 ///
 /// The only thing that buys a personalised YouTube Music feed. The OAuth tokens
 /// above cannot: Google refuses Bearer-authenticated InnerTube calls outright,
@@ -122,8 +125,7 @@ impl Credentials {
 /// player reaches them, by signing requests over a cookie.
 ///
 /// Entirely optional, and read on the same terms as everything else here: a
-/// user who never creates this file never touches it, and the landing page
-/// falls back to shelves built from their liked songs.
+/// user who never creates this file never touches it.
 #[derive(Debug, Clone)]
 pub struct Cookies {
     /// The whole header, sent back verbatim. Which cookies YouTube wants is
@@ -140,7 +142,7 @@ impl Cookies {
     ///
     /// A file that exists but carries no `SAPISID` is an error rather than a
     /// `None`: the user did something deliberate and it will not work, which is
-    /// worth saying now instead of silently serving them the generic feed.
+    /// worth saying now instead of silently failing personalized Home.
     pub fn load() -> Result<Option<Self>> {
         let path = dir()?.join(COOKIE_FILE);
         let raw = match fs::read_to_string(&path) {
@@ -198,12 +200,10 @@ impl Cookies {
     }
 }
 
-/// A session read out of a browser, and which browser it came from.
+/// A session established by interactive setup, and which surface created it.
 ///
-/// The browser's name is the point of storing this as a record rather than as a
-/// bare header: probing every browser costs a process spawn each, and going
-/// straight back to the one that worked last time is the difference between a
-/// re-import that is unnoticeable and one that takes ten seconds.
+/// `browser` is retained as the serialized field name for existing installs;
+/// current Windows setup stores `MTUI WebView2` there.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Import {
     pub browser: String,
@@ -237,7 +237,7 @@ impl Import {
         Ok(())
     }
 
-    /// Forgets the import, so the next launch reads the browser again.
+    /// Forgets the session, so the next launch asks the user to sign in again.
     pub fn forget() -> Result<()> {
         let path = dir()?.join(IMPORT_FILE);
         match fs::remove_file(&path) {
@@ -315,6 +315,33 @@ impl Presence {
 
         let body = serde_json::to_vec_pretty(&Self { enabled })
             .context("could not encode the presence setting")?;
+        fs::write(&path, body).with_context(|| format!("could not write {}", path.display()))
+    }
+}
+
+/// Preferences that affect how MTUI starts.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub start_in_tray: bool,
+}
+
+impl Settings {
+    pub fn load() -> Self {
+        let Some(path) = dir().ok().map(|dir| dir.join(SETTINGS_FILE)) else {
+            return Self::default();
+        };
+        fs::read(path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(self) -> Result<()> {
+        let dir = dir()?;
+        fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+        let path = dir.join(SETTINGS_FILE);
+        let body = serde_json::to_vec_pretty(&self).context("could not encode settings")?;
         fs::write(&path, body).with_context(|| format!("could not write {}", path.display()))
     }
 }
@@ -553,5 +580,22 @@ mod tests {
         if let Ok(path) = dir() {
             assert!(path.ends_with("mtui"));
         }
+    }
+
+    #[test]
+    fn old_or_empty_settings_default_to_the_terminal() {
+        assert!(!Settings::default().start_in_tray);
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.start_in_tray);
+    }
+
+    #[test]
+    fn the_tray_preference_round_trips() {
+        let body = serde_json::to_string(&Settings {
+            start_in_tray: true,
+        })
+        .unwrap();
+        let settings: Settings = serde_json::from_str(&body).unwrap();
+        assert!(settings.start_in_tray);
     }
 }

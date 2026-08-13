@@ -13,6 +13,7 @@
 
 #[cfg(windows)]
 mod imp {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
@@ -158,6 +159,12 @@ mod imp {
     const NIF_MESSAGE: u32 = 0x01;
     const NIF_ICON: u32 = 0x02;
     const NIF_TIP: u32 = 0x04;
+    const NIF_INFO: u32 = 0x10;
+    const NIIF_INFO: u32 = 0x01;
+
+    /// The shell may hide a new icon under its overflow arrow. Announce that
+    /// location once per process rather than on every background/restore cycle.
+    static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
     const MF_STRING: u32 = 0x0000;
     const MF_SEPARATOR: u32 = 0x0800;
@@ -371,8 +378,16 @@ mod imp {
         /// already there. `tip` is what hovering the icon says.
         pub fn show(&mut self, tip: &str) -> Result<()> {
             let message = if self.visible { NIM_MODIFY } else { NIM_ADD };
-            if unsafe { Shell_NotifyIconW(message, &self.icon_data(tip)) } == 0 {
-                return Err(anyhow!("the notification area refused the icon"));
+            let announce = !self.visible && !ANNOUNCED.swap(true, Ordering::Relaxed);
+            if unsafe { Shell_NotifyIconW(message, &self.icon_data(tip, announce)) } == 0 {
+                // Explorer drops all icons when its notification area restarts.
+                // A failed modify is therefore retried as a fresh add.
+                if !self.visible
+                    || unsafe { Shell_NotifyIconW(NIM_ADD, &self.icon_data(tip, false)) } == 0
+                {
+                    self.visible = false;
+                    return Err(anyhow!("the notification area refused the icon"));
+                }
             }
             self.visible = true;
             Ok(())
@@ -382,7 +397,7 @@ mod imp {
         /// so that MTUI is in one place at a time rather than two.
         pub fn hide(&mut self) {
             if self.visible {
-                unsafe { Shell_NotifyIconW(NIM_DELETE, &self.icon_data("")) };
+                unsafe { Shell_NotifyIconW(NIM_DELETE, &self.icon_data("", false)) };
                 self.visible = false;
             }
         }
@@ -396,7 +411,7 @@ mod imp {
             self.rx.recv_timeout(timeout).ok()
         }
 
-        fn icon_data(&self, tip: &str) -> NotifyIconDataW {
+        fn icon_data(&self, tip: &str, announce: bool) -> NotifyIconDataW {
             let mut data = NotifyIconDataW {
                 cb_size: size_of::<NotifyIconDataW>() as u32,
                 hwnd: self.hwnd,
@@ -410,7 +425,7 @@ mod imp {
                 info: [0; 256],
                 version: 0,
                 info_title: [0; 64],
-                info_flags: 0,
+                info_flags: if announce { NIIF_INFO } else { 0 },
                 guid: [0; 16],
                 balloon_icon: 0,
             };
@@ -419,7 +434,21 @@ mod imp {
             for (slot, ch) in data.tip.iter_mut().zip(tip.encode_utf16().take(127)) {
                 *slot = ch;
             }
+            if announce {
+                data.flags |= NIF_INFO;
+                copy_wide(&mut data.info_title, "MTUI is running in the tray");
+                copy_wide(
+                    &mut data.info,
+                    "Click the MTUI icon to open it. Windows may place new icons under the ^ hidden-icons menu.",
+                );
+            }
             data
+        }
+    }
+
+    fn copy_wide<const N: usize>(dest: &mut [u16; N], text: &str) {
+        for (slot, ch) in dest.iter_mut().zip(text.encode_utf16().take(N - 1)) {
+            *slot = ch;
         }
     }
 

@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod bootstrap;
+#[cfg(test)]
 pub mod browser;
 pub mod cover;
 pub mod home;

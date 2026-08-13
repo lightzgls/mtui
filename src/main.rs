@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 //! MTUI -- a terminal music player built to stay small in memory.
 //!
 //! This thread renders and reads input; a player thread owns audio, and the
@@ -17,18 +19,24 @@ mod console;
 mod discord;
 mod graphics;
 mod player;
+mod session;
 mod sixel;
 mod source;
 mod tray;
 mod ui;
 
-use std::io::{self, Write};
+use std::io::Write;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
-use crossterm::event::{self, Event};
-use crossterm::queue;
+use crossterm::event::Event;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use crossterm::{execute, queue};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 use app::App;
 use player::Player;
@@ -53,6 +61,34 @@ const BUSY_TICK: Duration = Duration::from_millis(50);
 const IDLE_TICK: Duration = Duration::from_millis(500);
 
 fn main() -> Result<()> {
+    if let Err(err) = start() {
+        console::report_error(&format!("{err:#}"));
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn start() -> Result<()> {
+    let keep_tray = config::Settings::load().start_in_tray;
+    // The Windows-subsystem binary starts without a console. Opening one here
+    // makes the UI the normal startup state; the tray icon is an additional
+    // entry point, and `B` is still the explicit action that hides the UI.
+    #[cfg(windows)]
+    console::attach().context("could not open the startup terminal")?;
+
+    let startup_tray = if keep_tray {
+        Tray::spawn().ok().and_then(|mut tray| {
+            tray.show("MTUI is starting ...").ok()?;
+            Some(tray)
+        })
+    } else {
+        None
+    };
+
+    run(keep_tray, startup_tray)
+}
+
+fn run(keep_tray: bool, mut tray: Option<Tray>) -> Result<()> {
     // Fail before touching the terminal, so a missing dependency prints a plain
     // message instead of appearing as a blank alternate screen. On a first run
     // this is also where yt-dlp gets fetched, which prints progress -- another
@@ -68,16 +104,17 @@ fn main() -> Result<()> {
     let player = Player::spawn()?;
     let source = SourceWorker::spawn(yt)?;
     let mut app = App::new(player, source, graphics);
+    app.start_in_tray = keep_tray;
 
     // The two faces, alternating until something asks to quit. The terminal one
     // runs first because that is how the program is started; after that, each
     // returns when the user has asked for the other.
     loop {
-        run_foreground(&mut app)?;
+        run_foreground(&mut app, &mut tray)?;
         if app.should_quit {
             break;
         }
-        run_background(&mut app)?;
+        run_background(&mut app, &mut tray)?;
         if app.should_quit {
             break;
         }
@@ -91,15 +128,16 @@ fn main() -> Result<()> {
 }
 
 /// The terminal interface. Returns when the user quits or asks to background.
-fn run_foreground(app: &mut App) -> Result<()> {
+fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
     app.wants_foreground = false;
 
-    // `ratatui::run` enables raw mode and the alternate screen, and installs a
-    // panic hook that restores the terminal before unwinding. Restoring on the
-    // way out is what makes it safe to call again: the console this leaves
-    // behind is one a shell can carry on using, whether it belongs to the
-    // window MTUI started in or to one `console::attach` opened later.
-    ratatui::run(|terminal| -> Result<()> {
+    // A fresh CONOUT$ writer per foreground session is load-bearing on Windows:
+    // Rust's global stdout keeps the dead handle from before FreeConsole, even
+    // after AllocConsole and SetStdHandle point at the replacement.
+    let mut foreground = Foreground::open()?;
+    let mut input = console::Input::open().context("could not open foreground input")?;
+
+    (|| -> Result<()> {
         while !app.should_quit && !app.wants_background {
             app.poll_source();
             // Before the prefetch: a track that just ended starts the next one
@@ -108,24 +146,38 @@ fn run_foreground(app: &mut App) -> Result<()> {
             app.tick_page();
             app.tick_prefetch();
             app.tick_presence();
-            terminal.draw(|frame| ui::render(frame, app))?;
+            sync_foreground_tray(app, tray);
+            foreground
+                .terminal
+                .draw(|frame| ui::render(frame, app))
+                .context("could not draw the foreground")?;
 
             // Sixel pixels live outside ratatui's buffer, so nothing it draws
             // can erase them. When they no longer belong where they are, the
             // screen has to be cleared and rebuilt in the same breath -- a bare
             // clear would leave the user looking at nothing until the next tick.
             if app.image_needs_clearing() {
-                terminal.clear()?;
+                foreground
+                    .terminal
+                    .clear()
+                    .context("could not clear the foreground")?;
                 app.invalidate_image();
-                terminal.draw(|frame| ui::render(frame, app))?;
+                foreground
+                    .terminal
+                    .draw(|frame| ui::render(frame, app))
+                    .context("could not redraw the foreground")?;
             }
-            paint_cover(app)?;
+            paint_cover(app, foreground.terminal.backend_mut())
+                .context("could not draw the cover")?;
 
             // Block for input, but wake on TICK so the position clock advances
             // and worker responses are picked up without a keypress.
             let tick = if app.awaiting() { BUSY_TICK } else { TICK };
-            if event::poll(tick)? {
-                match event::read()? {
+            if let Some(event) = input
+                .next(tick)
+                .context("could not poll foreground input")?
+            {
+                match event {
                     // Windows reports both press and release; acting on both
                     // would double every keystroke.
                     Event::Key(key) if key.is_press() => app.handle_key(key)?,
@@ -137,7 +189,90 @@ fn run_foreground(app: &mut App) -> Result<()> {
             }
         }
         Ok(())
-    })
+    })()
+}
+
+struct Foreground {
+    terminal: Terminal<CrosstermBackend<console::Output>>,
+}
+
+impl Foreground {
+    fn open() -> Result<Self> {
+        let mut output = console::output().context("could not open the foreground output")?;
+        enable_raw_mode().context("could not enable foreground input")?;
+        if let Err(err) = execute!(output, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(err).context("could not enter the alternate screen");
+        }
+        let backend = CrosstermBackend::new(output);
+        let terminal = match Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(err) => {
+                if let Ok(mut output) = console::output() {
+                    let _ = execute!(output, LeaveAlternateScreen);
+                }
+                let _ = disable_raw_mode();
+                return Err(err).context("could not create the terminal renderer");
+            }
+        };
+        Ok(Self { terminal })
+    }
+}
+
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+    }
+}
+
+fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
+    if app.start_in_tray && tray.is_none() {
+        match Tray::spawn() {
+            Ok(icon) => *tray = Some(icon),
+            Err(err) => {
+                app.start_in_tray = false;
+                app.status = format!("could not create the tray icon: {err:#}");
+                if let Err(save) = (config::Settings {
+                    start_in_tray: false,
+                })
+                .save()
+                {
+                    app.status
+                        .push_str(&format!("; could not save settings: {save:#}"));
+                }
+                return;
+            }
+        }
+    } else if !app.start_in_tray
+        && let Some(mut icon) = tray.take()
+    {
+        icon.hide();
+    }
+
+    let Some(icon) = tray.as_mut() else {
+        return;
+    };
+    if let Err(err) = icon.show(&app.tray_tip()) {
+        app.start_in_tray = false;
+        app.status = format!("could not show the tray icon: {err:#}");
+        icon.hide();
+        *tray = None;
+        if let Err(save) = (config::Settings {
+            start_in_tray: false,
+        })
+        .save()
+        {
+            app.status
+                .push_str(&format!("; could not save settings: {save:#}"));
+        }
+        return;
+    }
+    if let Some(command) = icon.next_command(Duration::ZERO)
+        && command != tray::TrayCommand::Show
+    {
+        app.handle_tray(command);
+    }
 }
 
 /// Detached: no console, no drawing, an icon in the notification area and the
@@ -148,31 +283,35 @@ fn run_foreground(app: &mut App) -> Result<()> {
 /// in the foreground, with the reason in the status bar. Backgrounding is a
 /// convenience, and half of one, with the icon missing or the console gone, is
 /// a player the user cannot reach at all.
-fn run_background(app: &mut App) -> Result<()> {
+fn run_background(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
     app.wants_background = false;
 
-    let mut tray = match Tray::spawn() {
-        Ok(tray) => tray,
-        Err(err) => {
-            app.status = format!("{err:#}");
-            return Ok(());
-        }
-    };
-    if let Err(err) = tray.show(&app.tray_tip()) {
+    if tray.is_none() {
+        *tray = match Tray::spawn() {
+            Ok(tray) => Some(tray),
+            Err(err) => {
+                app.status = format!("{err:#}");
+                return Ok(());
+            }
+        };
+    }
+    let icon = tray.as_mut().expect("the tray was created above");
+    if let Err(err) = icon.show(&app.tray_tip()) {
         app.status = format!("{err:#}");
         return Ok(());
     }
 
     // Said on the terminal that is about to be given up, since it is the last
     // thing this window will ever show and the icon is small.
-    let mut out = io::stdout();
-    let _ = writeln!(
-        out,
-        "MTUI is playing in the background. Its icon is in the notification area, \
-         by the clock -- click it to bring this back, or right-click for controls. \
-         This window can be closed."
-    );
-    let _ = out.flush();
+    if let Ok(mut out) = console::output() {
+        let _ = writeln!(
+            out,
+            "MTUI is running in the background. Its icon is in the notification area, \
+             by the clock -- click it to bring this back, or right-click for controls. \
+             This window can be closed."
+        );
+        let _ = out.flush();
+    }
 
     if let Err(err) = console::detach() {
         app.status = format!("{err:#}");
@@ -191,19 +330,28 @@ fn run_background(app: &mut App) -> Result<()> {
         // Not `tick_page`: lyrics and comments are panels of a page nobody can
         // see, and fetching them here would spend a request per track on
         // something that is thrown away when the track changes.
-        let _ = tray.show(&app.tray_tip());
+        if let Err(err) = icon.show(&app.tray_tip()) {
+            app.status = format!("the tray icon was lost: {err:#}");
+            app.wants_foreground = true;
+            continue;
+        }
 
         let tick = if app.awaiting() { BUSY_TICK } else { IDLE_TICK };
-        if let Some(command) = tray.next_command(tick) {
+        if let Some(command) = icon.next_command(tick) {
             app.handle_tray(command);
         }
     }
 
     // Order matters on the way out: the icon goes first, so that a failure to
     // get a console back does not leave the user with neither.
-    tray.hide();
+    if !app.start_in_tray {
+        icon.hide();
+    }
     if app.wants_foreground {
         console::attach().context("could not reopen a terminal window")?;
+    }
+    if !app.start_in_tray {
+        *tray = None;
     }
     Ok(())
 }
@@ -213,14 +361,13 @@ fn run_background(app: &mut App) -> Result<()> {
 /// Encoding runs here rather than in the renderer: it costs tens of
 /// milliseconds and happens once per track, which is fine between frames and
 /// would not be fine inside one.
-fn paint_cover(app: &mut App) -> Result<()> {
+fn paint_cover(app: &mut App, out: &mut impl Write) -> Result<()> {
     let Some((cover, plan)) = app.image_to_paint() else {
         return Ok(());
     };
     let (width, height) = (u32::from(plan.width), u32::from(plan.height));
     let payload = sixel::encode(&cover.resample(width, height), width, height);
 
-    let mut out = io::stdout();
     // Save and restore around the write: drawing an image leaves the cursor
     // after it, and ratatui has already put the cursor where the search box
     // wants it.

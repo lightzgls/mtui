@@ -5,6 +5,7 @@
 //! screen are turned into widget items, so a full result set costs the same to
 //! draw as a single screenful.
 
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
@@ -12,7 +13,7 @@ use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{
     App, CardShape, CoverSize, ImagePlan, Mode, NowPlaying, Overlay, Panel, RelatedRow, SignIn,
@@ -39,6 +40,10 @@ const ALBUM_WIDTH: usize = 20;
 /// title truncates to the point of not identifying a song, which costs more
 /// than the artist and album are worth.
 const MIN_TITLE_WIDTH: usize = 24;
+
+/// Focused long titles rest at each end before moving one column per frame.
+const MARQUEE_HOLD: usize = 6;
+static MARQUEE_START: OnceLock<Instant> = OnceLock::new();
 
 /// Bounds on the columns given to the cover pane, borders included. The pane is
 /// a fraction of the row between these, so a wide terminal spends its extra
@@ -99,13 +104,13 @@ const MIN_PLAYLIST_NAME: usize = 8;
 /// area -- can be named without any of the existing hints being dropped for
 /// them. The name gives up less than it looks: it is the one thing on this bar
 /// that is also written across the pane above in full.
-const HINTS_WIDTH: u16 = 52;
+const HINTS_WIDTH: u16 = 63;
 
 /// Named rather than inlined into [`hint_line`] so the test that checks they
 /// fit [`HINTS_WIDTH`] measures the strings that are actually drawn.
-const HINTS_EDITING: &str = "Enter run   Esc browse   ^L your library";
-const HINTS_PLAYLISTS: &str = "Enter open  r reload  x sign out  Esc back";
-const HINTS_TRACKS: &str = "/ search  L library  a add  f like  q quit";
+const HINTS_EDITING: &str = "Enter run   Esc browse   ^L your library   ^S settings";
+const HINTS_PLAYLISTS: &str = "Enter open  r reload  x sign out  Esc back  S settings";
+const HINTS_TRACKS: &str = "/ search  L library  a add  f like  S settings  q quit";
 /// The landing page. `Esc` and `H` also return here from the track list, and
 /// neither fits beside what that line already has to offer -- so this one names
 /// what moves the cursor instead, which is the part a grid needs said.
@@ -113,17 +118,17 @@ const HINTS_TRACKS: &str = "/ search  L library  a add  f like  q quit";
 /// room for it: it rebuilds the page from different seeds rather than merely
 /// re-fetching it, which is not something a user would think to try unprompted.
 ///
-const HINTS_HOME: &str = "Enter play  hjkl move  r refresh  / search  q quit";
+const HINTS_HOME: &str = "Enter play  hjkl move  r refresh  M sign in  S settings  q quit";
 /// The player page. `n`, `p` and the tab keys are what it is for; `Esc` is
 /// named because the view is entered without being asked for and the way out of
 /// it is the first thing a user looks for. `+-` is named beside the volume bar
 /// this page draws, since a bar with no key named for it invites hunting.
-const HINTS_PLAYING: &str = "hl tabs  n next  jk scroll  +- vol  Esc back  B tray";
+const HINTS_PLAYING: &str = "hl tabs  n next  jk scroll  Esc back  S settings  B tray";
 /// Offered in either browse view with no session. `a`, `f`, `x` and `Enter` on
 /// a playlist all need one, so naming them to a signed-out user advertises keys
 /// that can only answer by starting a sign-in they did not ask for. Every key
 /// here works in both views, which is what lets one line serve both.
-const HINTS_SIGNED_OUT: &str = "A sign in   / search   q quit";
+const HINTS_SIGNED_OUT: &str = "A sign in   / search   S settings   q quit";
 
 /// The same four lines for when something is playing and its page is not on
 /// screen, each naming the two keys that only mean anything then: `P` back to
@@ -150,7 +155,7 @@ const SIGN_IN_MIN_WIDTH: u16 = 48;
 
 /// Ceiling on the width of wrapped error text. Only the URL is allowed to push
 /// the panel past this, and only because it cannot be wrapped.
-const SIGN_IN_MAX_WIDTH: u16 = 64;
+const SIGN_IN_MAX_WIDTH: u16 = 70;
 
 /// Indent shared by the URL and the code box, aligning both under the text of
 /// the numbered step above them rather than under its number.
@@ -351,7 +356,45 @@ fn render_overlay(frame: &mut Frame, app: &App) {
             title, selected, ..
         } => render_add_to(frame, app, title, *selected),
         Overlay::Message { body } => render_message(frame, body),
+        Overlay::Settings => render_settings(frame, app),
     }
+}
+
+fn render_settings(frame: &mut Frame, app: &App) {
+    let area = centred(frame.area(), 78, 11);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" settings ");
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let mark = if app.start_in_tray { "x" } else { " " };
+    let availability = if cfg!(windows) {
+        "Icon stays while the UI is open; check Windows' ^ menu."
+    } else {
+        "Available on Windows only."
+    };
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  > ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("[{mark}] Keep notification-area icon"),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!("    {availability}"),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Space / Enter toggle    Esc close    ^S open",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// A multi-line message, sized to its own content.
@@ -396,7 +439,29 @@ fn render_sign_in(frame: &mut Frame, phase: &SignIn) {
             deadline,
         } => render_waiting(frame, user_code, url, *deadline),
         SignIn::Failed { reason } => render_sign_in_failed(frame, reason),
+        SignIn::Music { started } => render_music_sign_in(frame, started.elapsed()),
     }
+}
+
+fn render_music_sign_in(frame: &mut Frame, elapsed: Duration) {
+    let inner = sign_in_panel(frame, SIGN_IN_MIN_WIDTH, 8, Color::Cyan);
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Complete sign-in in the YouTube Music window.",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            format!("  Waiting for a Music session{}", ellipsis(elapsed)),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  MTUI never receives your password. Esc hides this panel.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Border, title and backdrop shared by all three phases.
@@ -610,7 +675,7 @@ fn render_sign_in_failed(frame: &mut Frame, reason: &str) {
     }));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  A try again   Esc dismiss",
+        "  A OAuth sign-in   M Music sign-in   Esc dismiss",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -1438,7 +1503,7 @@ fn card_lines(
 
     let mut lines = vec![Line::from(vec![
         Span::raw(" "),
-        Span::styled(truncate(&card.title, room), title),
+        Span::styled(focused_text(&card.title, room, selected), title),
     ])];
 
     let detail = card.detail();
@@ -1728,7 +1793,7 @@ fn render_hero(frame: &mut Frame, hero: &Hero, area: Rect) {
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            truncate(hero.title, width),
+            marquee(hero.title, width),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -1904,7 +1969,7 @@ fn render_track_info(
     let width = area.width as usize;
     let mut lines = vec![
         Line::from(Span::styled(
-            truncate(&now.title, width),
+            marquee(&now.title, width),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
@@ -2191,7 +2256,7 @@ fn queue_line<'a>(
             format!(" {} ", if playing { "▶" } else { " " }),
             if playing { style } else { dim(Color::DarkGray) },
         ),
-        Span::styled(cell(&track.title, title_width), style),
+        Span::styled(focused_cell(&track.title, title_width, selected), style),
     ];
     if artist_width > 0 {
         spans.push(Span::styled(
@@ -2478,7 +2543,10 @@ fn related_line<'a>(card: &Card, selected: bool, width: usize, ambient: Color) -
     let rest = width.saturating_sub(title_width + 2);
 
     Line::from(vec![
-        Span::styled(format!("   {}", cell(&card.title, title_width)), style),
+        Span::styled(
+            format!("   {}", focused_cell(&card.title, title_width, selected)),
+            style,
+        ),
         Span::styled(cell(&card.subtitle, rest), subtitle),
     ])
 }
@@ -2605,7 +2673,7 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
             };
 
             let mut spans = vec![Span::styled(
-                format!(" {}", cell(&track.title, title_width)),
+                format!(" {}", focused_cell(&track.title, title_width, selected)),
                 style,
             )];
             if artist_width > 0 {
@@ -2851,8 +2919,9 @@ fn now_playing_line<'a>(snap: &'a Snapshot, app: &'a App, clock: bool, width: us
         let secs = snap.position.as_secs();
         spans.push(Span::raw(format!("{}:{:02}  ", secs / 60, secs % 60)));
     }
+    let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
     spans.push(Span::styled(
-        truncate(&snap.title, 60),
+        marquee(&snap.title, width.saturating_sub(used).min(60)),
         Style::default().add_modifier(Modifier::BOLD),
     ));
     Line::from(spans)
@@ -2889,6 +2958,79 @@ fn cell(text: &str, width: usize) -> String {
     let text = truncate(text, width.saturating_sub(1));
     let pad = width.saturating_sub(display_width(&text));
     format!("{text}{:pad$}", "", pad = pad)
+}
+
+fn focused_cell(text: &str, width: usize, focused: bool) -> String {
+    let room = width.saturating_sub(1);
+    let text = focused_text(text, room, focused);
+    let pad = width.saturating_sub(display_width(&text));
+    format!("{text}{:pad$}", "", pad = pad)
+}
+
+fn focused_text(text: &str, width: usize, focused: bool) -> String {
+    if focused {
+        marquee(text, width)
+    } else {
+        truncate(text, width)
+    }
+}
+
+/// A looping, Unicode-safe window over a long title.
+fn marquee(text: &str, width: usize) -> String {
+    let tick = (MARQUEE_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        / 200) as usize;
+    marquee_at(text, width, tick)
+}
+
+fn marquee_at(text: &str, width: usize, tick: usize) -> String {
+    let total = display_width(text);
+    if width == 0 {
+        return String::new();
+    }
+    if total <= width {
+        return text.to_string();
+    }
+
+    let travel = total - width;
+    let cycle = MARQUEE_HOLD + travel + MARQUEE_HOLD + travel;
+    let tick = tick % cycle;
+    let offset = match tick {
+        tick if tick < MARQUEE_HOLD => 0,
+        tick if tick < MARQUEE_HOLD + travel => tick - MARQUEE_HOLD + 1,
+        tick if tick < MARQUEE_HOLD + travel + MARQUEE_HOLD => travel,
+        tick => travel.saturating_sub(tick - (MARQUEE_HOLD + travel + MARQUEE_HOLD) + 1),
+    };
+    column_window(text, offset, width)
+}
+
+fn column_window(text: &str, offset: usize, width: usize) -> String {
+    let mut out = String::new();
+    let mut at = 0;
+    let mut used = 0;
+    for c in text.chars() {
+        let size = char_width(c);
+        if at + size <= offset {
+            at += size;
+            continue;
+        }
+        if at < offset {
+            let clipped = (at + size - offset).min(width.saturating_sub(used));
+            out.push_str(&" ".repeat(clipped));
+            used += clipped;
+            at += size;
+            continue;
+        }
+        if used + size > width {
+            break;
+        }
+        out.push(c);
+        used += size;
+        at += size;
+    }
+    out
 }
 
 /// Truncates to `max` *terminal columns*, adding an ellipsis when it cuts.
@@ -4915,6 +5057,9 @@ mod tests {
             SignIn::Failed {
                 reason: "sign-in was declined".to_string(),
             },
+            SignIn::Music {
+                started: Instant::now(),
+            },
         ] {
             let rows = drawn(70, 24, &phase).join("\n");
             assert!(rows.contains("sign in with Google"), "{rows}");
@@ -4930,7 +5075,8 @@ mod tests {
         };
         let rows = drawn(70, 24, &phase).join("\n");
         assert!(rows.contains("sign-in was declined"), "{rows}");
-        assert!(rows.contains("A try again"), "{rows}");
+        assert!(rows.contains("A OAuth sign-in"), "{rows}");
+        assert!(rows.contains("M Music sign-in"), "{rows}");
     }
 
     /// Every phase is sized to its own content, and the row that a too-short
@@ -4945,6 +5091,9 @@ mod tests {
             waiting(),
             SignIn::Failed {
                 reason: "sign-in was declined".to_string(),
+            },
+            SignIn::Music {
+                started: Instant::now(),
             },
         ] {
             let rows = drawn(70, 24, &phase).join("\n");
@@ -5029,6 +5178,20 @@ mod tests {
                 display_width(hint)
             );
         }
+    }
+
+    #[test]
+    fn every_non_editing_view_names_settings() {
+        for hint in [
+            HINTS_PLAYLISTS,
+            HINTS_TRACKS,
+            HINTS_SIGNED_OUT,
+            HINTS_HOME,
+            HINTS_PLAYING,
+        ] {
+            assert!(hint.contains("S settings"), "{hint:?} does not name S");
+        }
+        assert!(HINTS_EDITING.contains("^S settings"));
     }
 
     #[test]
@@ -5192,6 +5355,28 @@ mod tests {
                     "{text:?} overflowed a {max}-column budget"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn marquee_pauses_scrolls_and_returns() {
+        let title = "abcdefgh";
+        assert_eq!(marquee_at(title, 4, 0), "abcd");
+        assert_eq!(marquee_at(title, 4, MARQUEE_HOLD - 1), "abcd");
+        assert_eq!(marquee_at(title, 4, MARQUEE_HOLD), "bcde");
+        assert_eq!(marquee_at(title, 4, MARQUEE_HOLD + 3), "efgh");
+        assert_eq!(
+            marquee_at(title, 4, MARQUEE_HOLD + 4 + MARQUEE_HOLD),
+            "defg"
+        );
+    }
+
+    #[test]
+    fn marquee_never_splits_a_wide_character() {
+        for tick in 0..30 {
+            let shown = marquee_at("A日本語Z", 4, tick);
+            assert!(display_width(&shown) <= 4, "{shown:?} overflowed");
+            assert!(std::str::from_utf8(shown.as_bytes()).is_ok());
         }
     }
 }
