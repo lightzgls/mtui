@@ -63,6 +63,12 @@ reqwest = { version = "0.13.4", default-features = false, features = [
 # not need a thread pool.
 jpeg-decoder = { version = "0.3", default-features = false }
 
+# Deno is offered as an optional first-run install when yt-dlp has no supported
+# JavaScript runtime. Its official release is one executable in a deflated zip.
+zip = { version = "7.2", default-features = false, features = [
+    "deflate-flate2-zlib-rs",
+] }
+
 # Both are already in the tree underneath reqwest and stream-download, so
 # declaring them compiles nothing new. They are named here because the chunked
 # HTTP client in `player::chunked` has to spell out the types in

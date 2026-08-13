@@ -44,19 +44,30 @@ struct YtDlpEntry {
 pub struct YouTube {
     /// Path to the binary, so a user with a non-PATH install can point at it.
     bin: String,
+    /// yt-dlp spelling, for example `deno:C:\path\deno.exe`.
+    js_runtime: Option<String>,
 }
 
 impl Default for YouTube {
     fn default() -> Self {
         Self {
             bin: "yt-dlp".to_string(),
+            js_runtime: None,
         }
     }
 }
 
 impl YouTube {
     pub fn new(bin: impl Into<String>) -> Self {
-        Self { bin: bin.into() }
+        Self {
+            bin: bin.into(),
+            js_runtime: None,
+        }
+    }
+
+    pub fn with_js_runtime(mut self, runtime: Option<String>) -> Self {
+        self.js_runtime = runtime;
+        self
     }
 
     /// The binary, lent to [`crate::source::browser`].
@@ -67,6 +78,10 @@ impl YouTube {
     /// flag against would be absurd.
     pub(super) fn bin(&self) -> &str {
         &self.bin
+    }
+
+    pub(super) fn js_runtime(&self) -> Option<&str> {
+        self.js_runtime.as_deref()
     }
 
     /// Verifies yt-dlp is present and returns its version.
@@ -101,7 +116,11 @@ impl YouTube {
             return Ok(Vec::new());
         }
 
-        let out = Command::new(&self.bin)
+        let mut command = Command::new(&self.bin);
+        if let Some(runtime) = &self.js_runtime {
+            command.args(["--no-js-runtimes", "--js-runtimes", runtime]);
+        }
+        let out = command
             .args(SEARCH_FLAGS)
             .arg(format!("ytsearch{limit}:{query}"))
             .stdin(Stdio::null())
@@ -212,6 +231,12 @@ fn strip_preamble(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_runtime_is_carried_to_every_yt_dlp_call() {
+        let yt = YouTube::new("yt-dlp").with_js_runtime(Some("deno:/tmp/deno".to_string()));
+        assert_eq!(yt.js_runtime(), Some("deno:/tmp/deno"));
+    }
 
     /// Guards against passing a flag yt-dlp does not have.
     ///

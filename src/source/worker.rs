@@ -593,6 +593,7 @@ fn run(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>, asked: &AtomicU
             return;
         }
     };
+    resolver.set_js_runtime(yt.js_runtime().map(str::to_string));
     // Resolves taken off the queue. Behind `asked` exactly when the queue holds
     // one the user asked for more recently than the one in hand.
     let mut taken = 0u64;

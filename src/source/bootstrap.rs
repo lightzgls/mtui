@@ -18,8 +18,9 @@
 //! a half-written binary is found and trusted on the next launch.
 
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -65,6 +66,12 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// error page through the redirect would otherwise be written to disk and only
 /// fail later, when it is run.
 const MIN_PLAUSIBLE_BYTES: u64 = 1024 * 1024;
+const MIN_DENO_ARCHIVE_BYTES: u64 = 10 * 1024 * 1024;
+
+#[cfg(windows)]
+const DENO_BIN: &str = "deno.exe";
+#[cfg(not(windows))]
+const DENO_BIN: &str = "deno";
 
 /// Where we keep binaries we fetched.
 ///
@@ -117,6 +124,152 @@ pub fn locate() -> Result<YouTube> {
     Ok(ours)
 }
 
+/// Reuses a supported JavaScript runtime, or installs a private copy of Deno.
+/// A failed install is non-fatal: simpler yt-dlp paths still work without it.
+pub fn with_js_runtime(yt: YouTube) -> Result<YouTube> {
+    for runtime in ["deno", "node", "bun"] {
+        if runtime_supported(runtime) {
+            return Ok(yt.with_js_runtime(Some(runtime.to_string())));
+        }
+    }
+
+    let managed = bin_dir()?.join(DENO_BIN);
+    if runtime_supported_at("deno", &managed) {
+        return Ok(yt.with_js_runtime(Some(runtime_arg(&managed))));
+    }
+
+    if let Err(error) = install_deno(&managed) {
+        eprintln!("mtui: could not install Deno: {error:#}");
+        eprintln!("mtui: continuing without a JavaScript runtime");
+        return Ok(yt);
+    }
+    Ok(yt.with_js_runtime(Some(runtime_arg(&managed))))
+}
+
+fn runtime_supported(runtime: &str) -> bool {
+    runtime_supported_at(runtime, runtime)
+}
+
+fn runtime_supported_at(runtime: &str, command: impl AsRef<std::ffi::OsStr>) -> bool {
+    let Ok(output) = Command::new(command)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version = match runtime {
+        "deno" => stdout
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1)),
+        "node" => Some(stdout.trim().trim_start_matches('v')),
+        "bun" => Some(stdout.trim()),
+        _ => None,
+    };
+    let Some(version) = version.and_then(parse_version) else {
+        return false;
+    };
+    match runtime {
+        "deno" => version >= (2, 3, 0),
+        "node" => version >= (22, 0, 0),
+        // yt-dlp deprecated Bun and supports no release after 1.3.14.
+        "bun" => ((1, 2, 11)..=(1, 3, 14)).contains(&version),
+        _ => false,
+    }
+}
+
+fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.split('-').next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn runtime_arg(path: &Path) -> String {
+    format!("deno:{}", path.to_string_lossy())
+}
+
+fn deno_download_url() -> Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => Ok(
+            "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip",
+        ),
+        ("windows", "aarch64") => Ok(
+            "https://github.com/denoland/deno/releases/latest/download/deno-aarch64-pc-windows-msvc.zip",
+        ),
+        ("linux", "x86_64") => Ok(
+            "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip",
+        ),
+        ("linux", "aarch64") => Ok(
+            "https://github.com/denoland/deno/releases/latest/download/deno-aarch64-unknown-linux-gnu.zip",
+        ),
+        ("macos", "x86_64") => Ok(
+            "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-apple-darwin.zip",
+        ),
+        ("macos", "aarch64") => Ok(
+            "https://github.com/denoland/deno/releases/latest/download/deno-aarch64-apple-darwin.zip",
+        ),
+        (os, arch) => bail!("automatic Deno installation is not available for {os}/{arch}"),
+    }
+}
+
+fn install_deno(dest: &Path) -> Result<()> {
+    let dir = dest.parent().expect("Deno path always has a parent");
+    fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    let archive = dir.join("deno.zip.part");
+    let executable = dest.with_extension("part");
+    let _ = fs::remove_file(&archive);
+    let _ = fs::remove_file(&executable);
+
+    let result = (|| {
+        download_asset(
+            &archive,
+            deno_download_url()?,
+            "Deno",
+            MIN_DENO_ARCHIVE_BYTES,
+        )?;
+        let file = fs::File::open(&archive)
+            .with_context(|| format!("could not open {}", archive.display()))?;
+        let mut zip = zip::ZipArchive::new(file).context("the Deno download was not a zip file")?;
+        let mut entry = zip
+            .by_name(DENO_BIN)
+            .with_context(|| format!("the Deno archive did not contain {DENO_BIN}"))?;
+        let mut output = fs::File::create(&executable)
+            .with_context(|| format!("could not create {}", executable.display()))?;
+        io::copy(&mut entry, &mut output).context("could not extract Deno")?;
+        output
+            .flush()
+            .context("could not flush the Deno executable")?;
+        drop(output);
+
+        make_executable(&executable)?;
+        if dest.exists() {
+            fs::remove_file(dest)
+                .with_context(|| format!("could not replace {}", dest.display()))?;
+        }
+        fs::rename(&executable, dest)
+            .with_context(|| format!("could not move Deno to {}", dest.display()))?;
+        if !runtime_supported_at("deno", dest) {
+            bail!("downloaded Deno to {} but it does not run", dest.display());
+        }
+        eprintln!("mtui: installed Deno into {}", dir.display());
+        Ok(())
+    })();
+
+    let _ = fs::remove_file(&archive);
+    let _ = fs::remove_file(&executable);
+    if result.is_err() {
+        let _ = fs::remove_file(dest);
+    }
+    result
+}
+
 /// Downloads the asset to `dest`, atomically and verifiably or not at all.
 fn install(dest: &Path) -> Result<()> {
     let dir = dest.parent().expect("asset path always has a parent");
@@ -145,37 +298,42 @@ fn install(dest: &Path) -> Result<()> {
 /// The download proper. Split out so that [`install`] has exactly one place to
 /// clean up from, whatever went wrong.
 fn download(part: &Path, dest: &Path) -> Result<()> {
+    let written = download_asset(part, DOWNLOAD_URL, "yt-dlp", MIN_PLAUSIBLE_BYTES)?;
+    finish(part, dest, written)
+}
+
+fn download_asset(part: &Path, url: &str, name: &str, minimum: u64) -> Result<u64> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("could not start a runtime to download yt-dlp")?;
+        .with_context(|| format!("could not start a runtime to download {name}"))?;
 
     let client = reqwest::Client::builder()
         .read_timeout(READ_TIMEOUT)
         .build()
-        .context("could not build an HTTP client to download yt-dlp")?;
+        .with_context(|| format!("could not build an HTTP client to download {name}"))?;
 
     eprintln!(
-        "mtui: yt-dlp not found, fetching it once into {}",
-        dest.parent()
-            .expect("asset path always has a parent")
+        "mtui: fetching {name} into {}",
+        part.parent()
+            .expect("download path always has a parent")
             .display()
     );
 
     runtime.block_on(async {
         let response = client
-            .get(DOWNLOAD_URL)
+            .get(url)
             .send()
             .await
-            .context("could not reach github.com to download yt-dlp")?
+            .with_context(|| format!("could not reach github.com to download {name}"))?
             .error_for_status()
-            .context("github.com refused the yt-dlp download")?;
+            .with_context(|| format!("github.com refused the {name} download"))?;
 
         let total = response.content_length();
         if let Some(len) = total
-            && len < MIN_PLAUSIBLE_BYTES
+            && len < minimum
         {
-            bail!("yt-dlp download was only {len} bytes, which is not the binary");
+            bail!("{name} download was only {len} bytes, which is not the expected file");
         }
 
         let mut file = fs::File::create(part)
@@ -184,7 +342,7 @@ fn download(part: &Path, dest: &Path) -> Result<()> {
         let mut stream = response.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("the yt-dlp download was interrupted")?;
+            let chunk = chunk.with_context(|| format!("the {name} download was interrupted"))?;
             file.write_all(&chunk)
                 .with_context(|| format!("could not write to {}", part.display()))?;
             written += chunk.len() as u64;
@@ -196,26 +354,33 @@ fn download(part: &Path, dest: &Path) -> Result<()> {
         // reached the disk would produce exactly the truncated binary this
         // whole path exists to avoid.
         file.flush()
-            .context("could not flush the yt-dlp download")?;
+            .with_context(|| format!("could not flush the {name} download"))?;
         drop(file);
 
-        if written < MIN_PLAUSIBLE_BYTES {
-            bail!("yt-dlp download ended early at {written} bytes");
+        if written < minimum {
+            bail!("{name} download ended early at {written} bytes");
         }
-        finish(part, dest, written)
+        Ok(written)
     })
+}
+
+fn make_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("could not make {} executable", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// Makes the finished download executable and moves it into place.
 fn finish(part: &Path, dest: &Path, written: u64) -> Result<()> {
     // Downloaded files are not executable on Unix, and yt-dlp is about to be
     // spawned as a child process. No-op on Windows, which goes by extension.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(part, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("could not make {} executable", part.display()))?;
-    }
+    make_executable(part)?;
 
     // Windows refuses a rename onto an existing file. Only reachable when the
     // copy already there failed to run, which is why replacing it is the point.
@@ -277,6 +442,21 @@ mod tests {
         assert_ne!(bin, config);
     }
 
+    #[test]
+    fn runtime_versions_are_compared_numerically() {
+        assert_eq!(parse_version("2.3.0"), Some((2, 3, 0)));
+        assert_eq!(parse_version("24.11.1"), Some((24, 11, 1)));
+        assert_eq!(parse_version("1.3.14-canary"), Some((1, 3, 14)));
+        assert_eq!(parse_version("not-a-version"), None);
+    }
+
+    #[test]
+    fn this_platform_has_a_deno_asset() {
+        let url = deno_download_url().expect("CI platforms should have a Deno release");
+        assert!(url.starts_with("https://github.com/denoland/deno/releases/latest/download/"));
+        assert!(url.ends_with(".zip"));
+    }
+
     /// The contract [`install`] offers: whatever happens, the temporary file is
     /// gone.
     ///
@@ -301,6 +481,20 @@ mod tests {
         // and with one it downloads 17 MB. Either way the partial must be gone.
         let _ = install(&dest);
         assert!(!part.exists(), "install() left {} behind", part.display());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "downloads Deno from github.com"]
+    fn installs_a_working_deno() {
+        let dir = std::env::temp_dir().join("mtui-deno-bootstrap-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join(DENO_BIN);
+
+        install_deno(&dest).expect("Deno should install");
+        assert!(runtime_supported_at("deno", &dest));
 
         let _ = fs::remove_dir_all(&dir);
     }

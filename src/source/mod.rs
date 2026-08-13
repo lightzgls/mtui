@@ -36,6 +36,7 @@ pub fn resolve_stream(
     video_id: &str,
 ) -> anyhow::Result<(StreamUrl, bool)> {
     let mut resolver = mtui_resolver::Resolver::new(yt.bin())?;
+    resolver.set_js_runtime(yt.js_runtime().map(str::to_string));
     if let Some(cookies) = crate::config::Cookies::available()? {
         resolver.set_session(Some(mtui_resolver::PlaybackSession::new(
             cookies.header().to_string(),
@@ -105,6 +106,7 @@ mod live_quality {
             .expect("saved cookies should parse")
             .expect("no saved browser session is available");
         let mut resolver = mtui_resolver::Resolver::new(yt.bin()).expect("resolver should build");
+        resolver.set_js_runtime(yt.js_runtime().map(str::to_string));
         resolver.set_session(Some(mtui_resolver::PlaybackSession::new(
             cookies.header().to_string(),
             cookies.sapisid().to_string(),

@@ -197,6 +197,7 @@ impl std::error::Error for ResolveError {}
 /// Stateful resolver with a pooled native client and bounded URL cache.
 pub struct Resolver {
     bin: String,
+    js_runtime: Option<String>,
     client: reqwest::Client,
     runtime: tokio::runtime::Runtime,
     cache: UrlCache,
@@ -215,11 +216,17 @@ impl Resolver {
             .map_err(|e| ResolveError::from_message(format!("could not build resolver: {e}")))?;
         Ok(Self {
             bin: bin.into(),
+            js_runtime: None,
             client,
             runtime,
             cache: UrlCache::new(),
             session: None,
         })
+    }
+
+    /// Selects the JavaScript runtime used by yt-dlp fallbacks.
+    pub fn set_js_runtime(&mut self, runtime: Option<String>) {
+        self.js_runtime = runtime;
     }
 
     /// Replaces the account used for Premium-capable player requests.
@@ -326,7 +333,13 @@ impl Resolver {
         ));
         for (session, watch_url, format, flags, source) in attempts {
             let candidate = resolve_yt_dlp_as(
-                &self.bin, session, video_id, watch_url, format, flags, source,
+                (&self.bin, self.js_runtime.as_deref()),
+                session,
+                video_id,
+                watch_url,
+                format,
+                flags,
+                source,
             );
             match candidate {
                 Ok(stream) if serves_whole_file(&self.runtime, &self.client, &stream.url) => {
@@ -536,7 +549,7 @@ fn pick_audio(formats: &[Format]) -> Option<(&str, u32)> {
 }
 
 fn resolve_yt_dlp_as(
-    bin: &str,
+    tool: (&str, Option<&str>),
     session: Option<&PlaybackSession>,
     video_id: &str,
     watch_url: &str,
@@ -544,8 +557,12 @@ fn resolve_yt_dlp_as(
     extra: &[&str],
     source: ResolveSource,
 ) -> Result<ResolvedStream> {
+    let (bin, js_runtime) = tool;
     let cookie_jar = session.map(SessionJar::create).transpose()?;
     let mut command = Command::new(bin);
+    if let Some(runtime) = js_runtime {
+        command.args(["--no-js-runtimes", "--js-runtimes", runtime]);
+    }
     command
         .arg("--format")
         .arg(format)
