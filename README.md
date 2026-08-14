@@ -13,7 +13,7 @@ MTUI is a keyboard-driven YouTube Music player for the terminal, written in Rust
 
 ### Windows
 
-Download the Windows folder from the [latest release](https://github.com/lightzgls/mtui/releases/latest), keep `mtui.exe` and `WebView2Loader.dll` together, and run:
+Download `mtui.exe` from the [latest release](https://github.com/lightzgls/mtui/releases/latest) and run:
 
 ```powershell
 .\mtui.exe
@@ -139,6 +139,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Network and live-account tests are ignored by default.
+
+Windows releases use the MSVC target so WebView2's loader is linked into `mtui.exe`. GNU Windows builds remain supported, but require the generated `WebView2Loader.dll` beside the executable.
 
 ## License
 

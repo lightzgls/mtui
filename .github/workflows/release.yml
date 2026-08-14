@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+          rustup default stable-x86_64-pc-windows-msvc
+
+      # webview2-com statically links WebView2Loader on MSVC. GNU links the DLL
+      # dynamically, which would turn the release into a two-file download.
+      - name: Build single-file Windows release
+        run: cargo build --release --locked
+
+      - name: Verify WebView2 loader is static
+        shell: pwsh
+        run: |
+          $imports = & link.exe /dump /dependents target/release/mtui.exe
+          if ($LASTEXITCODE -ne 0) { throw "Could not inspect mtui.exe imports" }
+          if ($imports -match "WebView2Loader\.dll") {
+            throw "mtui.exe still imports WebView2Loader.dll"
+          }
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" "target/release/mtui.exe#MTUI for Windows (x64)" --generate-notes --verify-tag
