@@ -16,6 +16,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 
+fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 const PLAYER_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(45);
 const PROCESS_POLL: Duration = Duration::from_millis(50);
@@ -559,7 +571,7 @@ fn resolve_yt_dlp_as(
 ) -> Result<ResolvedStream> {
     let (bin, js_runtime) = tool;
     let cookie_jar = session.map(SessionJar::create).transpose()?;
-    let mut command = Command::new(bin);
+    let mut command = command(bin);
     if let Some(runtime) = js_runtime {
         command.args(["--no-js-runtimes", "--js-runtimes", runtime]);
     }
@@ -1056,7 +1068,7 @@ mod tests {
 
     #[test]
     fn yt_dlp_flags_exist_when_installed() {
-        let Ok(out) = Command::new("yt-dlp").arg("--help").output() else {
+        let Ok(out) = command("yt-dlp").arg("--help").output() else {
             return;
         };
         let help = String::from_utf8_lossy(&out.stdout);

@@ -33,11 +33,11 @@
 //! cookie wins. A browser that is not installed fails in milliseconds, which is
 //! what keeps probing the whole list affordable.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 
-use super::youtube::YouTube;
+use super::{command, youtube::YouTube};
 use crate::config::Cookies;
 
 /// Everything yt-dlp can read, most-likely-to-work first.
@@ -102,7 +102,7 @@ pub fn extract(yt: &YouTube, browser: &str) -> Result<Cookies> {
     // attempt would otherwise be parsed as though this attempt had produced it.
     let _ = std::fs::remove_file(&jar);
 
-    let out = Command::new(yt.bin())
+    let out = command(yt.bin())
         .arg("--cookies-from-browser")
         .arg(browser)
         // yt-dlp reads cookies from this path *and dumps the jar back into it*,

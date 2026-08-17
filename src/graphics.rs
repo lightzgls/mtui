@@ -11,11 +11,19 @@
 //! character cell. The second is what lets an image be sized to fill a whole
 //! number of columns exactly.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::Write;
+#[cfg(not(windows))]
+use std::io::{self, IsTerminal};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode};
+#[cfg(not(windows))]
+use crossterm::event;
+use crossterm::event::{Event, KeyCode};
+#[cfg(not(windows))]
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+#[cfg(windows)]
+use crate::console;
 
 /// How long to wait for a terminal that may never answer. Paid once, before the
 /// UI is up, and only by terminals that stay silent.
@@ -77,6 +85,7 @@ pub fn detect() -> Graphics {
 ///
 /// Raw mode is required: cooked input would hold the reply until a newline that
 /// is never coming. Returns `None` when stdout is not a terminal at all.
+#[cfg(not(windows))]
 fn ask() -> Option<String> {
     if !io::stdout().is_terminal() {
         return None;
@@ -87,6 +96,32 @@ fn ask() -> Option<String> {
     reply
 }
 
+#[cfg(windows)]
+fn ask() -> Option<String> {
+    let mut out = console::output().ok()?;
+    let mut input = console::Input::open().ok()?;
+    out.write_all(b"\x1b[c\x1b[16t").ok()?;
+    out.flush().ok()?;
+
+    let deadline = Instant::now() + BUDGET;
+    let mut reply = String::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let Some(event) = input.next(left).ok()? else {
+            break;
+        };
+        collect_key(event, &mut reply);
+        if complete(&reply) {
+            break;
+        }
+    }
+    (!reply.is_empty()).then_some(reply)
+}
+
+#[cfg(not(windows))]
 fn collect() -> Option<String> {
     let mut out = io::stdout();
     out.write_all(b"\x1b[c\x1b[16t").ok()?;
@@ -102,22 +137,35 @@ fn collect() -> Option<String> {
         // Terminal replies arrive on the input stream as if typed. Presses
         // only: Windows reports releases too, which would double every
         // character of the reply.
-        if let Ok(Event::Key(key)) = event::read()
-            && key.is_press()
-        {
-            match key.code {
-                KeyCode::Esc => reply.push('\x1b'),
-                KeyCode::Char(c) => reply.push(c),
-                _ => {}
-            }
+        if let Ok(event) = event::read() {
+            collect_key(event, &mut reply);
         }
         // Both replies are in: attributes end at `c`, the cell report at `t`.
-        if reply.contains('c') && reply.contains('t') {
+        if complete(&reply) {
             break;
         }
     }
 
     (!reply.is_empty()).then_some(reply)
+}
+
+fn collect_key(event: Event, reply: &mut String) {
+    // Terminal replies arrive as input records. Presses only: Windows also
+    // reports releases, which would double every character of the reply.
+    if let Event::Key(key) = event
+        && key.is_press()
+    {
+        match key.code {
+            KeyCode::Esc => reply.push('\x1b'),
+            KeyCode::Char('\x1b') => reply.push('\x1b'),
+            KeyCode::Char(c) => reply.push(c),
+            _ => {}
+        }
+    }
+}
+
+fn complete(reply: &str) -> bool {
+    reply.contains('c') && reply.contains('t')
 }
 
 /// Pulls sixel support and cell size out of the raw reply.

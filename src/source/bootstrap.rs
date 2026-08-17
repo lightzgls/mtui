@@ -20,13 +20,13 @@
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 
-use super::youtube::YouTube;
+use super::{command, youtube::YouTube};
 
 /// The release asset for this platform, and where it comes from.
 ///
@@ -150,8 +150,8 @@ fn runtime_supported(runtime: &str) -> bool {
     runtime_supported_at(runtime, runtime)
 }
 
-fn runtime_supported_at(runtime: &str, command: impl AsRef<std::ffi::OsStr>) -> bool {
-    let Ok(output) = Command::new(command)
+fn runtime_supported_at(runtime: &str, executable: impl AsRef<std::ffi::OsStr>) -> bool {
+    let Ok(output) = command(executable)
         .arg("--version")
         .stdin(Stdio::null())
         .output()

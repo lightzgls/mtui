@@ -23,9 +23,24 @@ pub mod youtube;
 #[cfg(feature = "spotify")]
 pub mod spotify;
 
+use std::ffi::OsStr;
+use std::process::Command;
 use std::time::Duration;
 
 pub use mtui_resolver::StreamUrl;
+
+/// A command-line child that must never acquire a console of its own.
+pub(super) fn command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
 
 /// Compatibility entry point for network diagnostics and ignored player tests.
 /// Production playback keeps one [`mtui_resolver::Resolver`] in the source

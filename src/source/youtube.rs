@@ -6,12 +6,12 @@
 //! a video id into a signed `googlevideo.com` URL, prints it, and exits. All
 //! subsequent streaming and decoding happens in-process.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::{Track, UNKNOWN_ARTIST};
+use super::{Track, UNKNOWN_ARTIST, command};
 
 /// Hard ceiling on search results. Bounded by construction so a long session
 /// cannot grow the heap.
@@ -89,7 +89,7 @@ impl YouTube {
     /// Called once at startup so a missing dependency surfaces as a clear
     /// message instead of a confusing failure on the first play.
     pub fn version(&self) -> Result<String> {
-        let out = Command::new(&self.bin)
+        let out = command(&self.bin)
             .arg("--version")
             .stdin(Stdio::null())
             .output()
@@ -116,7 +116,7 @@ impl YouTube {
             return Ok(Vec::new());
         }
 
-        let mut command = Command::new(&self.bin);
+        let mut command = command(&self.bin);
         if let Some(runtime) = &self.js_runtime {
             command.args(["--no-js-runtimes", "--js-runtimes", runtime]);
         }
@@ -247,7 +247,7 @@ mod tests {
     /// still runs on a machine without it.
     #[test]
     fn flags_are_accepted_by_yt_dlp() {
-        let Ok(out) = Command::new("yt-dlp").arg("--help").output() else {
+        let Ok(out) = command("yt-dlp").arg("--help").output() else {
             eprintln!("skipping: yt-dlp not installed");
             return;
         };

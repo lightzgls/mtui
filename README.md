@@ -114,7 +114,7 @@ Keys are context-sensitive. The footer always shows the controls available in th
 
 ## Windows Tray
 
-Press `B` while music is playing to close the terminal and continue in the notification area. The tray menu can show MTUI, pause or resume, move between tracks, and quit. Enable **Keep notification-area icon** under `S` Settings to retain the icon while the terminal UI is open. Windows may place it under the hidden-icons `^` menu.
+Press `B` while music is playing to close the terminal and continue in the notification area. Closing the terminal with its `X` button also moves MTUI to the tray without interrupting playback. The tray menu can show MTUI, pause or resume, move between tracks, and quit. Enable **Keep notification-area icon** under `S` Settings to retain the icon while the terminal UI is open. Windows may place it under the hidden-icons `^` menu.
 
 ## Configuration
 

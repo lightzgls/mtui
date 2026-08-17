@@ -25,18 +25,30 @@ mod source;
 mod tray;
 mod ui;
 
+#[cfg(windows)]
+use std::io;
 use std::io::Write;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
 use crossterm::event::Event;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+#[cfg(not(windows))]
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, queue};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+#[cfg(windows)]
+use ratatui::backend::{Backend, ClearType, WindowSize};
+#[cfg(windows)]
+use ratatui::buffer::Cell;
+#[cfg(windows)]
+use ratatui::layout::{Position, Rect, Size};
+#[cfg(windows)]
+use ratatui::{TerminalOptions, Viewport};
+#[cfg(windows)]
+use unicode_width::UnicodeWidthStr;
 
 use app::App;
 use player::Player;
@@ -61,6 +73,13 @@ const BUSY_TICK: Duration = Duration::from_millis(50);
 const IDLE_TICK: Duration = Duration::from_millis(500);
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    if console::is_host() {
+        return console::run_host();
+    }
+    #[cfg(windows)]
+    console::prepare_parent();
+
     if let Err(err) = start() {
         console::report_error(&format!("{err:#}"));
         return Err(err);
@@ -131,17 +150,35 @@ fn run(keep_tray: bool, mut tray: Option<Tray>) -> Result<()> {
 fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
     app.wants_foreground = false;
 
-    // A fresh CONOUT$ writer per foreground session is load-bearing on Windows:
-    // Rust's global stdout keeps the dead handle from before FreeConsole, even
-    // after AllocConsole and SetStdHandle point at the replacement.
-    let mut foreground = Foreground::open()?;
-    let mut input = console::Input::open().context("could not open foreground input")?;
+    if console::closed() {
+        app.wants_background = true;
+        return Ok(());
+    }
+
+    // Each foreground owner gets duplicate helper pipes. The graphics probe
+    // has already released its copies before normal input begins.
+    let mut foreground = match Foreground::open() {
+        Ok(foreground) => foreground,
+        Err(_) if console::closed() => {
+            app.wants_background = true;
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+    let mut input = match console::Input::open().context("could not open foreground input") {
+        Ok(input) => input,
+        Err(_) if console::closed() => {
+            app.wants_background = true;
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
 
     (|| -> Result<()> {
         while !app.should_quit && !app.wants_background {
             app.poll_source();
             // Before the prefetch: a track that just ended starts the next one
-            // here, and the prefetch wants to be warming the one after it.
+            // here, and the prefetch warms the one after it.
             app.tick_playback();
             app.tick_page();
             app.tick_prefetch();
@@ -153,9 +190,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
                 .context("could not draw the foreground")?;
 
             // Sixel pixels live outside ratatui's buffer, so nothing it draws
-            // can erase them. When they no longer belong where they are, the
-            // screen has to be cleared and rebuilt in the same breath -- a bare
-            // clear would leave the user looking at nothing until the next tick.
+            // can erase them. Clear and rebuild in the same breath.
             if app.image_needs_clearing() {
                 foreground
                     .terminal
@@ -169,49 +204,80 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
             }
             paint_cover(app, foreground.terminal.backend_mut())
                 .context("could not draw the cover")?;
+            if console::closed() {
+                // Unlike explicit B, X always backgrounds, including idle.
+                app.wants_background = true;
+                break;
+            }
 
-            // Block for input, but wake on TICK so the position clock advances
-            // and worker responses are picked up without a keypress.
+            // Block for input, but wake so clocks and workers advance.
             let tick = if app.awaiting() { BUSY_TICK } else { TICK };
             if let Some(event) = input
                 .next(tick)
                 .context("could not poll foreground input")?
             {
                 match event {
-                    // Windows reports both press and release; acting on both
-                    // would double every keystroke.
                     Event::Key(key) if key.is_press() => app.handle_key(key)?,
-                    // A resize can drop the pixels without moving the pane,
-                    // so the image is repainted rather than assumed intact.
-                    Event::Resize(_, _) => app.invalidate_image(),
+                    Event::Resize(width, height) => {
+                        #[cfg(windows)]
+                        {
+                            foreground
+                                .terminal
+                                .backend_mut()
+                                .set_size(Size { width, height });
+                            foreground
+                                .terminal
+                                .resize(Rect::new(0, 0, width, height))
+                                .context("could not resize the foreground")?;
+                        }
+                        app.invalidate_image();
+                    }
                     _ => {}
                 }
+            }
+            if console::closed() {
+                app.wants_background = true;
             }
         }
         Ok(())
     })()
 }
 
+#[cfg(windows)]
+type ForegroundBackend = WindowsBackend;
+#[cfg(not(windows))]
+type ForegroundBackend = CrosstermBackend<console::Output>;
+
 struct Foreground {
-    terminal: Terminal<CrosstermBackend<console::Output>>,
+    terminal: Terminal<ForegroundBackend>,
 }
 
 impl Foreground {
     fn open() -> Result<Self> {
+        #[cfg(windows)]
+        let (width, height) = console::size().context("could not read the foreground size")?;
         let mut output = console::output().context("could not open the foreground output")?;
-        enable_raw_mode().context("could not enable foreground input")?;
+        enable_foreground_input().context("could not enable foreground input")?;
         if let Err(err) = execute!(output, EnterAlternateScreen) {
-            let _ = disable_raw_mode();
+            disable_foreground_input();
             return Err(err).context("could not enter the alternate screen");
         }
-        let backend = CrosstermBackend::new(output);
-        let terminal = match Terminal::new(backend) {
+        #[cfg(windows)]
+        let terminal = Terminal::with_options(
+            WindowsBackend::new(output, Size { width, height }),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, width, height)),
+            },
+        );
+        #[cfg(not(windows))]
+        let terminal = Terminal::new(CrosstermBackend::new(output));
+        let terminal = match terminal {
             Ok(terminal) => terminal,
             Err(err) => {
                 if let Ok(mut output) = console::output() {
                     let _ = execute!(output, LeaveAlternateScreen);
                 }
-                let _ = disable_raw_mode();
+                disable_foreground_input();
                 return Err(err).context("could not create the terminal renderer");
             }
         };
@@ -219,11 +285,152 @@ impl Foreground {
     }
 }
 
+#[cfg(windows)]
+struct WindowsBackend {
+    inner: CrosstermBackend<console::Output>,
+    size: Size,
+    cursor: Position,
+}
+
+#[cfg(windows)]
+impl WindowsBackend {
+    fn new(output: console::Output, size: Size) -> Self {
+        Self {
+            inner: CrosstermBackend::new(output),
+            size,
+            cursor: Position::ORIGIN,
+        }
+    }
+
+    fn set_size(&mut self, size: Size) {
+        self.size = size;
+        self.cursor.x = self.cursor.x.min(size.width.saturating_sub(1));
+        self.cursor.y = self.cursor.y.min(size.height.saturating_sub(1));
+    }
+}
+
+#[cfg(windows)]
+impl Write for WindowsBackend {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Write::flush(&mut self.inner)
+    }
+}
+
+#[cfg(windows)]
+impl Backend for WindowsBackend {
+    type Error = io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        let mut cursor = self.cursor;
+        let size = self.size;
+        let tracked = content.inspect(|(x, y, cell)| {
+            let width = u16::try_from(cell.symbol().width())
+                .unwrap_or(u16::MAX)
+                .max(1);
+            let next = x.saturating_add(width);
+            cursor = if size.width != 0 && next >= size.width {
+                Position {
+                    x: 0,
+                    y: y.saturating_add(1).min(size.height.saturating_sub(1)),
+                }
+            } else {
+                Position { x: next, y: *y }
+            };
+        });
+        Backend::draw(&mut self.inner, tracked)?;
+        self.cursor = cursor;
+        Ok(())
+    }
+
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        Backend::append_lines(&mut self.inner, n)?;
+        self.cursor.x = 0;
+        self.cursor.y = self
+            .cursor
+            .y
+            .saturating_add(n)
+            .min(self.size.height.saturating_sub(1));
+        Ok(())
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        Backend::hide_cursor(&mut self.inner)
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        Backend::show_cursor(&mut self.inner)
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        Ok(self.cursor)
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        let position = position.into();
+        Backend::set_cursor_position(&mut self.inner, position)?;
+        self.cursor = position;
+        Ok(())
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        Backend::clear(&mut self.inner)
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        Backend::clear_region(&mut self.inner, clear_type)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        Ok(self.size)
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        Ok(WindowSize {
+            columns_rows: self.size,
+            pixels: Size {
+                width: 0,
+                height: 0,
+            },
+        })
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Backend::flush(&mut self.inner)
+    }
+}
+
 impl Drop for Foreground {
     fn drop(&mut self) {
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
-        let _ = disable_raw_mode();
+        disable_foreground_input();
     }
+}
+
+#[cfg(windows)]
+fn enable_foreground_input() -> Result<()> {
+    // Raw mode belongs to the helper's CONIN$, configured before its handshake.
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn enable_foreground_input() -> Result<()> {
+    enable_raw_mode()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn disable_foreground_input() {}
+
+#[cfg(not(windows))]
+fn disable_foreground_input() {
+    let _ = disable_raw_mode();
 }
 
 fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
@@ -291,6 +498,11 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
             Ok(tray) => Some(tray),
             Err(err) => {
                 app.status = format!("{err:#}");
+                if console::closed() {
+                    console::detach()?;
+                    console::attach()
+                        .context("could not restore the terminal after tray failure")?;
+                }
                 return Ok(());
             }
         };
@@ -298,6 +510,10 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
     let icon = tray.as_mut().expect("the tray was created above");
     if let Err(err) = icon.show(&app.tray_tip()) {
         app.status = format!("{err:#}");
+        if console::closed() {
+            console::detach()?;
+            console::attach().context("could not restore the terminal after tray failure")?;
+        }
         return Ok(());
     }
 
