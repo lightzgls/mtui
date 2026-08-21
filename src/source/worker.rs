@@ -315,6 +315,8 @@ pub enum Response {
     },
     SignedIn,
     SignedOut,
+    /// Stored tokens could not be removed, so the existing session remains.
+    SignOutFailed(String),
     /// The device flow ended without a session. Separate from [`Self::Failed`]
     /// so the UI can keep it in the sign-in panel, where the user is already
     /// looking and where the retry key lives, instead of the status bar.
@@ -764,6 +766,18 @@ fn sign_in(tx: &Sender<Response>) -> Result<()> {
     tokens.save()
 }
 
+fn sign_out_library(library: Option<&mut Library>) -> Response {
+    match Tokens::forget() {
+        Ok(()) => {
+            if let Some(library) = library {
+                library.sign_out();
+            }
+            Response::SignedOut
+        }
+        Err(e) => Response::SignOutFailed(format!("{e:#}")),
+    }
+}
+
 fn run_library(rx: Receiver<Request>, tx: Sender<Response>) {
     // Built once so the connection pool and TLS session outlive a single call,
     // for the same reason `InnerTube` holds its own.
@@ -781,9 +795,15 @@ fn run_library(rx: Receiver<Request>, tx: Sender<Response>) {
         let library = match library.as_mut() {
             Ok(library) => library,
             // Nothing here can work without it, so every request gets the same
-            // honest answer rather than the thread dying silently.
+            // honest answer rather than the thread dying silently. Signing out
+            // is the exception: deleting a local token file needs no client.
             Err(e) => {
-                if tx.send(Response::Failed(format!("{e:#}"))).is_err() {
+                let response = if matches!(&req, Request::SignOut) {
+                    sign_out_library(None)
+                } else {
+                    Response::Failed(format!("{e:#}"))
+                };
+                if tx.send(response).is_err() {
                     break;
                 }
                 continue;
@@ -874,11 +894,7 @@ fn handle_library(
             tracks: home::tracks(library.http(), &browse_id)?,
             title,
         },
-        Request::SignOut => {
-            library.sign_out();
-            Tokens::forget()?;
-            Response::SignedOut
-        }
+        Request::SignOut => sign_out_library(Some(library)),
         Request::Playlists => Response::Playlists(library.playlists()?),
         Request::OpenPlaylist { id, title } => Response::PlaylistTracks {
             tracks: library.tracks(&id, MAX_LIBRARY_TRACKS)?,

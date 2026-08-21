@@ -325,6 +325,11 @@ impl Presence {
         self.enabled
     }
 
+    /// Current value of the user's switch.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// What to tell the user about the switch they just pressed.
     pub fn status(&self) -> String {
         match &self.unavailable {

@@ -85,10 +85,13 @@ Press `A` again and follow the device-code prompt. MTUI stores refreshed tokens 
 
 ## Controls
 
-Keys are context-sensitive. The footer always shows the controls available in the current view.
+MTUI has two command surfaces: `Ctrl-K` opens the global App Menu and, outside search entry, `.` opens actions for the current page or selection. The footer keeps these entry points visible while leaving room for playback progress and the current track.
 
 | Key | Action |
 |---|---|
+| `Ctrl-K` | Open the App Menu for navigation, accounts, settings, help, tray, and quit |
+| `.` | Open actions for the current page or selection when not typing a search |
+| `?` | Open keyboard help |
 | Arrows or `hjkl` | Move through rows, cards, shelves, and tabs |
 | `g` / `G` | Jump to the beginning or end |
 | `Page Up` / `Page Down` | Move by a page |
@@ -101,14 +104,14 @@ Keys are context-sensitive. The footer always shows the controls available in th
 | `+` / `-` | Change volume |
 | Left / Right | Seek five seconds while browsing tracks or the player |
 | `n` / `p` | Next or previous track on the player |
-| `1`-`4` or `Tab` | Open Up Next, Lyrics, Comments, or Related |
+| `1`-`4` or `Tab` | Open Queue, Lyrics, Related, or Comments |
 | `a` | Add the selected track to a playlist |
 | `f` | Like or unlike the selected track |
 | `c` | Change cover-art size |
 | `A` | Start OAuth library sign-in |
 | `M` | Start YouTube Music Home sign-in |
-| `D` | Toggle Discord Rich Presence |
-| `S` or `Ctrl-S` | Open settings |
+| `D` | Toggle Discord Rich Presence directly |
+| `S` or `Ctrl-S` | Open settings for tray and Discord presence |
 | `B` | Continue in the Windows notification area |
 | `q` or `Ctrl-C` | Quit |
 

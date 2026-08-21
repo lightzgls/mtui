@@ -186,7 +186,7 @@ pub enum View {
     /// The signed-in user's playlists.
     Playlists,
     /// The player page: the cover of what is playing, and beside it the queue,
-    /// the lyrics, the comments and what to listen to next. Opened by playing
+    /// the lyrics, what to listen to next and the comments. Opened by playing
     /// something, which is the moment all four become answerable.
     Playing,
 }
@@ -200,21 +200,21 @@ pub enum View {
 pub enum Tab {
     UpNext,
     Lyrics,
-    Comments,
     Related,
+    Comments,
 }
 
 impl Tab {
     /// In the order they are drawn, which is the order the keys `1`-`4` and the
     /// Tab key walk them in.
-    pub const ALL: [Tab; 4] = [Tab::UpNext, Tab::Lyrics, Tab::Comments, Tab::Related];
+    pub const ALL: [Tab; 4] = [Tab::UpNext, Tab::Lyrics, Tab::Related, Tab::Comments];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::UpNext => "UP NEXT",
-            Self::Lyrics => "LYRICS",
-            Self::Comments => "COMMENTS",
-            Self::Related => "RELATED",
+            Self::UpNext => "Queue",
+            Self::Lyrics => "Lyrics",
+            Self::Related => "Related",
+            Self::Comments => "Comments",
         }
     }
 
@@ -438,6 +438,31 @@ impl NowPlaying {
         changed
     }
 
+    /// Replaces the deliberately thin metadata used for a pasted URL or bare
+    /// id with the real row from the queue once the watch response arrives.
+    fn hydrate_from_queue(&mut self) -> Option<Track> {
+        let track = self
+            .playing
+            .and_then(|index| self.queue.get(index))
+            .cloned()?;
+
+        if self.artist.is_empty() {
+            self.artist = track.uploader.clone();
+        }
+        if self.title == self.video_id
+            || extract_video_id(&self.title).as_deref() == Some(self.video_id.as_str())
+        {
+            self.title = track.title.clone();
+        }
+        if self.album.is_none() {
+            self.album = track.album.clone();
+        }
+        if self.duration.is_none() {
+            self.duration = track.duration;
+        }
+        Some(track)
+    }
+
     /// The track the queue would play next, if there is one.
     fn next_in_queue(&self) -> Option<&Track> {
         self.queue.get(self.playing? + 1)
@@ -569,7 +594,133 @@ pub enum RelatedRow<'a> {
     Card(&'a Card),
 }
 
-/// A modal that owns keyboard input for as long as it is up.
+/// Which page the shared modal menu is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuPage {
+    Root,
+    Account,
+    Help,
+    PageActions,
+}
+
+impl MenuPage {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Root => "App Menu",
+            Self::Account => "Account & Sessions",
+            Self::Help => "Keyboard Help",
+            Self::PageActions => "Page Actions",
+        }
+    }
+}
+
+/// Cursor state for the one menu overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Menu {
+    pub page: MenuPage,
+    pub selected: usize,
+    items: Vec<MenuItem>,
+}
+
+impl Menu {
+    fn new(page: MenuPage, items: Vec<MenuItem>) -> Self {
+        Self {
+            page,
+            selected: 0,
+            items,
+        }
+    }
+
+    fn move_by(&mut self, delta: isize, len: usize) {
+        self.selected = moved_cursor(self.selected, delta, len);
+    }
+
+    fn first(&mut self) {
+        self.selected = 0;
+    }
+
+    fn last(&mut self, len: usize) {
+        self.selected = len.saturating_sub(1);
+    }
+
+    fn clamp(&mut self, len: usize) {
+        self.selected = self.selected.min(len.saturating_sub(1));
+    }
+}
+
+/// A renderer-facing menu row. The semantic action stays private so drawing and
+/// execution cannot grow separate command maps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuItem {
+    pub label: String,
+    pub shortcut: Option<&'static str>,
+    pub enabled: bool,
+    /// A heading to draw immediately before this row.
+    pub section: Option<&'static str>,
+    action: Option<MenuAction>,
+}
+
+impl MenuItem {
+    fn action(
+        label: impl Into<String>,
+        shortcut: Option<&'static str>,
+        enabled: bool,
+        section: Option<&'static str>,
+        action: MenuAction,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            shortcut,
+            enabled,
+            section,
+            action: Some(action),
+        }
+    }
+
+    fn help(label: &'static str, shortcut: &'static str, section: Option<&'static str>) -> Self {
+        Self {
+            label: label.to_string(),
+            shortcut: Some(shortcut),
+            enabled: false,
+            section,
+            action: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    GoHome,
+    BeginSearch,
+    OpenLibrary,
+    OpenPlayer,
+    OpenAccount,
+    OpenSettings,
+    OpenHelp,
+    #[cfg(windows)]
+    Background,
+    Quit,
+    ConnectGoogle,
+    ConnectMusic,
+    SignOut,
+    OpenHomeSelection,
+    RefreshHome,
+    PlaySelected,
+    AddTrack,
+    ToggleLike,
+    RemoveSelected,
+    OpenPlaylist,
+    ReloadLibrary,
+    OpenPageSelection,
+    FollowLyrics,
+    TogglePause,
+    Next,
+    Previous,
+    Stop,
+    ToggleCoverSize,
+}
+
+/// A non-menu modal that owns keyboard input for as long as it is up.
 ///
 /// Deliberately a single value rather than a stack: none can meaningfully sit on
 /// top of another, and a stack would only add states that cannot be reached.
@@ -744,6 +895,12 @@ pub struct App {
     /// `None` means `results` are search results, which have no rows to remove.
     pub open_playlist: Option<(String, String)>,
     pub overlay: Overlay,
+    /// The shared command menu. It stays separate from asynchronous overlays
+    /// such as sign-in so neither can accidentally replace the other; input
+    /// maintains the one-modal-at-a-time invariant.
+    menu: Option<Menu>,
+    /// Cursor for the two persisted preferences in the Settings modal.
+    settings_selected: usize,
     /// Whether a session exists, as far as the last worker response revealed.
     /// Only drives what the status bar offers -- the worker is the authority.
     ///
@@ -760,6 +917,9 @@ pub struct App {
     /// assumed, because a track can be started from any of the three lists and
     /// Esc should go back to the one it came from.
     back_to: View,
+    /// The page hidden when search editing began. Unlike `back_to`, this also
+    /// covers Home and Library searches that are cancelled before submission.
+    search_origin: View,
     /// Player state as of the last frame, so a track that has *ended* can be
     /// told from one that was already stopped. The snapshot only says what is
     /// true now; the queue advances on the edge between the two.
@@ -796,8 +956,18 @@ pub struct App {
     imported: bool,
     /// Whether a stale InnerTube session already triggered interactive setup.
     cookie_refresh_attempted: bool,
+    /// Prevents a second OAuth device flow, and keeps it from overlapping the
+    /// separate Music-session WebView after its panel has been hidden.
+    oauth_signing_in: bool,
+    /// Keeps a queued token deletion from overlapping a new OAuth device flow.
+    oauth_signing_out: bool,
+    /// A library request that asked for OAuth while the Music WebView was open.
+    oauth_sign_in_pending: bool,
     /// Prevents repeated `M` presses from opening duplicate WebView2 windows.
     music_signing_in: bool,
+    /// A stale Music session discovered while OAuth was running. `true` keeps
+    /// the forced-refresh intent used by that recovery path.
+    music_sign_in_pending: Option<bool>,
 
     /// A track whose stream died, waiting on a fresh URL to carry on with.
     ///
@@ -833,6 +1003,33 @@ fn panel<T>(fetched: Result<T, String>) -> Panel<T> {
     match fetched {
         Ok(value) => Panel::Ready(value),
         Err(msg) => Panel::Empty(msg),
+    }
+}
+
+fn moved_cursor(selected: usize, delta: isize, len: usize) -> usize {
+    let last = len.saturating_sub(1);
+    let selected = selected.min(last);
+    if delta < 0 {
+        selected.saturating_sub(delta.unsigned_abs())
+    } else {
+        selected.saturating_add(delta as usize).min(last)
+    }
+}
+
+fn is_ctrl_key(key: KeyEvent, character: char) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&character))
+}
+
+fn is_bare_character(key: KeyEvent, character: char) -> bool {
+    key.modifiers.difference(KeyModifiers::SHIFT).is_empty() && key.code == KeyCode::Char(character)
+}
+
+fn page_behind_search(origin: View, player_back: View) -> View {
+    match origin {
+        View::Playing => player_back,
+        origin => origin,
     }
 }
 
@@ -879,6 +1076,8 @@ impl App {
             playlist_offset: 0,
             open_playlist: None,
             overlay: Overlay::None,
+            menu: None,
+            settings_selected: 0,
             // A token file that is present but stale still reads as signed in
             // here. That is the right fidelity for a key hint: the alternative
             // is a refresh round trip before the first frame, and the worker
@@ -886,6 +1085,7 @@ impl App {
             signed_in: Tokens::load().ok().flatten().is_some(),
             now: None,
             back_to: View::Home,
+            search_origin: View::Home,
             last_state: PlayState::Idle,
             auto: false,
             skips: 0,
@@ -894,7 +1094,11 @@ impl App {
             seed_rotation: 0,
             imported: false,
             cookie_refresh_attempted: false,
+            oauth_signing_in: false,
+            oauth_signing_out: false,
+            oauth_sign_in_pending: false,
             music_signing_in: false,
+            music_sign_in_pending: None,
             resuming: None,
             // Started whether or not Discord is running and whether or not the
             // switch is on: what this costs while idle is one sleeping thread,
@@ -922,6 +1126,317 @@ impl App {
             }
             (View::Tracks, None, None) => " results ".to_string(),
         }
+    }
+
+    /// State for the active menu overlay, if the keyboard belongs to one.
+    pub fn menu(&self) -> Option<&Menu> {
+        self.menu.as_ref()
+    }
+
+    /// Rows for the active menu. Enter resolves its action from this same list,
+    /// so a renderer can never show a command different from the one invoked.
+    pub fn menu_items(&self) -> Vec<MenuItem> {
+        self.menu()
+            .map(|menu| menu.items.clone())
+            .unwrap_or_default()
+    }
+
+    /// Cursor used by the persisted-settings overlay.
+    pub fn settings_selected(&self) -> usize {
+        self.settings_selected
+    }
+
+    pub fn presence_enabled(&self) -> bool {
+        self.presence.enabled()
+    }
+
+    fn root_menu_items(&self) -> Vec<MenuItem> {
+        let mut items = vec![
+            MenuItem::action("Home", Some("H"), true, Some("Go to"), MenuAction::GoHome),
+            MenuItem::action("Search", Some("/"), true, None, MenuAction::BeginSearch),
+            MenuItem::action("Library", Some("L"), true, None, MenuAction::OpenLibrary),
+            MenuItem::action(
+                "Now Playing",
+                Some("P"),
+                self.now.is_some(),
+                None,
+                MenuAction::OpenPlayer,
+            ),
+            MenuItem::action(
+                "Account & Sessions",
+                None,
+                true,
+                Some("MTUI"),
+                MenuAction::OpenAccount,
+            ),
+            MenuItem::action("Settings", Some("S"), true, None, MenuAction::OpenSettings),
+            MenuItem::action("Keyboard Help", Some("?"), true, None, MenuAction::OpenHelp),
+        ];
+        #[cfg(windows)]
+        items.push(MenuItem::action(
+            "Continue in notification area",
+            Some("B"),
+            self.now.is_some(),
+            None,
+            MenuAction::Background,
+        ));
+        items.push(MenuItem::action(
+            "Quit",
+            Some("Ctrl+C"),
+            true,
+            None,
+            MenuAction::Quit,
+        ));
+        items
+    }
+
+    fn account_menu_items(&self) -> Vec<MenuItem> {
+        let mut items = vec![
+            MenuItem::action(
+                if self.signed_in {
+                    "Reconnect Google Library"
+                } else {
+                    "Connect Google Library"
+                },
+                Some("A"),
+                !self.oauth_signing_in && !self.oauth_signing_out && !self.music_signing_in,
+                Some("Accounts"),
+                MenuAction::ConnectGoogle,
+            ),
+            MenuItem::action(
+                if cfg!(windows) {
+                    "Connect YouTube Music"
+                } else {
+                    "Connect YouTube Music (Windows only)"
+                },
+                Some("M"),
+                cfg!(windows) && !self.oauth_signing_in && !self.music_signing_in,
+                None,
+                MenuAction::ConnectMusic,
+            ),
+        ];
+        if self.signed_in {
+            items.push(MenuItem::action(
+                "Sign out Google Library",
+                Some("x"),
+                !self.oauth_signing_in && !self.oauth_signing_out,
+                None,
+                MenuAction::SignOut,
+            ));
+        }
+        items
+    }
+
+    fn help_menu_items(&self) -> Vec<MenuItem> {
+        vec![
+            MenuItem::help("Move selection", "j/k, Up/Down", Some("Navigation")),
+            MenuItem::help("First or last item", "g/G, Home/End", None),
+            MenuItem::help("Open or play", "Enter", None),
+            MenuItem::help("Go back", "Esc", None),
+            MenuItem::help("Search", "/ or i", Some("Pages")),
+            MenuItem::help("Home", "H", None),
+            MenuItem::help("Library", "L", None),
+            MenuItem::help("Now Playing", "P", None),
+            MenuItem::help("Pause or resume", "Space", Some("Playback")),
+            MenuItem::help("Next or previous", "n / p", None),
+            MenuItem::help("Seek", "Left/Right", None),
+            MenuItem::help("Change volume", "+ / -", None),
+            MenuItem::help("Stop", "s", None),
+            MenuItem::help("App Menu", "Ctrl+K", Some("Global")),
+            MenuItem::help("Page Actions (outside search)", ".", None),
+            MenuItem::help("Keyboard Help", "?", None),
+            MenuItem::help("Settings", "Ctrl+S", None),
+            MenuItem::help("Quit immediately", "Ctrl+C", None),
+        ]
+    }
+
+    fn page_action_items(&self) -> Vec<MenuItem> {
+        match self.view {
+            View::Home => {
+                let (label, enabled) = match self.home_card() {
+                    Some(card) if matches!(&card.target, Target::Play { .. }) => {
+                        ("Play selected item", true)
+                    }
+                    Some(_) => ("Open selected item", true),
+                    None => ("Open selected item", false),
+                };
+                vec![
+                    MenuItem::action(
+                        label,
+                        Some("Enter"),
+                        enabled,
+                        Some("Home"),
+                        MenuAction::OpenHomeSelection,
+                    ),
+                    MenuItem::action(
+                        "Refresh Home",
+                        Some("r"),
+                        !self.home_pending,
+                        None,
+                        MenuAction::RefreshHome,
+                    ),
+                ]
+            }
+            View::Tracks => {
+                let selected = self.results.get(self.selected);
+                let mut items = vec![
+                    MenuItem::action(
+                        "Play selected track",
+                        Some("Enter"),
+                        selected.is_some(),
+                        Some("Selected track"),
+                        MenuAction::PlaySelected,
+                    ),
+                    MenuItem::action(
+                        "Add selected track to playlist",
+                        Some("a"),
+                        selected.is_some() && self.signed_in && !self.oauth_signing_out,
+                        None,
+                        MenuAction::AddTrack,
+                    ),
+                    MenuItem::action(
+                        "Like/unlike selected track",
+                        Some("f"),
+                        selected.is_some() && self.signed_in && !self.oauth_signing_out,
+                        None,
+                        MenuAction::ToggleLike,
+                    ),
+                ];
+                if self.open_playlist.is_some()
+                    && selected.is_some_and(|track| track.playlist_item_id.is_some())
+                {
+                    items.push(MenuItem::action(
+                        "Remove selected track from playlist",
+                        Some("d"),
+                        self.signed_in && !self.oauth_signing_out,
+                        None,
+                        MenuAction::RemoveSelected,
+                    ));
+                }
+                items
+            }
+            View::Playlists => vec![
+                MenuItem::action(
+                    "Open selected playlist",
+                    Some("Enter"),
+                    self.playlists.get(self.playlist_selected).is_some() && !self.oauth_signing_out,
+                    Some("Library"),
+                    MenuAction::OpenPlaylist,
+                ),
+                MenuItem::action(
+                    "Reload Library",
+                    Some("r"),
+                    !self.oauth_signing_out,
+                    None,
+                    MenuAction::ReloadLibrary,
+                ),
+            ],
+            View::Playing => self.playing_action_items(),
+        }
+    }
+
+    fn playing_action_items(&self) -> Vec<MenuItem> {
+        let mut items = Vec::new();
+        let Some(now) = self.now.as_ref() else {
+            return items;
+        };
+
+        match now.tab {
+            Tab::UpNext => items.push(MenuItem::action(
+                "Play selected queue track",
+                Some("Enter"),
+                now.queue.get(now.cursor()).is_some(),
+                Some("Selection"),
+                MenuAction::OpenPageSelection,
+            )),
+            Tab::Related => {
+                let (label, enabled) = match now.related_rows().get(now.cursor()) {
+                    Some(RelatedRow::Card(card)) if matches!(&card.target, Target::Play { .. }) => {
+                        ("Play selected related track", true)
+                    }
+                    Some(RelatedRow::Card(_)) => ("Open selected related item", true),
+                    _ => ("Open selected related item", false),
+                };
+                items.push(MenuItem::action(
+                    label,
+                    Some("Enter"),
+                    enabled,
+                    Some("Selection"),
+                    MenuAction::OpenPageSelection,
+                ));
+            }
+            Tab::Lyrics if matches!(&now.lyrics, Panel::Ready(lyrics) if !lyrics.timed.is_empty()) =>
+            {
+                items.push(MenuItem::action(
+                    "Follow current lyric",
+                    Some("2"),
+                    true,
+                    Some("Lyrics"),
+                    MenuAction::FollowLyrics,
+                ));
+            }
+            Tab::Lyrics | Tab::Comments => {}
+        }
+
+        let snapshot = self.snapshot();
+        let current = now.playing;
+        let can_previous =
+            current.is_some_and(|index| index > 0 && now.queue.get(index - 1).is_some());
+        let can_next = current.is_some_and(|index| now.queue.get(index + 1).is_some());
+        items.extend([
+            MenuItem::action(
+                "Add current track to playlist",
+                Some("a"),
+                self.signed_in && !self.oauth_signing_out,
+                Some("Current track"),
+                MenuAction::AddTrack,
+            ),
+            MenuItem::action(
+                "Like/unlike current track",
+                Some("f"),
+                self.signed_in && !self.oauth_signing_out,
+                None,
+                MenuAction::ToggleLike,
+            ),
+            MenuItem::action(
+                if snapshot.state == PlayState::Paused {
+                    "Resume current track"
+                } else {
+                    "Pause current track"
+                },
+                Some("Space"),
+                snapshot.state != PlayState::Idle,
+                Some("Playback"),
+                MenuAction::TogglePause,
+            ),
+            MenuItem::action(
+                "Play next track",
+                Some("n"),
+                can_next,
+                None,
+                MenuAction::Next,
+            ),
+            MenuItem::action(
+                "Play previous track",
+                Some("p"),
+                can_previous,
+                None,
+                MenuAction::Previous,
+            ),
+            MenuItem::action("Stop playback", Some("s"), true, None, MenuAction::Stop),
+            MenuItem::action(
+                if self.cover_size == CoverSize::Side {
+                    "Show full-size cover"
+                } else {
+                    "Show side cover"
+                },
+                Some("c"),
+                true,
+                None,
+                MenuAction::ToggleCoverSize,
+            ),
+        ]);
+        items
     }
 
     /// The card under the cursor on the landing page.
@@ -1028,6 +1543,22 @@ impl App {
     }
 
     fn apply(&mut self, response: Response) {
+        // A contextual menu is a snapshot of the page under it. Responses that
+        // replace that page close the menu rather than letting Enter act on a
+        // different row than the one still visible in the modal.
+        if matches!(
+            &response,
+            Response::Results(_)
+                | Response::Home { .. }
+                | Response::Browsed { .. }
+                | Response::SignedOut
+                | Response::Playlists(_)
+                | Response::PlaylistTracks { .. }
+                | Response::Removed { .. }
+        ) {
+            self.close_page_actions();
+        }
+
         // Nothing here is something the user is waiting on, so none of it may
         // clear the flag a search or a play set. The player page matters as
         // much as the cover does: its panels land on their own threads, and the
@@ -1124,12 +1655,16 @@ impl App {
                 // than holding the first frame back behind it.
                 self.status = format!("read your YouTube session from {browser}");
                 self.music_signing_in = false;
-                self.overlay = Overlay::None;
+                if matches!(self.overlay, Overlay::SignIn(SignIn::Music { .. })) {
+                    self.overlay = Overlay::None;
+                }
                 self.request_home();
+                self.resume_deferred_sign_in();
             }
             Response::MusicSignInFailed(msg) => {
                 self.music_signing_in = false;
                 self.status = msg.clone();
+                self.menu = None;
                 self.overlay = Overlay::SignIn(SignIn::Failed { reason: msg });
             }
             Response::Browsed { title, tracks } => {
@@ -1190,6 +1725,7 @@ impl App {
                 expires_in,
             } => {
                 self.status = "waiting for you to approve the sign-in ...".to_string();
+                self.menu = None;
                 self.overlay = Overlay::SignIn(SignIn::Waiting {
                     user_code,
                     url,
@@ -1197,15 +1733,23 @@ impl App {
                 });
             }
             Response::SignedIn => {
+                self.oauth_signing_in = false;
                 self.signed_in = true;
-                self.overlay = Overlay::None;
+                if matches!(
+                    self.overlay,
+                    Overlay::SignIn(SignIn::Connecting { .. } | SignIn::Waiting { .. })
+                ) {
+                    self.overlay = Overlay::None;
+                }
                 self.status = "signed in".to_string();
                 // Sign-in is only ever reached by asking for something that
                 // needs it, so going straight to the library is what the user
                 // was after. A pending `AddTo` picks itself up when these land.
                 self.request_playlists();
+                self.resume_deferred_sign_in();
             }
             Response::SignedOut => {
+                self.oauth_signing_out = false;
                 self.signed_in = false;
                 self.playlists.clear();
                 self.playlist_selected = 0;
@@ -1220,6 +1764,12 @@ impl App {
                 self.status = "signed out (the grant is still listed at \
                                myaccount.google.com/permissions)"
                     .to_string();
+                self.resume_deferred_sign_in();
+            }
+            Response::SignOutFailed(msg) => {
+                self.oauth_signing_out = false;
+                self.status = format!("could not sign out: {msg}");
+                self.resume_deferred_sign_in();
             }
             Response::NeedsSignIn => {
                 self.signed_in = false;
@@ -1229,6 +1779,7 @@ impl App {
                 self.begin_sign_in();
             }
             Response::SignInFailed(msg) => {
+                self.oauth_signing_in = false;
                 self.signed_in = false;
                 // A multi-line failure is the OAuth setup procedure, which is
                 // six lines of console instructions -- far more than the panel
@@ -1239,6 +1790,7 @@ impl App {
                     self.report(msg);
                 } else {
                     self.status = msg.clone();
+                    self.menu = None;
                     self.overlay = Overlay::SignIn(SignIn::Failed { reason: msg });
                 }
             }
@@ -1465,21 +2017,6 @@ impl App {
 
         now.lyrics_id = watch.lyrics_id;
         now.related_id = watch.related_id;
-        // A tab YouTube did not offer is one that will never be fetched, so it
-        // is settled here rather than left waiting. Without this a track with
-        // no lyrics -- an instrumental, or most videos -- shows a panel that
-        // says "loading" for as long as it plays, because the fetch that would
-        // have finished the sentence is one there is no id to make.
-        //
-        // Lyrics are settled only when LRCLIB cannot be asked either. YouTube
-        // offering no lyrics page is the ordinary case for anything outside its
-        // own catalogue, and is the case the second source exists for.
-        if now.lyrics_id.is_none() && now.lyrics_query().is_none() {
-            now.lyrics = Panel::Empty("no lyrics are published for this track".to_string());
-        }
-        if now.related_id.is_none() {
-            now.related = Panel::Empty("nothing related came back for this track".to_string());
-        }
 
         match now.queue.iter().position(|track| track.id == video_id) {
             // The queue carried over, so this response describes a queue we are
@@ -1505,16 +2042,19 @@ impl App {
             }
         }
 
-        // The length the track was started with may be missing: a card on the
-        // landing page carries none, and a pasted link carries nothing at all.
-        // The queue states one for every row, and without it the player page
-        // has a bare clock where its progress bar belongs -- rodio reports how
-        // far it has got, never how far there is to go.
-        if now.duration.is_none() {
-            now.duration = now
-                .playing
-                .and_then(|index| now.queue.get(index))
-                .and_then(|track| track.duration);
+        // Cards can omit duration, while pasted URLs initially carry no useful
+        // metadata at all. The queue has the canonical row for both.
+        let canonical = now.hydrate_from_queue();
+
+        // A tab YouTube did not offer is one that will never be fetched, so it
+        // is settled here rather than left waiting. Lyrics are checked only
+        // after queue hydration because pasted URLs learn the artist and title
+        // from that row, which can make LRCLIB a valid fallback.
+        if now.lyrics_id.is_none() && now.lyrics_query().is_none() {
+            now.lyrics = Panel::Empty("no lyrics are published for this track".to_string());
+        }
+        if now.related_id.is_none() {
+            now.related = Panel::Empty("nothing related came back for this track".to_string());
         }
 
         // Warm the track after this one while the current one plays. This is
@@ -1523,6 +2063,15 @@ impl App {
         // one spends seconds of silence between tracks.
         if let Some(next) = now.next_in_queue().map(|track| track.id.clone()) {
             let _ = self.source.send(Request::Prefetch { id: next });
+        }
+
+        // Listening history and recommendations must use the same canonical
+        // metadata the player page now shows, not a pasted URL and blank artist.
+        if let Some(canonical) = canonical
+            && let Some((listening, _)) = self.listening.as_mut()
+            && listening.id == canonical.id
+        {
+            *listening = canonical;
         }
 
         // A queue short enough to need topping up the moment it lands -- the
@@ -1658,6 +2207,9 @@ impl App {
     /// `auto` marks a play the queue started rather than the user; only those
     /// are allowed to step over a track that will not resolve.
     fn play_track(&mut self, track: Track, auto: bool) {
+        // Automatic queue advances can happen while a contextual menu is open.
+        // Its actions belong to the track it was opened over, not its successor.
+        self.close_page_actions();
         // Before anything else touches the player: whatever was playing is over
         // as of this call, and this is the last moment its position is still
         // readable. Every play in the program funnels through here, so this
@@ -1974,6 +2526,14 @@ impl App {
         }
     }
 
+    fn toggle_pause(&mut self) {
+        let _ = self.player.send(Command::TogglePause);
+    }
+
+    fn toggle_cover_size(&mut self) {
+        self.cover_size = self.cover_size.toggled();
+    }
+
     /// Moves `delta` tracks through the queue and plays what it lands on.
     ///
     /// Silent at either end: there is nothing before the first track, and a
@@ -2019,6 +2579,7 @@ impl App {
     fn report(&mut self, msg: String) {
         if msg.contains('\n') {
             self.status = "press Esc to dismiss".to_string();
+            self.menu = None;
             self.overlay = Overlay::Message { body: msg };
         } else {
             self.status = msg;
@@ -2095,6 +2656,14 @@ impl App {
         }
     }
 
+    fn refresh_home(&mut self) {
+        if self.home_pending {
+            return;
+        }
+        self.status = "refreshing the home feed ...".to_string();
+        self.request_home();
+    }
+
     fn finish_home_attempts(&mut self) {
         if self.home_attempts != 0 {
             return;
@@ -2162,6 +2731,10 @@ impl App {
     /// Asks for the playlist list, reporting a dead worker rather than leaving
     /// the UI stuck on `busy`.
     fn request_playlists(&mut self) {
+        if self.oauth_signing_out {
+            self.status = "wait for Google Library sign-out to finish".to_string();
+            return;
+        }
         self.busy = true;
         if self.source.send(Request::Playlists).is_err() {
             self.busy = false;
@@ -2183,7 +2756,7 @@ impl App {
         }
         // Nothing playable is under the cursor while a modal has it, so there
         // is nothing worth warming.
-        if self.overlay.is_open() {
+        if self.overlay.is_open() || self.menu.is_some() {
             return;
         }
         let Some(settled) = self.selection_settled else {
@@ -2340,13 +2913,157 @@ impl App {
         *offset = (*offset).min(len.saturating_sub(cards));
     }
 
+    fn open_menu(&mut self, page: MenuPage) {
+        if !self.overlay.is_open() {
+            let items = self.items_for_menu(page);
+            self.menu = Some(Menu::new(page, items));
+        }
+    }
+
+    fn items_for_menu(&self, page: MenuPage) -> Vec<MenuItem> {
+        match page {
+            MenuPage::Root => self.root_menu_items(),
+            MenuPage::Account => self.account_menu_items(),
+            MenuPage::Help => self.help_menu_items(),
+            MenuPage::PageActions => self.page_action_items(),
+        }
+    }
+
+    fn close_page_actions(&mut self) {
+        if matches!(
+            self.menu.as_ref().map(|menu| menu.page),
+            Some(MenuPage::PageActions)
+        ) {
+            self.menu = None;
+        }
+    }
+
+    fn toggle_root_menu(&mut self) {
+        match self.menu.as_ref().map(|menu| menu.page) {
+            Some(MenuPage::Root) => self.menu = None,
+            Some(_) => self.open_menu(MenuPage::Root),
+            None => self.open_menu(MenuPage::Root),
+        }
+    }
+
+    fn handle_menu_key(&mut self, key: KeyEvent) -> Result<()> {
+        let len = self.menu_items().len();
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.move_by(1, len);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.move_by(-1, len);
+                }
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.first();
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.last(len);
+                }
+            }
+            KeyCode::Enter => self.invoke_menu_item(),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                if matches!(
+                    self.menu.as_ref().map(|menu| menu.page),
+                    Some(MenuPage::Account | MenuPage::Help)
+                ) {
+                    self.open_menu(MenuPage::Root);
+                } else {
+                    self.menu = None;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn invoke_menu_item(&mut self) {
+        let items = self.menu_items();
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        menu.clamp(items.len());
+        let Some(item) = items.get(menu.selected) else {
+            return;
+        };
+        if !item.enabled {
+            return;
+        }
+        let Some(action) = item.action else {
+            return;
+        };
+
+        self.menu = None;
+        match action {
+            MenuAction::GoHome => {
+                self.mode = Mode::Browse;
+                self.view = View::Home;
+            }
+            MenuAction::BeginSearch => self.begin_search(),
+            MenuAction::OpenLibrary => self.open_library(),
+            MenuAction::OpenPlayer => self.open_player(),
+            MenuAction::OpenAccount => self.open_menu(MenuPage::Account),
+            MenuAction::OpenSettings => self.open_settings(),
+            MenuAction::OpenHelp => self.open_menu(MenuPage::Help),
+            #[cfg(windows)]
+            MenuAction::Background => self.background(),
+            MenuAction::Quit => self.should_quit = true,
+            MenuAction::ConnectGoogle => self.begin_sign_in(),
+            MenuAction::ConnectMusic => self.begin_music_sign_in(false),
+            MenuAction::SignOut => self.sign_out(),
+            MenuAction::OpenHomeSelection => self.open_card(),
+            MenuAction::RefreshHome => self.refresh_home(),
+            MenuAction::PlaySelected => self.play_selected(),
+            MenuAction::AddTrack => self.begin_add(),
+            MenuAction::ToggleLike => self.toggle_like(),
+            MenuAction::RemoveSelected => self.remove_selected(),
+            MenuAction::OpenPlaylist => self.open_selected_playlist(),
+            MenuAction::ReloadLibrary => self.request_playlists(),
+            MenuAction::OpenPageSelection => self.open_page_row(),
+            MenuAction::FollowLyrics => {
+                if let Some(now) = self.now.as_mut() {
+                    now.open(Tab::Lyrics);
+                }
+            }
+            MenuAction::TogglePause => self.toggle_pause(),
+            MenuAction::Next => self.advance(1, false),
+            MenuAction::Previous => self.advance(-1, false),
+            MenuAction::Stop => self.stop(),
+            MenuAction::ToggleCoverSize => self.toggle_cover_size(),
+        }
+    }
+
+    fn open_settings(&mut self) {
+        if self.oauth_signing_in || self.music_signing_in {
+            self.status = "finish the pending sign-in before opening settings".to_string();
+            self.menu = None;
+            return;
+        }
+        self.menu = None;
+        self.settings_selected = 0;
+        self.overlay = Overlay::Settings;
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // Ctrl-C quits from any mode.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT)
-            && key.code == KeyCode::Char('c')
-        {
+        if is_ctrl_key(key, 'c') {
             self.should_quit = true;
+            return Ok(());
+        }
+
+        if is_ctrl_key(key, 'k') {
+            // Menus never displace a sign-in, picker, message or Settings.
+            if !self.overlay.is_open() {
+                self.toggle_root_menu();
+            }
             return Ok(());
         }
 
@@ -2355,19 +3072,16 @@ impl App {
         // key is text -- a bare `L` there types an L -- so without a modifier
         // the library would only be reachable after a search had already
         // returned something, which is not a precondition it actually has.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT)
-            && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
-        {
+        if is_ctrl_key(key, 'l') {
+            self.menu = None;
             self.open_library();
             return Ok(());
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT)
-            && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
-        {
-            self.overlay = Overlay::Settings;
+        if is_ctrl_key(key, 's') {
+            if !self.overlay.is_open() {
+                self.open_settings();
+            }
             return Ok(());
         }
 
@@ -2375,6 +3089,19 @@ impl App {
         // aimed at the picker cannot quit the program behind it.
         if self.overlay.is_open() {
             return self.handle_overlay_key(key);
+        }
+
+        if self.menu.is_some() {
+            return self.handle_menu_key(key);
+        }
+
+        if self.mode == Mode::Browse && is_bare_character(key, '?') {
+            self.open_menu(MenuPage::Help);
+            return Ok(());
+        }
+        if self.mode == Mode::Browse && is_bare_character(key, '.') {
+            self.open_menu(MenuPage::PageActions);
+            return Ok(());
         }
 
         match self.mode {
@@ -2400,6 +3127,7 @@ impl App {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                     self.overlay = Overlay::None;
                     self.status = "press A to try signing in again".to_string();
+                    self.resume_deferred_sign_in();
                 }
                 _ => {}
             },
@@ -2416,12 +3144,24 @@ impl App {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     self.overlay = Overlay::None;
                     self.status = String::new();
+                    self.resume_deferred_sign_in();
                 }
             }
             Overlay::Settings => match key.code {
-                KeyCode::Char(' ') | KeyCode::Enter => self.toggle_start_in_tray(),
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
+                    self.settings_selected = moved_cursor(self.settings_selected, 1, 2);
+                }
+                KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
+                    self.settings_selected = moved_cursor(self.settings_selected, -1, 2);
+                }
+                KeyCode::Char(' ') | KeyCode::Enter => match self.settings_selected() {
+                    0 => self.toggle_start_in_tray(),
+                    1 => self.toggle_presence(),
+                    _ => {}
+                },
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => {
                     self.overlay = Overlay::None;
+                    self.resume_deferred_sign_in();
                 }
                 _ => {}
             },
@@ -2436,6 +3176,7 @@ impl App {
                     KeyCode::Esc | KeyCode::Char('q') => {
                         self.overlay = Overlay::None;
                         self.status = "cancelled".to_string();
+                        self.resume_deferred_sign_in();
                     }
                     _ => {}
                 }
@@ -2474,31 +3215,19 @@ impl App {
             KeyCode::PageDown => self.home_shelf = (self.home_shelf + 3).min(last_shelf),
             KeyCode::PageUp => self.home_shelf = self.home_shelf.saturating_sub(3),
             KeyCode::Enter => self.open_card(),
-            KeyCode::Char('r') => {
-                if self.home_pending {
-                    return Ok(());
-                }
-                self.status = "refreshing the home feed ...".to_string();
-                self.request_home();
-            }
-            KeyCode::Char('/') | KeyCode::Char('i') => {
-                self.view = View::Tracks;
-                self.mode = Mode::Editing;
-                self.status = "type to search, Enter to run".to_string();
-            }
+            KeyCode::Char('r') => self.refresh_home(),
+            KeyCode::Char('/') | KeyCode::Char('i') => self.begin_search(),
             KeyCode::Char('L') => self.open_library(),
             KeyCode::Char('A') => self.begin_sign_in(),
             KeyCode::Char('M') => self.begin_music_sign_in(false),
             KeyCode::Char('P') | KeyCode::Char('p') => self.open_player(),
             KeyCode::Char('B') => self.background(),
             KeyCode::Char('D') => self.toggle_presence(),
-            KeyCode::Char('S') => self.overlay = Overlay::Settings,
+            KeyCode::Char('S') => self.open_settings(),
             // Back to whatever the track list was showing, when there is one.
             KeyCode::Esc if !self.results.is_empty() => self.view = View::Tracks,
-            KeyCode::Char('c') => self.cover_size = self.cover_size.toggled(),
-            KeyCode::Char(' ') => {
-                let _ = self.player.send(Command::TogglePause);
-            }
+            KeyCode::Char('c') => self.toggle_cover_size(),
+            KeyCode::Char(' ') => self.toggle_pause(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_volume(VOLUME_STEP),
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_volume(-VOLUME_STEP),
             _ => {}
@@ -2583,11 +3312,9 @@ impl App {
             KeyCode::Enter => self.open_page_row(),
             KeyCode::Char('n') => self.advance(1, false),
             KeyCode::Char('p') => self.advance(-1, false),
-            KeyCode::Char(' ') => {
-                let _ = self.player.send(Command::TogglePause);
-            }
+            KeyCode::Char(' ') => self.toggle_pause(),
             KeyCode::Char('s') => self.stop(),
-            KeyCode::Char('c') => self.cover_size = self.cover_size.toggled(),
+            KeyCode::Char('c') => self.toggle_cover_size(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_volume(VOLUME_STEP),
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_volume(-VOLUME_STEP),
             KeyCode::Right => self.seek_relative(5),
@@ -2599,12 +3326,8 @@ impl App {
             KeyCode::Char('M') => self.begin_music_sign_in(false),
             KeyCode::Char('B') => self.background(),
             KeyCode::Char('D') => self.toggle_presence(),
-            KeyCode::Char('S') => self.overlay = Overlay::Settings,
-            KeyCode::Char('/') | KeyCode::Char('i') => {
-                self.view = View::Tracks;
-                self.mode = Mode::Editing;
-                self.status = "type to search, Enter to run".to_string();
-            }
+            KeyCode::Char('S') => self.open_settings(),
+            KeyCode::Char('/') | KeyCode::Char('i') => self.begin_search(),
             // Back to the list the track was started from. The music keeps
             // playing -- leaving the page is not stopping it, and `P` brings it
             // back.
@@ -2729,7 +3452,7 @@ impl App {
             KeyCode::Char('P') | KeyCode::Char('p') => self.open_player(),
             KeyCode::Char('B') => self.background(),
             KeyCode::Char('D') => self.toggle_presence(),
-            KeyCode::Char('S') => self.overlay = Overlay::Settings,
+            KeyCode::Char('S') => self.open_settings(),
             KeyCode::Char('x') => self.sign_out(),
             // Back to whatever the track list was showing before, or to the
             // landing page when it was showing nothing.
@@ -2741,16 +3464,10 @@ impl App {
                 };
             }
             KeyCode::Char('H') => self.view = View::Home,
-            KeyCode::Char('/') | KeyCode::Char('i') => {
-                self.view = View::Tracks;
-                self.mode = Mode::Editing;
-                self.status = "type to search, Enter to run".to_string();
-            }
+            KeyCode::Char('/') | KeyCode::Char('i') => self.begin_search(),
             // Playback keys stay live here: the library is a list to browse,
             // not a reason to lose control of what is already playing.
-            KeyCode::Char(' ') => {
-                let _ = self.player.send(Command::TogglePause);
-            }
+            KeyCode::Char(' ') => self.toggle_pause(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_volume(VOLUME_STEP),
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_volume(-VOLUME_STEP),
             _ => {}
@@ -2758,21 +3475,23 @@ impl App {
         Ok(())
     }
 
+    fn begin_search(&mut self) {
+        // Opening the App Menu while editing does not end the edit. Choosing
+        // Search from it must therefore retain the page already remembered.
+        if self.mode != Mode::Editing {
+            self.search_origin = self.view;
+        }
+        self.view = View::Tracks;
+        self.mode = Mode::Editing;
+        self.status = "type to search, Enter to run".to_string();
+    }
+
     fn handle_editing_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Enter => self.submit_search(),
             KeyCode::Esc => {
-                // Unconditional, even with an empty list. It used to require
-                // results, on the reasoning that there was nothing to go back
-                // to -- but that left a fresh launch with no way out of the
-                // search box at all, and single-key commands like `L` and `q`
-                // only exist on the other side of it.
                 self.mode = Mode::Browse;
-                // An empty result list is nothing to leave the user looking at
-                // when the landing page is a keypress away and already loaded.
-                if self.results.is_empty() && !self.home.is_empty() {
-                    self.view = View::Home;
-                }
+                self.view = self.search_origin;
                 self.status = "/ to search, L for your library".to_string();
             }
             KeyCode::Backspace => {
@@ -2788,10 +3507,7 @@ impl App {
         let was_selected = self.selected;
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('/') | KeyCode::Char('i') => {
-                self.mode = Mode::Editing;
-                self.status = "type to search, Enter to run".to_string();
-            }
+            KeyCode::Char('/') | KeyCode::Char('i') => self.begin_search(),
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('g') | KeyCode::Home => self.selected = 0,
@@ -2801,10 +3517,8 @@ impl App {
             KeyCode::PageDown => self.move_selection(10),
             KeyCode::PageUp => self.move_selection(-10),
             KeyCode::Enter => self.play_selected(),
-            KeyCode::Char(' ') => {
-                let _ = self.player.send(Command::TogglePause);
-            }
-            KeyCode::Char('c') => self.cover_size = self.cover_size.toggled(),
+            KeyCode::Char(' ') => self.toggle_pause(),
+            KeyCode::Char('c') => self.toggle_cover_size(),
             KeyCode::Char('s') => self.stop(),
             // Both cases, for the same reason as `l` below: this is the way back
             // to a track that is already playing, and a user looking for it is
@@ -2818,7 +3532,7 @@ impl App {
             // an icon in the notification area. `P` costs a keypress to undo.
             KeyCode::Char('B') => self.background(),
             KeyCode::Char('D') => self.toggle_presence(),
-            KeyCode::Char('S') => self.overlay = Overlay::Settings,
+            KeyCode::Char('S') => self.open_settings(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_volume(VOLUME_STEP),
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_volume(-VOLUME_STEP),
             KeyCode::Right => self.seek_relative(5),
@@ -2871,6 +3585,11 @@ impl App {
         // as an address bar. Everything the page needs beyond the id -- the
         // real title, the artist, the queue -- arrives with the watch response.
         if let Some(id) = extract_video_id(&query) {
+            // `play_track` records the view it is called from as Player's back
+            // target. Search uses Tracks as its editing surface, not as that
+            // target, so restore the page the edit hid before entering Player.
+            self.mode = Mode::Browse;
+            self.view = page_behind_search(self.search_origin, self.back_to);
             return self.play_track(
                 Track {
                     id,
@@ -2924,8 +3643,15 @@ impl App {
     /// playing this says so rather than opening an empty one.
     fn open_player(&mut self) {
         if self.now.is_some() {
-            self.back_to = self.view;
+            if self.view != View::Playing {
+                self.back_to = if self.mode == Mode::Editing {
+                    page_behind_search(self.search_origin, self.back_to)
+                } else {
+                    self.view
+                };
+            }
             self.view = View::Playing;
+            self.mode = Mode::Browse;
         } else {
             self.status = "nothing is playing".to_string();
         }
@@ -2953,9 +3679,7 @@ impl App {
     pub fn handle_tray(&mut self, command: TrayCommand) {
         match command {
             TrayCommand::Show => self.wants_foreground = true,
-            TrayCommand::TogglePause => {
-                let _ = self.player.send(Command::TogglePause);
-            }
+            TrayCommand::TogglePause => self.toggle_pause(),
             TrayCommand::Next => self.advance(1, false),
             TrayCommand::Previous => self.advance(-1, false),
             TrayCommand::Quit => self.should_quit = true,
@@ -2998,6 +3722,10 @@ impl App {
     }
 
     fn open_selected_playlist(&mut self) {
+        if self.oauth_signing_out {
+            self.status = "wait for Google Library sign-out to finish".to_string();
+            return;
+        }
         let Some(playlist) = self.playlists.get(self.playlist_selected) else {
             return;
         };
@@ -3023,11 +3751,35 @@ impl App {
     /// has since invalidated -- that is exactly the case `auth` points at this
     /// key -- so refusing to re-run the flow would block the only way out of it.
     fn begin_sign_in(&mut self) {
+        if self.oauth_signing_out {
+            self.status = "wait for Google Library sign-out to finish".to_string();
+            return;
+        }
+        if self.oauth_signing_in {
+            self.status = "the Google Library sign-in is already pending".to_string();
+            return;
+        }
+        if self.music_signing_in {
+            self.oauth_sign_in_pending = true;
+            self.status =
+                "Google Library sign-in will open after YouTube Music finishes".to_string();
+            return;
+        }
+        if self.overlay.is_open() && !matches!(self.overlay, Overlay::SignIn(SignIn::Failed { .. }))
+        {
+            self.oauth_sign_in_pending = true;
+            self.status = "close the current panel to continue Google sign-in".to_string();
+            return;
+        }
+        self.oauth_sign_in_pending = false;
+        self.oauth_signing_in = true;
         self.status = "signing in with Google ...".to_string();
+        self.menu = None;
         self.overlay = Overlay::SignIn(SignIn::Connecting {
             started: Instant::now(),
         });
         if self.source.send(Request::SignIn).is_err() {
+            self.oauth_signing_in = false;
             self.status = "source worker is not running".to_string();
             self.overlay = Overlay::SignIn(SignIn::Failed {
                 reason: "source worker is not running".to_string(),
@@ -3040,8 +3792,24 @@ impl App {
             self.status = "the YouTube Music sign-in window is already open".to_string();
             return;
         }
+        if self.oauth_signing_in {
+            self.music_sign_in_pending =
+                Some(self.music_sign_in_pending.is_some_and(|pending| pending) || force);
+            self.status =
+                "YouTube Music sign-in will open after Google Library finishes".to_string();
+            return;
+        }
+        if self.overlay.is_open() && !matches!(self.overlay, Overlay::SignIn(SignIn::Failed { .. }))
+        {
+            self.music_sign_in_pending =
+                Some(self.music_sign_in_pending.is_some_and(|pending| pending) || force);
+            self.status = "close the current panel to continue YouTube Music sign-in".to_string();
+            return;
+        }
+        self.music_sign_in_pending = None;
         self.music_signing_in = true;
         self.status = "finish signing in in the YouTube Music window ...".to_string();
+        self.menu = None;
         self.overlay = Overlay::SignIn(SignIn::Music {
             started: Instant::now(),
         });
@@ -3053,8 +3821,39 @@ impl App {
         }
     }
 
+    fn resume_deferred_sign_in(&mut self) {
+        if self.oauth_signing_in
+            || self.oauth_signing_out
+            || self.music_signing_in
+            || self.overlay.is_open()
+        {
+            return;
+        }
+        if self.oauth_sign_in_pending {
+            self.oauth_sign_in_pending = false;
+            self.begin_sign_in();
+        } else if let Some(force) = self.music_sign_in_pending.take() {
+            self.begin_music_sign_in(force);
+        }
+    }
+
     fn sign_out(&mut self) {
+        if self.oauth_signing_out {
+            self.status = "Google Library sign-out is already pending".to_string();
+            return;
+        }
+        if self.oauth_signing_in {
+            self.status = "finish the Google Library sign-in before signing out".to_string();
+            return;
+        }
+        // Signing out is an explicit cancellation of any reconnect that was
+        // waiting behind the Music WebView or another modal.
+        self.oauth_sign_in_pending = false;
+        self.oauth_signing_out = true;
+        self.status = "signing out of Google Library ...".to_string();
+        self.menu = None;
         if self.source.send(Request::SignOut).is_err() {
+            self.oauth_signing_out = false;
             self.status = "source worker is not running".to_string();
         }
     }
@@ -3065,9 +3864,20 @@ impl App {
     /// already held, so the keypress has a visible effect immediately;
     /// [`Response::Playlists`] fills it in.
     fn begin_add(&mut self) {
+        if self.oauth_signing_out {
+            self.status = "wait for Google Library sign-out to finish".to_string();
+            self.menu = None;
+            return;
+        }
+        if self.oauth_signing_in || self.music_signing_in {
+            self.status = "finish the pending sign-in before editing playlists".to_string();
+            self.menu = None;
+            return;
+        }
         let Some((video_id, title)) = self.acting_on() else {
             return;
         };
+        self.menu = None;
         self.overlay = Overlay::AddTo {
             video_id,
             title,
@@ -3106,6 +3916,7 @@ impl App {
             self.busy = false;
             self.status = "source worker is not running".to_string();
         }
+        self.resume_deferred_sign_in();
     }
 
     /// Removes the selected track from the playlist it is being shown from.
@@ -3114,6 +3925,10 @@ impl App {
     /// "Liked songs" is not a playlist the API will remove a row from -- `f`
     /// unlikes there instead.
     fn remove_selected(&mut self) {
+        if self.oauth_signing_out {
+            self.status = "wait for Google Library sign-out to finish".to_string();
+            return;
+        }
         let Some(track) = self.results.get(self.selected) else {
             return;
         };
@@ -3140,6 +3955,10 @@ impl App {
     }
 
     fn toggle_like(&mut self) {
+        if self.oauth_signing_out {
+            self.status = "wait for Google Library sign-out to finish".to_string();
+            return;
+        }
         let Some((video_id, title)) = self.acting_on() else {
             return;
         };
@@ -3202,16 +4021,106 @@ impl App {
     }
 }
 
-/// Tests for [`NowPlaying`] alone.
-///
-/// [`App`] itself is not constructed here and deliberately has no tests: it
-/// owns a [`Player`], which opens an audio device, and a [`SourceWorker`],
-/// which spawns threads and may go to the network. [`NowPlaying`] is the part
-/// that holds the player page's state, is cheap to build, and is where the
-/// decisions worth pinning down actually live.
+/// Pure state tests. [`App`] itself is not constructed because it owns live
+/// audio and source workers.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_cursor_movement_clamps_at_both_ends() {
+        let mut menu = Menu::new(MenuPage::Root, Vec::new());
+
+        menu.move_by(-1, 4);
+        assert_eq!(menu.selected, 0);
+        menu.move_by(2, 4);
+        assert_eq!(menu.selected, 2);
+        menu.move_by(20, 4);
+        assert_eq!(menu.selected, 3);
+        menu.move_by(-20, 4);
+        assert_eq!(menu.selected, 0);
+
+        menu.selected = usize::MAX;
+        menu.clamp(2);
+        assert_eq!(menu.selected, 1);
+        menu.last(0);
+        assert_eq!(menu.selected, 0);
+    }
+
+    #[test]
+    fn player_tabs_use_the_number_key_order_and_title_case_labels() {
+        assert_eq!(
+            Tab::ALL,
+            [Tab::UpNext, Tab::Lyrics, Tab::Related, Tab::Comments]
+        );
+        assert_eq!(
+            Tab::ALL.map(Tab::label),
+            ["Queue", "Lyrics", "Related", "Comments"]
+        );
+        assert_eq!(Tab::UpNext.shifted(-1), Tab::Comments);
+        assert_eq!(Tab::Comments.shifted(1), Tab::UpNext);
+    }
+
+    #[test]
+    fn a_pasted_url_adopts_the_real_queue_metadata() {
+        let mut now = NowPlaying::new(&Track {
+            id: "JhulBGMA7G4".to_string(),
+            title: "https://music.youtube.com/watch?v=JhulBGMA7G4".to_string(),
+            uploader: String::new(),
+            duration: None,
+            album: None,
+            playlist_item_id: None,
+        });
+        now.queue = vec![Track {
+            id: "JhulBGMA7G4".to_string(),
+            title: "Harder, Better, Faster, Stronger".to_string(),
+            uploader: "Daft Punk".to_string(),
+            duration: Some(Duration::from_secs(224)),
+            album: Some("Discovery".to_string()),
+            playlist_item_id: None,
+        }];
+        now.playing = Some(0);
+
+        let _ = now.hydrate_from_queue();
+
+        assert_eq!(now.title, "Harder, Better, Faster, Stronger");
+        assert_eq!(now.artist, "Daft Punk");
+        assert_eq!(now.album.as_deref(), Some("Discovery"));
+        assert_eq!(now.duration, Some(Duration::from_secs(224)));
+        assert!(now.lyrics_query().is_some());
+    }
+
+    #[test]
+    fn bare_menu_keys_allow_shift_but_not_control_or_alt() {
+        assert!(is_bare_character(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            '?'
+        ));
+        assert!(!is_bare_character(
+            KeyEvent::new(KeyCode::Char('.'), KeyModifiers::CONTROL),
+            '.'
+        ));
+        assert!(!is_bare_character(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::ALT),
+            '?'
+        ));
+        assert!(is_ctrl_key(
+            KeyEvent::new(
+                KeyCode::Char('K'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ),
+            'k'
+        ));
+    }
+
+    #[test]
+    fn a_search_started_on_player_returns_to_the_page_behind_player() {
+        assert_eq!(page_behind_search(View::Home, View::Tracks), View::Home);
+        assert_eq!(
+            page_behind_search(View::Playing, View::Playlists),
+            View::Playlists
+        );
+    }
 
     fn playing() -> NowPlaying {
         NowPlaying::new(&Track {

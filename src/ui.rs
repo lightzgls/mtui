@@ -13,11 +13,11 @@ use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph};
 
 use crate::app::{
-    App, CardShape, CoverSize, ImagePlan, Mode, NowPlaying, Overlay, Panel, RelatedRow, SignIn,
-    Tab, View,
+    App, CardShape, CoverSize, ImagePlan, MenuItem, MenuPage, Mode, NowPlaying, Overlay, Panel,
+    RelatedRow, SignIn, Tab, View,
 };
 use crate::art::ArtCache;
 use crate::graphics::Graphics;
@@ -57,9 +57,8 @@ const MIN_WIDTH_WITH_COVER: u16 = 64;
 
 /// Bounds on the player page's panel, borders included.
 ///
-/// The floor is what the tab row measures: four names and their padding come to
-/// thirty-two columns, and a panel that cannot show its own tabs cannot be
-/// navigated. The ceiling exists so a wide terminal spends its columns on the
+/// The floor leaves thirty-two inner columns, enough for all four compact tab
+/// labels. The ceiling exists so a wide terminal spends its columns on the
 /// cover, which is the thing that gets better with more of them.
 const PANEL_MIN_WIDTH: u16 = 34;
 const PANEL_MAX_WIDTH: u16 = 52;
@@ -96,54 +95,24 @@ const LYRIC_GUTTER: usize = 2;
 /// Same principle as [`MIN_TITLE_WIDTH`]: the label outranks the metadata.
 const MIN_PLAYLIST_NAME: usize = 8;
 
-/// Columns the status bar reserves for the key hints. Every hint below has to
-/// fit, since the column truncates rather than wraps.
-///
-/// Six wider than it was, bought from the track name beside it, so that the two
-/// keys a playing track adds -- back to its page, and away to the notification
-/// area -- can be named without any of the existing hints being dropped for
-/// them. The name gives up less than it looks: it is the one thing on this bar
-/// that is also written across the pane above in full.
-const HINTS_WIDTH: u16 = 63;
+/// Most the status bar gives its right-side key hints. The actual column shrinks
+/// to each line, returning every unused cell to the mini-player.
+const HINTS_WIDTH: u16 = 40;
+/// Even a narrow active player keeps enough room to identify itself before the
+/// hint line is clipped.
+const MINI_PLAYER_FLOOR: u16 = 12;
 
 /// Named rather than inlined into [`hint_line`] so the test that checks they
 /// fit [`HINTS_WIDTH`] measures the strings that are actually drawn.
-const HINTS_EDITING: &str = "Enter run   Esc browse   ^L your library   ^S settings";
-const HINTS_PLAYLISTS: &str = "Enter open  r reload  x sign out  Esc back  S settings";
-const HINTS_TRACKS: &str = "/ search  L library  a add  f like  S settings  q quit";
-/// The landing page. `Esc` and `H` also return here from the track list, and
-/// neither fits beside what that line already has to offer -- so this one names
-/// what moves the cursor instead, which is the part a grid needs said.
-/// `r` is named here and not on the playing variant below, where there is no
-/// room for it: it rebuilds the page from different seeds rather than merely
-/// re-fetching it, which is not something a user would think to try unprompted.
-///
-const HINTS_HOME: &str = "Enter play  hjkl move  r refresh  M sign in  S settings  q quit";
-/// The player page. `n`, `p` and the tab keys are what it is for; `Esc` is
-/// named because the view is entered without being asked for and the way out of
-/// it is the first thing a user looks for. `+-` is named beside the volume bar
-/// this page draws, since a bar with no key named for it invites hunting.
-const HINTS_PLAYING: &str = "hl tabs  n next  jk scroll  Esc back  S settings  B tray";
-/// Offered in either browse view with no session. `a`, `f`, `x` and `Enter` on
-/// a playlist all need one, so naming them to a signed-out user advertises keys
-/// that can only answer by starting a sign-in they did not ask for. Every key
-/// here works in both views, which is what lets one line serve both.
-const HINTS_SIGNED_OUT: &str = "A sign in   / search   S settings   q quit";
+const HINTS_EDITING: &str = "Enter search  Esc close  ^K app menu";
+const HINTS_BROWSE: &str = "^K app menu  . actions  ? help";
+const HINTS_AWAY: &str = "P player  ^K menu  . actions";
+const HINTS_PLAYING: &str = "Tab panels  Esc back  ^K menu  . actions";
 
-/// The same four lines for when something is playing and its page is not on
-/// screen, each naming the two keys that only mean anything then: `P` back to
-/// the page, and `B` away from the terminal altogether.
-///
-/// A separate set rather than a line appended to the others, because the column
-/// is full: every one of these gives up a hint to make the room. What they give
-/// up is the least of what they offered -- `q` has `Ctrl-C` behind it, and
-/// reload and sign-out are session-long errands -- and what they gain is the
-/// only thing on screen that says a playing track can be returned to at all,
-/// or left running without a window.
-const HINTS_PLAYLISTS_PLAYING: &str = "Enter open  r reload  Esc back  P player  B tray";
-const HINTS_TRACKS_PLAYING: &str = "/ search  L library  a add  f like  P player  B tray";
-const HINTS_HOME_PLAYING: &str = "Enter play  hjkl move  / search  P player  B tray";
-const HINTS_SIGNED_OUT_PLAYING: &str = "A sign in   / search   P player   B tray   q quit";
+const MENU_MAX_WIDTH: u16 = 56;
+const MENU_MAX_HEIGHT: u16 = 24;
+const SETTINGS_WIDTH: u16 = 56;
+const SETTINGS_HEIGHT: u16 = 10;
 
 /// Full height of the sign-in panel, borders included. Below this the compact
 /// layout runs instead.
@@ -332,7 +301,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         // them would not cover them -- the modal would appear with the picture
         // showing through. Dropping the plan is what puts the existing
         // clear-and-redraw path to work erasing it.
-        _ if app.overlay.is_open() => None,
+        _ if app.overlay.is_open() || app.menu().is_some() => None,
         (Some(area), Some(cover)) if app.graphics.sixel => {
             plan_image(frame, cover, area, app.graphics, size)
         }
@@ -345,6 +314,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Over everything, including the cover pane's cells.
     render_overlay(frame, app);
+    // Menus are the final layer. Input keeps them mutually exclusive with the
+    // ordinary overlays, but drawing last preserves that invariant visually.
+    render_menu(frame, app);
 }
 
 /// Draws whichever modal is up, centred over the whole window.
@@ -360,41 +332,388 @@ fn render_overlay(frame: &mut Frame, app: &App) {
     }
 }
 
-fn render_settings(frame: &mut Frame, app: &App) {
-    let area = centred(frame.area(), 78, 11);
+struct MenuRenderLine {
+    item: Option<usize>,
+    line: Line<'static>,
+}
+
+fn render_menu(frame: &mut Frame, app: &App) {
+    let Some(menu) = app.menu() else {
+        return;
+    };
+    let page = menu.page;
+    let items = app.menu_items();
+    let outer_width = MENU_MAX_WIDTH.min(frame.area().width);
+    let inner_width = outer_width.saturating_sub(2) as usize;
+    let description = menu_description_lines(page, inner_width);
+    let selected = menu.selected.min(items.len().saturating_sub(1));
+    let lines = menu_lines(
+        &items,
+        selected,
+        page == MenuPage::Help,
+        inner_width,
+        ambient(app),
+    );
+    let area = menu_modal_area(frame.area(), lines.len(), description.len());
     let block = Block::bordered()
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" settings ");
+        .border_style(Style::default().fg(ambient(app)))
+        .title(format!(" {} ", page.title()));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+
+    // Keep the footer pinned to the bottom and preserve one content row before
+    // allowing the optional description to spend height in a short terminal.
+    let footer_height = u16::from(inner.height > 0);
+    let footer_gap = u16::from(inner.height >= 4);
+    let before_footer = inner
+        .height
+        .saturating_sub(footer_height)
+        .saturating_sub(footer_gap);
+    let min_content = u16::from(!lines.is_empty() && before_footer > 0);
+    let description_height =
+        (description.len() as u16).min(before_footer.saturating_sub(min_content));
+    let description_gap = u16::from(
+        description_height > 0
+            && description_height as usize == description.len()
+            && before_footer > description_height + min_content,
+    );
+    let content_height = before_footer
+        .saturating_sub(description_height)
+        .saturating_sub(description_gap);
+
+    let description_area = Rect::new(inner.x, inner.y, inner.width, description_height);
+    let content_area = Rect::new(
+        inner.x,
+        inner.y + description_height + description_gap,
+        inner.width,
+        content_height,
+    );
+    let footer_area = Rect::new(
+        inner.x,
+        inner.y + inner.height.saturating_sub(footer_height),
+        inner.width,
+        footer_height,
+    );
+    frame.render_widget(
+        Paragraph::new(
+            description
+                .into_iter()
+                .take(description_height as usize)
+                .collect::<Vec<_>>(),
+        ),
+        description_area,
+    );
+
+    let offset = menu_offset(&lines, selected, content_height as usize);
+    let visible = lines
+        .into_iter()
+        .skip(offset)
+        .take(content_height as usize)
+        .map(|row| row.line)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), content_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            menu_footer(page, inner_width),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        footer_area,
+    );
+}
+
+fn menu_description(page: MenuPage) -> &'static str {
+    match page {
+        MenuPage::Root => "Navigate, manage MTUI, or quit.",
+        MenuPage::Account => "Library OAuth and Music Home are separate sessions.",
+        MenuPage::Help => "Reference only; these rows do not run commands.",
+        MenuPage::PageActions => "Actions for the current page and selection.",
+    }
+}
+
+fn menu_description_lines(page: MenuPage, width: usize) -> Vec<Line<'static>> {
+    let room = width.saturating_sub(2);
+    if room == 0 {
+        return Vec::new();
+    }
+    wrap(menu_description(page), room)
+        .into_iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                format!("  {}", truncate(&line, room)),
+                Style::default().fg(Color::Gray),
+            ))
+        })
+        .collect()
+}
+
+fn menu_modal_area(window: Rect, content_rows: usize, description_rows: usize) -> Rect {
+    // Border, description separator, footer separator and footer. Each is
+    // clamped with the window, so even a two-row terminal remains bounded.
+    let description_gap = usize::from(description_rows > 0);
+    let wanted = 2usize
+        .saturating_add(description_rows)
+        .saturating_add(description_gap)
+        .saturating_add(content_rows)
+        .saturating_add(2);
+    centred(
+        window,
+        MENU_MAX_WIDTH,
+        (wanted.min(MENU_MAX_HEIGHT as usize)) as u16,
+    )
+}
+
+fn menu_lines(
+    items: &[MenuItem],
+    selected: usize,
+    informational: bool,
+    width: usize,
+    ambient: Color,
+) -> Vec<MenuRenderLine> {
+    let mut lines = Vec::with_capacity(items.len() * 2);
+    for (index, item) in items.iter().enumerate() {
+        if let Some(section) = item.section {
+            lines.push(MenuRenderLine {
+                item: None,
+                line: menu_heading_line(section, width),
+            });
+        }
+        lines.push(MenuRenderLine {
+            item: Some(index),
+            line: menu_row_line(
+                &item.label,
+                item.shortcut,
+                item.enabled,
+                index == selected,
+                informational,
+                width,
+                ambient,
+            ),
+        });
+    }
+    lines
+}
+
+fn menu_heading_line(section: &str, width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  {}", truncate(section, width.saturating_sub(2))),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn menu_row_line(
+    label: &str,
+    shortcut: Option<&str>,
+    enabled: bool,
+    selected: bool,
+    informational: bool,
+    width: usize,
+    ambient: Color,
+) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+
+    let actionable_selection = selected && enabled && !informational;
+    let selected_style = highlight(ambient);
+    let label_style = if actionable_selection {
+        selected_style
+    } else if informational || enabled {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let shortcut_style = if actionable_selection {
+        selected_style
+    } else if informational {
+        Style::default().fg(ambient).add_modifier(Modifier::BOLD)
+    } else if enabled {
+        Style::default().fg(Color::Gray)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let prefix_width = width.min(2);
+    let right_padding = if width >= 8 { 2 } else { 0 };
+    let available = width
+        .saturating_sub(prefix_width)
+        .saturating_sub(right_padding);
+    let shortcut_budget = if available >= 8 {
+        (available / 3).min(16)
+    } else {
+        0
+    };
+    let shortcut = shortcut
+        .map(|shortcut| truncate(shortcut, shortcut_budget))
+        .unwrap_or_default();
+    let shortcut_width = display_width(&shortcut);
+    let label_width = available.saturating_sub(shortcut_width + usize::from(shortcut_width > 0));
+    let label = truncate(label, label_width);
+    let gap = available
+        .saturating_sub(display_width(&label))
+        .saturating_sub(shortcut_width);
+    let prefix = if selected && !informational {
+        truncate("› ", prefix_width)
+    } else {
+        " ".repeat(prefix_width)
+    };
+
+    let fill_style = if actionable_selection {
+        selected_style
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(prefix, label_style),
+        Span::styled(label, label_style),
+        Span::styled(" ".repeat(gap), fill_style),
+        Span::styled(shortcut, shortcut_style),
+        Span::styled(" ".repeat(right_padding), fill_style),
+    ])
+}
+
+fn menu_offset(lines: &[MenuRenderLine], selected: usize, viewport: usize) -> usize {
+    if lines.len() <= viewport || viewport == 0 {
+        return 0;
+    }
+    let selected_line = lines
+        .iter()
+        .position(|line| line.item == Some(selected))
+        .unwrap_or(0);
+    let mut offset = centred_offset(selected_line, viewport, lines.len());
+    // Do not strand a section's first item at the top without its heading.
+    if viewport > 1
+        && offset > 0
+        && lines[offset].item.is_some()
+        && lines[offset - 1].item.is_none()
+    {
+        offset -= 1;
+    }
+    offset.min(lines.len().saturating_sub(viewport))
+}
+
+fn menu_footer(page: MenuPage, width: usize) -> String {
+    let (full, compact) = if page == MenuPage::Help {
+        (" ↑↓ scroll  Esc back, again close", " ↑↓  Esc back/close")
+    } else {
+        (" ↑↓ move  Enter choose  Esc back/close", " ↑↓  Enter  Esc")
+    };
+    truncate(
+        if display_width(full) <= width {
+            full
+        } else {
+            compact
+        },
+        width,
+    )
+}
+
+fn render_settings(frame: &mut Frame, app: &App) {
+    let area = centred(frame.area(), SETTINGS_WIDTH, SETTINGS_HEIGHT);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(ambient(app)))
+        .title(" Settings ");
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
-    let mark = if app.start_in_tray { "x" } else { " " };
-    let availability = if cfg!(windows) {
-        "Icon stays while the UI is open; check Windows' ^ menu."
+    if inner.is_empty() {
+        return;
+    }
+
+    let footer_height = u16::from(inner.height > 0);
+    let content_height = inner.height.saturating_sub(footer_height);
+    let content = Rect::new(inner.x, inner.y, inner.width, content_height);
+    let footer = Rect::new(
+        inner.x,
+        inner.y + content_height,
+        inner.width,
+        footer_height,
+    );
+    let width = inner.width as usize;
+    let tray_description = if cfg!(windows) {
+        "Keeps tray access while this window is open."
     } else {
         "Available on Windows only."
     };
     let lines = vec![
+        setting_line(
+            "Keep notification-area icon",
+            app.start_in_tray,
+            app.settings_selected() == 0,
+            width,
+            ambient(app),
+        ),
+        muted_detail(tray_description, width),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  > ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!("[{mark}] Keep notification-area icon"),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(Span::styled(
-            format!("    {availability}"),
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Space / Enter toggle    Esc close    ^S open",
-            Style::default().fg(Color::DarkGray),
-        )),
+        setting_line(
+            "Discord Rich Presence",
+            app.presence_enabled(),
+            app.settings_selected() == 1,
+            width,
+            ambient(app),
+        ),
+        muted_detail("Shares the current track and playback state.", width),
     ];
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    let selected_line = if app.settings_selected() == 0 { 0 } else { 3 };
+    let offset = centred_offset(selected_line, content_height as usize, lines.len());
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(offset)
+                .take(content_height as usize)
+                .collect::<Vec<_>>(),
+        ),
+        content,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            settings_footer(width),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        footer,
+    );
+}
+
+fn setting_line(
+    label: &str,
+    checked: bool,
+    selected: bool,
+    width: usize,
+    ambient: Color,
+) -> Line<'static> {
+    let mark = if checked { "x" } else { " " };
+    let text = padded(&format!("  [{mark}] {label}"), width);
+    let style = if selected {
+        highlight(ambient)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    Line::from(Span::styled(text, style))
+}
+
+fn muted_detail(text: &str, width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        truncate(&format!("    {text}"), width),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+fn settings_footer(width: usize) -> String {
+    const FULL: &str = " ↑↓ move  Space/Enter toggle  Esc close";
+    const COMPACT: &str = "↑↓ Space/Enter Esc";
+    let hint = if display_width(FULL) <= width {
+        FULL
+    } else {
+        COMPACT
+    };
+    truncate(hint, width)
 }
 
 /// A multi-line message, sized to its own content.
@@ -720,10 +1039,8 @@ fn countdown(left: Duration) -> String {
 
 /// Breaks text onto lines of at most `width` columns, at spaces.
 ///
-/// Only used for error text, which is a sentence from Google of no predictable
-/// length. A word longer than the width is left to overhang rather than split:
-/// the long words in these messages are URLs, and a URL broken across two lines
-/// is one the user cannot use.
+/// A word longer than the width is left to overhang rather than split. The only
+/// such words passed here are URLs, and half a URL is not useful.
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
@@ -974,7 +1291,7 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
 
     // Show a real cursor while typing so the terminal's own caret is the
     // affordance, rather than drawing a fake one.
-    if editing {
+    if editing && app.menu().is_none() && !app.overlay.is_open() {
         let x = inner.x + app.query.chars().count().min(inner.width as usize) as u16;
         frame.set_cursor_position((x, inner.y));
     }
@@ -2136,8 +2453,20 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect) {
 fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Color) {
     let mut labels = Vec::new();
     let mut rule = Vec::new();
+    let roomy_width = Tab::ALL
+        .iter()
+        .map(|tab| display_width(tab.label()) + 2)
+        .sum::<usize>();
+    let compact_width = Tab::ALL
+        .iter()
+        .map(|tab| display_width(tab.label()) + 1)
+        .sum::<usize>();
+    let roomy = roomy_width <= area.width as usize;
+    let tiny = compact_width > area.width as usize;
+    let initials = area.width >= 12;
+    let numbered_padding = if area.width >= 8 { " " } else { "" };
 
-    for tab in Tab::ALL {
+    for (index, tab) in Tab::ALL.into_iter().enumerate() {
         let selected = tab == open;
         let style = if selected {
             Style::default()
@@ -2146,13 +2475,30 @@ fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Color) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        labels.push(Span::styled(format!(" {} ", tab.label()), style));
+        // At the panel's minimum width, one leading cell per tab keeps all four
+        // names visible. Extremely narrow windows retain every destination as
+        // its number and initial rather than silently clipping whole tabs.
+        let label = if tiny {
+            if initials {
+                format!("{}{}", index + 1, tab.label().chars().next().unwrap_or('?'))
+            } else {
+                (index + 1).to_string()
+            }
+        } else {
+            tab.label().to_string()
+        };
+        let right = if roomy { " " } else { "" };
+        let left = if tiny { numbered_padding } else { " " };
+        labels.push(Span::styled(format!("{left}{label}{right}"), style));
 
         // Under the letters rather than under the padding, so the rule reads as
         // belonging to the name above it rather than to the gap beside it.
-        let width = tab.label().chars().count();
+        let width = display_width(&label);
         rule.push(Span::styled(
-            format!(" {} ", if selected { "─" } else { " " }.repeat(width)),
+            format!(
+                "{left}{}{right}",
+                if selected { "─" } else { " " }.repeat(width)
+            ),
             Style::default().fg(ambient),
         ));
     }
@@ -2817,79 +3163,84 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, page_draws_progress: 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let hint = hint_line(app);
+    let hint_width = (display_width(hint) as u16).min(HINTS_WIDTH).min(
+        inner
+            .width
+            .saturating_sub(MINI_PLAYER_FLOOR.min(inner.width)),
+    );
     let [now_playing, hints] =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(HINTS_WIDTH)]).areas(inner);
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(hint_width)]).areas(inner);
+
+    let byline = app.now.as_ref().map(NowPlaying::byline);
+    let track = app.now.as_ref().map(|now| MiniTrack {
+        title: &now.title,
+        byline: byline.as_deref().unwrap_or(""),
+        duration: now.duration,
+    });
 
     frame.render_widget(
-        Paragraph::new(now_playing_line(
+        Paragraph::new(mini_player_line(
             &snap,
-            app,
+            track,
+            &app.status,
             !page_draws_progress,
-            now_playing.width as usize,
+            (now_playing.width as usize).saturating_sub(1),
+            ambient(app),
         )),
         now_playing,
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            hint_line(app),
+            truncate(hint, hints.width as usize),
             Style::default().fg(Color::DarkGray),
         ))),
         hints,
     );
 }
 
-/// The key hints, which vary by mode and view because there is only room for
-/// one line of them and the useful keys differ.
+/// The key hints name navigation entry points rather than repeating every
+/// command. The shared menus carry the full command vocabulary.
 ///
 /// Mode matters as much as view: in the search box every printable key is text,
-/// so a hint offering `L` there would be describing a key that types an L. That
-/// is exactly the trap this line exists to keep users out of, which is why the
-/// editing hint names `^L` and `Esc` instead.
-///
-/// All three fit the reserved width exactly; adding to any of them means
-/// widening the column, not letting it truncate.
+/// so only Enter, Esc and a Ctrl chord are advertised there.
 fn hint_line(app: &App) -> &'static str {
-    // Something is playing and the page built around it is not on screen. That
-    // page is entered by playing rather than by asking for it, so a user who
-    // leaves has no reason to know it can be gone back to -- and unlike every
-    // other view here, there is nothing on screen to stumble into that reopens
-    // it. Naming `P` is the whole of what makes it reachable a second time.
-    //
-    // Not offered in the search box, where `P` types a P like every other
-    // printable key, and not on the player page, which is already open.
-    let away = app.now.is_some() && app.view != View::Playing;
-    match (app.mode, app.view) {
-        (Mode::Editing, _) => HINTS_EDITING,
-        // Before the signed-out line: every key it names works with no session,
-        // and this is the one view a signed-out user reaches by playing
-        // something rather than by asking for it.
-        (_, View::Playing) => HINTS_PLAYING,
-        // The landing page needs no session and offers no key that does, so it
-        // keeps its own hints rather than the signed-out ones -- which exist to
-        // avoid advertising keys that can only answer with a sign-in.
-        (_, View::Home) if away => HINTS_HOME_PLAYING,
-        (_, View::Home) => HINTS_HOME,
-        _ if !app.signed_in && away => HINTS_SIGNED_OUT_PLAYING,
-        _ if !app.signed_in => HINTS_SIGNED_OUT,
-        (_, View::Playlists) if away => HINTS_PLAYLISTS_PLAYING,
-        (_, View::Playlists) => HINTS_PLAYLISTS,
-        (_, View::Tracks) if away => HINTS_TRACKS_PLAYING,
-        (_, View::Tracks) => HINTS_TRACKS,
+    if app.mode == Mode::Editing {
+        HINTS_EDITING
+    } else if app.view == View::Playing {
+        HINTS_PLAYING
+    } else if app.now.is_some() {
+        HINTS_AWAY
+    } else {
+        HINTS_BROWSE
     }
 }
 
-/// What is playing, for the bar along the bottom.
+#[derive(Clone, Copy)]
+struct MiniTrack<'a> {
+    title: &'a str,
+    byline: &'a str,
+    duration: Option<Duration>,
+}
+
+/// Persistent playback state for the bar along the bottom.
 ///
-/// `clock` is false while the player page is showing a progress bar of its own:
-/// the elapsed time belongs beside that bar, and a second copy of the same
-/// ticking number in the corner is one the eye has to keep checking against.
-fn now_playing_line<'a>(snap: &'a Snapshot, app: &'a App, clock: bool, width: usize) -> Line<'a> {
+/// `progress` is false while the player page already has a clock and scrubber.
+/// The helper takes only render data so every width and player state can be
+/// tested without opening an audio device through [`App`].
+fn mini_player_line(
+    snap: &Snapshot,
+    track: Option<MiniTrack<'_>>,
+    idle_status: &str,
+    progress: bool,
+    width: usize,
+    ambient: Color,
+) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+
     // An error outranks everything else -- it is the thing the user must see.
-    //
-    // Truncated rather than left to the buffer's own clipping, which cuts at
-    // the column the hints begin at and leaves the last word of the message
-    // running into the first word of a hint. An ellipsis at least says that
-    // there was more of it.
     if let Some(err) = &snap.error {
         return Line::from(Span::styled(
             format!(" {}", truncate(err, width.saturating_sub(1))),
@@ -2906,24 +3257,87 @@ fn now_playing_line<'a>(snap: &'a Snapshot, app: &'a App, clock: bool, width: us
 
     if snap.state == PlayState::Idle {
         return Line::from(Span::styled(
-            format!(" {}", truncate(&app.status, width.saturating_sub(1))),
+            format!(" {}", truncate(idle_status, width.saturating_sub(1))),
             Style::default().fg(Color::DarkGray),
         ));
     }
 
-    let mut spans = vec![Span::styled(
-        format!(" {symbol} "),
-        Style::default().fg(colour),
-    )];
-    if clock {
-        let secs = snap.position.as_secs();
-        spans.push(Span::raw(format!("{}:{:02}  ", secs / 60, secs % 60)));
+    let lead = if width >= 3 {
+        format!(" {symbol} ")
+    } else {
+        padded(symbol, width)
+    };
+    let mut spans = vec![Span::styled(lead, Style::default().fg(colour))];
+    let mut remaining = width.saturating_sub(
+        spans
+            .iter()
+            .map(|span| display_width(&span.content))
+            .sum::<usize>(),
+    );
+
+    const BAR_WIDTH: usize = 5;
+    const TEXT_FLOOR: usize = 8;
+    if progress {
+        let total = track
+            .and_then(|track| track.duration)
+            .filter(|total| !total.is_zero());
+        let time = match total {
+            Some(total) => format!("{}/{}", clock(snap.position), clock(total)),
+            None => clock(snap.position),
+        };
+        let time_cost = display_width(&time) + 2;
+        if remaining >= time_cost + TEXT_FLOOR {
+            if let Some(total) =
+                total.filter(|_| remaining >= BAR_WIDTH + 1 + time_cost + TEXT_FLOOR)
+            {
+                let filled = ((snap.position.as_secs_f64() / total.as_secs_f64()).min(1.0)
+                    * BAR_WIDTH as f64)
+                    .round() as usize;
+                spans.extend([
+                    Span::styled(
+                        "━".repeat(filled),
+                        Style::default().fg(ambient).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "─".repeat(BAR_WIDTH - filled),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(" "),
+                ]);
+                remaining = remaining.saturating_sub(BAR_WIDTH + 1);
+            }
+            spans.push(Span::styled(
+                format!("{time}  "),
+                Style::default().fg(Color::Gray),
+            ));
+            remaining = remaining.saturating_sub(time_cost);
+        }
     }
-    let used: usize = spans.iter().map(|span| display_width(&span.content)).sum();
-    spans.push(Span::styled(
-        marquee(&snap.title, width.saturating_sub(used).min(60)),
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
+
+    let title = track.map_or(snap.title.as_str(), |track| track.title);
+    let byline = track.map_or("", |track| track.byline);
+    let details = if byline.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title} · {byline}")
+    };
+    if !details.is_empty() && remaining > 0 {
+        if !byline.is_empty() && display_width(&details) <= remaining {
+            spans.extend([
+                Span::styled(
+                    truncate(title, remaining),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled(byline.to_string(), Style::default().fg(Color::Gray)),
+            ]);
+        } else {
+            spans.push(Span::styled(
+                marquee(&details, remaining),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
     Line::from(spans)
 }
 
@@ -2956,6 +3370,12 @@ fn columns(width: usize) -> (usize, usize, usize) {
 /// always leaving a trailing space so neighbouring columns cannot run together.
 fn cell(text: &str, width: usize) -> String {
     let text = truncate(text, width.saturating_sub(1));
+    let pad = width.saturating_sub(display_width(&text));
+    format!("{text}{:pad$}", "", pad = pad)
+}
+
+fn padded(text: &str, width: usize) -> String {
+    let text = truncate(text, width);
     let pad = width.saturating_sub(display_width(&text));
     format!("{text}{:pad$}", "", pad = pad)
 }
@@ -3091,6 +3511,13 @@ mod tests {
     /// A 16:9 cover, as every YouTube thumbnail is once shrunk.
     fn wide() -> Cover {
         Cover::solid(160, 90)
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     #[test]
@@ -3843,25 +4270,43 @@ mod tests {
     }
 
     #[test]
-    fn the_open_tab_is_the_underlined_one() {
+    fn compact_tabs_keep_the_new_order_and_underline_the_open_one() {
         let mut now = playing();
-        now.tab = Tab::Comments;
-        let rows = drawn_panel(&now, 44, 6);
+        now.tab = Tab::Related;
+        // PANEL_MIN_WIDTH has a 32-column interior. Every title must survive in
+        // that exact width rather than relying on a roomier preview panel.
+        let rows = drawn_panel(&now, PANEL_MIN_WIDTH - 2, 6);
 
+        let tabs = &rows[0];
+        let positions = ["Queue", "Lyrics", "Related", "Comments"].map(|label| {
+            tabs.find(label)
+                .unwrap_or_else(|| panic!("{label:?} is missing from {tabs:?}"))
+        });
         assert!(
-            rows[0].contains("COMMENTS"),
-            "every tab is named: {:?}",
-            rows[0]
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{tabs:?}"
         );
         // The rule sits under the open tab and nothing else, which is the only
         // thing on the row that says which panel is showing.
         let rule = &rows[1];
-        assert_eq!(rule.trim(), "─".repeat("COMMENTS".chars().count()));
+        assert_eq!(rule.trim(), "─".repeat(display_width("Related")));
         assert_eq!(
             rule.find('─'),
-            rows[0].find("COMMENTS"),
+            tabs.find("Related"),
             "the rule sits under the letters, not the padding: {rule:?}"
         );
+    }
+
+    #[test]
+    fn tiny_panels_keep_all_four_tab_destinations() {
+        let rows = drawn_panel(&playing(), 12, 4);
+        assert_eq!(rows[0], " 1Q 2L 3R 4C");
+
+        let rows = drawn_panel(&playing(), 8, 4);
+        assert_eq!(rows[0], " 1 2 3 4");
+
+        let rows = drawn_panel(&playing(), 4, 4);
+        assert_eq!(rows[0], "1234");
     }
 
     #[test]
@@ -4243,6 +4688,133 @@ mod tests {
         let line = progress_line(&snap, None, 40, Color::Cyan);
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].content.trim(), "1:05");
+    }
+
+    #[test]
+    fn mini_player_combines_known_progress_clock_and_track() {
+        let snap = Snapshot {
+            state: PlayState::Playing,
+            title: "Let It Happen".to_string(),
+            position: Duration::from_secs(65),
+            ..Default::default()
+        };
+        let line = mini_player_line(
+            &snap,
+            Some(MiniTrack {
+                title: "Let It Happen",
+                byline: "Tame Impala",
+                duration: Some(Duration::from_secs(180)),
+            }),
+            "idle",
+            true,
+            40,
+            Color::Magenta,
+        );
+        let text = line_text(&line);
+
+        assert!(text.starts_with(" > "), "{text:?}");
+        assert!(text.contains("1:05/3:00"), "{text:?}");
+        assert!(text.contains('━') && text.contains('─'), "{text:?}");
+        assert!(text.contains("Let It Happen"), "{text:?}");
+        assert!(display_width(&text) <= 40, "{text:?}");
+    }
+
+    #[test]
+    fn mini_player_never_invents_progress_for_an_unknown_duration() {
+        let snap = Snapshot {
+            state: PlayState::Playing,
+            title: "Live set".to_string(),
+            position: Duration::from_secs(65),
+            ..Default::default()
+        };
+        let line = mini_player_line(
+            &snap,
+            Some(MiniTrack {
+                title: "Live set",
+                byline: "Night Radio",
+                duration: None,
+            }),
+            "idle",
+            true,
+            32,
+            Color::Cyan,
+        );
+        let text = line_text(&line);
+
+        assert!(text.contains("1:05"), "{text:?}");
+        assert!(!text.contains('/'), "no invented total: {text:?}");
+        assert!(
+            !text.contains('━') && !text.contains('─'),
+            "no invented bar: {text:?}"
+        );
+    }
+
+    #[test]
+    fn mini_player_stays_bounded_when_narrow_and_omits_a_duplicate_clock() {
+        let snap = Snapshot {
+            state: PlayState::Playing,
+            title: "日本語の長いタイトル".to_string(),
+            position: Duration::from_secs(65),
+            ..Default::default()
+        };
+        let track = Some(MiniTrack {
+            title: "日本語の長いタイトル",
+            byline: "アーティスト",
+            duration: Some(Duration::from_secs(180)),
+        });
+
+        let narrow = line_text(&mini_player_line(
+            &snap,
+            track,
+            "idle",
+            true,
+            7,
+            Color::Cyan,
+        ));
+        assert!(display_width(&narrow) <= 7, "{narrow:?}");
+
+        let without_progress = line_text(&mini_player_line(
+            &snap,
+            track,
+            "idle",
+            false,
+            32,
+            Color::Cyan,
+        ));
+        assert!(!without_progress.contains("1:05"), "{without_progress:?}");
+        assert!(!without_progress.contains('/'), "{without_progress:?}");
+        assert!(!without_progress.contains('━'), "{without_progress:?}");
+    }
+
+    #[test]
+    fn mini_player_distinguishes_pause_but_errors_still_win() {
+        let paused = Snapshot {
+            state: PlayState::Paused,
+            title: "Feather".to_string(),
+            ..Default::default()
+        };
+        let paused_text = line_text(&mini_player_line(
+            &paused,
+            None,
+            "idle",
+            true,
+            20,
+            Color::Cyan,
+        ));
+        assert!(paused_text.starts_with(" = "), "{paused_text:?}");
+        assert!(paused_text.contains("Feather"), "{paused_text:?}");
+
+        let failed = Snapshot {
+            state: PlayState::Playing,
+            title: "Feather".to_string(),
+            error: Some("decoder stopped unexpectedly".to_string()),
+            ..Default::default()
+        };
+        let line = mini_player_line(&failed, None, "idle", true, 14, Color::Cyan);
+        let error_text = line_text(&line);
+        assert!(display_width(&error_text) <= 14, "{error_text:?}");
+        assert!(!error_text.contains("Feather"), "{error_text:?}");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Red));
     }
 
     #[test]
@@ -5157,21 +5729,108 @@ mod tests {
     }
 
     #[test]
+    fn menu_rows_are_bounded_and_style_each_kind_distinctly() {
+        let selected = menu_row_line(
+            "A very long 日本語 menu label",
+            Some("Ctrl+Shift+Enter"),
+            true,
+            true,
+            false,
+            24,
+            Color::Magenta,
+        );
+        assert_eq!(display_width(&line_text(&selected)), 24);
+        assert!(
+            selected
+                .spans
+                .iter()
+                .filter(|span| !span.content.is_empty())
+                .all(|span| span.style.bg == Some(Color::Magenta)),
+            "an actionable selection fills the row: {selected:?}"
+        );
+
+        let disabled = menu_row_line(
+            "Unavailable action",
+            Some("Enter"),
+            false,
+            true,
+            false,
+            24,
+            Color::Magenta,
+        );
+        assert_eq!(display_width(&line_text(&disabled)), 24);
+        assert_eq!(disabled.spans[1].style.fg, Some(Color::DarkGray));
+        assert!(disabled.spans.iter().all(|span| span.style.bg.is_none()));
+
+        let help = menu_row_line(
+            "Move selection",
+            Some("j/k, Up/Down"),
+            false,
+            true,
+            true,
+            32,
+            Color::Cyan,
+        );
+        assert_eq!(help.spans[0].content, "  ", "help has no action cursor");
+        assert_eq!(help.spans[1].style.fg, Some(Color::White));
+        assert_eq!(help.spans[3].style.fg, Some(Color::Cyan));
+        assert!(help.spans.iter().all(|span| span.style.bg.is_none()));
+    }
+
+    #[test]
+    fn menu_heading_is_muted_and_scroll_keeps_it_with_its_row() {
+        let heading = menu_heading_line("Playback", 12);
+        assert_eq!(line_text(&heading), "  Playback");
+        assert_eq!(heading.spans[0].style.fg, Some(Color::DarkGray));
+
+        let lines = vec![
+            MenuRenderLine {
+                item: None,
+                line: menu_heading_line("First", 20),
+            },
+            MenuRenderLine {
+                item: Some(0),
+                line: Line::from("one"),
+            },
+            MenuRenderLine {
+                item: Some(1),
+                line: Line::from("two"),
+            },
+            MenuRenderLine {
+                item: None,
+                line: menu_heading_line("Second", 20),
+            },
+            MenuRenderLine {
+                item: Some(2),
+                line: Line::from("three"),
+            },
+        ];
+        let offset = menu_offset(&lines, 2, 2);
+        assert_eq!(
+            offset, 3,
+            "the section heading stays immediately above item 2"
+        );
+    }
+
+    #[test]
+    fn settings_rows_show_state_and_use_ambient_selection() {
+        let row = setting_line("Discord Rich Presence", true, true, 30, Color::Blue);
+        assert_eq!(display_width(&line_text(&row)), 30);
+        assert!(line_text(&row).contains("[x] Discord Rich Presence"));
+        assert_eq!(row.spans[0].style.bg, Some(Color::Blue));
+
+        let footer = settings_footer(54);
+        assert!(footer.contains("↑↓"));
+        assert!(footer.contains("Space/Enter"));
+        assert!(footer.contains("Esc"));
+        assert!(display_width(&settings_footer(18)) <= 18);
+    }
+
+    #[test]
     fn every_hint_line_fits_the_column_reserved_for_it() {
         // The hints column truncates rather than wrapping, so a hint that grew
         // past it would be silently cut mid-word.
-        for hint in [
-            HINTS_EDITING,
-            HINTS_PLAYLISTS,
-            HINTS_TRACKS,
-            HINTS_SIGNED_OUT,
-            HINTS_HOME,
-            HINTS_PLAYING,
-            HINTS_PLAYLISTS_PLAYING,
-            HINTS_TRACKS_PLAYING,
-            HINTS_HOME_PLAYING,
-            HINTS_SIGNED_OUT_PLAYING,
-        ] {
+        for hint in [HINTS_EDITING, HINTS_BROWSE, HINTS_AWAY, HINTS_PLAYING] {
             assert!(
                 display_width(hint) <= HINTS_WIDTH as usize,
                 "{hint:?} is {} columns, over the {HINTS_WIDTH} reserved",
@@ -5181,42 +5840,10 @@ mod tests {
     }
 
     #[test]
-    fn every_non_editing_view_names_settings() {
-        for hint in [
-            HINTS_PLAYLISTS,
-            HINTS_TRACKS,
-            HINTS_SIGNED_OUT,
-            HINTS_HOME,
-            HINTS_PLAYING,
-        ] {
-            assert!(hint.contains("S settings"), "{hint:?} does not name S");
-        }
-        assert!(HINTS_EDITING.contains("^S settings"));
-    }
-
-    #[test]
-    fn every_view_names_the_way_back_to_a_playing_track() {
-        // The player page is entered by playing something rather than by asking
-        // for it, so nothing about leaving it teaches the user it can be
-        // reopened. Whichever list they leave it for has to say so.
-        for hint in [
-            HINTS_PLAYLISTS_PLAYING,
-            HINTS_TRACKS_PLAYING,
-            HINTS_HOME_PLAYING,
-            HINTS_SIGNED_OUT_PLAYING,
-        ] {
-            assert!(hint.contains("P player"), "{hint:?} does not name P");
-            assert!(hint.contains("B tray"), "{hint:?} does not name B");
-        }
-        // `B` refuses with nothing playing, so the lines shown then must not
-        // offer it -- a key that answers "nothing is playing" is worse than no
-        // key at all.
-        for hint in [HINTS_PLAYLISTS, HINTS_TRACKS, HINTS_HOME, HINTS_SIGNED_OUT] {
-            assert!(
-                !hint.contains("B tray"),
-                "{hint:?} offers B with nothing playing"
-            );
-        }
+    fn browse_hints_route_to_the_shared_command_surfaces() {
+        assert_eq!(HINTS_BROWSE, "^K app menu  . actions  ? help");
+        assert_eq!(HINTS_AWAY, "P player  ^K menu  . actions");
+        assert_eq!(HINTS_PLAYING, "Tab panels  Esc back  ^K menu  . actions");
     }
 
     #[test]
@@ -5225,20 +5852,38 @@ mod tests {
         // name a key that inserts that letter -- the exact trap that made the
         // library unreachable from a fresh launch. Only Enter, Esc and a
         // Ctrl-chord survive the search box.
-        assert!(!HINTS_EDITING.contains(" L "));
-        assert!(HINTS_EDITING.contains("^L"));
-        assert!(HINTS_EDITING.contains("Esc"));
+        let advertised_keys = HINTS_EDITING
+            .split("  ")
+            .map(|hint| hint.split_whitespace().next().unwrap_or(""))
+            .collect::<Vec<_>>();
+        assert_eq!(advertised_keys, ["Enter", "Esc", "^K"]);
     }
 
     #[test]
-    fn an_overlay_is_centred_and_never_escapes_the_window() {
+    fn modals_are_centred_and_never_escape_the_window() {
         let window = Rect::new(0, 0, 80, 24);
         let area = centred(window, 40, 10);
         assert_eq!((area.x, area.y, area.width, area.height), (20, 7, 40, 10));
 
+        let menu = menu_modal_area(window, 22, 1);
+        assert_eq!(
+            (menu.x, menu.y, menu.width, menu.height),
+            (12, 0, MENU_MAX_WIDTH, MENU_MAX_HEIGHT)
+        );
+
         // A modal larger than the window is clamped, not drawn off-screen.
         let huge = centred(Rect::new(0, 0, 30, 6), 56, 12);
         assert_eq!((huge.x, huge.y, huge.width, huge.height), (0, 0, 30, 6));
+        let narrow_menu = menu_modal_area(Rect::new(4, 3, 30, 6), 22, 3);
+        assert_eq!(
+            (
+                narrow_menu.x,
+                narrow_menu.y,
+                narrow_menu.width,
+                narrow_menu.height,
+            ),
+            (4, 3, 30, 6)
+        );
     }
 
     #[test]
