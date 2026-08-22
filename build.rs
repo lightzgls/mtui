@@ -9,6 +9,9 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=assets/mtui.rc");
     println!("cargo:rerun-if-changed=assets/mtui.ico");
+    println!("cargo:rerun-if-changed=assets/mtui-wave.ico");
+    println!("cargo:rerun-if-changed=assets/mtui-mono.ico");
+    println!("cargo:rerun-if-changed=assets/mtui-orbit.ico");
     println!("cargo:rerun-if-env-changed=RC");
     println!("cargo:rerun-if-env-changed=WINDRES");
 

@@ -437,6 +437,9 @@ fn parse_videos(json: &serde_json::Value) -> Vec<Track> {
                     .and_then(parse_iso_duration),
                 // The Data API has no album field. A video is not a release.
                 album: None,
+                // This channel may be an uploader or Topic channel rather than
+                // the canonical Music artist, so it is not promoted to a route.
+                artist_ref: None,
                 playlist_item_id: None,
             })
         })

@@ -16,6 +16,7 @@ mod app;
 mod art;
 mod config;
 mod console;
+mod diagnostics;
 mod discord;
 mod graphics;
 mod player;
@@ -75,20 +76,36 @@ const IDLE_TICK: Duration = Duration::from_millis(500);
 fn main() -> Result<()> {
     #[cfg(windows)]
     if console::is_host() {
-        return console::run_host();
+        diagnostics::init();
+        diagnostics::info("console", "helper started");
+        let result = console::run_host();
+        match &result {
+            Ok(()) => diagnostics::info("console", "helper stopped"),
+            Err(error) => diagnostics::error("console", &format!("helper failed: {error:#}")),
+        }
+        return result;
     }
     #[cfg(windows)]
     console::prepare_parent();
 
+    diagnostics::init();
+    diagnostics::info(
+        "app",
+        &format!("MTUI {} started", env!("CARGO_PKG_VERSION")),
+    );
+
     if let Err(err) = start() {
+        diagnostics::error("app", &format!("fatal error: {err:#}"));
         console::report_error(&format!("{err:#}"));
         return Err(err);
     }
+    diagnostics::info("app", "clean shutdown");
     Ok(())
 }
 
 fn start() -> Result<()> {
-    let keep_tray = config::Settings::load().start_in_tray;
+    let settings = config::Settings::load();
+    let keep_tray = settings.start_in_tray;
     // The Windows-subsystem binary starts without a console. Opening one here
     // makes the UI the normal startup state; the tray icon is an additional
     // entry point, and `B` is still the explicit action that hides the UI.
@@ -97,17 +114,18 @@ fn start() -> Result<()> {
 
     let startup_tray = if keep_tray {
         Tray::spawn().ok().and_then(|mut tray| {
-            tray.show("MTUI is starting ...").ok()?;
+            tray.show("MTUI is starting ...", settings.icon_theme)
+                .ok()?;
             Some(tray)
         })
     } else {
         None
     };
 
-    run(keep_tray, startup_tray)
+    run(settings, startup_tray)
 }
 
-fn run(keep_tray: bool, mut tray: Option<Tray>) -> Result<()> {
+fn run(settings: config::Settings, mut tray: Option<Tray>) -> Result<()> {
     // Fail before touching the terminal, so a missing dependency prints a plain
     // message instead of appearing as a blank alternate screen. On a first run
     // this is also where yt-dlp gets fetched, which prints progress -- another
@@ -122,8 +140,7 @@ fn run(keep_tray: bool, mut tray: Option<Tray>) -> Result<()> {
 
     let player = Player::spawn()?;
     let source = SourceWorker::spawn(yt)?;
-    let mut app = App::new(player, source, graphics);
-    app.start_in_tray = keep_tray;
+    let mut app = App::new(player, source, graphics, settings);
 
     // The two faces, alternating until something asks to quit. The terminal one
     // runs first because that is how the program is started; after that, each
@@ -438,10 +455,13 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
         match Tray::spawn() {
             Ok(icon) => *tray = Some(icon),
             Err(err) => {
+                diagnostics::error("tray", &format!("could not create icon: {err:#}"));
                 app.start_in_tray = false;
                 app.status = format!("could not create the tray icon: {err:#}");
                 if let Err(save) = (config::Settings {
                     start_in_tray: false,
+                    icon_theme: app.icon_theme(),
+                    cover_style: app.cover_style(),
                 })
                 .save()
                 {
@@ -460,13 +480,16 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
     let Some(icon) = tray.as_mut() else {
         return;
     };
-    if let Err(err) = icon.show(&app.tray_tip()) {
+    if let Err(err) = icon.show(&app.tray_tip(), app.icon_theme()) {
+        diagnostics::error("tray", &format!("could not show icon: {err:#}"));
         app.start_in_tray = false;
         app.status = format!("could not show the tray icon: {err:#}");
         icon.hide();
         *tray = None;
         if let Err(save) = (config::Settings {
             start_in_tray: false,
+            icon_theme: app.icon_theme(),
+            cover_style: app.cover_style(),
         })
         .save()
         {
@@ -497,6 +520,10 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
         *tray = match Tray::spawn() {
             Ok(tray) => Some(tray),
             Err(err) => {
+                diagnostics::error(
+                    "tray",
+                    &format!("could not create background icon: {err:#}"),
+                );
                 app.status = format!("{err:#}");
                 if console::closed() {
                     console::detach()?;
@@ -508,7 +535,8 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
         };
     }
     let icon = tray.as_mut().expect("the tray was created above");
-    if let Err(err) = icon.show(&app.tray_tip()) {
+    if let Err(err) = icon.show(&app.tray_tip(), app.icon_theme()) {
+        diagnostics::error("tray", &format!("could not enter background: {err:#}"));
         app.status = format!("{err:#}");
         if console::closed() {
             console::detach()?;
@@ -530,6 +558,7 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
     }
 
     if let Err(err) = console::detach() {
+        diagnostics::error("app", &format!("could not detach console: {err:#}"));
         app.status = format!("{err:#}");
         return Ok(());
     }
@@ -546,7 +575,8 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
         // Not `tick_page`: lyrics and comments are panels of a page nobody can
         // see, and fetching them here would spend a request per track on
         // something that is thrown away when the track changes.
-        if let Err(err) = icon.show(&app.tray_tip()) {
+        if let Err(err) = icon.show(&app.tray_tip(), app.icon_theme()) {
+            diagnostics::error("tray", &format!("background icon lost: {err:#}"));
             app.status = format!("the tray icon was lost: {err:#}");
             app.wants_foreground = true;
             continue;

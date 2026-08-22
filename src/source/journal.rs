@@ -442,6 +442,7 @@ impl Journal {
                     uploader: play.artist.clone(),
                     duration: play.duration.map(Duration::from_secs),
                     album: play.album.clone(),
+                    artist_ref: None,
                     playlist_item_id: None,
                 },
                 score: 0.0,
@@ -596,6 +597,7 @@ mod tests {
             uploader: artist.to_string(),
             duration: Some(Duration::from_secs(200)),
             album: None,
+            artist_ref: None,
             playlist_item_id: None,
         }
     }

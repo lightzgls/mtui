@@ -279,29 +279,27 @@ impl Discord {
 /// Whether what MTUI is playing may be broadcast to Discord.
 ///
 /// Persisted rather than kept for the session, because it is a privacy setting
-/// and a user who switched it off meant it. On by default -- see
-/// [`Presence::load`] -- so that the feature is discoverable at all: the card
-/// is something other people see, and a broadcast nobody knows exists is a
-/// feature nobody ever turns on.
+/// and a user who switched it off meant it. Off by default -- see
+/// [`Presence::load`] -- so playback metadata does not leave the machine until
+/// the user has explicitly enabled it.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Presence {
     pub enabled: bool,
 }
 
 impl Presence {
-    /// Reads the switch, defaulting to on.
+    /// Reads the switch, defaulting to off.
     ///
-    /// The default is the whole reason a missing file and an unparseable one
-    /// are treated alike here. Neither is a state worth a message: the switch
-    /// is one keypress away and the status bar reports where it landed.
+    /// A missing or unparseable preference fails closed. The switch is one
+    /// keypress away and the status bar reports where it landed.
     pub fn load() -> bool {
         let Ok(path) = dir().map(|dir| dir.join(PRESENCE_FILE)) else {
-            return true;
+            return false;
         };
         fs::read(path)
             .ok()
             .and_then(|raw| serde_json::from_slice::<Self>(&raw).ok())
-            .is_none_or(|presence| presence.enabled)
+            .is_some_and(|presence| presence.enabled)
     }
 
     /// Records where the switch was left.
@@ -319,11 +317,82 @@ impl Presence {
     }
 }
 
-/// Preferences that affect how MTUI starts.
+/// How the large cover for the current song is drawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoverStyle {
+    #[default]
+    Pixel,
+    ColoredAscii,
+}
+
+impl CoverStyle {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pixel => "Pixel art",
+            Self::ColoredAscii => "Colored ASCII",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Pixel => Self::ColoredAscii,
+            Self::ColoredAscii => Self::Pixel,
+        }
+    }
+
+    pub const fn previous(self) -> Self {
+        self.next()
+    }
+}
+
+/// Artwork used for MTUI's runtime-owned icons.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IconTheme {
+    #[default]
+    Signal,
+    Wave,
+    Orbit,
+    Mono,
+}
+
+impl IconTheme {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Signal => "Signal",
+            Self::Wave => "Wave",
+            Self::Orbit => "Orbit",
+            Self::Mono => "Mono",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Signal => Self::Wave,
+            Self::Wave => Self::Orbit,
+            Self::Orbit => Self::Mono,
+            Self::Mono => Self::Signal,
+        }
+    }
+
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Signal => Self::Mono,
+            Self::Wave => Self::Signal,
+            Self::Orbit => Self::Wave,
+            Self::Mono => Self::Orbit,
+        }
+    }
+}
+
+/// Preferences changed from MTUI's Settings panel.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub start_in_tray: bool,
+    pub icon_theme: IconTheme,
+    pub cover_style: CoverStyle,
 }
 
 impl Settings {
@@ -587,15 +656,47 @@ mod tests {
         assert!(!Settings::default().start_in_tray);
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert!(!settings.start_in_tray);
+        assert_eq!(settings.icon_theme, IconTheme::Signal);
+        assert_eq!(settings.cover_style, CoverStyle::Pixel);
+
+        let legacy: Settings = serde_json::from_str(r#"{"start_in_tray":true}"#).unwrap();
+        assert!(legacy.start_in_tray);
+        assert_eq!(legacy.icon_theme, IconTheme::Signal);
+        assert_eq!(legacy.cover_style, CoverStyle::Pixel);
     }
 
     #[test]
     fn the_tray_preference_round_trips() {
         let body = serde_json::to_string(&Settings {
             start_in_tray: true,
+            icon_theme: IconTheme::Wave,
+            cover_style: CoverStyle::ColoredAscii,
         })
         .unwrap();
         let settings: Settings = serde_json::from_str(&body).unwrap();
         assert!(settings.start_in_tray);
+        assert_eq!(settings.icon_theme, IconTheme::Wave);
+        assert_eq!(settings.cover_style, CoverStyle::ColoredAscii);
+    }
+
+    #[test]
+    fn cover_styles_cycle_and_use_stable_config_names() {
+        assert_eq!(CoverStyle::Pixel.next(), CoverStyle::ColoredAscii);
+        assert_eq!(CoverStyle::ColoredAscii.next(), CoverStyle::Pixel);
+        assert_eq!(CoverStyle::Pixel.previous(), CoverStyle::ColoredAscii);
+        assert_eq!(
+            serde_json::to_string(&CoverStyle::ColoredAscii).unwrap(),
+            "\"colored-ascii\""
+        );
+    }
+
+    #[test]
+    fn icon_themes_cycle_and_use_stable_config_names() {
+        assert_eq!(IconTheme::Signal.next(), IconTheme::Wave);
+        assert_eq!(IconTheme::Signal.previous(), IconTheme::Mono);
+        assert_eq!(IconTheme::Wave.next(), IconTheme::Orbit);
+        assert_eq!(IconTheme::Orbit.next(), IconTheme::Mono);
+        assert_eq!(IconTheme::Mono.next(), IconTheme::Signal);
+        assert_eq!(serde_json::to_string(&IconTheme::Wave).unwrap(), "\"wave\"");
     }
 }

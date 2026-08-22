@@ -20,6 +20,8 @@ mod imp {
 
     use anyhow::{Context, Result, anyhow};
 
+    use crate::config::IconTheme;
+
     type Handle = isize;
     type Wparam = usize;
     type Lparam = isize;
@@ -183,9 +185,6 @@ mod imp {
 
     /// The stock icon Windows keeps for programs that bring none of their own.
     const IDI_APPLICATION: *const u16 = std::ptr::without_provenance(32512);
-    /// MTUI's own, as `build.rs` compiled it in under the id `assets/mtui.rc`
-    /// gives it.
-    const ICON_ID: *const u16 = std::ptr::without_provenance(1);
     const IMAGE_ICON: u32 = 1;
     /// Asks for the process-wide copy of the icon rather than a fresh one.
     /// That is what makes it safe never to destroy it: the icon is loaded once
@@ -376,14 +375,15 @@ mod imp {
 
         /// Puts the icon in the notification area, or updates the tooltip of one
         /// already there. `tip` is what hovering the icon says.
-        pub fn show(&mut self, tip: &str) -> Result<()> {
+        pub fn show(&mut self, tip: &str, theme: IconTheme) -> Result<()> {
             let message = if self.visible { NIM_MODIFY } else { NIM_ADD };
             let announce = !self.visible && !ANNOUNCED.swap(true, Ordering::Relaxed);
-            if unsafe { Shell_NotifyIconW(message, &self.icon_data(tip, announce)) } == 0 {
+            if unsafe { Shell_NotifyIconW(message, &self.icon_data(tip, announce, theme)) } == 0 {
                 // Explorer drops all icons when its notification area restarts.
                 // A failed modify is therefore retried as a fresh add.
                 if !self.visible
-                    || unsafe { Shell_NotifyIconW(NIM_ADD, &self.icon_data(tip, false)) } == 0
+                    || unsafe { Shell_NotifyIconW(NIM_ADD, &self.icon_data(tip, false, theme)) }
+                        == 0
                 {
                     self.visible = false;
                     return Err(anyhow!("the notification area refused the icon"));
@@ -397,7 +397,9 @@ mod imp {
         /// so that MTUI is in one place at a time rather than two.
         pub fn hide(&mut self) {
             if self.visible {
-                unsafe { Shell_NotifyIconW(NIM_DELETE, &self.icon_data("", false)) };
+                unsafe {
+                    Shell_NotifyIconW(NIM_DELETE, &self.icon_data("", false, IconTheme::Signal))
+                };
                 self.visible = false;
             }
         }
@@ -411,14 +413,14 @@ mod imp {
             self.rx.recv_timeout(timeout).ok()
         }
 
-        fn icon_data(&self, tip: &str, announce: bool) -> NotifyIconDataW {
+        fn icon_data(&self, tip: &str, announce: bool, theme: IconTheme) -> NotifyIconDataW {
             let mut data = NotifyIconDataW {
                 cb_size: size_of::<NotifyIconDataW>() as u32,
                 hwnd: self.hwnd,
                 id: 1,
                 flags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
                 callback_message: WM_TRAY,
-                icon: app_icon(),
+                icon: app_icon(theme),
                 tip: [0; 128],
                 state: 0,
                 state_mask: 0,
@@ -472,11 +474,18 @@ mod imp {
     /// resource holds a 16px drawing made for that slot, and naming the small-
     /// icon metrics is what picks it -- on a scaled display those metrics are
     /// larger, and the request lands on one of the bigger drawings instead.
-    fn app_icon() -> Handle {
+    fn app_icon(theme: IconTheme) -> Handle {
         let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
         let cx = unsafe { GetSystemMetrics(SM_CXSMICON) };
         let cy = unsafe { GetSystemMetrics(SM_CYSMICON) };
-        let icon = unsafe { LoadImageW(instance, ICON_ID, IMAGE_ICON, cx, cy, LR_SHARED) };
+        let id = match theme {
+            IconTheme::Signal => 1,
+            IconTheme::Wave => 2,
+            IconTheme::Mono => 3,
+            IconTheme::Orbit => 4,
+        };
+        let resource = std::ptr::without_provenance(id);
+        let icon = unsafe { LoadImageW(instance, resource, IMAGE_ICON, cx, cy, LR_SHARED) };
 
         // A binary built where no resource compiler could be found has no icon
         // in it -- see build.rs, which warns and carries on rather than failing
@@ -570,13 +579,16 @@ mod imp {
         #[ignore]
         fn tray_icon_appears_and_goes_away() {
             let mut tray = Tray::spawn().expect("the tray window should be creatable");
-            tray.show("MTUI test -- this should vanish in a second")
-                .expect("the shell should accept the icon");
+            tray.show(
+                "MTUI test -- this should vanish in a second",
+                IconTheme::Signal,
+            )
+            .expect("the shell should accept the icon");
             assert!(tray.visible);
 
             // A second show is the tooltip update the background loop does on
             // every tick, and must be a modify rather than a second icon.
-            tray.show("MTUI test -- updated tooltip")
+            tray.show("MTUI test -- updated tooltip", IconTheme::Wave)
                 .expect("the shell should accept the update");
 
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -594,6 +606,8 @@ mod imp {
     use std::time::Duration;
 
     use anyhow::{Result, anyhow};
+
+    use crate::config::IconTheme;
 
     // Only the Windows message pump constructs these variants; the portable
     // shape lets the rest of the event loop compile on unsupported platforms.
@@ -621,7 +635,7 @@ mod imp {
             ))
         }
 
-        pub fn show(&mut self, _tip: &str) -> Result<()> {
+        pub fn show(&mut self, _tip: &str, _theme: IconTheme) -> Result<()> {
             unreachable!("no Tray can be constructed off Windows")
         }
 

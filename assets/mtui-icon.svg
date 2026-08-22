@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">MTUI app icon</title>
+  <desc id="desc">An open cyan terminal prompt beside a mint three-bar audio meter on a midnight rounded square.</desc>
+  <rect x="24" y="24" width="464" height="464" rx="104" fill="#0b1020"/>
+  <rect x="30" y="30" width="452" height="452" rx="98" fill="none" stroke="#24314a" stroke-width="8"/>
+  <path d="M122 186L196 256 122 326" fill="none" stroke="#49d7f2" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M250 216V296M312 158V354M374 202V310" fill="none" stroke="#65f5b5" stroke-width="38" stroke-linecap="round"/>
+</svg>

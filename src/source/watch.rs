@@ -640,6 +640,9 @@ fn parse_queue_row(row: &Value) -> Option<Track> {
         album: (fields.len() >= 3)
             .then(|| fields[1].to_string())
             .filter(|album| !album.is_empty()),
+        artist_ref: row
+            .pointer("/longBylineText/runs")
+            .and_then(home::artist_ref),
         // A radio queue is nobody's playlist, so there is no row to remove.
         playlist_item_id: None,
     })
@@ -862,6 +865,33 @@ mod tests {
         assert_eq!(queue[0].uploader, "Tame Impala");
         assert_eq!(queue[0].album.as_deref(), Some("Currents"));
         assert_eq!(queue[0].duration, Some(Duration::from_secs(468)));
+    }
+
+    #[test]
+    fn a_queue_row_keeps_its_linked_artist() {
+        let mut json = row(
+            "x",
+            "Let It Happen",
+            "Tame Impala • Currents • 2015",
+            "7:48",
+        );
+        json["playlistPanelVideoRenderer"]["longBylineText"]["runs"] = serde_json::json!([
+            {
+                "text": "Tame Impala",
+                "navigationEndpoint": { "browseEndpoint": {
+                    "browseId": "UCGz-artist",
+                    "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                        }
+                    }
+                } }
+            },
+            { "text": " • Currents • 2015" }
+        ]);
+
+        let track = queue(&json).remove(0);
+        assert_eq!(track.artist_ref.unwrap().endpoint.browse_id, "UCGz-artist");
     }
 
     #[test]

@@ -909,6 +909,7 @@ fn update(snapshot: &Arc<Mutex<Snapshot>>, f: impl FnOnce(&mut Snapshot)) {
 }
 
 fn set_error(snapshot: &Arc<Mutex<Snapshot>>, msg: String) {
+    crate::diagnostics::error("player", &msg);
     update(snapshot, |s| {
         s.state = PlayState::Idle;
         s.error = Some(msg);

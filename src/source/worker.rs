@@ -37,13 +37,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use super::artist::{self, ArtistPage};
 use super::auth::{self, Http};
 use super::cover::{self, Cover};
 use super::home::{self, Shelf};
 use super::innertube::InnerTube;
 use super::journal::{Journal, Play};
 use super::library::{Library, Playlist};
-use super::{StreamUrl, Track};
+use super::{ArtistRef, BrowseEndpoint, StreamUrl, Track};
 use super::{lrclib, stats, watch};
 use crate::config::{Cookies, Credentials, Import, Tokens};
 use crate::source::youtube::YouTube;
@@ -56,8 +57,11 @@ use mtui_resolver::{PlaybackSession, ResolveRequest, Resolver};
 /// each further fifty rows is two more round trips for lines nobody scrolls to.
 const MAX_LIBRARY_TRACKS: usize = 200;
 
+pub type PageRequestId = u64;
+
 pub enum Request {
     Search {
+        request_id: PageRequestId,
         query: String,
         limit: usize,
     },
@@ -116,8 +120,14 @@ pub enum Request {
     /// Tracks behind a card that browses rather than plays -- an album, a
     /// playlist or an artist. `title` is carried through to label the list.
     OpenBrowse {
-        browse_id: String,
+        request_id: PageRequestId,
+        endpoint: BrowseEndpoint,
         title: String,
+    },
+    /// Opens the mixed Music page for one artist.
+    OpenArtist {
+        request_id: PageRequestId,
+        artist: ArtistRef,
     },
     /// The queue a track plays inside, asked for the moment it starts. This is
     /// what decides what plays when it ends, so it is the one part of the
@@ -183,6 +193,7 @@ pub enum Request {
     /// Contents of one playlist. `title` is carried through so the UI can label
     /// the list without holding the playlist it came from.
     OpenPlaylist {
+        request_id: PageRequestId,
         id: String,
         title: String,
     },
@@ -208,7 +219,10 @@ pub enum Request {
 }
 
 pub enum Response {
-    Results(Vec<Track>),
+    Results {
+        request_id: PageRequestId,
+        tracks: Result<Vec<Track>, String>,
+    },
     /// The landing page.
     Home {
         generation: u64,
@@ -235,8 +249,15 @@ pub enum Response {
     /// belong to a YouTube Music album or a stranger's playlist, so there is
     /// nothing here that removing a row could apply to.
     Browsed {
+        request_id: PageRequestId,
+        endpoint: BrowseEndpoint,
         title: String,
-        tracks: Vec<Track>,
+        tracks: Result<Vec<Track>, String>,
+    },
+    Artist {
+        request_id: PageRequestId,
+        browse_id: String,
+        page: Box<Result<ArtistPage, String>>,
     },
     /// A resolve finished, whichever way it went.
     ///
@@ -324,14 +345,18 @@ pub enum Response {
     /// A library request arrived with no session. The UI turns this into a
     /// sign-in rather than an error, since asking for the library is a clear
     /// enough statement of intent.
-    NeedsSignIn,
+    NeedsSignIn {
+        /// Present when the refused operation was a correlated page request.
+        request_id: Option<PageRequestId>,
+    },
     Playlists(Vec<Playlist>),
     /// Contents of an opened playlist. `id` and `title` come back so the UI can
     /// label the list and know which playlist a later removal applies to.
     PlaylistTracks {
+        request_id: PageRequestId,
         id: String,
         title: String,
-        tracks: Vec<Track>,
+        tracks: Result<Vec<Track>, String>,
     },
     /// A row was removed from the open playlist. The id lets the UI drop it
     /// locally rather than re-fetching the whole playlist to lose one line.
@@ -481,6 +506,7 @@ impl SourceWorker {
             Request::SignOut
             | Request::ReportPlay { .. }
             | Request::OpenBrowse { .. }
+            | Request::OpenArtist { .. }
             | Request::Playlists
             | Request::OpenPlaylist { .. }
             | Request::AddToPlaylist { .. }
@@ -524,6 +550,7 @@ fn name(req: &Request) -> &'static str {
         Request::MusicSignIn { .. } => "MusicSignIn",
         Request::ReportPlay { .. } => "ReportPlay",
         Request::OpenBrowse { .. } => "OpenBrowse",
+        Request::OpenArtist { .. } => "OpenArtist",
         Request::Watch { .. } => "Watch",
         Request::MoreQueue { .. } => "MoreQueue",
         Request::SeedQueue { .. } => "SeedQueue",
@@ -572,14 +599,22 @@ fn run(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>, asked: &AtomicU
     // Owned outright by this thread, so its bounded cache and pooled playback
     // client need no locks. Search keeps the older shared client below because
     // it also serves the home and queue parsers.
-    let mut resolver = match Resolver::new(yt.bin()) {
-        Ok(resolver) => resolver,
-        Err(error) => {
-            let _ = tx.send(Response::Failed(error.to_string()));
-            return;
-        }
-    };
-    resolver.set_js_runtime(yt.js_runtime().map(str::to_string));
+    // Search does not depend on the playback resolver. Keep servicing it when
+    // resolver setup fails, and report that failure only to playback requests.
+    let resolver = Resolver::new(yt.bin()).map_err(|error| error.to_string());
+    run_source_loop(yt, rx, tx, asked, resolver);
+}
+
+fn run_source_loop(
+    yt: YouTube,
+    rx: Receiver<Request>,
+    tx: Sender<Response>,
+    asked: &AtomicU64,
+    mut resolver: std::result::Result<Resolver, String>,
+) {
+    if let Ok(active) = resolver.as_mut() {
+        active.set_js_runtime(yt.js_runtime().map(str::to_string));
+    }
     // Resolves taken off the queue. Behind `asked` exactly when the queue holds
     // one the user asked for more recently than the one in hand.
     let mut taken = 0u64;
@@ -590,16 +625,20 @@ fn run(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>, asked: &AtomicU
 
     while let Ok(req) = rx.recv() {
         let response = match req {
-            Request::Search { query, limit } => match search(&yt, tube.as_ref(), &query, limit) {
-                Ok(tracks) => Response::Results(tracks),
-                Err(e) => Response::Failed(format!("{e:#}")),
+            Request::Search {
+                request_id,
+                query,
+                limit,
+            } => Response::Results {
+                request_id,
+                tracks: search(&yt, tube.as_ref(), &query, limit)
+                    .map_err(|error| format!("{error:#}")),
             },
             Request::Resolve {
                 id,
                 title,
                 bypass_cache,
             } => {
-                resolver.set_session(playback_session());
                 taken += 1;
                 // A newer play is already queued behind this one, so nobody is
                 // waiting on it any more. Spending seconds of yt-dlp on it
@@ -610,23 +649,33 @@ fn run(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>, asked: &AtomicU
                 if taken < asked.load(Ordering::SeqCst) {
                     continue;
                 }
-                let stream = resolver
-                    .resolve(ResolveRequest {
-                        video_id: &id,
-                        bypass_cache,
-                    })
-                    .map_err(|error| error.to_string());
+                let stream = match resolver.as_mut() {
+                    Ok(active) => {
+                        active.set_session(playback_session());
+                        active
+                            .resolve(ResolveRequest {
+                                video_id: &id,
+                                bypass_cache,
+                            })
+                            .map_err(|error| error.to_string())
+                    }
+                    Err(error) => Err(error.to_string()),
+                };
                 Response::Resolved { id, title, stream }
             }
             Request::Prefetch { id } => {
-                resolver.set_session(playback_session());
                 // Nothing speculative may run in front of a play. The cache is
                 // still worth consulting -- it is a scan of 32 entries -- so an
                 // already-warm track is still reported as warm.
-                let ready = if taken < asked.load(Ordering::SeqCst) {
-                    resolver.is_cached(&id)
+                let ready = if let Ok(active) = resolver.as_mut() {
+                    active.set_session(playback_session());
+                    if taken < asked.load(Ordering::SeqCst) {
+                        active.is_cached(&id)
+                    } else {
+                        active.prefetch_fast(&id)
+                    }
                 } else {
-                    resolver.prefetch_fast(&id)
+                    false
                 };
                 Response::Prefetched { id, ready }
             }
@@ -798,10 +847,35 @@ fn run_library(rx: Receiver<Request>, tx: Sender<Response>) {
             // honest answer rather than the thread dying silently. Signing out
             // is the exception: deleting a local token file needs no client.
             Err(e) => {
-                let response = if matches!(&req, Request::SignOut) {
-                    sign_out_library(None)
-                } else {
-                    Response::Failed(format!("{e:#}"))
+                let reason = format!("{e:#}");
+                let response = match req {
+                    Request::SignOut => sign_out_library(None),
+                    Request::OpenBrowse {
+                        request_id,
+                        endpoint,
+                        title,
+                    } => Response::Browsed {
+                        request_id,
+                        endpoint,
+                        title,
+                        tracks: Err(reason),
+                    },
+                    Request::OpenArtist { request_id, artist } => Response::Artist {
+                        request_id,
+                        browse_id: artist.endpoint.browse_id.clone(),
+                        page: Box::new(Err(reason)),
+                    },
+                    Request::OpenPlaylist {
+                        request_id,
+                        id,
+                        title,
+                    } => Response::PlaylistTracks {
+                        request_id,
+                        id,
+                        title,
+                        tracks: Err(reason),
+                    },
+                    _ => Response::Failed(reason),
                 };
                 if tx.send(response).is_err() {
                     break;
@@ -851,9 +925,10 @@ fn handle_library(
             // the one part of this that works without Google's permission.
             | Request::ReportPlay { .. }
             | Request::OpenBrowse { .. }
+            | Request::OpenArtist { .. }
     );
     if !library.is_signed_in() && !exempt {
-        return Ok(Some(Response::NeedsSignIn));
+        return Ok(Some(needs_sign_in(&req)));
     }
 
     let response = match req {
@@ -890,14 +965,35 @@ fn handle_library(
             }
             return Ok(None);
         }
-        Request::OpenBrowse { browse_id, title } => Response::Browsed {
-            tracks: home::tracks(library.http(), &browse_id)?,
+        Request::OpenBrowse {
+            request_id,
+            endpoint,
             title,
+        } => Response::Browsed {
+            request_id,
+            tracks: home::tracks_endpoint(library.http(), &endpoint)
+                .map_err(|error| format!("{error:#}")),
+            endpoint,
+            title,
+        },
+        Request::OpenArtist { request_id, artist } => Response::Artist {
+            request_id,
+            browse_id: artist.endpoint.browse_id.clone(),
+            page: Box::new(
+                artist::fetch(library.http(), artist).map_err(|error| format!("{error:#}")),
+            ),
         },
         Request::SignOut => sign_out_library(Some(library)),
         Request::Playlists => Response::Playlists(library.playlists()?),
-        Request::OpenPlaylist { id, title } => Response::PlaylistTracks {
-            tracks: library.tracks(&id, MAX_LIBRARY_TRACKS)?,
+        Request::OpenPlaylist {
+            request_id,
+            id,
+            title,
+        } => Response::PlaylistTracks {
+            request_id,
+            tracks: library
+                .tracks(&id, MAX_LIBRARY_TRACKS)
+                .map_err(|error| format!("{error:#}")),
             id,
             title,
         },
@@ -936,6 +1032,14 @@ fn handle_library(
     };
 
     Ok(Some(response))
+}
+
+fn needs_sign_in(req: &Request) -> Response {
+    let request_id = match req {
+        Request::OpenPlaylist { request_id, .. } => Some(*request_id),
+        _ => None,
+    };
+    Response::NeedsSignIn { request_id }
 }
 
 /// Fetches the panels of the player page.
@@ -1159,5 +1263,67 @@ fn run_art(rx: &Receiver<Request>, tx: &Sender<Response>) {
         if shutting_down {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playlist_auth_failure_keeps_its_page_request_id() {
+        let response = needs_sign_in(&Request::OpenPlaylist {
+            request_id: 73,
+            id: "PLmine".to_string(),
+            title: "My playlist".to_string(),
+        });
+
+        assert!(matches!(
+            response,
+            Response::NeedsSignIn {
+                request_id: Some(73)
+            }
+        ));
+    }
+
+    #[test]
+    fn resolver_startup_failure_is_answered_per_playback_request() {
+        let (request_tx, request_rx) = channel();
+        let (response_tx, response_rx) = channel();
+        request_tx
+            .send(Request::Resolve {
+                id: "video".to_string(),
+                title: "Track".to_string(),
+                bypass_cache: false,
+            })
+            .unwrap();
+        request_tx
+            .send(Request::Prefetch {
+                id: "next".to_string(),
+            })
+            .unwrap();
+        request_tx.send(Request::Shutdown).unwrap();
+
+        run_source_loop(
+            YouTube::default(),
+            request_rx,
+            response_tx,
+            &AtomicU64::new(1),
+            Err("resolver unavailable".to_string()),
+        );
+
+        let response = response_rx.recv().unwrap();
+        assert!(matches!(
+            response,
+            Response::Resolved {
+                id,
+                stream: Err(reason),
+                ..
+            } if id == "video" && reason == "resolver unavailable"
+        ));
+        assert!(matches!(
+            response_rx.recv().unwrap(),
+            Response::Prefetched { id, ready: false } if id == "next"
+        ));
     }
 }

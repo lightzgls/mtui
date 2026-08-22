@@ -28,11 +28,13 @@ use serde_json::Value;
 
 use super::auth::Http;
 use super::cover;
-use super::innertube::{MUSIC_CLIENT_NAME, MUSIC_CLIENT_VERSION, flex_column, parse_duration};
+use super::innertube::{
+    MUSIC_CLIENT_NAME, MUSIC_CLIENT_VERSION, flex_column, flex_runs, parse_duration,
+};
 #[cfg(test)]
 use super::journal::Journal;
 use super::sapisid;
-use super::{Track, UNKNOWN_ARTIST};
+use super::{ArtistRef, BrowseEndpoint, Track, UNKNOWN_ARTIST};
 use crate::config::Cookies;
 
 const ORIGIN: &str = "https://music.youtube.com";
@@ -114,6 +116,10 @@ pub struct Card {
     /// duration for one. The renderer draws this when it is there and drops the
     /// badge when it is not, rather than printing a guess.
     pub duration: Option<std::time::Duration>,
+    /// Lead artist link when the card's metadata carried one. Kept separately
+    /// from the card target because an album can browse itself while still
+    /// naming an artist the page actions can open.
+    pub artist_ref: Option<ArtistRef>,
     pub target: Target,
 }
 
@@ -122,8 +128,10 @@ pub struct Card {
 pub enum Target {
     /// A song or video: resolve and play it.
     Play { video_id: String },
-    /// An album, playlist or artist: fetch its tracks and show them as a list.
-    Open { browse_id: String },
+    /// An album or playlist: fetch its tracks and show them as a list.
+    Open { endpoint: BrowseEndpoint },
+    /// A Music artist has a mixed page rather than a flat track listing.
+    Artist { artist: ArtistRef },
 }
 
 impl Card {
@@ -169,7 +177,8 @@ impl Card {
     pub fn art_key(&self) -> &str {
         match &self.target {
             Target::Play { video_id } => video_id,
-            Target::Open { browse_id } => browse_id,
+            Target::Open { endpoint } => &endpoint.browse_id,
+            Target::Artist { artist } => &artist.endpoint.browse_id,
         }
     }
 
@@ -190,6 +199,7 @@ impl Card {
             uploader: artist(&self.subtitle).unwrap_or(UNKNOWN_ARTIST).to_string(),
             duration: self.duration,
             album: None,
+            artist_ref: self.artist_ref.clone(),
             playlist_item_id: None,
         })
     }
@@ -212,6 +222,7 @@ impl Card {
             // built card is no poorer than a fetched one.
             art: Some(cover::thumb_url(&track.id)),
             duration: track.duration,
+            artist_ref: track.artist_ref.clone(),
             target: Target::Play {
                 video_id: track.id.clone(),
             },
@@ -265,15 +276,13 @@ pub fn is_personalised(shelves: &[Shelf]) -> bool {
         .any(|name| shelves.iter().any(|shelf| shelf.title.starts_with(name)))
 }
 
-/// Tracks behind a card that browses rather than plays: an album, a playlist,
-/// or an artist page.
+/// Tracks behind a collection card that browses rather than plays.
 ///
-/// The three answer with different trees -- an album nests its rows one way, a
-/// playlist another, and either may arrive in a one- or two-column layout -- so
-/// the rows are collected by walking for them rather than by following a path
-/// that is only correct for one of the three.
-pub fn tracks(http: &Http, browse_id: &str) -> Result<Vec<Track>> {
-    let json = browse(http, None, browse_id)?;
+/// Albums and playlists answer with different trees, and either may arrive in
+/// a one- or two-column layout, so rows are found by walking. Artist pages use
+/// their dedicated mixed-content parser instead.
+pub fn tracks_endpoint(http: &Http, endpoint: &BrowseEndpoint) -> Result<Vec<Track>> {
+    let json = browse_endpoint(http, None, endpoint)?;
 
     let mut rows = Vec::new();
     collect(&json, "musicResponsiveListItemRenderer", &mut rows);
@@ -291,7 +300,16 @@ pub fn tracks(http: &Http, browse_id: &str) -> Result<Vec<Track>> {
 
 /// One `browse` call against YouTube Music's internal API.
 pub(super) fn browse(http: &Http, cookies: Option<&Cookies>, browse_id: &str) -> Result<Value> {
-    browse_as(http, cookies, browse_id, MUSIC_CLIENT_VERSION)
+    browse_endpoint(http, cookies, &BrowseEndpoint::new(browse_id))
+}
+
+/// One browse call that preserves the endpoint's optional parameters.
+pub(super) fn browse_endpoint(
+    http: &Http,
+    cookies: Option<&Cookies>,
+    endpoint: &BrowseEndpoint,
+) -> Result<Value> {
+    browse_endpoint_as(http, cookies, endpoint, MUSIC_CLIENT_VERSION)
 }
 
 /// [`browse`], as a stated version of the music client.
@@ -305,7 +323,21 @@ pub(super) fn browse_as(
     browse_id: &str,
     client_version: &str,
 ) -> Result<Value> {
-    let request = browse_request(http, cookies, browse_id, client_version)?;
+    browse_endpoint_as(
+        http,
+        cookies,
+        &BrowseEndpoint::new(browse_id),
+        client_version,
+    )
+}
+
+fn browse_endpoint_as(
+    http: &Http,
+    cookies: Option<&Cookies>,
+    endpoint: &BrowseEndpoint,
+    client_version: &str,
+) -> Result<Value> {
+    let request = browse_request(http, cookies, endpoint, client_version)?;
     let (status, raw) = http.send(request)?;
     if !(200..300).contains(&status) {
         bail!("YouTube Music refused the request: HTTP {status}");
@@ -316,17 +348,15 @@ pub(super) fn browse_as(
 fn browse_request(
     http: &Http,
     cookies: Option<&Cookies>,
-    browse_id: &str,
+    endpoint: &BrowseEndpoint,
     client_version: &str,
 ) -> Result<reqwest::RequestBuilder> {
-    post_request_as(
-        http,
-        BROWSE_URL,
-        cookies,
-        client_version,
-        serde_json::json!({ "browseId": browse_id }),
-    )
-    .with_context(|| format!("could not prepare {browse_id}"))
+    let mut extra = serde_json::json!({ "browseId": endpoint.browse_id });
+    if let Some(params) = &endpoint.params {
+        extra["params"] = Value::String(params.clone());
+    }
+    post_request_as(http, BROWSE_URL, cookies, client_version, extra)
+        .with_context(|| format!("could not prepare {}", endpoint.browse_id))
 }
 
 /// One InnerTube call, signed with the user's cookie when there is one.
@@ -627,8 +657,9 @@ fn push(shelves: &mut Vec<Shelf>, seen: &mut HashSet<String>, title: &str, cards
             Target::Play { video_id } => {
                 !seen.contains(video_id) && within.insert(video_id.clone())
             }
-            // Albums and artists are not songs and cannot collide with them.
-            Target::Open { .. } => true,
+            // Browsable collections and artists are not songs and cannot
+            // collide with them.
+            Target::Open { .. } | Target::Artist { .. } => true,
         })
         .take(SHELF_DEPTH)
         .collect();
@@ -738,6 +769,7 @@ fn queue(json: &Value) -> Vec<Card> {
                     .and_then(runs_text)
                     .as_deref()
                     .and_then(parse_duration),
+                artist_ref: row.pointer("/longBylineText/runs").and_then(artist_ref),
                 target: Target::Play { video_id },
             })
         })
@@ -802,8 +834,9 @@ fn parse_community_playlists(json: &Value) -> Option<Shelf> {
         .iter()
         .filter_map(parse_card)
         .filter_map(|mut card| match &card.target {
-            Target::Open { browse_id }
-                if browse_id.starts_with("VL") && seen.insert(browse_id.clone()) =>
+            Target::Open { endpoint }
+                if endpoint.browse_id.starts_with("VL")
+                    && seen.insert(endpoint.browse_id.clone()) =>
             {
                 if card.kind().is_none() {
                     card.subtitle = if card.subtitle.is_empty() {
@@ -828,43 +861,47 @@ fn parse_community_playlists(json: &Value) -> Option<Shelf> {
 fn parse_card(item: &Value) -> Option<Card> {
     let two_row = &item["musicTwoRowItemRenderer"];
     if two_row.is_object() {
-        let subtitle = two_row
-            .pointer("/subtitle/runs")
-            .and_then(runs_text)
-            .unwrap_or_default();
+        let title = two_row.pointer("/title/runs").and_then(runs_text)?;
+        let subtitle_runs = two_row.pointer("/subtitle/runs");
+        let subtitle = subtitle_runs.and_then(runs_text).unwrap_or_default();
+        let artist_hint = subtitle.split('•').any(|field| field.trim() == "Artist");
         return Some(Card {
-            title: two_row.pointer("/title/runs").and_then(runs_text)?,
+            artist_ref: subtitle_runs.and_then(artist_ref),
+            target: target(&two_row["navigationEndpoint"], &title, artist_hint)?,
+            title,
             duration: subtitle.split('•').map(str::trim).find_map(parse_duration),
             subtitle,
             art: art_url(two_row.pointer("/thumbnailRenderer")),
-            target: target(&two_row["navigationEndpoint"])?,
         });
     }
 
     let row = &item["musicResponsiveListItemRenderer"];
     if row.is_object() {
-        let target = target(&row["navigationEndpoint"])
+        let title = flex_column(row, 0)?;
+        let subtitle = flex_column(row, 1).unwrap_or_default();
+        let artist_hint = subtitle.split('•').any(|field| field.trim() == "Artist");
+        let target = target(&row["navigationEndpoint"], &title, artist_hint)
             .or_else(|| {
                 row.pointer(
                     "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint",
                 )
-                .and_then(target)
+                .and_then(|endpoint| target(endpoint, &title, artist_hint))
             })
             .or_else(|| video_id(row).map(|video_id| Target::Play { video_id }))?;
-        let subtitle = flex_column(row, 1).unwrap_or_default();
         return Some(Card {
-            title: flex_column(row, 0)?,
+            title,
             duration: fixed_column(row, 0)
                 .as_deref()
                 .and_then(parse_duration)
                 .or_else(|| subtitle.split('•').map(str::trim).find_map(parse_duration)),
+            artist_ref: flex_runs(row, 1).and_then(artist_ref),
             subtitle,
             // A list row carries a thumbnail too, but not always: falling back
             // to the video's own means a "Quick picks" row is never the one
             // card on the page drawn without a picture.
             art: art_url(row.pointer("/thumbnail")).or_else(|| match &target {
                 Target::Play { video_id } => Some(cover::thumb_url(video_id)),
-                Target::Open { .. } => None,
+                Target::Open { .. } | Target::Artist { .. } => None,
             }),
             target,
         });
@@ -882,7 +919,7 @@ fn parse_card(item: &Value) -> Option<Card> {
 /// and rewriting the size suffix to ask for a different one is not the shortcut
 /// it appears to be: Google's image CDN answers an invented size with a 500,
 /// and takes half a minute to do it.
-fn art_url(renderer: Option<&Value>) -> Option<String> {
+pub(super) fn art_url(renderer: Option<&Value>) -> Option<String> {
     /// Longest edge worth fetching, in image pixels. Comfortably above the
     /// biggest tile a terminal cell grid can draw -- see [`crate::art::EDGE`].
     const WANTED: u64 = crate::art::EDGE as u64;
@@ -908,7 +945,7 @@ fn art_url(renderer: Option<&Value>) -> Option<String> {
 }
 
 /// What a card's endpoint does, if it does either.
-fn target(endpoint: &Value) -> Option<Target> {
+fn target(endpoint: &Value, label: &str, artist_hint: bool) -> Option<Target> {
     if let Some(id) = endpoint
         .pointer("/watchEndpoint/videoId")
         .and_then(Value::as_str)
@@ -917,11 +954,56 @@ fn target(endpoint: &Value) -> Option<Target> {
             video_id: id.to_string(),
         });
     }
-    let browse_id = endpoint
-        .pointer("/browseEndpoint/browseId")
-        .and_then(Value::as_str)?;
-    Some(Target::Open {
-        browse_id: browse_id.to_string(),
+    let route = browse_route(endpoint)?;
+    if is_artist_endpoint(endpoint) || artist_hint {
+        return Some(Target::Artist {
+            artist: ArtistRef {
+                name: label.to_string(),
+                endpoint: route,
+            },
+        });
+    }
+    Some(Target::Open { endpoint: route })
+}
+
+fn browse_route(endpoint: &Value) -> Option<BrowseEndpoint> {
+    Some(BrowseEndpoint {
+        browse_id: endpoint
+            .pointer("/browseEndpoint/browseId")?
+            .as_str()?
+            .to_string(),
+        params: endpoint
+            .pointer("/browseEndpoint/params")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn is_artist_endpoint(endpoint: &Value) -> bool {
+    matches!(
+        endpoint
+            .pointer(
+                "/browseEndpoint/browseEndpointContextSupportedConfigs/\
+                 browseEndpointContextMusicConfig/pageType",
+            )
+            .and_then(Value::as_str),
+        Some("MUSIC_PAGE_TYPE_ARTIST" | "MUSIC_PAGE_TYPE_USER_CHANNEL")
+    )
+}
+
+/// First linked Music artist in a run list. Collaborations keep their complete
+/// display credit; this chooses only the first stable route for navigation.
+pub(super) fn artist_ref(runs: &Value) -> Option<ArtistRef> {
+    runs.as_array()?.iter().find_map(|run| {
+        let name = run["text"].as_str()?.trim();
+        let endpoint = &run["navigationEndpoint"];
+        if name.is_empty() || !is_artist_endpoint(endpoint) {
+            return None;
+        }
+        Some(ArtistRef {
+            name: name.to_string(),
+            endpoint: browse_route(endpoint)?,
+        })
     })
 }
 
@@ -930,7 +1012,7 @@ fn target(endpoint: &Value) -> Option<Target> {
 /// Three places, and which one is used varies by shelf rather than by anything
 /// about the row: a playlist listing carries it in `playlistItemData`, the
 /// trending shelf only in the play button drawn over its thumbnail.
-fn video_id(row: &Value) -> Option<String> {
+pub(super) fn video_id(row: &Value) -> Option<String> {
     const PATHS: [&str; 3] = [
         "/playlistItemData/videoId",
         "/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer\
@@ -978,6 +1060,7 @@ fn parse_row(row: &Value) -> Option<Track> {
             .and_then(parse_duration)
             .or_else(|| fields.last().copied().and_then(parse_duration)),
         album: flex_column(row, 2).filter(|album| !album.is_empty()),
+        artist_ref: flex_runs(row, 1).and_then(artist_ref),
         // These rows are not the user's to remove; only a Data API listing
         // knows an id that could be.
         playlist_item_id: None,
@@ -986,7 +1069,7 @@ fn parse_row(row: &Value) -> Option<Track> {
 
 /// The duration column of a list row, which is fixed rather than flexible
 /// because it is the one column YouTube never lets the layout drop.
-fn fixed_column(row: &Value, index: usize) -> Option<String> {
+pub(super) fn fixed_column(row: &Value, index: usize) -> Option<String> {
     row.pointer(&format!(
         "/fixedColumns/{index}/musicResponsiveListItemFixedColumnRenderer/text/runs"
     ))
@@ -1143,9 +1226,110 @@ mod tests {
         let card = &parse_shelves(&json)[0].cards[0];
         assert!(!card.is_playable());
         match &card.target {
-            Target::Open { browse_id } => assert_eq!(browse_id, "MPREb_abc"),
-            Target::Play { .. } => panic!("an album is not a video"),
+            Target::Open { endpoint } => assert_eq!(endpoint.browse_id, "MPREb_abc"),
+            Target::Play { .. } | Target::Artist { .. } => panic!("an album is not a video"),
         }
+    }
+
+    #[test]
+    fn an_artist_card_keeps_its_semantic_route_and_params() {
+        let endpoint = serde_json::json!({
+            "browseEndpoint": {
+                "browseId": "UCGz-artist",
+                "params": "opaque-section-params",
+                "browseEndpointContextSupportedConfigs": {
+                    "browseEndpointContextMusicConfig": {
+                        "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                    }
+                }
+            }
+        });
+        let json = shelf(
+            "Artists",
+            vec![card("Tame Impala", "Artist • 30M subscribers", endpoint)],
+        );
+
+        let card = &parse_shelves(&json)[0].cards[0];
+        let Target::Artist { artist } = &card.target else {
+            panic!("an artist page was flattened into a collection");
+        };
+        assert_eq!(artist.name, "Tame Impala");
+        assert_eq!(artist.endpoint.browse_id, "UCGz-artist");
+        assert_eq!(
+            artist.endpoint.params.as_deref(),
+            Some("opaque-section-params")
+        );
+    }
+
+    #[test]
+    fn a_user_channel_page_type_keeps_its_artist_link() {
+        let runs = serde_json::json!([ {
+            "text": "MrSuicideSheep",
+            "navigationEndpoint": {
+                "browseEndpoint": {
+                    "browseId": "UC5nc_ZtjKW1htCVZVRxlQAQ",
+                    "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_USER_CHANNEL"
+                        }
+                    }
+                }
+            }
+        } ]);
+
+        let artist = artist_ref(&runs).expect("a user channel is still an artist route");
+        assert_eq!(artist.name, "MrSuicideSheep");
+        assert_eq!(artist.endpoint.browse_id, "UC5nc_ZtjKW1htCVZVRxlQAQ");
+    }
+
+    #[test]
+    fn an_artist_badge_is_the_fallback_when_page_type_is_missing() {
+        let json = shelf(
+            "Fans might also like",
+            vec![card(
+                "Metronomy",
+                "Artist • 1.15M monthly audience",
+                serde_json::json!({ "browseEndpoint": { "browseId": "UCmetronomy" } }),
+            )],
+        );
+
+        assert!(matches!(
+            parse_shelves(&json)[0].cards[0].target,
+            Target::Artist { .. }
+        ));
+    }
+
+    #[test]
+    fn a_playable_card_keeps_its_linked_artist() {
+        let json = shelf(
+            "Songs",
+            vec![serde_json::json!({ "musicTwoRowItemRenderer": {
+                "title": { "runs": [ { "text": "Let It Happen" } ] },
+                "subtitle": { "runs": [
+                    { "text": "Song • " },
+                    { "text": "Tame Impala", "navigationEndpoint": {
+                        "browseEndpoint": {
+                            "browseId": "UCGz-artist",
+                            "browseEndpointContextSupportedConfigs": {
+                                "browseEndpointContextMusicConfig": {
+                                    "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                }
+                            }
+                        }
+                    } }
+                ] },
+                "navigationEndpoint": { "watchEndpoint": { "videoId": "aBcDeFgHiJk" } }
+            } })],
+        );
+
+        let track = parse_shelves(&json)[0].cards[0].track().unwrap();
+        assert_eq!(
+            track
+                .artist_ref
+                .as_ref()
+                .map(|artist| artist.endpoint.browse_id.as_str()),
+            Some("UCGz-artist")
+        );
     }
 
     fn community_row(id: &str, title: &str, subtitle: &str) -> Value {
@@ -1177,8 +1361,10 @@ mod tests {
         assert_eq!(shelf.cards[0].kind(), Some("Playlist"));
         assert_eq!(shelf.cards[0].detail(), "Alex • 42 songs");
         match &shelf.cards[0].target {
-            Target::Open { browse_id } => assert_eq!(browse_id, "VLone"),
-            Target::Play { .. } => panic!("a community playlist must browse"),
+            Target::Open { endpoint } => assert_eq!(endpoint.browse_id, "VLone"),
+            Target::Play { .. } | Target::Artist { .. } => {
+                panic!("a community playlist must browse")
+            }
         }
     }
 
@@ -1262,13 +1448,13 @@ mod tests {
         )
         .expect("community playlist search should answer");
         let shelf = parse_community_playlists(&json).expect("community playlists should parse");
-        let Target::Open { browse_id } = &shelf.cards[0].target else {
+        let Target::Open { endpoint } = &shelf.cards[0].target else {
             panic!("a community result should open a playlist");
         };
 
-        assert!(browse_id.starts_with("VL"));
+        assert!(endpoint.browse_id.starts_with("VL"));
         assert!(
-            !tracks(&http, browse_id)
+            !tracks_endpoint(&http, endpoint)
                 .expect("the first community playlist should open")
                 .is_empty()
         );
@@ -1438,6 +1624,7 @@ mod tests {
             subtitle: "Song • Someone".to_string(),
             art: None,
             duration: None,
+            artist_ref: None,
             target: Target::Play {
                 video_id: id.to_string(),
             },
@@ -1458,7 +1645,7 @@ mod tests {
             .iter()
             .map(|card| match &card.target {
                 Target::Play { video_id } => video_id.as_str(),
-                Target::Open { .. } => unreachable!(),
+                Target::Open { .. } | Target::Artist { .. } => unreachable!(),
             })
             .collect();
         // Round by round, and a station that runs out is simply skipped rather
@@ -1523,8 +1710,9 @@ mod tests {
             subtitle: "Album • Tame Impala".to_string(),
             art: None,
             duration: None,
+            artist_ref: None,
             target: Target::Open {
-                browse_id: "MPREb_abc".to_string(),
+                endpoint: BrowseEndpoint::new("MPREb_abc"),
             },
         };
 
@@ -1566,6 +1754,7 @@ mod tests {
             uploader: artist.to_string(),
             duration: None,
             album: None,
+            artist_ref: None,
             playlist_item_id: None,
         }
     }

@@ -36,14 +36,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 ///
 /// Registering one takes about two minutes and is done once for the project,
 /// not once per user: <https://discord.com/developers/applications> -> New
-/// Application -> name it `MTUI` -> copy the Application ID here. Nothing else
-/// on that page needs filling in; the artwork this sends is a URL, so there are
-/// no assets to upload.
+/// Application -> name it `MTUI` -> copy the Application ID here. The Public
+/// Key, Client Secret, bot settings and interaction endpoints are not used.
 ///
 /// Empty means the feature is off and says so when asked for, which is the
 /// honest failure: a wrong id would connect, hand Discord a card headed with
 /// somebody else's application name, and look like a bug in MTUI.
-const APPLICATION_ID: &str = "";
+const APPLICATION_ID: &str = "1540750108822339695";
 
 /// Where the "Get MTUI" button goes. Taken from the manifest so the address
 /// lives in one place and cannot drift from the one crates.io publishes.
@@ -188,6 +187,11 @@ impl Activity {
             // rather than "Playing MTUI", and it is the difference between
             // reading as a music player and reading as a game.
             "type": 2,
+            // 2 is Details. It makes Discord use the song title below as the
+            // compact status text on the user card and member list, rather than
+            // the fixed application name. This is the same field Pear Desktop
+            // uses; the expanded activity still identifies MTUI normally.
+            "status_display_type": 2,
             "details": clamp(&self.title),
             "state": clamp(&state),
             "assets": {
@@ -197,6 +201,10 @@ impl Activity {
                 // which is to say, it is not an alternative.
                 "large_image": cover_url(&self.video_id),
                 "large_text": clamp(self.album.as_deref().unwrap_or(&self.title)),
+                // Discord does not show activity buttons on every compact
+                // surface. Linking the artwork gives the repository a second
+                // entry point wherever the client makes activity art clickable.
+                "large_url": REPOSITORY,
             },
             // Two is the maximum, and both are spent deliberately: one so that
             // anyone reading the card can hear the track, one so they can find
@@ -301,16 +309,20 @@ impl Presence {
         // Detached rather than held: see `Drop`. A failure to spawn is treated
         // exactly like Discord being absent, because to the user it is the same
         // thing -- no card, and everything else still playing.
-        let _ = thread::Builder::new()
+        let spawn_error = thread::Builder::new()
             .name("mtui-discord".to_string())
-            .spawn(move || run(&id, &rx));
+            .spawn(move || run(&id, &rx))
+            .err();
+        if let Some(error) = &spawn_error {
+            crate::diagnostics::error("discord", &format!("worker did not start: {error}"));
+        }
 
         Self {
             tx,
             last: None,
             cleared: true,
-            enabled,
-            unavailable: None,
+            enabled: enabled && spawn_error.is_none(),
+            unavailable: spawn_error.map(|_| "the presence worker could not start".to_string()),
         }
     }
 
@@ -387,6 +399,7 @@ impl Drop for Presence {
 /// The worker loop: hold a connection when Discord is there, find one again
 /// when it is not, and never let either concern reach the caller.
 fn run(application_id: &str, rx: &Receiver<Message>) {
+    crate::diagnostics::info("discord", "worker started");
     let mut conn: Option<Connection> = None;
     // The card that should be showing, which is not the card that has been
     // sent: an update arriving inside `MIN_GAP`, or while Discord is closed,
@@ -395,6 +408,7 @@ fn run(application_id: &str, rx: &Receiver<Message>) {
     let mut sent: Option<Activity> = None;
     let mut last_write: Option<Instant> = None;
     let mut next_attempt = Instant::now();
+    let mut unavailable_logged = false;
 
     loop {
         // Whether the card Discord is showing is the card it should be showing.
@@ -420,7 +434,10 @@ fn run(application_id: &str, rx: &Receiver<Message>) {
             Err(RecvTimeoutError::Timeout) => {}
             // The app is on its way out. Nothing to clean up: dropping the
             // connection closes the pipe, which is how Discord is told.
-            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Disconnected) => {
+                crate::diagnostics::info("discord", "worker stopped");
+                return;
+            }
         }
 
         // Nothing to show and nothing showing. Deliberately does not open a
@@ -435,7 +452,23 @@ fn run(application_id: &str, rx: &Receiver<Message>) {
                 continue;
             }
             next_attempt = Instant::now() + RECONNECT;
-            conn = Connection::open(application_id).ok();
+            conn = match Connection::open(application_id) {
+                Ok(connection) => {
+                    crate::diagnostics::info("discord", "connected");
+                    unavailable_logged = false;
+                    Some(connection)
+                }
+                Err(error) => {
+                    if !unavailable_logged {
+                        crate::diagnostics::warn(
+                            "discord",
+                            &format!("connection unavailable; retrying: {error}"),
+                        );
+                        unavailable_logged = true;
+                    }
+                    None
+                }
+            };
             if conn.is_none() {
                 continue;
             }
@@ -465,13 +498,25 @@ fn run(application_id: &str, rx: &Receiver<Message>) {
 
         match active.set_activity(wanted.as_ref()) {
             Ok(()) => {
+                crate::diagnostics::info(
+                    "discord",
+                    if wanted.is_some() {
+                        "activity updated"
+                    } else {
+                        "activity cleared"
+                    },
+                );
                 sent = wanted.clone();
                 last_write = Some(Instant::now());
             }
             // Discord closed, or was closed. Drop the connection and let the
             // reconnect path pick it up; `wanted` survives, so whatever is
             // playing goes back up the moment Discord returns.
-            Err(_) => {
+            Err(error) => {
+                crate::diagnostics::error(
+                    "discord",
+                    &format!("activity update failed; reconnecting: {error}"),
+                );
                 conn = None;
                 sent = None;
                 next_attempt = Instant::now() + RECONNECT;
@@ -817,10 +862,12 @@ mod tests {
     fn the_payload_says_listening_and_carries_both_buttons() {
         let payload = activity().payload();
         assert_eq!(payload["type"], 2);
+        assert_eq!(payload["status_display_type"], 2);
         assert_eq!(payload["details"], "Let It Happen");
         assert_eq!(payload["state"], "Tame Impala");
         assert_eq!(payload["large_text"], serde_json::Value::Null);
         assert_eq!(payload["assets"]["large_text"], "Currents");
+        assert_eq!(payload["assets"]["large_url"], REPOSITORY);
         assert!(
             payload["assets"]["large_image"]
                 .as_str()
@@ -891,13 +938,12 @@ mod tests {
     }
 
     #[test]
-    fn a_build_with_no_application_id_stays_switched_off() {
-        // What a user of an unconfigured build meets: the key answers, the
-        // answer explains itself, and nothing ever opens a socket.
+    fn a_blank_override_uses_the_built_in_application_id() {
+        // An empty discord.json must not disable the official project id.
+        assert!(!APPLICATION_ID.is_empty());
         let mut presence = Presence::spawn(Some("   ".to_string()), true);
-        assert!(!presence.enabled);
+        assert!(presence.enabled);
         assert!(!presence.toggle());
-        assert!(presence.status().contains("application id"));
     }
 
     #[test]

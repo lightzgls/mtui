@@ -22,6 +22,18 @@ jobs:
           rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
           rustup default stable-x86_64-pc-windows-msvc
 
+      - name: Verify release tag
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object { $_.name -eq "mtui" }).version
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match Cargo version $version"
+          }
+
+      - name: Test
+        run: cargo test --workspace --all-targets --locked
+
       # webview2-com statically links WebView2Loader on MSVC. GNU links the DLL
       # dynamically, which would turn the release into a two-file download.
       - name: Build single-file Windows release

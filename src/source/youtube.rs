@@ -147,6 +147,7 @@ impl YouTube {
                 // A flat search listing carries no album; only the music
                 // corpus knows one.
                 album: None,
+                artist_ref: None,
                 // Search results are not in a playlist.
                 playlist_item_id: None,
                 id: e.id,
@@ -328,6 +329,7 @@ mod tests {
             uploader: "u".into(),
             duration: secs.map(Duration::from_secs),
             album: None,
+            artist_ref: None,
             playlist_item_id: None,
         };
         assert_eq!(t(Some(65)).duration_str(), "1:05");

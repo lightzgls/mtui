@@ -4,6 +4,7 @@
 //! resolution lives in `mtui-resolver`, while the worker here decides when that
 //! potentially blocking work may run.
 
+pub mod artist;
 pub mod auth;
 pub mod bootstrap;
 #[cfg(test)]
@@ -67,6 +68,31 @@ pub fn resolve_stream(
 /// which write it and the places which suppress it cannot drift apart.
 pub const UNKNOWN_ARTIST: &str = "unknown";
 
+/// A YouTube Music browse route, including the opaque parameters some pages
+/// require in addition to their id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BrowseEndpoint {
+    pub browse_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<String>,
+}
+
+impl BrowseEndpoint {
+    pub fn new(browse_id: impl Into<String>) -> Self {
+        Self {
+            browse_id: browse_id.into(),
+            params: None,
+        }
+    }
+}
+
+/// A named, stable route to an artist page.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArtistRef {
+    pub name: String,
+    pub endpoint: BrowseEndpoint,
+}
+
 /// A track as shown in search results. Deliberately small and owned -- these
 /// are held in bounded `Vec`s and dropped as soon as the user moves on.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -82,6 +108,11 @@ pub struct Track {
     /// Album, when the source knows one. YouTube Music supplies it; a plain
     /// YouTube search cannot, and singles genuinely have none.
     pub album: Option<String>,
+    /// Canonical Music artist route when the source exposed one. A display
+    /// name alone is never promoted into a route because channel names are not
+    /// stable artist identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artist_ref: Option<ArtistRef>,
     /// Identifies this row within one playlist. Only playlist listings have it.
     #[serde(default)]
     pub playlist_item_id: Option<String>,

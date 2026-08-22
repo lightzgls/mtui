@@ -1,54 +1,48 @@
 <#
 .SYNOPSIS
-    Builds assets/mtui.ico from canvas.png.
+    Builds MTUI's preview PNG and multi-size Windows icons.
 
 .DESCRIPTION
-    Committed alongside the .ico it produces, because the icon is not a
-    straight copy of the drawing and the difference is worth being able to
-    reproduce.
+    Draws four original MTUI marks at 512px, then creates every Windows icon
+    size from those masters. Signal combines an open terminal
+    prompt with an audio meter; Wave is an oscilloscope trace; Mono is a quiet
+    monochrome Signal. Orbit adds a circular music cue without using YouTube's
+    red concentric disc or play-button silhouette.
 
-    Two things happen here that a plain "save as .ico" would not do:
-
-    The white square goes. canvas.png is a red disc painted on an opaque white
-    background, and an icon that keeps it is a white tile on the taskbar rather
-    than a disc. The white is removed by flooding inwards from the border, so
-    only the paper *around* the disc is taken -- the white ring and the play
-    triangle inside it are walled off by solid red and survive. Pixels the
-    drawing anti-aliased into the paper are not simply dropped either: a pixel
-    that is a mix of red and white becomes pure red at the alpha that mix
-    implies, which is what keeps the rim from turning into a pink fringe on a
-    dark taskbar.
-
-    And every size is drawn from the 500px original rather than from the next
-    size up, so the 16px entry -- the one that ends up in the title bar and the
-    taskbar, and the only one most people ever look at -- is a single clean
-    downsample instead of a chain of them.
+    assets/mtui-icon.svg is the portable vector version of the same artwork.
 
 .EXAMPLE
-    pwsh -File scripts/make-icon.ps1
+    powershell -ExecutionPolicy Bypass -File scripts/make-icon.ps1
 #>
 [CmdletBinding()]
 param(
-    [string]$Source,
-    [string]$Output
+    [string]$Canvas,
+    [string]$Output,
+    [string]$WaveOutput,
+    [string]$MonoOutput,
+    [string]$OrbitOutput
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 
-# Not defaulted in the param block: $PSScriptRoot is not filled in yet while
-# those are being bound, and the repo-relative paths would come out rooted at
-# whatever directory the script was run from.
 $root = Split-Path -Parent $PSScriptRoot
-if (-not $Source) { $Source = Join-Path $root 'canvas.png' }
+if (-not $Canvas) { $Canvas = Join-Path $root 'canvas.png' }
 if (-not $Output) { $Output = Join-Path $root 'assets\mtui.ico' }
+if (-not $WaveOutput) { $WaveOutput = Join-Path $root 'assets\mtui-wave.ico' }
+if (-not $MonoOutput) { $MonoOutput = Join-Path $root 'assets\mtui-mono.ico' }
+if (-not $OrbitOutput) { $OrbitOutput = Join-Path $root 'assets\mtui-orbit.ico' }
 
-$source = (Resolve-Path -LiteralPath $Source).Path
+$canvasDir = Split-Path -Parent $Canvas
 $outDir = Split-Path -Parent $Output
-if (-not (Test-Path -LiteralPath $outDir)) {
-    New-Item -ItemType Directory -Path $outDir | Out-Null
+$waveOutDir = Split-Path -Parent $WaveOutput
+$monoOutDir = Split-Path -Parent $MonoOutput
+$orbitOutDir = Split-Path -Parent $OrbitOutput
+foreach ($dir in @($canvasDir, $outDir, $waveOutDir, $monoOutDir, $orbitOutDir)) {
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir | Out-Null
+    }
 }
-$output = Join-Path (Resolve-Path -LiteralPath $outDir).Path (Split-Path -Leaf $Output)
 
 Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
 using System;
@@ -61,96 +55,177 @@ using System.Runtime.InteropServices;
 
 public static class MtuiIcon
 {
-    // What Windows asks for, and nothing else. 16 is the title bar and the
-    // taskbar, 32 the alt-tab and shortcut overlay, 48 the medium view in
-    // Explorer, 256 the extra-large one; 24, 64 and 128 keep the in-between
-    // scalings (125%, 150%, 200% displays) from being resampled by the shell.
     static readonly int[] Sizes = { 16, 24, 32, 48, 64, 128, 256 };
-
-    // Entries this size and up are stored as PNG rather than a raw bitmap.
-    // A 256px entry uncompressed is 256 KB of the binary; as PNG it is a few.
-    // The small ones stay uncompressed, which every icon reader understands.
+    const int MasterSize = 512;
     const int PngFrom = 128;
 
-    // Anything greener than this is paper or paper blending into the disc.
-    // The disc itself is pure red -- green 0 -- so the margin is enormous and
-    // the exact threshold does not matter.
-    const int PaperGreen = 40;
-
-    public static void Build(string sourcePath, string outputPath)
+    public static void Build(
+        string canvasPath,
+        string signalPath,
+        string wavePath,
+        string monoPath,
+        string orbitPath)
     {
-        using (Bitmap art = Knockout(sourcePath))
+        using (Bitmap signal = DrawArt(0))
         {
-            List<int> dims = new List<int>();
-            List<byte[]> images = new List<byte[]>();
-            foreach (int size in Sizes)
+            signal.Save(canvasPath, ImageFormat.Png);
+            BuildIcon(signal, signalPath);
+        }
+        using (Bitmap wave = DrawArt(1))
+        {
+            BuildIcon(wave, wavePath);
+        }
+        using (Bitmap mono = DrawArt(2))
+        {
+            BuildIcon(mono, monoPath);
+        }
+        using (Bitmap orbit = DrawArt(3))
+        {
+            BuildIcon(orbit, orbitPath);
+        }
+    }
+
+    static void BuildIcon(Bitmap art, string path)
+    {
+        List<int> dims = new List<int>();
+        List<byte[]> images = new List<byte[]>();
+        foreach (int size in Sizes)
+        {
+            using (Bitmap scaled = Resize(art, size))
             {
-                using (Bitmap scaled = Resize(art, size))
-                {
-                    dims.Add(size);
-                    images.Add(size >= PngFrom ? Png(scaled) : Dib(scaled));
-                }
+                dims.Add(size);
+                images.Add(size >= PngFrom ? Png(scaled) : Dib(scaled));
             }
-            Write(outputPath, dims, images);
         }
+        WriteIcon(path, dims, images);
     }
 
-    /// The drawing with the paper around the disc taken out of it.
-    static Bitmap Knockout(string path)
+    static Bitmap DrawArt(int style)
     {
-        using (Bitmap src = new Bitmap(path))
+        Bitmap art = new Bitmap(MasterSize, MasterSize, PixelFormat.Format32bppArgb);
+        using (Graphics g = Graphics.FromImage(art))
         {
-            int w = src.Width, h = src.Height;
-            int[] px = Read(src);
-            bool[] paper = new bool[w * h];
-            Flood(px, paper, w, h);
+            g.Clear(Color.Transparent);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.CompositingQuality = CompositingQuality.HighQuality;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
 
-            for (int i = 0; i < px.Length; i++)
+            if (style == 3)
             {
-                if (!paper[i]) continue;
-                // The pixel is red mixed with white. Undo the mix: the green
-                // channel says how much white is in it, and what is left is
-                // red at that much alpha. Fully white gives alpha 0 -- and it
-                // still gives *red*, so that scaling this image later blends
-                // red into red at the rim instead of dragging white in.
-                int alpha = 255 - ((px[i] >> 8) & 0xFF);
-                px[i] = (alpha << 24) | 0x00FF0000;
+                DrawTile(g, Color.FromArgb(255, 7, 24, 33), Color.FromArgb(255, 22, 71, 91));
+                DrawOrbit(g);
             }
+            else if (style == 1)
+            {
+                DrawTile(g, Color.FromArgb(255, 17, 13, 31), Color.FromArgb(255, 58, 47, 88));
+                DrawWave(g);
+            }
+            else if (style == 2)
+            {
+                DrawTile(g, Color.FromArgb(255, 11, 13, 16), Color.FromArgb(255, 48, 54, 61));
+                DrawSignal(g, Color.FromArgb(255, 241, 245, 249), Color.FromArgb(255, 148, 163, 184));
+            }
+            else
+            {
+                DrawTile(g, Color.FromArgb(255, 11, 16, 32), Color.FromArgb(255, 36, 49, 74));
+                DrawSignal(g, Color.FromArgb(255, 73, 215, 242), Color.FromArgb(255, 101, 245, 181));
+            }
+        }
+        return art;
+    }
 
-            return Write(px, w, h);
+    static void DrawTile(Graphics g, Color background, Color edge)
+    {
+        using (GraphicsPath tile = RoundedRect(24, 24, 464, 464, 104))
+        using (SolidBrush brush = new SolidBrush(background))
+            g.FillPath(brush, tile);
+        using (GraphicsPath rim = RoundedRect(30, 30, 452, 452, 98))
+        using (Pen border = new Pen(edge, 8))
+            g.DrawPath(border, rim);
+    }
+
+    static void DrawSignal(Graphics g, Color promptColor, Color meterColor)
+    {
+        Point[] prompt = {
+            new Point(122, 186),
+            new Point(196, 256),
+            new Point(122, 326)
+        };
+        using (Pen promptPen = new Pen(promptColor, 44))
+        {
+            promptPen.StartCap = LineCap.Round;
+            promptPen.EndCap = LineCap.Round;
+            promptPen.LineJoin = LineJoin.Round;
+            g.DrawLines(promptPen, prompt);
+        }
+
+        int[] xs = { 250, 312, 374 };
+        int[] tops = { 216, 158, 202 };
+        int[] bottoms = { 296, 354, 310 };
+        using (Pen meter = new Pen(meterColor, 38))
+        {
+            meter.StartCap = LineCap.Round;
+            meter.EndCap = LineCap.Round;
+            for (int i = 0; i < xs.Length; i++)
+                g.DrawLine(meter, xs[i], tops[i], xs[i], bottoms[i]);
         }
     }
 
-    /// Marks every pixel reachable from the border without crossing the disc.
-    static void Flood(int[] px, bool[] paper, int w, int h)
+    static void DrawWave(Graphics g)
     {
-        Stack<int> stack = new Stack<int>();
-        for (int x = 0; x < w; x++)
+        Point[] points = {
+            new Point(98, 272),
+            new Point(146, 272),
+            new Point(182, 206),
+            new Point(224, 326),
+            new Point(272, 162),
+            new Point(316, 336),
+            new Point(354, 230),
+            new Point(414, 230)
+        };
+        using (Pen wave = new Pen(Color.FromArgb(255, 167, 139, 250), 34))
         {
-            Take(px, paper, stack, x);
-            Take(px, paper, stack, (h - 1) * w + x);
+            wave.StartCap = LineCap.Round;
+            wave.EndCap = LineCap.Round;
+            wave.LineJoin = LineJoin.Round;
+            g.DrawLines(wave, points);
         }
-        for (int y = 0; y < h; y++)
+        using (SolidBrush cursor = new SolidBrush(Color.FromArgb(255, 251, 191, 36)))
+            g.FillRectangle(cursor, 376, 330, 44, 44);
+    }
+
+    static void DrawOrbit(Graphics g)
+    {
+        using (Pen orbit = new Pen(Color.FromArgb(255, 64, 207, 232), 34))
         {
-            Take(px, paper, stack, y * w);
-            Take(px, paper, stack, y * w + w - 1);
+            orbit.StartCap = LineCap.Round;
+            orbit.EndCap = LineCap.Round;
+            g.DrawArc(orbit, 106, 106, 300, 300, 28, 132);
+            g.DrawArc(orbit, 106, 106, 300, 300, 208, 132);
         }
-        while (stack.Count > 0)
+
+        int[] xs = { 210, 256, 302 };
+        int[] tops = { 222, 174, 204 };
+        int[] bottoms = { 290, 338, 308 };
+        using (Pen meter = new Pen(Color.FromArgb(255, 111, 242, 190), 34))
         {
-            int i = stack.Pop();
-            int x = i % w, y = i / w;
-            if (x > 0) Take(px, paper, stack, i - 1);
-            if (x < w - 1) Take(px, paper, stack, i + 1);
-            if (y > 0) Take(px, paper, stack, i - w);
-            if (y < h - 1) Take(px, paper, stack, i + w);
+            meter.StartCap = LineCap.Round;
+            meter.EndCap = LineCap.Round;
+            for (int i = 0; i < xs.Length; i++)
+                g.DrawLine(meter, xs[i], tops[i], xs[i], bottoms[i]);
         }
     }
 
-    static void Take(int[] px, bool[] paper, Stack<int> stack, int i)
+    static GraphicsPath RoundedRect(int x, int y, int width, int height, int radius)
     {
-        if (paper[i] || ((px[i] >> 8) & 0xFF) <= PaperGreen) return;
-        paper[i] = true;
-        stack.Push(i);
+        GraphicsPath path = new GraphicsPath();
+        int d = radius * 2;
+        path.AddArc(x, y, d, d, 180, 90);
+        path.AddArc(x + width - d, y, d, d, 270, 90);
+        path.AddArc(x + width - d, y + height - d, d, d, 0, 90);
+        path.AddArc(x, y + height - d, d, d, 90, 90);
+        path.CloseFigure();
+        return path;
     }
 
     static Bitmap Resize(Bitmap src, int size)
@@ -158,16 +233,11 @@ public static class MtuiIcon
         Bitmap dst = new Bitmap(size, size, PixelFormat.Format32bppArgb);
         using (Graphics g = Graphics.FromImage(dst))
         {
-            // SourceCopy, not the default SourceOver: the destination starts
-            // out transparent, and blending onto it would multiply the alpha
-            // of the rim by itself and leave the disc with a chewed edge.
             g.CompositingMode = CompositingMode.SourceCopy;
             g.InterpolationMode = InterpolationMode.HighQualityBicubic;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
             using (ImageAttributes attrs = new ImageAttributes())
             {
-                // Without this the sampler reads past the edge of the source
-                // and mixes in transparent black, thinning the outermost row.
                 attrs.SetWrapMode(WrapMode.TileFlipXY);
                 g.DrawImage(src, new Rectangle(0, 0, size, size),
                             0, 0, src.Width, src.Height, GraphicsUnit.Pixel, attrs);
@@ -176,8 +246,6 @@ public static class MtuiIcon
         return dst;
     }
 
-    /// An entry in the uncompressed form: a header claiming twice the real
-    /// height, the colours bottom-up, then a 1-bit mask underneath them.
     static byte[] Dib(Bitmap b)
     {
         int w = b.Width, h = b.Height;
@@ -186,22 +254,19 @@ public static class MtuiIcon
 
         MemoryStream ms = new MemoryStream();
         BinaryWriter bw = new BinaryWriter(ms);
-        bw.Write(40);                               // header size
+        bw.Write(40);
         bw.Write(w);
-        bw.Write(h * 2);                            // colours and mask together
-        bw.Write((short)1);                         // planes
-        bw.Write((short)32);                        // bits per pixel
-        bw.Write(0);                                // uncompressed
+        bw.Write(h * 2);
+        bw.Write((short)1);
+        bw.Write((short)32);
+        bw.Write(0);
         bw.Write(w * h * 4 + maskStride * h);
         bw.Write(0); bw.Write(0); bw.Write(0); bw.Write(0);
 
         for (int y = h - 1; y >= 0; y--)
             for (int x = 0; x < w; x++)
-                bw.Write(px[y * w + x]);            // little-endian: B,G,R,A
+                bw.Write(px[y * w + x]);
 
-        // The mask is what a reader too old to know about the alpha channel
-        // uses instead. Nothing modern reads it, and leaving it wrong is how
-        // an icon ends up with a black box behind it in some forgotten dialog.
         byte[] row = new byte[maskStride];
         for (int y = h - 1; y >= 0; y--)
         {
@@ -223,25 +288,24 @@ public static class MtuiIcon
         return ms.ToArray();
     }
 
-    static void Write(string path, List<int> dims, List<byte[]> images)
+    static void WriteIcon(string path, List<int> dims, List<byte[]> images)
     {
         using (FileStream fs = new FileStream(path, FileMode.Create, FileAccess.Write))
         {
             BinaryWriter bw = new BinaryWriter(fs);
-            bw.Write((short)0);                     // reserved
-            bw.Write((short)1);                     // an icon, not a cursor
+            bw.Write((short)0);
+            bw.Write((short)1);
             bw.Write((short)images.Count);
 
             int offset = 6 + 16 * images.Count;
             for (int i = 0; i < images.Count; i++)
             {
-                // One byte per side, so 256 has to be written as 0.
                 byte dim = dims[i] >= 256 ? (byte)0 : (byte)dims[i];
                 bw.Write(dim); bw.Write(dim);
-                bw.Write((byte)0);                  // not a palette
-                bw.Write((byte)0);                  // reserved
-                bw.Write((short)1);                 // planes
-                bw.Write((short)32);                // bits per pixel
+                bw.Write((byte)0);
+                bw.Write((byte)0);
+                bw.Write((short)1);
+                bw.Write((short)32);
                 bw.Write(images[i].Length);
                 bw.Write(offset);
                 offset += images[i].Length;
@@ -262,20 +326,13 @@ public static class MtuiIcon
         b.UnlockBits(data);
         return px;
     }
-
-    static Bitmap Write(int[] px, int w, int h)
-    {
-        Bitmap b = new Bitmap(w, h, PixelFormat.Format32bppArgb);
-        BitmapData data = b.LockBits(new Rectangle(0, 0, w, h),
-                                     ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-        for (int y = 0; y < h; y++)
-            Marshal.Copy(px, y * w,
-                         new IntPtr(data.Scan0.ToInt64() + (long)y * data.Stride), w);
-        b.UnlockBits(data);
-        return b;
-    }
 }
 '@
 
-[MtuiIcon]::Build($source, $output)
-Write-Host ("wrote {0} ({1:N0} bytes)" -f $output, (Get-Item -LiteralPath $output).Length)
+$canvasPath = [System.IO.Path]::GetFullPath($Canvas)
+$outputPath = [System.IO.Path]::GetFullPath($Output)
+$wavePath = [System.IO.Path]::GetFullPath($WaveOutput)
+$monoPath = [System.IO.Path]::GetFullPath($MonoOutput)
+$orbitPath = [System.IO.Path]::GetFullPath($OrbitOutput)
+[MtuiIcon]::Build($canvasPath, $outputPath, $wavePath, $monoPath, $orbitPath)
+Write-Host ("wrote {0}, {1}, {2}, {3}, and {4}" -f $canvasPath, $outputPath, $wavePath, $monoPath, $orbitPath)

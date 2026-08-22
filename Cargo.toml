@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "mtui"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "A terminal music player for YouTube Music, built to stay small in memory"
 license = "MIT"
@@ -91,6 +91,7 @@ form_urlencoded = { version = "1", default-features = false }
 # per glyph but two terminal columns, so counting chars silently overflows the
 # row and pushes every column out of line.
 unicode-width = { version = "0.2", default-features = false }
+unicode-segmentation = { version = "1.13", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # A first-party sign-in surface for YouTube Music Home. WebView2 uses the Edge

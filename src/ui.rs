@@ -14,15 +14,18 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{
     App, CardShape, CoverSize, ImagePlan, MenuItem, MenuPage, Mode, NowPlaying, Overlay, Panel,
     RelatedRow, SignIn, Tab, View,
 };
 use crate::art::ArtCache;
+use crate::config::CoverStyle;
 use crate::graphics::Graphics;
 use crate::player::{PlayState, Snapshot};
 use crate::source::Track;
+use crate::source::artist::{ArtistPage, ArtistSong};
 use crate::source::cover::Cover;
 use crate::source::home::{Card, Shelf};
 use crate::source::library::Playlist;
@@ -112,7 +115,7 @@ const HINTS_PLAYING: &str = "Tab panels  Esc back  ^K menu  . actions";
 const MENU_MAX_WIDTH: u16 = 56;
 const MENU_MAX_HEIGHT: u16 = 24;
 const SETTINGS_WIDTH: u16 = 56;
-const SETTINGS_HEIGHT: u16 = 10;
+const SETTINGS_HEIGHT: u16 = 16;
 
 /// Full height of the sign-in panel, borders included. Below this the compact
 /// layout runs instead.
@@ -276,6 +279,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 View::Home => render_home(frame, app, area),
                 View::Tracks => render_results(frame, app, area),
                 View::Playlists => render_playlists(frame, app, area),
+                View::Artist => render_artist(frame, app, area),
                 // Handled above.
                 View::Playing => {}
             }
@@ -302,8 +306,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         // showing through. Dropping the plan is what puts the existing
         // clear-and-redraw path to work erasing it.
         _ if app.overlay.is_open() || app.menu().is_some() => None,
-        (Some(area), Some(cover)) if app.graphics.sixel => {
+        (Some(area), Some(cover)) if app.cover_style == CoverStyle::Pixel && app.graphics.sixel => {
             plan_image(frame, cover, area, app.graphics, size)
+        }
+        (Some(area), Some(cover)) if app.cover_style == CoverStyle::ColoredAscii => {
+            render_ascii_cover(frame, cover, area, size);
+            None
         }
         (Some(area), Some(cover)) => {
             render_cover(frame, cover, area, size);
@@ -641,6 +649,11 @@ fn render_settings(frame: &mut Frame, app: &App) {
     } else {
         "Available on Windows only."
     };
+    let icon_description = if cfg!(windows) {
+        "Changes MTUI's notification-area icon."
+    } else {
+        "Available on Windows only."
+    };
     let lines = vec![
         setting_line(
             "Keep notification-area icon",
@@ -659,8 +672,26 @@ fn render_settings(frame: &mut Frame, app: &App) {
             ambient(app),
         ),
         muted_detail("Shares the current track and playback state.", width),
+        Line::from(""),
+        choice_line(
+            "Song cover",
+            app.cover_style().label(),
+            app.settings_selected() == 2,
+            width,
+            ambient(app),
+        ),
+        muted_detail("Pixel keeps detail; ASCII uses colored glyphs.", width),
+        Line::from(""),
+        choice_line(
+            "App icon",
+            app.icon_theme().label(),
+            app.settings_selected() == 3,
+            width,
+            ambient(app),
+        ),
+        muted_detail(icon_description, width),
     ];
-    let selected_line = if app.settings_selected() == 0 { 0 } else { 3 };
+    let selected_line = app.settings_selected() * 3;
     let offset = centred_offset(selected_line, content_height as usize, lines.len());
     frame.render_widget(
         Paragraph::new(
@@ -698,6 +729,22 @@ fn setting_line(
     Line::from(Span::styled(text, style))
 }
 
+fn choice_line(
+    label: &str,
+    value: &str,
+    selected: bool,
+    width: usize,
+    ambient: Color,
+) -> Line<'static> {
+    let text = padded(&format!("  {label}: < {value} >"), width);
+    let style = if selected {
+        highlight(ambient)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    Line::from(Span::styled(text, style))
+}
+
 fn muted_detail(text: &str, width: usize) -> Line<'static> {
     Line::from(Span::styled(
         truncate(&format!("    {text}"), width),
@@ -706,8 +753,8 @@ fn muted_detail(text: &str, width: usize) -> Line<'static> {
 }
 
 fn settings_footer(width: usize) -> String {
-    const FULL: &str = " ↑↓ move  Space/Enter toggle  Esc close";
-    const COMPACT: &str = "↑↓ Space/Enter Esc";
+    const FULL: &str = " ↑↓ move  ←→ change  Space/Enter  Esc close";
+    const COMPACT: &str = "↑↓ ←→ Space/Enter Esc";
     let hint = if display_width(FULL) <= width {
         FULL
     } else {
@@ -1064,6 +1111,45 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Wraps prose without allowing a language that omits spaces to overhang.
+fn bounded_wrap(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    for line in wrap(text, width) {
+        if display_width(&line) <= width {
+            lines.push(line);
+            continue;
+        }
+
+        let mut chunk = String::new();
+        let mut used = 0;
+        for grapheme in line.graphemes(true) {
+            let size = display_width(grapheme).max(1);
+            if size > width {
+                if !chunk.is_empty() {
+                    lines.push(std::mem::take(&mut chunk));
+                    used = 0;
+                }
+                lines.push(truncate(grapheme, width));
+            } else {
+                if used + size > width {
+                    lines.push(std::mem::take(&mut chunk));
+                    used = 0;
+                }
+                chunk.push_str(grapheme);
+                used += size;
+            }
+        }
+        if !chunk.is_empty() {
+            lines.push(chunk);
+        }
+    }
+    lines
+}
+
 fn render_add_to(frame: &mut Frame, app: &App, title: &str, selected: usize) {
     let rows = app.playlists.len().clamp(1, 12) as u16;
     let area = centred(frame.area(), 56, rows + 4);
@@ -1222,7 +1308,7 @@ fn split_cover(app: &App, area: Rect) -> (Option<Rect>, Option<Rect>) {
     // not what someone browsing for the next track is looking at. `c` still
     // takes the whole window, which is an explicit request rather than a
     // default.
-    if app.view == View::Home {
+    if matches!(app.view, View::Home | View::Artist) {
         return (Some(area), None);
     }
     let width = (area.width * 2 / 5).clamp(COVER_MIN_WIDTH, COVER_MAX_WIDTH);
@@ -1390,6 +1476,484 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
     app.want_art(wanted);
 }
 
+const ARTIST_TOP_SONG_ROWS: u16 = 6;
+
+fn render_artist(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::bordered().title(app.list_title());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let accent = ambient(app);
+    let art = &app.art;
+    let mut wanted = Vec::new();
+    {
+        let Some(view) = app.artist.as_mut() else {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "artist unavailable",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                inner,
+            );
+            return;
+        };
+        let page = match &view.page {
+            Panel::Ready(page) => page,
+            Panel::Empty(reason) => {
+                let message = format!("{reason} -- press r to try again");
+                frame.render_widget(
+                    Paragraph::new(Span::styled(message, Style::default().fg(Color::DarkGray))),
+                    inner,
+                );
+                return;
+            }
+            panel => {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        waiting_on(panel),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    inner,
+                );
+                return;
+            }
+        };
+
+        let header_height = artist_header_height(inner.height);
+        let [header, content] =
+            Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)]).areas(inner);
+        let header_art = if artist_header_art_width(header, page.art.is_some()) > 0 {
+            page.art.as_ref().and_then(|url| {
+                let key = page.art_key();
+                wanted.push((key.clone(), Some(url.clone())));
+                art.get(&key)
+            })
+        } else {
+            None
+        };
+        render_artist_header(frame, page, header_art, header, accent);
+
+        let has_songs = !page.top_songs.is_empty();
+        let sections = page.shelves.len() + usize::from(has_songs);
+        if sections == 0 || content.is_empty() {
+            return;
+        }
+        view.section = view.section.min(sections - 1);
+        view.top = view.top.min(view.section);
+        view.scroll.resize(page.shelves.len(), 0);
+
+        let max_shape = CardShape::ALL
+            .into_iter()
+            .find(|shape| card_size(*shape).1 < content.height)
+            .unwrap_or(CardShape::Text);
+        let mut layouts = artist_layouts(page, content, view.top, max_shape);
+        while !layouts.iter().any(|layout| layout.section == view.section)
+            && view.top < view.section
+        {
+            view.top += 1;
+            layouts = artist_layouts(page, content, view.top, max_shape);
+        }
+
+        for layout in layouts {
+            match layout.kind {
+                ArtistSection::Songs => {
+                    view.song = view.song.min(page.top_songs.len().saturating_sub(1));
+                    render_artist_songs(
+                        frame,
+                        &page.top_songs,
+                        layout.area,
+                        view.section == layout.section,
+                        view.song,
+                        &mut view.song_offset,
+                        accent,
+                    );
+                }
+                ArtistSection::Shelf(index) => {
+                    let Some(shelf) = page.shelves.get(index) else {
+                        continue;
+                    };
+                    let offset = &mut view.scroll[index];
+                    let cursor = artist_shelf_cursor(
+                        &mut view.card,
+                        offset,
+                        view.section == layout.section,
+                        layout.across as usize,
+                        shelf.cards.len(),
+                    );
+                    let mut tiles = Tiles {
+                        shape: layout.shape,
+                        art,
+                        wanted: &mut wanted,
+                    };
+                    render_shelf(
+                        frame,
+                        shelf,
+                        layout.area,
+                        cursor,
+                        (layout.across, layout.slot),
+                        &mut tiles,
+                    );
+                }
+            }
+        }
+    }
+    app.want_art(wanted);
+}
+
+fn artist_header_height(available: u16) -> u16 {
+    match available {
+        0..=2 => 0,
+        3..=8 => 1,
+        9 => 2,
+        10..=15 => 3,
+        16 => 4,
+        17 => 5,
+        _ => 6,
+    }
+}
+
+fn artist_header_art_width(area: Rect, has_art: bool) -> u16 {
+    if has_art && area.height >= 3 && area.width >= 48 {
+        (area.height * 2).min(16).min(area.width / 3)
+    } else {
+        0
+    }
+}
+
+fn render_artist_header(
+    frame: &mut Frame,
+    page: &ArtistPage,
+    art: Option<&Cover>,
+    area: Rect,
+    accent: Color,
+) {
+    if area.is_empty() {
+        return;
+    }
+    // Reserve the same space before and after the image arrives so loading it
+    // cannot move the artist name and description between frames.
+    let art_width = artist_header_art_width(area, page.art.is_some());
+    let [art_area, text_area] =
+        Layout::horizontal([Constraint::Length(art_width), Constraint::Min(0)]).areas(area);
+    if let Some(art) = art.filter(|_| art_width > 0) {
+        render_cover(frame, art, art_area, CoverSize::Full);
+    }
+
+    let mut lines = vec![Line::from(Span::styled(
+        truncate(&page.artist.name, text_area.width as usize),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    ))];
+    if text_area.height >= 2
+        && let Some(audience) = &page.audience
+    {
+        lines.push(Line::from(Span::styled(
+            truncate(audience, text_area.width as usize),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    if text_area.height >= 4
+        && let Some(description) = &page.description
+    {
+        lines.push(Line::from(""));
+        lines.extend(
+            bounded_wrap(description, text_area.width as usize)
+                .into_iter()
+                .take(text_area.height.saturating_sub(3) as usize)
+                .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::DarkGray)))),
+        );
+    }
+    frame.render_widget(Paragraph::new(lines), text_area);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtistSection {
+    Songs,
+    Shelf(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArtistLayout {
+    section: usize,
+    kind: ArtistSection,
+    area: Rect,
+    shape: CardShape,
+    across: u16,
+    slot: u16,
+}
+
+fn artist_layouts(
+    page: &ArtistPage,
+    area: Rect,
+    top: usize,
+    max_shape: CardShape,
+) -> Vec<ArtistLayout> {
+    let has_songs = !page.top_songs.is_empty();
+    let count = page.shelves.len() + usize::from(has_songs);
+    let mut layouts = Vec::new();
+    let mut y = area.y;
+    let bottom = area.y + area.height;
+
+    for section in top..count {
+        let available = bottom.saturating_sub(y);
+        if available == 0 {
+            break;
+        }
+        if has_songs && section == 0 {
+            let wanted = (page.top_songs.len() as u16 + 2)
+                .min(ARTIST_TOP_SONG_ROWS + 2)
+                .min(available);
+            if wanted < 2 {
+                break;
+            }
+            layouts.push(ArtistLayout {
+                section,
+                kind: ArtistSection::Songs,
+                area: Rect::new(area.x, y, area.width, wanted),
+                shape: CardShape::Text,
+                across: 1,
+                slot: area.width,
+            });
+            y += wanted.saturating_add(1);
+            continue;
+        }
+
+        let shelf_index = section - usize::from(has_songs);
+        let Some(shelf) = page.shelves.get(shelf_index) else {
+            continue;
+        };
+        let desired = artist_shelf_shape(shelf).min(max_shape);
+        let Some(shape) = CardShape::ALL
+            .into_iter()
+            .find(|shape| *shape <= desired && card_size(*shape).1 < available)
+        else {
+            break;
+        };
+        let (width, height) = card_size(shape);
+        let row_height = height + 1;
+        let across = (area.width / width).max(1);
+        layouts.push(ArtistLayout {
+            section,
+            kind: ArtistSection::Shelf(shelf_index),
+            area: Rect::new(area.x, y, area.width, row_height),
+            shape,
+            across,
+            slot: area.width / across,
+        });
+        y += row_height.saturating_add(1);
+    }
+    layouts
+}
+
+fn artist_shelf_shape(shelf: &Shelf) -> CardShape {
+    let playable = shelf.cards.iter().filter(|card| card.is_playable()).count();
+    if playable * 2 < shelf.cards.len() {
+        CardShape::Poster
+    } else {
+        CardShape::Tile
+    }
+}
+
+fn clamp_card_offset(selected: &mut usize, offset: &mut usize, across: usize, len: usize) {
+    *selected = (*selected).min(len.saturating_sub(1));
+    if across == 0 || len == 0 {
+        *offset = 0;
+    } else if *selected < *offset {
+        *offset = *selected;
+    } else if *selected >= *offset + across {
+        *offset = *selected + 1 - across;
+    }
+    *offset = (*offset).min(len.saturating_sub(across));
+}
+
+fn artist_shelf_cursor(
+    selected: &mut usize,
+    offset: &mut usize,
+    focused: bool,
+    across: usize,
+    len: usize,
+) -> ShelfCursor {
+    if focused {
+        clamp_card_offset(selected, offset, across, len);
+    } else {
+        *offset = (*offset).min(len.saturating_sub(across));
+    }
+    ShelfCursor {
+        focused,
+        selected: (*selected).min(len.saturating_sub(1)),
+        offset: *offset,
+    }
+}
+
+fn render_artist_songs(
+    frame: &mut Frame,
+    songs: &[ArtistSong],
+    area: Rect,
+    focused: bool,
+    selected: usize,
+    offset: &mut usize,
+    accent: Color,
+) {
+    let [heading, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let marker = if focused { accent } else { Color::DarkGray };
+    let title = if focused {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("▌ ", Style::default().fg(marker)),
+            Span::styled("Top songs", title),
+            Span::styled(
+                format!("  {} songs", songs.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
+        heading,
+    );
+    if body.is_empty() {
+        return;
+    }
+
+    let width = body.width as usize;
+    let columns = artist_song_columns(width);
+    let list = if body.height >= 2 {
+        let [header, list] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+        frame.render_widget(Paragraph::new(artist_song_header(columns)), header);
+        list
+    } else {
+        body
+    };
+    let viewport = list.height as usize;
+    if viewport == 0 {
+        return;
+    }
+    if selected < *offset {
+        *offset = selected;
+    } else if selected >= *offset + viewport {
+        *offset = selected + 1 - viewport;
+    }
+    *offset = (*offset).min(songs.len().saturating_sub(viewport));
+    let end = (*offset + viewport).min(songs.len());
+    let items = songs[*offset..end]
+        .iter()
+        .enumerate()
+        .map(|(index, song)| {
+            ListItem::new(artist_song_line(
+                song,
+                *offset + index == selected && focused,
+                columns,
+                accent,
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(items), list);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArtistSongColumns {
+    width: usize,
+    title: usize,
+    album: usize,
+    plays: usize,
+    duration: usize,
+}
+
+fn artist_song_columns(width: usize) -> ArtistSongColumns {
+    let duration = usize::from(width >= 24) * DURATION_WIDTH;
+    let plays = if width >= 48 { 14 } else { 0 };
+    let album = if width >= 72 { ALBUM_WIDTH } else { 0 };
+    ArtistSongColumns {
+        width,
+        title: width.saturating_sub(1 + duration + plays + album),
+        album,
+        plays,
+        duration,
+    }
+}
+
+fn artist_song_header(columns: ArtistSongColumns) -> Line<'static> {
+    if columns.width == 0 {
+        return Line::default();
+    }
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::styled(
+        format!(" {}", cell("TITLE", columns.title)),
+        style,
+    )];
+    if columns.album > 0 {
+        spans.push(Span::styled(cell("ALBUM", columns.album), style));
+    }
+    if columns.plays > 0 {
+        spans.push(Span::styled(cell("PLAYS", columns.plays), style));
+    }
+    if columns.duration > 0 {
+        spans.push(Span::styled(
+            format!("{:>width$}", "DURATION", width = columns.duration),
+            style,
+        ));
+    }
+    Line::from(spans)
+}
+
+fn artist_song_line(
+    song: &ArtistSong,
+    selected: bool,
+    columns: ArtistSongColumns,
+    accent: Color,
+) -> Line<'static> {
+    if columns.width == 0 {
+        return Line::default();
+    }
+    let style = if selected {
+        highlight(accent)
+    } else {
+        Style::default()
+    };
+    let dim = |colour| {
+        if selected {
+            style
+        } else {
+            Style::default().fg(colour)
+        }
+    };
+    let mut spans = vec![Span::styled(
+        format!(
+            " {}",
+            focused_cell(&song.track.title, columns.title, selected)
+        ),
+        style,
+    )];
+    if columns.album > 0 {
+        spans.push(Span::styled(
+            cell(song.track.album.as_deref().unwrap_or(""), columns.album),
+            dim(Color::Gray),
+        ));
+    }
+    if columns.plays > 0 {
+        spans.push(Span::styled(
+            cell(song.plays.as_deref().unwrap_or(""), columns.plays),
+            dim(Color::DarkGray),
+        ));
+    }
+    if columns.duration > 0 {
+        let duration = truncate(
+            &song.track.duration.map(clock).unwrap_or_default(),
+            columns.duration,
+        );
+        spans.push(Span::styled(
+            format!("{duration:>width$}", width = columns.duration),
+            dim(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
+}
+
 /// How the landing page is laid out for the window it has: which card shape,
 /// and whether there is room left over for the now-playing strip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1540,20 +2104,20 @@ fn shelf_layouts(
 struct Tiles<'a> {
     shape: CardShape,
     art: &'a ArtCache,
-    /// Key and URL of every card drawn this frame whose picture is not in
-    /// `art`. Handed to [`App::want_art`] once the borrow of the feed ends.
-    wanted: &'a mut Vec<(String, String)>,
+    /// Key and optional URL of every visible picture. Cached URL-less duplicates
+    /// still keep their shared key recent; only real misses need the URL.
+    wanted: &'a mut Vec<(String, Option<String>)>,
 }
 
 impl Tiles<'_> {
     /// The picture for a card, noting the miss when there is not one.
     fn art(&mut self, card: &Card) -> Option<&Cover> {
-        if let Some(url) = &card.art
-            && self.art.get(card.art_key()).is_none()
-        {
-            self.wanted.push((card.art_key().to_string(), url.clone()));
+        let key = card.art_key();
+        let art = self.art.get(key);
+        if art.is_some() || card.art.is_some() {
+            self.wanted.push((key.to_string(), card.art.clone()));
         }
-        self.art.get(card.art_key())
+        art
     }
 }
 
@@ -2135,7 +2699,7 @@ fn render_playlists(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(block, area);
 
     if app.playlists.is_empty() {
-        let hint = if app.busy {
+        let hint = if app.page_pending() {
             "loading ..."
         } else if app.signed_in {
             "no playlists on this account"
@@ -3115,6 +3679,58 @@ fn render_cover(frame: &mut Frame, cover: &Cover, area: Rect, size: CoverSize) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+const ASCII_RAMP: &[u8] = b" .:-=+*#%@";
+
+/// Draws the cover as colored ASCII, using glyph density for brightness and the
+/// source pixel for colour. Geometry matches the half-block renderer so changing
+/// styles never moves the surrounding layout.
+fn render_ascii_cover(frame: &mut Frame, cover: &Cover, area: Rect, size: CoverSize) {
+    let (max_cols, max_rows) = usable(area, size);
+    let (px_w, px_h) = fit_ascii(cover, max_cols, max_rows);
+    if px_w == 0 || px_h == 0 {
+        return;
+    }
+
+    let rows = px_h.div_ceil(2) as u16;
+    let (col, row) = place(frame, area, (px_w as u16, rows), size);
+    let inner = Rect::new(col, row, px_w as u16, rows);
+    let lines = (0..rows)
+        .map(|row| {
+            let spans = (0..px_w)
+                .map(|x| {
+                    let (glyph, colour) = ascii_cell(cover, x, u32::from(row), px_w, px_h);
+                    Span::styled(glyph.to_string(), ascii_style(colour))
+                })
+                .collect::<Vec<_>>();
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn ascii_cell(cover: &Cover, x: u32, row: u32, px_w: u32, px_h: u32) -> (char, Color) {
+    let y = row * 2;
+    let upper = sample_rgb(cover, x, y, px_w, px_h);
+    let (r, g, b) = if y + 1 < px_h {
+        let lower = sample_rgb(cover, x, y + 1, px_w, px_h);
+        (
+            ((u16::from(upper.0) + u16::from(lower.0)) / 2) as u8,
+            ((u16::from(upper.1) + u16::from(lower.1)) / 2) as u8,
+            ((u16::from(upper.2) + u16::from(lower.2)) / 2) as u8,
+        )
+    } else {
+        upper
+    };
+    let luminance = (u32::from(r) * 54 + u32::from(g) * 183 + u32::from(b) * 19) / 256;
+    let index = luminance as usize * (ASCII_RAMP.len() - 1) / 255;
+    (char::from(ASCII_RAMP[index]), Color::Rgb(r, g, b))
+}
+
+fn ascii_style(colour: Color) -> Style {
+    Style::default().fg(colour).bg(Color::Rgb(0, 0, 0))
+}
+
 /// Largest image size, in pixels, that fits a `cols` x `rows` box of cells
 /// without distorting the aspect ratio.
 fn fit(cover: &Cover, cols: u16, rows: u16) -> (u32, u32) {
@@ -3131,12 +3747,26 @@ fn fit(cover: &Cover, cols: u16, rows: u16) -> (u32, u32) {
     }
 }
 
+fn fit_ascii(cover: &Cover, cols: u16, rows: u16) -> (u32, u32) {
+    let (width, height) = fit(cover, cols, rows);
+    let height = height - height % 2;
+    if height == 0 {
+        return (0, 0);
+    }
+    let width = (height * cover.width / cover.height).max(1).min(width);
+    (width, height)
+}
+
 /// Nearest-neighbour sample of `cover` at a point on the `px_w` x `px_h` grid
 /// being drawn. Nearest-neighbour is right here: the cover was already box
 /// filtered down to near this size when it was fetched.
 fn sample(cover: &Cover, x: u32, y: u32, px_w: u32, px_h: u32) -> Color {
-    let (r, g, b) = cover.pixel(x * cover.width / px_w, y * cover.height / px_h);
+    let (r, g, b) = sample_rgb(cover, x, y, px_w, px_h);
     Color::Rgb(r, g, b)
+}
+
+fn sample_rgb(cover: &Cover, x: u32, y: u32, px_w: u32, px_h: u32) -> (u8, u8, u8) {
+    cover.pixel(x * cover.width / px_w, y * cover.height / px_h)
 }
 
 /// Whether the player page is drawing the track's own progress bar, which
@@ -3507,6 +4137,7 @@ mod tests {
 
     use super::*;
     use crate::source::watch::{Comment, Comments, Lyrics, TimedLine};
+    use crate::source::{ArtistRef, BrowseEndpoint};
 
     /// A 16:9 cover, as every YouTube thumbnail is once shrunk.
     fn wide() -> Cover {
@@ -3518,6 +4149,133 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn artist_song(duration: Option<Duration>) -> ArtistSong {
+        ArtistSong {
+            track: Track {
+                id: "letithappen".to_string(),
+                title: "Let It Happen".to_string(),
+                uploader: "Tame Impala".to_string(),
+                duration,
+                album: Some("Currents".to_string()),
+                artist_ref: None,
+                playlist_item_id: None,
+            },
+            plays: Some("120M plays".to_string()),
+        }
+    }
+
+    fn artist_page() -> ArtistPage {
+        ArtistPage {
+            artist: ArtistRef {
+                name: "Tame Impala".to_string(),
+                endpoint: BrowseEndpoint::new("UCGz-artist"),
+            },
+            audience: Some("30M monthly listeners".to_string()),
+            description: Some("Psychedelic music from Kevin Parker.".to_string()),
+            art: None,
+            top_songs: vec![
+                artist_song(None),
+                artist_song(Some(Duration::from_secs(468))),
+            ],
+            shelves: vec![Shelf {
+                title: "Albums".to_string(),
+                cards: vec![album("Currents", "Album • Tame Impala")],
+            }],
+        }
+    }
+
+    #[test]
+    fn artist_song_rows_are_bounded_at_every_width() {
+        for duration in [Duration::from_secs(468), Duration::from_secs(100 * 60 * 60)] {
+            let song = artist_song(Some(duration));
+            for width in 0..120 {
+                let columns = artist_song_columns(width);
+                assert_eq!(
+                    artist_song_line(&song, true, columns, Color::Cyan).width(),
+                    width,
+                    "artist row escaped a {width}-column pane"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn artist_previews_do_not_label_missing_durations_as_live() {
+        let columns = artist_song_columns(90);
+        let text = line_text(&artist_song_line(
+            &artist_song(None),
+            false,
+            columns,
+            Color::Cyan,
+        ));
+        assert!(!text.contains("LIVE"), "{text:?}");
+        assert!(text.contains("120M plays"), "{text:?}");
+    }
+
+    #[test]
+    fn artist_layout_keeps_top_songs_before_catalogue_shelves() {
+        let layouts = artist_layouts(&artist_page(), Rect::new(0, 0, 100, 20), 0, CardShape::Tile);
+        assert_eq!(layouts[0].kind, ArtistSection::Songs);
+        assert_eq!(layouts[1].kind, ArtistSection::Shelf(0));
+        assert!(layouts[0].area.y < layouts[1].area.y);
+    }
+
+    #[test]
+    fn compact_artist_headers_keep_identity_and_drop_description_first() {
+        let page = artist_page();
+        let mut terminal = Terminal::new(TestBackend::new(40, 3)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_artist_header(frame, &page, None, Rect::new(0, 0, 40, 3), Color::Cyan)
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..3)
+            .map(|y| (0..40).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Tame Impala"), "{text}");
+        assert!(text.contains("30M monthly listeners"), "{text}");
+        assert!(!text.contains("Psychedelic"), "{text}");
+    }
+
+    #[test]
+    fn artist_header_growth_never_takes_space_back_from_content() {
+        let mut previous = 0;
+        for available in 0..32 {
+            let content = available - artist_header_height(available);
+            assert!(
+                content >= previous,
+                "content shrank from {previous} to {content} at height {available}"
+            );
+            previous = content;
+        }
+    }
+
+    #[test]
+    fn artist_header_art_is_reserved_only_where_it_can_be_drawn() {
+        assert_eq!(artist_header_art_width(Rect::new(0, 0, 60, 6), true), 12);
+        assert_eq!(artist_header_art_width(Rect::new(0, 0, 60, 6), false), 0);
+        assert_eq!(artist_header_art_width(Rect::new(0, 0, 40, 6), true), 0);
+        assert_eq!(artist_header_art_width(Rect::new(0, 0, 60, 2), true), 0);
+    }
+
+    #[test]
+    fn unfocused_artist_shelves_do_not_clamp_the_active_card() {
+        let mut selected = 7;
+        let mut offset = 5;
+
+        let cursor = artist_shelf_cursor(&mut selected, &mut offset, false, 2, 2);
+        assert_eq!(selected, 7);
+        assert_eq!(cursor.selected, 1);
+        assert_eq!(cursor.offset, 0);
+
+        let cursor = artist_shelf_cursor(&mut selected, &mut offset, true, 3, 10);
+        assert_eq!(selected, 7);
+        assert_eq!(cursor.selected, 7);
+        assert_eq!(cursor.offset, 5);
     }
 
     #[test]
@@ -3568,6 +4326,36 @@ mod tests {
         let bottom = &buf[(3, 6)];
         assert_eq!(bottom.fg, Color::Rgb(0, 0, 255));
         assert_eq!(bottom.bg, Color::Rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn colored_ascii_uses_brightness_for_glyphs_and_keeps_colour() {
+        let black_and_white =
+            Cover::from_rgb(1, 4, vec![0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255]);
+        assert_eq!(
+            ascii_cell(&black_and_white, 0, 0, 1, 4),
+            (' ', Color::Rgb(0, 0, 0))
+        );
+        assert_eq!(
+            ascii_cell(&black_and_white, 0, 1, 1, 4),
+            ('@', Color::Rgb(255, 255, 255))
+        );
+
+        let red = Cover::from_rgb(1, 2, vec![255, 0, 0, 255, 0, 0]);
+        let (glyph, colour) = ascii_cell(&red, 0, 0, 1, 2);
+        assert_ne!(glyph, ' ');
+        assert_eq!(colour, Color::Rgb(255, 0, 0));
+        assert_eq!(ascii_style(colour).bg, Some(Color::Rgb(0, 0, 0)));
+    }
+
+    #[test]
+    fn colored_ascii_uses_complete_character_rows_without_stretching() {
+        let square = Cover::solid(300, 300);
+        assert_eq!(fit_ascii(&square, 31, 40), (30, 30));
+        assert_eq!(fit_ascii(&square, 1, 1), (0, 0));
+        for width in 1..40 {
+            assert_eq!(fit_ascii(&square, width, 40).1 % 2, 0);
+        }
     }
 
     #[test]
@@ -3937,6 +4725,7 @@ mod tests {
             // their own artwork rather than one card drawn five times.
             art: Some(format!("https://example.invalid/{title}")),
             duration: None,
+            artist_ref: None,
             target: Target::Play {
                 video_id: title.to_string(),
             },
@@ -3949,8 +4738,9 @@ mod tests {
             subtitle: subtitle.to_string(),
             art: Some(format!("https://example.invalid/{title}")),
             duration: None,
+            artist_ref: None,
             target: Target::Open {
-                browse_id: title.to_string(),
+                endpoint: BrowseEndpoint::new(title),
             },
         }
     }
@@ -3961,7 +4751,7 @@ mod tests {
     /// which is deliberately the hardest case for the layout: the tiles are
     /// drawn as placeholders at exactly the size the real pictures will take,
     /// so anything that fits here fits once they land.
-    fn no_art() -> (ArtCache, Vec<(String, String)>) {
+    fn no_art() -> (ArtCache, Vec<(String, Option<String>)>) {
         (ArtCache::default(), Vec::new())
     }
 
@@ -4168,6 +4958,7 @@ mod tests {
             uploader: artist.to_string(),
             duration: Some(Duration::from_secs(secs)),
             album: None,
+            artist_ref: None,
             playlist_item_id: None,
         }
     }
@@ -4180,6 +4971,7 @@ mod tests {
             uploader: "Tame Impala".to_string(),
             duration: Some(Duration::from_secs(468)),
             album: Some("Currents".to_string()),
+            artist_ref: None,
             playlist_item_id: None,
         });
         now.queue_title = "Let It Happen Mix".to_string();
@@ -5434,12 +6226,14 @@ mod tests {
         assert_eq!(keys, ["Is It True", "Nice Boys"]);
     }
 
-    /// A picture already in hand is not asked for again -- the difference
-    /// between a cache and a download per frame.
+    /// A picture already in hand remains recent without being downloaded again.
     #[test]
-    fn artwork_already_held_is_not_asked_for() {
-        let shelves = vec![quick_picks()];
-        let art = stub_art(&shelves);
+    fn artwork_already_held_is_kept_recent_without_a_new_request() {
+        let mut shelves = vec![quick_picks()];
+        let mut art = stub_art(&shelves);
+        for card in &mut shelves[0].cards {
+            card.art = None;
+        }
         let mut wanted = Vec::new();
         let (width, height) = (2 * TEXT_CARD.0, TEXT_CARD.1 + 1);
 
@@ -5461,7 +6255,12 @@ mod tests {
             })
             .unwrap();
 
-        assert!(wanted.is_empty(), "asked again for {wanted:?}");
+        assert_eq!(wanted.len(), 2, "visible art was not kept recent");
+        assert!(wanted.iter().all(|(_, url)| url.is_none()));
+        assert!(
+            wanted.into_iter().all(|(key, _)| !art.want(&key)),
+            "cached artwork was requested again"
+        );
     }
 
     /// A tile fills its box corner to corner whatever shape the source is, so
@@ -5729,6 +6528,16 @@ mod tests {
     }
 
     #[test]
+    fn artist_prose_hard_wraps_languages_without_spaces() {
+        let lines = bounded_wrap("日本語の説明", 4);
+        assert_eq!(lines, ["日本", "語の", "説明"]);
+        assert!(lines.iter().all(|line| display_width(line) <= 4));
+
+        assert_eq!(bounded_wrap("か\u{3099}き", 2), ["か\u{3099}", "き"]);
+        assert_eq!(bounded_wrap("👩‍💻X", 2), ["👩‍💻", "X"]);
+    }
+
+    #[test]
     fn menu_rows_are_bounded_and_style_each_kind_distinctly() {
         let selected = menu_row_line(
             "A very long 日本語 menu label",
@@ -5819,8 +6628,17 @@ mod tests {
         assert!(line_text(&row).contains("[x] Discord Rich Presence"));
         assert_eq!(row.spans[0].style.bg, Some(Color::Blue));
 
+        let choice = choice_line("App icon", "Signal", true, 30, Color::Cyan);
+        assert!(line_text(&choice).contains("App icon: < Signal >"));
+        assert_eq!(choice.spans[0].style.bg, Some(Color::Cyan));
+
+        let cover = choice_line("Song cover", "Colored ASCII", true, 40, Color::Magenta);
+        assert!(line_text(&cover).contains("Song cover: < Colored ASCII >"));
+        assert_eq!(cover.spans[0].style.bg, Some(Color::Magenta));
+
         let footer = settings_footer(54);
         assert!(footer.contains("↑↓"));
+        assert!(footer.contains("←→"));
         assert!(footer.contains("Space/Enter"));
         assert!(footer.contains("Esc"));
         assert!(display_width(&settings_footer(18)) <= 18);

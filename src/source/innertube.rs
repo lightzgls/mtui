@@ -25,6 +25,7 @@ use anyhow::{Context, Result, bail};
 #[cfg(test)]
 use super::StreamUrl;
 use super::Track;
+use super::home;
 
 /// Kept short on purpose. This is a speculative fast path; if it is not clearly
 /// winning, the fallback is right there and will do the job properly.
@@ -183,6 +184,7 @@ fn parse_track(item: &serde_json::Value) -> Option<Track> {
         uploader: uploader.unwrap_or(super::UNKNOWN_ARTIST).to_string(),
         duration,
         album,
+        artist_ref: flex_runs(item, 1).and_then(home::artist_ref),
         // A search result is not a playlist row.
         playlist_item_id: None,
     })
@@ -193,14 +195,17 @@ fn parse_track(item: &serde_json::Value) -> Option<Track> {
 /// Shared with [`crate::source::home`]: the flexible-column shape is the same
 /// wherever YouTube Music draws a list row, whatever the row happens to mean.
 pub(super) fn flex_column(item: &serde_json::Value, index: usize) -> Option<String> {
-    let runs = item
-        .pointer(&format!(
-            "/flexColumns/{index}/musicResponsiveListItemFlexColumnRenderer/text/runs"
-        ))?
-        .as_array()?;
+    let runs = flex_runs(item, index)?.as_array()?;
 
     let text: String = runs.iter().filter_map(|run| run["text"].as_str()).collect();
     (!text.is_empty()).then_some(text)
+}
+
+/// Navigation-bearing runs behind one flexible display column.
+pub(super) fn flex_runs(item: &serde_json::Value, index: usize) -> Option<&serde_json::Value> {
+    item.pointer(&format!(
+        "/flexColumns/{index}/musicResponsiveListItemFlexColumnRenderer/text/runs"
+    ))
 }
 
 /// Parses `M:SS` or `H:MM:SS` into a duration. Anything else is `None`, which
@@ -267,6 +272,33 @@ mod tests {
         assert_eq!(track.uploader, "Daft Punk");
         assert_eq!(track.album.as_deref(), Some("Discovery"));
         assert_eq!(track.duration, Some(Duration::from_secs(227)));
+    }
+
+    #[test]
+    fn a_search_result_keeps_the_lead_artist_route() {
+        let mut item = row(
+            "JhulBGMA7G4",
+            "Harder, Better, Faster, Stronger",
+            "Daft Punk • Discovery • 3:47",
+        );
+        item["flexColumns"][1]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"] = serde_json::json!([
+            {
+                "text": "Daft Punk",
+                "navigationEndpoint": { "browseEndpoint": {
+                    "browseId": "UCdaft",
+                    "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                        }
+                    }
+                } }
+            },
+            { "text": " • Discovery • 3:47" }
+        ]);
+
+        let track = parse_track(&item).unwrap();
+        assert_eq!(track.uploader, "Daft Punk");
+        assert_eq!(track.artist_ref.unwrap().endpoint.browse_id, "UCdaft");
     }
 
     #[test]
