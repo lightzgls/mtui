@@ -876,6 +876,8 @@ fn unix_now() -> u64 {
 }
 
 /// SHA-1, used solely by Google's cookie-signing protocol. RFC 3174.
+#[allow(unknown_lints)]
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn sha1_hex(data: &[u8]) -> String {
     let mut state: [u32; 5] = [
         0x6745_2301,
