@@ -120,6 +120,8 @@ fn flush_run(out: &mut Vec<u8>, (ch, len): (u8, u32)) {
 /// Median cut rather than a fixed colour cube because album art is usually a
 /// handful of related tones: a cube spends most of its entries on colours the
 /// image does not contain and then bands the ones it does.
+#[allow(unknown_lints)]
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn quantise(rgb: &[u8]) -> (Vec<[u8; 3]>, Vec<u8>) {
     let mut counts: HashMap<[u8; 3], u32> = HashMap::new();
     for px in rgb.chunks_exact(3) {
@@ -402,6 +404,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(unknown_lints)]
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn quantisation_error_stays_small() {
         // Photographic-ish content: after quantisation no channel should be far
         // off, which is the property that makes the palette worth building.

@@ -180,6 +180,8 @@ impl Cover {
 /// counting cells rather than scoring pixels one at a time keeps a scatter of
 /// unrelated bright pixels from outvoting the block of colour that dominates
 /// the picture.
+#[allow(unknown_lints)]
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn accent_of(rgb: &[u8]) -> (u8, u8, u8) {
     /// Cells per channel in the colour cube. Four bits is fine enough to keep
     /// two different reds apart and coarse enough that one red does not land in
@@ -596,6 +598,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(unknown_lints)]
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn resample_interpolates_between_pixels() {
         // Two pixels, black then white. Doubling the width puts the new
         // in-between samples at intermediate greys rather than duplicating.
