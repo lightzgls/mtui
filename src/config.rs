@@ -224,6 +224,7 @@ impl Import {
         serde_json::from_slice(&fs::read(path).ok()?).ok()
     }
 
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     pub fn save(&self) -> Result<()> {
         let dir = dir()?;
         fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;

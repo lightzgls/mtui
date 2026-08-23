@@ -236,6 +236,8 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
                 match event {
                     Event::Key(key) if key.is_press() => app.handle_key(key)?,
                     Event::Resize(width, height) => {
+                        #[cfg(not(windows))]
+                        let _ = (width, height);
                         #[cfg(windows)]
                         {
                             foreground

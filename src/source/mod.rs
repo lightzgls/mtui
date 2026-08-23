@@ -32,6 +32,7 @@ pub use mtui_resolver::StreamUrl;
 
 /// A command-line child that must never acquire a console of its own.
 pub(super) fn command(program: impl AsRef<OsStr>) -> Command {
+    #[allow(unused_mut)]
     let mut command = Command::new(program);
     #[cfg(windows)]
     {
