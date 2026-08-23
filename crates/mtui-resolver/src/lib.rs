@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 
 fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
     let mut command = Command::new(program);
     #[cfg(windows)]
     {
