@@ -29,7 +29,8 @@ fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 }
 
 const PLAYER_TIMEOUT: Duration = Duration::from_secs(5);
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(45);
+const FALLBACK_BUDGET: Duration = Duration::from_secs(30);
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_POLL: Duration = Duration::from_millis(50);
 const SOCKET_TIMEOUT: &str = "10";
 const AUDIO_FORMAT: &str = "141/140/bestaudio[ext=m4a]";
@@ -307,26 +308,13 @@ impl Resolver {
         }
 
         let mut first_error = None;
-        // Authentication gets first chance at Premium quality, but never at the
-        // expense of the working anonymous formats. Each tier is validated
-        // before the next is tried, in descending quality/compatibility order.
+        // The native path above already gave complete Premium AAC its quick
+        // chance. Music's yt-dlp client is the most reliable complete fallback
+        // for art tracks, so try it before spending another process on standard
+        // clients whose signed URLs are commonly capped. Each process gets only
+        // a slice of the overall budget, so a stalled authenticated attempt
+        // cannot starve anonymous playback, or vice versa.
         let mut attempts = Vec::new();
-        if let Some(session) = self.session.as_ref() {
-            attempts.push((
-                Some(session),
-                "https://www.youtube.com/watch?v=",
-                AUDIO_FORMAT,
-                &[] as &[&str],
-                ResolveSource::YtDlp,
-            ));
-        }
-        attempts.push((
-            None,
-            "https://www.youtube.com/watch?v=",
-            AUDIO_FORMAT,
-            &[] as &[&str],
-            ResolveSource::YtDlp,
-        ));
         if let Some(session) = self.session.as_ref() {
             attempts.push((
                 Some(session),
@@ -343,9 +331,31 @@ impl Resolver {
             MUSIC_CLIENT_FLAGS,
             ResolveSource::YtDlpMusic,
         ));
+        if let Some(session) = self.session.as_ref() {
+            attempts.push((
+                Some(session),
+                "https://www.youtube.com/watch?v=",
+                AUDIO_FORMAT,
+                &[] as &[&str],
+                ResolveSource::YtDlp,
+            ));
+        }
+        attempts.push((
+            None,
+            "https://www.youtube.com/watch?v=",
+            AUDIO_FORMAT,
+            &[] as &[&str],
+            ResolveSource::YtDlp,
+        ));
+        let fallback_started = Instant::now();
         for (session, watch_url, format, flags, source) in attempts {
+            let remaining = FALLBACK_BUDGET.saturating_sub(fallback_started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            let timeout = remaining.min(ATTEMPT_TIMEOUT);
             let candidate = resolve_yt_dlp_as(
-                (&self.bin, self.js_runtime.as_deref()),
+                (&self.bin, self.js_runtime.as_deref(), timeout),
                 session,
                 video_id,
                 watch_url,
@@ -362,6 +372,11 @@ impl Resolver {
                     first_error.get_or_insert(error);
                 }
             }
+        }
+        if fallback_started.elapsed() >= FALLBACK_BUDGET {
+            return Err(ResolveError::from_message(
+                "stream resolution timed out after 30 seconds",
+            ));
         }
         if let Some(error) = first_error {
             let message = format!("{error:#}");
@@ -561,7 +576,7 @@ fn pick_audio(formats: &[Format]) -> Option<(&str, u32)> {
 }
 
 fn resolve_yt_dlp_as(
-    tool: (&str, Option<&str>),
+    tool: (&str, Option<&str>, Duration),
     session: Option<&PlaybackSession>,
     video_id: &str,
     watch_url: &str,
@@ -569,7 +584,7 @@ fn resolve_yt_dlp_as(
     extra: &[&str],
     source: ResolveSource,
 ) -> Result<ResolvedStream> {
-    let (bin, js_runtime) = tool;
+    let (bin, js_runtime, timeout) = tool;
     let cookie_jar = session.map(SessionJar::create).transpose()?;
     let mut command = command(bin);
     if let Some(runtime) = js_runtime {
@@ -601,10 +616,13 @@ fn resolve_yt_dlp_as(
         {
             break;
         }
-        if started.elapsed() >= PROCESS_TIMEOUT {
+        if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("could not resolve {video_id}: yt-dlp timed out after 45 seconds");
+            bail!(
+                "could not resolve {video_id}: yt-dlp timed out after {} seconds",
+                timeout.as_secs().max(1)
+            );
         }
         thread::sleep(PROCESS_POLL);
     }

@@ -147,7 +147,9 @@ impl Track {
 mod live_quality {
     #[test]
     #[ignore = "uses the saved YouTube Music browser session"]
-    fn saved_session_exposes_its_music_quality() {
+    fn saved_session_resolves_a_complete_stream_quickly() {
+        use std::time::{Duration, Instant};
+
         let yt = super::bootstrap::locate().expect("yt-dlp should be available");
         let cookies = crate::config::Cookies::available()
             .expect("saved cookies should parse")
@@ -159,17 +161,21 @@ mod live_quality {
             cookies.sapisid().to_string(),
         )));
 
+        let started = Instant::now();
         let stream = resolver
             .resolve(mtui_resolver::ResolveRequest::new("nNN88hijp-o"))
             .expect("the Music track should resolve");
+        let elapsed = started.elapsed();
         println!(
-            "authenticated source {:?}, itag {:?}",
-            stream.source, stream.format.itag
-        );
-        assert_eq!(
+            "authenticated source {:?}, itag {:?}, {:.2}s",
+            stream.source,
             stream.format.itag,
-            Some(141),
-            "the saved account did not expose 256 kbps AAC"
+            elapsed.as_secs_f64()
         );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "resolving held playback for {elapsed:.2?}"
+        );
+        assert!(matches!(stream.format.itag, Some(141 | 140 | 18)));
     }
 }
