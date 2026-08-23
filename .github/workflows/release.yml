@@ -42,7 +42,13 @@ jobs:
       - name: Verify WebView2 loader is static
         shell: pwsh
         run: |
-          $imports = & link.exe /dump /dependents target/release/mtui.exe
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -find "VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe" |
+            Select-Object -First 1
+          if (-not $dumpbin) { throw "Could not find Visual Studio dumpbin.exe" }
+          $imports = & $dumpbin /dependents target/release/mtui.exe
           if ($LASTEXITCODE -ne 0) { throw "Could not inspect mtui.exe imports" }
           if ($imports -match "WebView2Loader\.dll") {
             throw "mtui.exe still imports WebView2Loader.dll"
