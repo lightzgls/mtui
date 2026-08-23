@@ -2116,6 +2116,7 @@ impl App {
                 | Response::PlaylistTracks { .. }
                 | Response::Prefetched { .. }
                 | Response::Resolved { .. }
+                | Response::Replacement { .. }
                 | Response::Watch { .. }
                 | Response::MoreQueue { .. }
                 | Response::Lyrics { .. }
@@ -2269,6 +2270,20 @@ impl App {
                 self.selection_settled = Some(Instant::now());
             }
             Response::Resolved { id, title, stream } => self.apply_resolved(&id, title, stream),
+            Response::Replacement { id, stream } => {
+                if self
+                    .listening
+                    .as_ref()
+                    .is_some_and(|(track, _)| track.id == id)
+                    && let Ok(stream) = stream
+                {
+                    let _ = self.player.send(Command::ArmReplacement {
+                        id,
+                        url: stream.url,
+                        format: stream.format,
+                    });
+                }
+            }
             Response::Watch { video_id, watch } => self.apply_watch(&video_id, *watch),
             Response::MoreQueue { epoch, page } => self.apply_more_queue(epoch, page),
             Response::Lyrics { video_id, lyrics } => {

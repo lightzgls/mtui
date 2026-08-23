@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use mtui_resolver::AudioFormat;
@@ -73,6 +73,14 @@ pub enum Command {
         url: String,
         format: AudioFormat,
         from: Duration,
+    },
+    /// A verified whole-file stream resolved while the fast native URL is
+    /// already playing. Same-format URLs are armed directly on the downloader;
+    /// other formats are held for a track-time rebuild at the cap.
+    ArmReplacement {
+        id: String,
+        url: String,
+        format: AudioFormat,
     },
     /// A requested URL could not be produced, so the track cannot go on.
     ///
@@ -239,6 +247,7 @@ struct Track {
     /// call the track finished and move on to the next song.
     seeking_to: Option<Duration>,
     rebuilds: u8,
+    replacement: Option<(String, AudioFormat)>,
 }
 
 /// Why the queue went empty, decided before anything is touched so the caller
@@ -260,6 +269,16 @@ enum Ending {
 }
 
 impl Track {
+    fn arm_replacement(&mut self, url: String, format: AudioFormat) {
+        if same_representation(self.format, format) {
+            if self.link.supply_url(&url) {
+                self.url = url;
+            }
+        } else {
+            self.replacement = Some((url, format));
+        }
+    }
+
     /// Returns the budget once the current stream has played for [`PROGRESS`].
     ///
     /// Progress is measured from where this stream started rather than from the
@@ -458,6 +477,7 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
                                 position: Duration::ZERO,
                                 seeking_to: None,
                                 rebuilds: 0,
+                                replacement: None,
                             });
                             state = set_state(&snapshot, PlayState::Playing);
                         }
@@ -500,6 +520,7 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
                     // rebuild from track time instead of splicing the files.
                     cur.link.decline();
                     cur.format = format;
+                    cur.replacement = None;
 
                     let url = cur.url.clone();
                     match start_stream(&runtime, &player, &url, from) {
@@ -526,6 +547,12 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
                             );
                         }
                     }
+                }
+                Command::ArmReplacement { id, url, format } => {
+                    let Some(cur) = track.as_mut().filter(|cur| cur.id == id) else {
+                        continue;
+                    };
+                    cur.arm_replacement(url, format);
                 }
                 Command::ResumeFailed { why } => {
                     // Let a downloader still waiting stop waiting. Without
@@ -630,7 +657,26 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
         //
         // Checked before the drain test below, because catching it here is what
         // stops it ever becoming a drain.
-        if let Some(cur) = track.as_ref()
+        let armed = track
+            .as_mut()
+            .and_then(|cur| cur.link.wants_url().and_then(|_| cur.replacement.take()));
+        if let Some((url, format)) = armed {
+            let paused = state == PlayState::Paused;
+            match replace_running_stream(&runtime, &player, &mut track, url, format, paused) {
+                Ok(()) => {
+                    let restored = if paused {
+                        PlayState::Paused
+                    } else {
+                        PlayState::Playing
+                    };
+                    state = set_state(&snapshot, restored);
+                }
+                Err(error) => crate::diagnostics::warn(
+                    "player",
+                    &format!("armed stream replacement failed: {error:#}"),
+                ),
+            }
+        } else if let Some(cur) = track.as_ref()
             && !asked_for_url
             && cur.link.wants_url().is_some()
         {
@@ -699,6 +745,38 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
 /// different AAC encodes at the same numeric byte offset.
 fn same_representation(current: AudioFormat, fresh: AudioFormat) -> bool {
     current.itag.is_some() && current == fresh
+}
+
+/// Opens a different representation while the old buffered source keeps
+/// playing, then commits at the position reached after the open completed.
+fn replace_running_stream(
+    runtime: &tokio::runtime::Runtime,
+    player: &rodio::Player,
+    track: &mut Option<Track>,
+    url: String,
+    format: AudioFormat,
+    paused: bool,
+) -> Result<()> {
+    let (decoder, total, link) = open_stream(runtime, &url)?;
+    let Some(cur) = track.as_mut() else {
+        return Ok(());
+    };
+    let from = cur.offset + player.get_pos();
+    cur.link.decline();
+    play_source(player, decoder, from);
+    if paused {
+        player.pause();
+    }
+    cur.url = url;
+    cur.format = format;
+    cur.link = link;
+    if total.is_some() {
+        cur.total = total;
+    }
+    cur.offset = from;
+    cur.position = from;
+    cur.seeking_to = None;
+    Ok(())
 }
 
 /// Names where playback stopped, and why when the reason was recorded.
@@ -854,8 +932,37 @@ fn open_stream(
     Option<Duration>,
     StreamLink,
 )> {
-    let (stream, link) = runtime.block_on(backend::open(url))?;
-    let decoder = backend::decoder(stream)?;
+    let started = Instant::now();
+    let opened = runtime.block_on(backend::open(url));
+    let elapsed = started.elapsed().as_millis();
+    crate::diagnostics::info(
+        "player",
+        &format!(
+            "stream prefetch {} in {elapsed} ms",
+            if opened.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            }
+        ),
+    );
+    let (stream, link) = opened?;
+
+    let started = Instant::now();
+    let decoded = backend::decoder(stream);
+    let elapsed = started.elapsed().as_millis();
+    crate::diagnostics::info(
+        "player",
+        &format!(
+            "decoder initialization {} in {elapsed} ms",
+            if decoded.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            }
+        ),
+    );
+    let decoder = decoded?;
     let total = decoder.total_duration();
     Ok((decoder, total, link))
 }
@@ -931,6 +1038,7 @@ mod tests {
             position: Duration::from_secs(position),
             seeking_to: None,
             rebuilds: 0,
+            replacement: None,
         }
     }
 
@@ -942,6 +1050,28 @@ mod tests {
         assert!(!same_representation(
             AudioFormat { itag: None },
             AudioFormat { itag: None }
+        ));
+    }
+
+    #[test]
+    fn replacements_are_spliced_only_when_the_representation_matches() {
+        let mut same = track(5, Some(213));
+        same.arm_replacement(
+            "https://example.com/refreshed.m4a".into(),
+            AudioFormat { itag: Some(140) },
+        );
+        assert_eq!(same.url, "https://example.com/refreshed.m4a");
+        assert!(same.replacement.is_none());
+
+        let mut different = track(5, Some(213));
+        different.arm_replacement(
+            "https://example.com/complete.mp4".into(),
+            AudioFormat { itag: Some(18) },
+        );
+        assert_eq!(different.url, "https://example.com/a.m4a");
+        assert!(matches!(
+            different.replacement,
+            Some((_, AudioFormat { itag: Some(18) }))
         ));
     }
 

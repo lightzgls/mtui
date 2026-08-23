@@ -1,15 +1,16 @@
 //! Background worker for source operations.
 //!
 //! Every yt-dlp call blocks for seconds. Running one on the UI thread would
-//! freeze rendering and input for the whole duration, so all of them happen
-//! here and results are collected without blocking.
+//! freeze rendering and input for the whole duration, so all of them happen on
+//! background workers and results are collected without blocking.
 //!
-//! yt-dlp work is intentionally serial: concurrent invocations would multiply
-//! the ~80 MB transient cost, which is exactly the spike the whole design
-//! exists to contain. Covers get a second thread of their own -- they are one
-//! HTTPS GET with no subprocess, so they carry none of that cost, and leaving
-//! them in the same queue would let a slow thumbnail sit in front of the
-//! resolve that actually produces audio.
+//! Playback's yt-dlp work is intentionally serial on its completion worker:
+//! concurrent invocations would multiply the ~80 MB transient cost. The native
+//! player request stays on the source worker so audio can begin while that slow
+//! verification runs. Covers get a thread of their own -- they are one HTTPS
+//! GET with no subprocess, so they carry none of that cost, and leaving them in
+//! the same queue would let a slow thumbnail sit in front of the resolve that
+//! actually produces audio.
 //!
 //! Library calls get a third thread by the same argument: they are pure HTTPS
 //! against Google's API, and queueing one behind a four-second resolve would
@@ -33,7 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -58,6 +59,14 @@ use mtui_resolver::{PlaybackSession, ResolveRequest, Resolver};
 const MAX_LIBRARY_TRACKS: usize = 200;
 
 pub type PageRequestId = u64;
+
+struct CompletionRequest {
+    id: String,
+    /// Present when no fast stream was available and this answer must start or
+    /// resume playback. Background replacements carry no title.
+    title: Option<String>,
+    bypass_cache: bool,
+}
 
 pub enum Request {
     Search {
@@ -274,6 +283,12 @@ pub enum Response {
         title: String,
         stream: Result<StreamUrl, String>,
     },
+    /// A verified whole-file URL resolved while the native stream is already
+    /// playing. The player arms it for the point where that fast URL stops.
+    Replacement {
+        id: String,
+        stream: Result<StreamUrl, String>,
+    },
     /// The player page's queue. `video_id` comes back so a queue for a track
     /// the user has already skipped past is dropped rather than shown.
     ///
@@ -403,6 +418,7 @@ impl SourceWorker {
         let (library_req_tx, library_req_rx) = channel::<Request>();
         let (page_req_tx, page_req_rx) = channel::<Request>();
         let (art_req_tx, art_req_rx) = channel::<Request>();
+        let (complete_tx, complete_rx) = channel::<CompletionRequest>();
         let (res_tx, res_rx) = channel::<Response>();
         let resolves = Arc::new(AtomicU64::new(0));
         let thread_resolves = Arc::clone(&resolves);
@@ -411,10 +427,17 @@ impl SourceWorker {
         let page_res_tx = res_tx.clone();
         let art_res_tx = res_tx.clone();
         let spawn_res_tx = res_tx.clone();
+        let complete_res_tx = res_tx.clone();
+        let complete_yt = yt.clone();
+
+        thread::Builder::new()
+            .name("mtui-stream-completion".to_string())
+            .spawn(move || run_completions(complete_yt, complete_rx, complete_res_tx))
+            .context("failed to spawn stream completion worker")?;
 
         let handle = thread::Builder::new()
             .name("mtui-source".to_string())
-            .spawn(move || run(yt, req_rx, res_tx, &thread_resolves))
+            .spawn(move || run(yt, req_rx, res_tx, &thread_resolves, complete_tx))
             .context("failed to spawn source worker")?;
 
         // Both deliberately detached -- see `Drop`.
@@ -595,14 +618,73 @@ impl Drop for SourceWorker {
 /// otherwise wait out all four before hearing the fourth. Only the last of a
 /// run is worth doing, and a speculative prefetch queued in front of one is
 /// worth nothing at all.
-fn run(yt: YouTube, rx: Receiver<Request>, tx: Sender<Response>, asked: &AtomicU64) {
+fn run(
+    yt: YouTube,
+    rx: Receiver<Request>,
+    tx: Sender<Response>,
+    asked: &AtomicU64,
+    complete_tx: Sender<CompletionRequest>,
+) {
     // Owned outright by this thread, so its bounded cache and pooled playback
     // client need no locks. Search keeps the older shared client below because
     // it also serves the home and queue parsers.
     // Search does not depend on the playback resolver. Keep servicing it when
     // resolver setup fails, and report that failure only to playback requests.
     let resolver = Resolver::new(yt.bin()).map_err(|error| error.to_string());
-    run_source_loop(yt, rx, tx, asked, resolver);
+    run_source_loop(yt, rx, tx, asked, resolver, Some(&complete_tx));
+}
+
+/// Verifies the whole-file replacement without delaying native playback or a
+/// newer play request. Work remains serial so rapid skipping never starts a
+/// pile of yt-dlp processes.
+fn run_completions(yt: YouTube, rx: Receiver<CompletionRequest>, tx: Sender<Response>) {
+    let Ok(mut resolver) = Resolver::new(yt.bin()) else {
+        return;
+    };
+    resolver.set_js_runtime(yt.js_runtime().map(str::to_string));
+
+    while let Ok(mut request) = rx.recv() {
+        // Only the newest queued track can still benefit from expensive work.
+        while let Ok(newer) = rx.try_recv() {
+            request = newer;
+        }
+        resolver.set_session(playback_session());
+        let started = Instant::now();
+        let stream = resolver
+            .resolve(ResolveRequest {
+                video_id: &request.id,
+                bypass_cache: request.bypass_cache,
+            })
+            .map_err(|error| error.to_string());
+        let elapsed = started.elapsed().as_millis();
+        match &stream {
+            Ok(stream) => crate::diagnostics::info(
+                "source",
+                &format!(
+                    "complete replacement resolved in {elapsed} ms via {:?}, itag {:?}",
+                    stream.source, stream.format.itag
+                ),
+            ),
+            Err(_) => crate::diagnostics::warn(
+                "source",
+                &format!("complete replacement failed after {elapsed} ms"),
+            ),
+        }
+        let response = match request.title {
+            Some(title) => Response::Resolved {
+                id: request.id,
+                title,
+                stream,
+            },
+            None => Response::Replacement {
+                id: request.id,
+                stream,
+            },
+        };
+        if tx.send(response).is_err() {
+            break;
+        }
+    }
 }
 
 fn run_source_loop(
@@ -611,6 +693,7 @@ fn run_source_loop(
     tx: Sender<Response>,
     asked: &AtomicU64,
     mut resolver: std::result::Result<Resolver, String>,
+    complete_tx: Option<&Sender<CompletionRequest>>,
 ) {
     if let Ok(active) = resolver.as_mut() {
         active.set_js_runtime(yt.js_runtime().map(str::to_string));
@@ -649,18 +732,96 @@ fn run_source_loop(
                 if taken < asked.load(Ordering::SeqCst) {
                     continue;
                 }
+                let started = Instant::now();
                 let stream = match resolver.as_mut() {
                     Ok(active) => {
                         active.set_session(playback_session());
-                        active
-                            .resolve(ResolveRequest {
+                        if !bypass_cache {
+                            match active.resolve_fast(ResolveRequest::new(&id)) {
+                                Ok(stream) => {
+                                    let elapsed = started.elapsed().as_millis();
+                                    crate::diagnostics::info(
+                                        "source",
+                                        &format!(
+                                            "fast stream resolved in {elapsed} ms via {:?}, itag {:?}",
+                                            stream.source, stream.format.itag
+                                        ),
+                                    );
+                                    let needs_replacement =
+                                        stream.source != mtui_resolver::ResolveSource::Cache;
+                                    let response = Response::Resolved {
+                                        id: id.clone(),
+                                        title,
+                                        stream: Ok(stream),
+                                    };
+                                    if tx.send(response).is_err() {
+                                        break;
+                                    }
+                                    if needs_replacement {
+                                        let _ = complete_tx.and_then(|tx| {
+                                            tx.send(CompletionRequest {
+                                                id,
+                                                title: None,
+                                                bypass_cache: false,
+                                            })
+                                            .ok()
+                                        });
+                                    }
+                                    continue;
+                                }
+                                Err(error) => {
+                                    if complete_tx.is_some_and(|tx| {
+                                        tx.send(CompletionRequest {
+                                            id: id.clone(),
+                                            title: Some(title.clone()),
+                                            bypass_cache: false,
+                                        })
+                                        .is_ok()
+                                    }) {
+                                        continue;
+                                    }
+                                    crate::diagnostics::warn(
+                                        "source",
+                                        &format!(
+                                            "fast resolution failed, using local fallback: {error}"
+                                        ),
+                                    );
+                                    active.resolve(ResolveRequest::new(&id))
+                                }
+                            }
+                        } else if complete_tx.is_some_and(|tx| {
+                            tx.send(CompletionRequest {
+                                id: id.clone(),
+                                title: Some(title.clone()),
+                                bypass_cache: true,
+                            })
+                            .is_ok()
+                        }) {
+                            continue;
+                        } else {
+                            active.resolve(ResolveRequest {
                                 video_id: &id,
                                 bypass_cache,
                             })
-                            .map_err(|error| error.to_string())
+                        }
+                        .map_err(|error| error.to_string())
                     }
                     Err(error) => Err(error.to_string()),
                 };
+                let elapsed = started.elapsed().as_millis();
+                match &stream {
+                    Ok(stream) => crate::diagnostics::info(
+                        "source",
+                        &format!(
+                            "stream resolved in {elapsed} ms via {:?}, itag {:?}",
+                            stream.source, stream.format.itag
+                        ),
+                    ),
+                    Err(_) => crate::diagnostics::warn(
+                        "source",
+                        &format!("stream resolution failed after {elapsed} ms"),
+                    ),
+                }
                 Response::Resolved { id, title, stream }
             }
             Request::Prefetch { id } => {
@@ -1310,6 +1471,7 @@ mod tests {
             response_tx,
             &AtomicU64::new(1),
             Err("resolver unavailable".to_string()),
+            None,
         );
 
         let response = response_rx.recv().unwrap();

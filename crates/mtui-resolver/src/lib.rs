@@ -271,6 +271,33 @@ impl Resolver {
         Ok(stream)
     }
 
+    /// Resolves only through the pooled player API, without waiting for a
+    /// whole-file probe or starting yt-dlp.
+    ///
+    /// A returned native URL may be capped. Callers using this latency path
+    /// must arrange a complete replacement in the background before the
+    /// downloader reaches that cap. Cached entries are already verified by
+    /// [`Self::resolve`] and are safe to use without a replacement.
+    pub fn resolve_fast(
+        &mut self,
+        request: ResolveRequest<'_>,
+    ) -> std::result::Result<ResolvedStream, ResolveError> {
+        if request.bypass_cache {
+            self.invalidate(request.video_id);
+        } else if let Some(mut hit) = self.cache.get(request.video_id) {
+            hit.source = ResolveSource::Cache;
+            return Ok(hit);
+        }
+
+        resolve_player(
+            &self.runtime,
+            &self.client,
+            self.session.as_ref(),
+            request.video_id,
+        )
+        .map_err(|error| ResolveError::from_message(format!("{error:#}")))
+    }
+
     /// Warms only the cheap native fast path. Never starts yt-dlp.
     pub fn prefetch_fast(&mut self, video_id: &str) -> bool {
         if self.cache.get(video_id).is_some() {
@@ -1058,6 +1085,18 @@ mod tests {
         hit.source = ResolveSource::Cache;
         assert_eq!(hit.source, ResolveSource::Cache);
         assert_eq!(hit.format.itag, Some(140));
+    }
+
+    #[test]
+    fn fast_resolution_returns_verified_cache_entries_without_network() {
+        let mut resolver = Resolver::new("yt-dlp").expect("resolver should build");
+        resolver.cache.insert("track".into(), candidate("complete"));
+
+        let hit = resolver
+            .resolve_fast(ResolveRequest::new("track"))
+            .expect("cache hit should resolve");
+        assert_eq!(hit.source, ResolveSource::Cache);
+        assert!(hit.url.ends_with("/complete.m4a"));
     }
 
     #[test]
