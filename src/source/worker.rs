@@ -57,6 +57,7 @@ use mtui_resolver::{PlaybackSession, ResolveRequest, Resolver};
 /// long session must not be able to grow the heap without limit. Beyond this,
 /// each further fifty rows is two more round trips for lines nobody scrolls to.
 const MAX_LIBRARY_TRACKS: usize = 200;
+const RECENT_REPLACEMENT: Duration = Duration::from_secs(30);
 
 pub type PageRequestId = u64;
 
@@ -642,6 +643,7 @@ fn run_completions(yt: YouTube, rx: Receiver<CompletionRequest>, tx: Sender<Resp
         return;
     };
     resolver.set_js_runtime(yt.js_runtime().map(str::to_string));
+    let mut recent_background: Option<(String, Instant)> = None;
 
     while let Ok(mut request) = rx.recv() {
         // Only the newest queued track can still benefit from expensive work.
@@ -650,10 +652,15 @@ fn run_completions(yt: YouTube, rx: Receiver<CompletionRequest>, tx: Sender<Resp
         }
         resolver.set_session(playback_session());
         let started = Instant::now();
+        // A cap request is commonly queued while this worker is still finding
+        // the background replacement for that same cap. Once it reaches the
+        // queue, the verified URL is already cached; invalidating it would run
+        // the same four-second extraction twice and deliver a stale resume.
+        let reuse_background = can_reuse_background(&request, recent_background.as_ref());
         let stream = resolver
             .resolve(ResolveRequest {
                 video_id: &request.id,
-                bypass_cache: request.bypass_cache,
+                bypass_cache: request.bypass_cache && !reuse_background,
             })
             .map_err(|error| error.to_string());
         let elapsed = started.elapsed().as_millis();
@@ -670,6 +677,9 @@ fn run_completions(yt: YouTube, rx: Receiver<CompletionRequest>, tx: Sender<Resp
                 &format!("complete replacement failed after {elapsed} ms"),
             ),
         }
+        if request.title.is_none() && stream.is_ok() {
+            recent_background = Some((request.id.clone(), Instant::now()));
+        }
         let response = match request.title {
             Some(title) => Response::Resolved {
                 id: request.id,
@@ -685,6 +695,14 @@ fn run_completions(yt: YouTube, rx: Receiver<CompletionRequest>, tx: Sender<Resp
             break;
         }
     }
+}
+
+fn can_reuse_background(request: &CompletionRequest, recent: Option<&(String, Instant)>) -> bool {
+    request.bypass_cache
+        && request.title.is_some()
+        && recent.is_some_and(|(id, resolved)| {
+            *id == request.id && resolved.elapsed() < RECENT_REPLACEMENT
+        })
 }
 
 fn run_source_loop(
@@ -1487,5 +1505,25 @@ mod tests {
             response_rx.recv().unwrap(),
             Response::Prefetched { id, ready: false } if id == "next"
         ));
+    }
+
+    #[test]
+    fn recovery_reuses_a_just_completed_background_url() {
+        let recovery = CompletionRequest {
+            id: "video".into(),
+            title: Some("Track".into()),
+            bypass_cache: true,
+        };
+        let recent = ("video".to_string(), Instant::now());
+        assert!(can_reuse_background(&recovery, Some(&recent)));
+
+        let other = ("other".to_string(), Instant::now());
+        assert!(!can_reuse_background(&recovery, Some(&other)));
+
+        let background = CompletionRequest {
+            title: None,
+            ..recovery
+        };
+        assert!(!can_reuse_background(&background, Some(&recent)));
     }
 }

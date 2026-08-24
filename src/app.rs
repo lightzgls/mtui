@@ -2277,11 +2277,24 @@ impl App {
                     .is_some_and(|(track, _)| track.id == id)
                     && let Ok(stream) = stream
                 {
-                    let _ = self.player.send(Command::ArmReplacement {
-                        id,
-                        url: stream.url,
-                        format: stream.format,
-                    });
+                    let command = match self.resuming.take_if(|resuming| resuming.id == id) {
+                        Some(resuming) => {
+                            if let Some((track, _)) = self.listening.as_ref() {
+                                self.status = format!("playing {}", track.label());
+                            }
+                            Command::Resume {
+                                url: stream.url,
+                                format: stream.format,
+                                from: resuming.from,
+                            }
+                        }
+                        None => Command::ArmReplacement {
+                            id,
+                            url: stream.url,
+                            format: stream.format,
+                        },
+                    };
+                    let _ = self.player.send(command);
                 }
             }
             Response::Watch { video_id, watch } => self.apply_watch(&video_id, *watch),

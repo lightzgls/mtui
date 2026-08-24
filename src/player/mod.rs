@@ -497,6 +497,15 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
                     let Some(cur) = track.as_mut() else {
                         continue;
                     };
+
+                    // A background replacement may have answered the same
+                    // refusal while this resolve was still in flight. Once the
+                    // downloader is healthy again, this response carries a
+                    // stale `from`; rebuilding from it would replay the start
+                    // of the song several seconds into playback.
+                    if resume_is_stale(state, cur.link.wants_url().is_some()) {
+                        continue;
+                    }
                     cur.url = url;
 
                     // The stream is still running and only wants a signature
@@ -745,6 +754,10 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
 /// different AAC encodes at the same numeric byte offset.
 fn same_representation(current: AudioFormat, fresh: AudioFormat) -> bool {
     current.itag.is_some() && current == fresh
+}
+
+fn resume_is_stale(state: PlayState, downloader_waiting: bool) -> bool {
+    state == PlayState::Playing && !downloader_waiting
 }
 
 /// Opens a different representation while the old buffered source keeps
@@ -1073,6 +1086,13 @@ mod tests {
             different.replacement,
             Some((_, AudioFormat { itag: Some(18) }))
         ));
+    }
+
+    #[test]
+    fn a_late_resume_is_ignored_after_the_downloader_recovered() {
+        assert!(resume_is_stale(PlayState::Playing, false));
+        assert!(!resume_is_stale(PlayState::Playing, true));
+        assert!(!resume_is_stale(PlayState::Buffering, false));
     }
 
     /// The same track, whose downloader recorded a refusal at `offset`.
