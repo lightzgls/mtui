@@ -46,6 +46,10 @@ pub struct YouTube {
     bin: String,
     /// yt-dlp spelling, for example `deno:C:\path\deno.exe`.
     js_runtime: Option<String>,
+    /// Directory containing the provider plugin zip, for `--plugin-dirs`.
+    pot_plugin_dir: Option<String>,
+    /// Provider checkout's `server` directory, for script mode.
+    pot_server_home: Option<String>,
 }
 
 impl Default for YouTube {
@@ -53,6 +57,8 @@ impl Default for YouTube {
         Self {
             bin: "yt-dlp".to_string(),
             js_runtime: None,
+            pot_plugin_dir: None,
+            pot_server_home: None,
         }
     }
 }
@@ -62,11 +68,19 @@ impl YouTube {
         Self {
             bin: bin.into(),
             js_runtime: None,
+            pot_plugin_dir: None,
+            pot_server_home: None,
         }
     }
 
     pub fn with_js_runtime(mut self, runtime: Option<String>) -> Self {
         self.js_runtime = runtime;
+        self
+    }
+
+    pub(super) fn with_pot_provider(mut self, plugin_dir: String, server_home: String) -> Self {
+        self.pot_plugin_dir = Some(plugin_dir);
+        self.pot_server_home = Some(server_home);
         self
     }
 
@@ -82,6 +96,14 @@ impl YouTube {
 
     pub(super) fn js_runtime(&self) -> Option<&str> {
         self.js_runtime.as_deref()
+    }
+
+    pub(super) fn pot_plugin_dir(&self) -> Option<&str> {
+        self.pot_plugin_dir.as_deref()
+    }
+
+    pub(super) fn pot_server_home(&self) -> Option<&str> {
+        self.pot_server_home.as_deref()
     }
 
     /// Verifies yt-dlp is present and returns its version.
@@ -237,6 +259,15 @@ mod tests {
     fn a_runtime_is_carried_to_every_yt_dlp_call() {
         let yt = YouTube::new("yt-dlp").with_js_runtime(Some("deno:/tmp/deno".to_string()));
         assert_eq!(yt.js_runtime(), Some("deno:/tmp/deno"));
+    }
+
+    #[test]
+    fn provider_paths_are_carried_with_clones() {
+        let yt = YouTube::new("yt-dlp")
+            .with_pot_provider("/tmp/plugins".to_string(), "/tmp/server".to_string());
+        let clone = yt.clone();
+        assert_eq!(clone.pot_plugin_dir(), Some("/tmp/plugins"));
+        assert_eq!(clone.pot_server_home(), Some("/tmp/server"));
     }
 
     /// Guards against passing a flag yt-dlp does not have.

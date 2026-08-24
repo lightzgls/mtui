@@ -32,6 +32,8 @@ fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 const PLAYER_TIMEOUT: Duration = Duration::from_secs(5);
 const FALLBACK_BUDGET: Duration = Duration::from_secs(30);
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const POT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+const POT_ACTIVATION_DELAY: Duration = Duration::from_secs(5);
 const PROCESS_POLL: Duration = Duration::from_millis(50);
 const SOCKET_TIMEOUT: &str = "10";
 const AUDIO_FORMAT: &str = "141/140/bestaudio[ext=m4a]";
@@ -43,6 +45,7 @@ const MUSIC_CLIENT_FLAGS: &[&str] = &[
     "youtube:player_client=web_music;player_skip=webpage,configs",
 ];
 const EMBEDDED_CLIENT_FLAGS: &[&str] = &["--extractor-args", "youtube:player_client=web_embedded"];
+const MWEB_CLIENT_FLAGS: &[&str] = &["--extractor-args", "youtube:player_client=mweb"];
 const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player";
 const MUSIC_ORIGIN: &str = "https://music.youtube.com";
 /// Highest-quality formats the compiled AAC/MP4 decoder can consume.
@@ -98,6 +101,7 @@ pub enum ResolveSource {
     YtDlp,
     YtDlpMusic,
     YtDlpEmbedded,
+    YtDlpMweb,
 }
 
 /// Audio format information known at resolution time.
@@ -218,6 +222,8 @@ pub struct Resolver {
     runtime: tokio::runtime::Runtime,
     cache: UrlCache,
     session: Option<PlaybackSession>,
+    pot_plugin_dir: Option<String>,
+    pot_server_home: Option<String>,
 }
 
 impl Resolver {
@@ -237,12 +243,20 @@ impl Resolver {
             runtime,
             cache: UrlCache::new(),
             session: None,
+            pot_plugin_dir: None,
+            pot_server_home: None,
         })
     }
 
     /// Selects the JavaScript runtime used by yt-dlp fallbacks.
     pub fn set_js_runtime(&mut self, runtime: Option<String>) {
         self.js_runtime = runtime;
+    }
+
+    /// Configures yt-dlp's local proof-of-origin provider fallback.
+    pub fn set_pot_provider(&mut self, plugin_dir: Option<String>, server_home: Option<String>) {
+        self.pot_plugin_dir = plugin_dir;
+        self.pot_server_home = server_home;
     }
 
     /// Replaces the account used for Premium-capable player requests.
@@ -355,7 +369,18 @@ impl Resolver {
             AUDIO_FORMAT,
             EMBEDDED_CLIENT_FLAGS,
             ResolveSource::YtDlpEmbedded,
+            false,
         ));
+        if self.pot_plugin_dir.is_some() && self.pot_server_home.is_some() {
+            attempts.push((
+                None,
+                "https://www.youtube.com/watch?v=",
+                AUDIO_FORMAT,
+                MWEB_CLIENT_FLAGS,
+                ResolveSource::YtDlpMweb,
+                true,
+            ));
+        }
         if let Some(session) = self.session.as_ref() {
             attempts.push((
                 Some(session),
@@ -363,6 +388,7 @@ impl Resolver {
                 MUSIC_FORMAT,
                 MUSIC_CLIENT_FLAGS,
                 ResolveSource::YtDlpMusic,
+                false,
             ));
             attempts.push((
                 Some(session),
@@ -370,6 +396,7 @@ impl Resolver {
                 AUDIO_FORMAT,
                 &[] as &[&str],
                 ResolveSource::YtDlp,
+                false,
             ));
         }
         attempts.push((
@@ -378,6 +405,7 @@ impl Resolver {
             MUSIC_FORMAT,
             MUSIC_CLIENT_FLAGS,
             ResolveSource::YtDlpMusic,
+            false,
         ));
         attempts.push((
             None,
@@ -385,16 +413,31 @@ impl Resolver {
             AUDIO_FORMAT,
             &[] as &[&str],
             ResolveSource::YtDlp,
+            false,
         ));
         let fallback_started = Instant::now();
-        for (session, watch_url, format, flags, source) in attempts {
+        for (session, watch_url, format, flags, source, uses_pot) in attempts {
             let remaining = FALLBACK_BUDGET.saturating_sub(fallback_started.elapsed());
             if remaining.is_zero() {
                 break;
             }
-            let timeout = remaining.min(ATTEMPT_TIMEOUT);
+            let timeout = remaining.min(if uses_pot {
+                POT_ATTEMPT_TIMEOUT
+            } else {
+                ATTEMPT_TIMEOUT
+            });
             let candidate = resolve_yt_dlp_as(
-                (&self.bin, self.js_runtime.as_deref(), timeout),
+                (
+                    &self.bin,
+                    self.js_runtime.as_deref(),
+                    timeout,
+                    uses_pot.then(|| {
+                        (
+                            self.pot_plugin_dir.as_deref().unwrap_or_default(),
+                            self.pot_server_home.as_deref().unwrap_or_default(),
+                        )
+                    }),
+                ),
                 session,
                 video_id,
                 watch_url,
@@ -403,14 +446,19 @@ impl Resolver {
                 source,
             );
             match candidate {
-                Ok(stream) if serves_whole_file(&self.runtime, &self.client, &stream.url) => {
+                Ok(stream) => {
+                    if uses_pot {
+                        thread::sleep(POT_ACTIVATION_DELAY);
+                    }
+                    if !serves_whole_file(&self.runtime, &self.client, &stream.url) {
+                        continue;
+                    }
                     if stream.format.itag == Some(18) {
                         progressive_fallback.get_or_insert(stream);
                     } else {
                         return Ok(stream);
                     }
                 }
-                Ok(_) => {}
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
@@ -622,7 +670,7 @@ fn pick_audio(formats: &[Format]) -> Option<(&str, u32)> {
 }
 
 fn resolve_yt_dlp_as(
-    tool: (&str, Option<&str>, Duration),
+    tool: (&str, Option<&str>, Duration, Option<(&str, &str)>),
     session: Option<&PlaybackSession>,
     video_id: &str,
     watch_url: &str,
@@ -630,11 +678,19 @@ fn resolve_yt_dlp_as(
     extra: &[&str],
     source: ResolveSource,
 ) -> Result<ResolvedStream> {
-    let (bin, js_runtime, timeout) = tool;
+    let (bin, js_runtime, timeout, pot_provider) = tool;
     let cookie_jar = session.map(SessionJar::create).transpose()?;
     let mut command = command(bin);
     if let Some(runtime) = js_runtime {
         command.args(["--no-js-runtimes", "--js-runtimes", runtime]);
+    }
+    let provider_arg = pot_provider
+        .map(|(_, server_home)| format!("youtubepot-bgutilscript:server_home={server_home}"));
+    if let Some((plugin_dir, _)) = pot_provider {
+        command.args(["--plugin-dirs", plugin_dir]);
+    }
+    if let Some(provider_arg) = provider_arg.as_deref() {
+        command.args(["--extractor-args", provider_arg]);
     }
     command
         .arg("--format")
@@ -1167,6 +1223,10 @@ mod tests {
         let bin = std::env::var("MTUI_YT_DLP").unwrap_or_else(|_| "yt-dlp".into());
         let id = std::env::var("MTUI_VIDEO_ID").unwrap_or_else(|_| "nNN88hijp-o".into());
         let mut resolver = Resolver::new(bin).expect("resolver should build");
+        resolver.set_pot_provider(
+            std::env::var("MTUI_POT_PLUGIN_DIR").ok(),
+            std::env::var("MTUI_POT_SERVER_HOME").ok(),
+        );
         let stream = resolver
             .resolve(ResolveRequest::new(&id))
             .expect("track should resolve");
@@ -1175,6 +1235,33 @@ mod tests {
             stream.source, stream.format.itag
         );
         assert_ne!(stream.source, ResolveSource::Cache);
+        assert!(serves_whole_file(
+            &resolver.runtime,
+            &resolver.client,
+            &stream.url
+        ));
+    }
+
+    #[test]
+    #[ignore = "hits YouTube and requires the PO token provider"]
+    fn resolves_a_complete_tokenized_mweb_stream() {
+        let bin = std::env::var("MTUI_YT_DLP").unwrap_or_else(|_| "yt-dlp".into());
+        let plugin = std::env::var("MTUI_POT_PLUGIN_DIR").expect("plugin directory is required");
+        let server = std::env::var("MTUI_POT_SERVER_HOME").expect("server home is required");
+        let id = std::env::var("MTUI_VIDEO_ID").unwrap_or_else(|_| "nNN88hijp-o".into());
+        let resolver = Resolver::new(&bin).expect("resolver should build");
+        let stream = resolve_yt_dlp_as(
+            (&bin, None, POT_ATTEMPT_TIMEOUT, Some((&plugin, &server))),
+            None,
+            &id,
+            "https://www.youtube.com/watch?v=",
+            AUDIO_FORMAT,
+            MWEB_CLIENT_FLAGS,
+            ResolveSource::YtDlpMweb,
+        )
+        .expect("mweb should resolve");
+        thread::sleep(POT_ACTIVATION_DELAY);
+        assert_eq!(stream.format.itag, Some(140));
         assert!(serves_whole_file(
             &resolver.runtime,
             &resolver.client,

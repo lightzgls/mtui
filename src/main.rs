@@ -33,7 +33,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
-use crossterm::event::Event;
+#[cfg(not(windows))]
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{Event, MouseButton, MouseEventKind};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 #[cfg(not(windows))]
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -190,6 +192,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
         }
         Err(err) => return Err(err),
     };
+    let mut mouse = ui::MouseMap::default();
 
     (|| -> Result<()> {
         while !app.should_quit && !app.wants_background {
@@ -203,7 +206,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
             sync_foreground_tray(app, tray);
             foreground
                 .terminal
-                .draw(|frame| ui::render(frame, app))
+                .draw(|frame| ui::render(frame, app, &mut mouse))
                 .context("could not draw the foreground")?;
 
             // Sixel pixels live outside ratatui's buffer, so nothing it draws
@@ -216,7 +219,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
                 app.invalidate_image();
                 foreground
                     .terminal
-                    .draw(|frame| ui::render(frame, app))
+                    .draw(|frame| ui::render(frame, app, &mut mouse))
                     .context("could not redraw the foreground")?;
             }
             paint_cover(app, foreground.terminal.backend_mut())
@@ -235,6 +238,16 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
             {
                 match event {
                     Event::Key(key) if key.is_press() => app.handle_key(key)?,
+                    Event::Mouse(event) => match event.kind {
+                        MouseEventKind::ScrollDown => app.handle_mouse_scroll(true)?,
+                        MouseEventKind::ScrollUp => app.handle_mouse_scroll(false)?,
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Some(action) = mouse.action_at(event.column, event.row) {
+                                app.handle_mouse_action(action)?;
+                            }
+                        }
+                        _ => {}
+                    },
                     Event::Resize(width, height) => {
                         #[cfg(not(windows))]
                         let _ = (width, height);
@@ -277,7 +290,15 @@ impl Foreground {
         let (width, height) = console::size().context("could not read the foreground size")?;
         let mut output = console::output().context("could not open the foreground output")?;
         enable_foreground_input().context("could not enable foreground input")?;
-        if let Err(err) = execute!(output, EnterAlternateScreen) {
+        #[cfg(windows)]
+        let entered = execute!(output, EnterAlternateScreen);
+        #[cfg(not(windows))]
+        let entered = execute!(output, EnterAlternateScreen, EnableMouseCapture);
+        if let Err(err) = entered {
+            #[cfg(windows)]
+            let _ = execute!(output, LeaveAlternateScreen);
+            #[cfg(not(windows))]
+            let _ = execute!(output, DisableMouseCapture, LeaveAlternateScreen);
             disable_foreground_input();
             return Err(err).context("could not enter the alternate screen");
         }
@@ -294,7 +315,10 @@ impl Foreground {
             Ok(terminal) => terminal,
             Err(err) => {
                 if let Ok(mut output) = console::output() {
+                    #[cfg(windows)]
                     let _ = execute!(output, LeaveAlternateScreen);
+                    #[cfg(not(windows))]
+                    let _ = execute!(output, DisableMouseCapture, LeaveAlternateScreen);
                 }
                 disable_foreground_input();
                 return Err(err).context("could not create the terminal renderer");
@@ -427,7 +451,14 @@ impl Backend for WindowsBackend {
 
 impl Drop for Foreground {
     fn drop(&mut self) {
+        #[cfg(windows)]
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        #[cfg(not(windows))]
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         disable_foreground_input();
     }
 }

@@ -55,6 +55,10 @@ pub fn resolve_stream(
 ) -> anyhow::Result<(StreamUrl, bool)> {
     let mut resolver = mtui_resolver::Resolver::new(yt.bin())?;
     resolver.set_js_runtime(yt.js_runtime().map(str::to_string));
+    resolver.set_pot_provider(
+        yt.pot_plugin_dir().map(str::to_string),
+        yt.pot_server_home().map(str::to_string),
+    );
     if let Some(cookies) = crate::config::Cookies::available()? {
         resolver.set_session(Some(mtui_resolver::PlaybackSession::new(
             cookies.header().to_string(),
@@ -152,11 +156,16 @@ mod live_quality {
         use std::time::{Duration, Instant};
 
         let yt = super::bootstrap::locate().expect("yt-dlp should be available");
+        let yt = super::bootstrap::with_js_runtime(yt).expect("runtime setup should succeed");
         let cookies = crate::config::Cookies::available()
             .expect("saved cookies should parse")
             .expect("no saved browser session is available");
         let mut resolver = mtui_resolver::Resolver::new(yt.bin()).expect("resolver should build");
         resolver.set_js_runtime(yt.js_runtime().map(str::to_string));
+        resolver.set_pot_provider(
+            yt.pot_plugin_dir().map(str::to_string),
+            yt.pot_server_home().map(str::to_string),
+        );
         resolver.set_session(Some(mtui_resolver::PlaybackSession::new(
             cookies.header().to_string(),
             cookies.sapisid().to_string(),

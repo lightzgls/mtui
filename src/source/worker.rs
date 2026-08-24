@@ -643,6 +643,10 @@ fn run_completions(yt: YouTube, rx: Receiver<CompletionRequest>, tx: Sender<Resp
         return;
     };
     resolver.set_js_runtime(yt.js_runtime().map(str::to_string));
+    resolver.set_pot_provider(
+        yt.pot_plugin_dir().map(str::to_string),
+        yt.pot_server_home().map(str::to_string),
+    );
     let mut recent_background: Option<(String, Instant)> = None;
 
     while let Ok(mut request) = rx.recv() {
@@ -715,6 +719,10 @@ fn run_source_loop(
 ) {
     if let Ok(active) = resolver.as_mut() {
         active.set_js_runtime(yt.js_runtime().map(str::to_string));
+        active.set_pot_provider(
+            yt.pot_plugin_dir().map(str::to_string),
+            yt.pot_server_home().map(str::to_string),
+        );
     }
     // Resolves taken off the queue. Behind `asked` exactly when the queue holds
     // one the user asked for more recently than the one in hand.

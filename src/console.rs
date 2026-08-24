@@ -18,7 +18,10 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result, anyhow};
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton,
+        MouseEvent, MouseEventKind,
+    };
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -92,6 +95,15 @@ mod imp {
         pub(super) control: u32,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct MouseRecord {
+        pub(super) position: [i16; 2],
+        pub(super) button_state: u32,
+        pub(super) control: u32,
+        pub(super) event_flags: u32,
+    }
+
     const STD_INPUT_HANDLE: u32 = -10i32 as u32;
     const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
     const GENERIC_READ: u32 = 0x8000_0000;
@@ -103,6 +115,7 @@ mod imp {
     const CP_UTF8: u32 = 65001;
     const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
     const KEY_EVENT: u16 = 0x0001;
+    const MOUSE_EVENT: u16 = 0x0002;
     const WINDOW_BUFFER_SIZE_EVENT: u16 = 0x0004;
     const SHIFT_PRESSED: u32 = 0x0010;
     const ALT_PRESSED: u32 = 0x0001 | 0x0002;
@@ -111,8 +124,10 @@ mod imp {
     const ENABLE_LINE_INPUT: u32 = 0x0002;
     const ENABLE_ECHO_INPUT: u32 = 0x0004;
     const ENABLE_WINDOW_INPUT: u32 = 0x0008;
+    const ENABLE_MOUSE_INPUT: u32 = 0x0010;
     const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
     const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+    const MOUSE_WHEELED: u32 = 0x0004;
     const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
     const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
@@ -460,7 +475,7 @@ mod imp {
             | ENABLE_LINE_INPUT
             | ENABLE_ECHO_INPUT
             | ENABLE_QUICK_EDIT_MODE);
-        input_mode |= ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS;
+        input_mode |= ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
         if unsafe { SetConsoleMode(input_raw, input_mode) } == 0 {
             return Err(anyhow!("could not enable raw terminal input"));
         }
@@ -728,6 +743,12 @@ mod imp {
                     unsafe { std::ptr::read_unaligned(record.event.as_ptr().cast::<KeyRecord>()) };
                 key_event(key, high_surrogate).map(Event::Key)
             }
+            MOUSE_EVENT => {
+                let mouse = unsafe {
+                    std::ptr::read_unaligned(record.event.as_ptr().cast::<MouseRecord>())
+                };
+                mouse_event(mouse).map(Event::Mouse)
+            }
             WINDOW_BUFFER_SIZE_EVENT => {
                 let packed = record.event[0];
                 Some(Event::Resize(packed as u16, (packed >> 16) as u16))
@@ -736,20 +757,56 @@ mod imp {
         }
     }
 
+    pub(super) fn mouse_event(record: MouseRecord) -> Option<MouseEvent> {
+        let column = u16::try_from(record.position[0]).ok()?;
+        let row = u16::try_from(record.position[1]).ok()?;
+        let kind = if record.event_flags == MOUSE_WHEELED {
+            if (record.button_state >> 16) as i16 > 0 {
+                MouseEventKind::ScrollUp
+            } else {
+                MouseEventKind::ScrollDown
+            }
+        } else if record.event_flags == 0 {
+            let button = if record.button_state & 0x0001 != 0 {
+                MouseButton::Left
+            } else if record.button_state & 0x0002 != 0 {
+                MouseButton::Right
+            } else if record.button_state & 0x0004 != 0 {
+                MouseButton::Middle
+            } else {
+                return None;
+            };
+            MouseEventKind::Down(button)
+        } else {
+            return None;
+        };
+        Some(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: modifiers(record.control),
+        })
+    }
+
+    fn modifiers(control: u32) -> KeyModifiers {
+        let mut modifiers = KeyModifiers::empty();
+        if control & SHIFT_PRESSED != 0 {
+            modifiers.insert(KeyModifiers::SHIFT);
+        }
+        if control & ALT_PRESSED != 0 {
+            modifiers.insert(KeyModifiers::ALT);
+        }
+        if control & CONTROL_PRESSED != 0 {
+            modifiers.insert(KeyModifiers::CONTROL);
+        }
+        modifiers
+    }
+
     pub(super) fn key_event(
         record: KeyRecord,
         high_surrogate: &mut Option<u16>,
     ) -> Option<KeyEvent> {
-        let mut modifiers = KeyModifiers::empty();
-        if record.control & SHIFT_PRESSED != 0 {
-            modifiers.insert(KeyModifiers::SHIFT);
-        }
-        if record.control & ALT_PRESSED != 0 {
-            modifiers.insert(KeyModifiers::ALT);
-        }
-        if record.control & CONTROL_PRESSED != 0 {
-            modifiers.insert(KeyModifiers::CONTROL);
-        }
+        let modifiers = modifiers(record.control);
 
         let code = match record.virtual_key {
             0x08 => KeyCode::Backspace,
@@ -892,10 +949,11 @@ pub use imp::{is_host, prepare_parent, run_host, size};
 
 #[cfg(all(test, windows))]
 mod tests {
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 
     use super::imp::{
-        InputRecord, KeyRecord, decode_record, encode_record, key_event, unicode_char,
+        InputRecord, KeyRecord, MouseRecord, decode_record, encode_record, key_event, mouse_event,
+        unicode_char,
     };
 
     fn record(virtual_key: u16, unicode: u16, control: u32) -> KeyRecord {
@@ -961,6 +1019,42 @@ mod tests {
         let decoded = decode_record(&wire);
         assert_eq!(decoded.event_type, record.event_type);
         assert_eq!(decoded.event, record.event);
+    }
+
+    #[test]
+    fn native_left_click_becomes_a_terminal_mouse_event() {
+        let event = mouse_event(MouseRecord {
+            position: [12, 7],
+            button_state: 1,
+            control: 0,
+            event_flags: 0,
+        })
+        .unwrap();
+        assert_eq!(event.kind, MouseEventKind::Down(MouseButton::Left));
+        assert_eq!((event.column, event.row), (12, 7));
+    }
+
+    #[test]
+    fn native_wheel_direction_keeps_its_sign() {
+        let up = mouse_event(MouseRecord {
+            position: [0, 0],
+            button_state: (120u32) << 16,
+            control: 0,
+            event_flags: 4,
+        })
+        .unwrap();
+        let down = mouse_event(MouseRecord {
+            button_state: ((-120i16 as u16) as u32) << 16,
+            ..MouseRecord {
+                position: [0, 0],
+                button_state: 0,
+                control: 0,
+                event_flags: 4,
+            }
+        })
+        .unwrap();
+        assert_eq!(up.kind, MouseEventKind::ScrollUp);
+        assert_eq!(down.kind, MouseEventKind::ScrollDown);
     }
 
     /// Opens a real helper window, so it is kept out of automated test runs.

@@ -17,8 +17,8 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{
-    App, CardShape, CoverSize, ImagePlan, MenuItem, MenuPage, Mode, NowPlaying, Overlay, Panel,
-    RelatedRow, SignIn, Tab, View,
+    App, CardShape, CoverSize, ImagePlan, MenuItem, MenuPage, Mode, MouseAction, NowPlaying,
+    Overlay, Panel, RelatedRow, SignIn, Tab, View,
 };
 use crate::art::ArtCache;
 use crate::config::CoverStyle;
@@ -258,7 +258,46 @@ const MIN_SHELF_TITLE: usize = 8;
 const HINT_HIDE: &str = "  Esc hides this";
 const HINT_HIDE_RUNNING: &str = "  Esc hides this -- the sign-in keeps running";
 
-pub fn render(frame: &mut Frame, app: &mut App) {
+#[derive(Default)]
+pub struct MouseMap {
+    targets: Vec<MouseTarget>,
+}
+
+#[derive(Clone, Copy)]
+enum MouseTarget {
+    Area(Rect, MouseAction),
+    TrackRows { area: Rect, first: usize },
+    PlaylistRows { area: Rect, first: usize },
+    PageRows { area: Rect, first: usize },
+}
+
+impl MouseMap {
+    pub fn action_at(&self, column: u16, row: u16) -> Option<MouseAction> {
+        self.targets.iter().rev().find_map(|target| match *target {
+            MouseTarget::Area(area, action) if contains(area, column, row) => Some(action),
+            MouseTarget::TrackRows { area, first } if contains(area, column, row) => Some(
+                MouseAction::PlayTrack(first + usize::from(row.saturating_sub(area.y))),
+            ),
+            MouseTarget::PlaylistRows { area, first } if contains(area, column, row) => Some(
+                MouseAction::OpenPlaylist(first + usize::from(row.saturating_sub(area.y))),
+            ),
+            MouseTarget::PageRows { area, first } if contains(area, column, row) => Some(
+                MouseAction::OpenPageRow(first + usize::from(row.saturating_sub(area.y))),
+            ),
+            _ => None,
+        })
+    }
+}
+
+fn contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
+pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
+    mouse.targets.clear();
     let [search_area, main_area, status_area] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
@@ -267,18 +306,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     .areas(frame.area());
 
     render_search(frame, app, search_area);
+    mouse
+        .targets
+        .push(MouseTarget::Area(search_area, MouseAction::EditSearch));
 
     // The player page lays itself out around the cover rather than beside it,
     // so it reserves its own rect instead of going through `split_cover`.
     let cover_area = if app.view == View::Playing {
-        render_player(frame, app, main_area)
+        render_player(frame, app, main_area, mouse)
     } else {
         let (list_area, cover_area) = split_cover(app, main_area);
         if let Some(area) = list_area {
             match app.view {
-                View::Home => render_home(frame, app, area),
-                View::Tracks => render_results(frame, app, area),
-                View::Playlists => render_playlists(frame, app, area),
+                View::Home => render_home(frame, app, area, mouse),
+                View::Tracks => render_results(frame, app, area, mouse),
+                View::Playlists => render_playlists(frame, app, area, mouse),
                 View::Artist => render_artist(frame, app, area),
                 // Handled above.
                 View::Playing => {}
@@ -1392,7 +1434,7 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
 /// costs. The artwork obeys the same rule and is what makes it matter: the
 /// cards drawn here are the only ones whose pictures are ever fetched, which is
 /// a dozen requests for a feed of three hundred cards.
-fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_home(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMap) {
     let block = Block::bordered().title(app.list_title());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1451,6 +1493,35 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     if let Some(focused) = layouts.iter().find(|layout| layout.index == app.home_shelf) {
         app.clamp_home_cards(focused.across as usize);
+    }
+
+    for layout in &layouts {
+        let Some(shelf) = app.home.get(layout.index) else {
+            continue;
+        };
+        let offset = app.home_scroll.get(layout.index).copied().unwrap_or(0);
+        let cards = Rect {
+            y: layout.area.y.saturating_add(1),
+            height: layout.area.height.saturating_sub(1),
+            ..layout.area
+        };
+        for column in 0..layout.across {
+            let card = offset + column as usize;
+            if card >= shelf.cards.len() {
+                break;
+            }
+            mouse.targets.push(MouseTarget::Area(
+                Rect {
+                    x: cards.x + column * layout.slot,
+                    width: layout.slot.saturating_sub(1),
+                    ..cards
+                },
+                MouseAction::OpenHomeCard {
+                    shelf: layout.index,
+                    card,
+                },
+            ));
+        }
     }
 
     let cursor = HomeCursor {
@@ -2693,7 +2764,7 @@ fn render_hero(frame: &mut Frame, hero: &Hero, area: Rect) {
 }
 
 /// The user's playlists, with "Liked songs" pinned at the top.
-fn render_playlists(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_playlists(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMap) {
     let block = Block::bordered().title(app.list_title());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2719,6 +2790,13 @@ fn render_playlists(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Virtualized on the same principle as the results list.
     let end = (app.playlist_offset + height).min(app.playlists.len());
+    mouse.targets.push(MouseTarget::PlaylistRows {
+        area: Rect {
+            height: (end - app.playlist_offset) as u16,
+            ..inner
+        },
+        first: app.playlist_offset,
+    });
     let width = inner.width as usize;
     let items: Vec<ListItem> = app.playlists[app.playlist_offset..end]
         .iter()
@@ -2794,7 +2872,12 @@ fn playlist_line(
 /// Returns the rect the cover should be centred in, which the caller paints --
 /// the picture is not part of ratatui's buffer on the sixel path, so it cannot
 /// be drawn from here.
-fn render_player(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
+fn render_player(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    mouse: &mut MouseMap,
+) -> Option<Rect> {
     // Nothing is playing, so there is no page. Reachable for one frame after a
     // stop, before the key handler's view change is drawn.
     let now = app.now.as_ref()?;
@@ -2809,7 +2892,7 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
     // where the queue, the lyrics and the comments are, and a cover squeezed
     // into twenty columns is a smudge.
     if area.width < MIN_WIDTH_WITH_COVER {
-        render_panel(frame, app, area);
+        render_panel(frame, app, area, mouse);
         return None;
     }
 
@@ -2835,7 +2918,7 @@ fn render_player(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
     };
     render_track_info(frame, now, app.snapshot(), info, ambient(app));
 
-    render_panel(frame, app, panel_area);
+    render_panel(frame, app, panel_area, mouse);
     art
 }
 
@@ -2960,7 +3043,7 @@ fn volume_line<'a>(volume: f32, width: usize) -> Line<'a> {
 /// length is written back to the cursor the keys move. Doing it in that order
 /// means a frame is never drawn with a cursor past the end of a panel whose
 /// length only became knowable while drawing it.
-fn render_panel(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMap) {
     // Both taken before the page is borrowed, since the panels need them and
     // the borrow below is what stops either being asked for down there.
     let snap = app.snapshot();
@@ -2978,7 +3061,39 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let tab = now.tab;
     let [tabs, content] =
         Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
-    render_tabs(frame, tab, tabs, accent);
+    render_tabs(frame, tab, tabs, accent, mouse);
+
+    match tab {
+        Tab::UpNext if !now.queue.is_empty() => {
+            let viewport = (content.height as usize).saturating_sub(UP_NEXT_HEADER);
+            let cursor = now.cursor().min(now.queue.len().saturating_sub(1));
+            let first = centred_offset(cursor, viewport, now.queue.len());
+            let count = viewport.min(now.queue.len().saturating_sub(first));
+            mouse.targets.push(MouseTarget::PageRows {
+                area: Rect {
+                    y: content.y.saturating_add(UP_NEXT_HEADER as u16),
+                    height: count as u16,
+                    ..content
+                },
+                first,
+            });
+        }
+        Tab::Related => {
+            let total = now.related_rows().len();
+            let viewport = content.height as usize;
+            let cursor = now.cursor().min(total.saturating_sub(1));
+            let first = centred_offset(cursor, viewport, total);
+            let count = viewport.min(total.saturating_sub(first));
+            mouse.targets.push(MouseTarget::PageRows {
+                area: Rect {
+                    height: count as u16,
+                    ..content
+                },
+                first,
+            });
+        }
+        _ => {}
+    }
 
     // Set only by the lyrics panel, and only while it is following the singer:
     // where it scrolled itself to, which becomes the cursor the keys move.
@@ -3014,7 +3129,7 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect) {
 /// bar across the top of it would be the loudest thing on the page. The rule is
 /// drawn as its own row so it reads as the edge of the panel, which is what it
 /// is.
-fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Color) {
+fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Color, mouse: &mut MouseMap) {
     let mut labels = Vec::new();
     let mut rule = Vec::new();
     let roomy_width = Tab::ALL
@@ -3030,6 +3145,7 @@ fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Color) {
     let initials = area.width >= 12;
     let numbered_padding = if area.width >= 8 { " " } else { "" };
 
+    let mut x = area.x;
     for (index, tab) in Tab::ALL.into_iter().enumerate() {
         let selected = tab == open;
         let style = if selected {
@@ -3053,7 +3169,14 @@ fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Color) {
         };
         let right = if roomy { " " } else { "" };
         let left = if tiny { numbered_padding } else { " " };
-        labels.push(Span::styled(format!("{left}{label}{right}"), style));
+        let rendered = format!("{left}{label}{right}");
+        let rendered_width = display_width(&rendered) as u16;
+        mouse.targets.push(MouseTarget::Area(
+            Rect::new(x, area.y, rendered_width, area.height),
+            MouseAction::OpenTab(tab),
+        ));
+        x = x.saturating_add(rendered_width);
+        labels.push(Span::styled(rendered, style));
 
         // Under the letters rather than under the padding, so the rule reads as
         // belonging to the name above it rather than to the gap beside it.
@@ -3511,7 +3634,7 @@ fn clock(d: Duration) -> String {
     }
 }
 
-fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_results(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMap) {
     let block = Block::bordered().title(app.list_title());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -3558,6 +3681,13 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Virtualization: slice to the visible window before building any items.
     let end = (app.offset + height).min(app.results.len());
+    mouse.targets.push(MouseTarget::TrackRows {
+        area: Rect {
+            height: (end - app.offset) as u16,
+            ..list_area
+        },
+        first: app.offset,
+    });
     let visible = &app.results[app.offset..end];
 
     let items: Vec<ListItem> = visible
@@ -5034,12 +5164,13 @@ mod tests {
             ..Default::default()
         };
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut mouse = MouseMap::default();
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, width, height);
                 let [tabs, content] =
                     Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(area);
-                render_tabs(frame, now.tab, tabs, Color::Cyan);
+                render_tabs(frame, now.tab, tabs, Color::Cyan, &mut mouse);
                 match now.tab {
                     Tab::UpNext => render_up_next(frame, now, content, Color::Cyan),
                     Tab::Lyrics => render_lyrics(frame, now, &snap, content).0,

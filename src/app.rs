@@ -199,6 +199,17 @@ pub enum View {
     Playing,
 }
 
+/// A semantic action produced by hit-testing the last rendered terminal frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseAction {
+    EditSearch,
+    OpenHomeCard { shelf: usize, card: usize },
+    PlayTrack(usize),
+    OpenPlaylist(usize),
+    OpenTab(Tab),
+    OpenPageRow(usize),
+}
+
 /// Which panel of the player page is showing.
 ///
 /// One at a time rather than side by side, for the same reason the main pane
@@ -3874,6 +3885,65 @@ impl App {
                 View::Playing => self.handle_playing_key(key),
             },
         }
+    }
+
+    /// Applies a click without manufacturing a key whose meaning depends on the
+    /// current view. Modal layers retain the same ownership they have for keys.
+    pub fn handle_mouse_action(&mut self, action: MouseAction) -> Result<()> {
+        if self.overlay.is_open() || self.menu.is_some() {
+            return Ok(());
+        }
+        match action {
+            MouseAction::EditSearch => self.begin_search(),
+            MouseAction::OpenHomeCard { shelf, card } if self.view == View::Home => {
+                let selected = self
+                    .home
+                    .get(shelf)
+                    .and_then(|row| row.cards.get(card))
+                    .cloned();
+                if let Some(selected) = selected {
+                    self.home_shelf = shelf;
+                    self.home_card = card;
+                    self.selection_settled = Some(Instant::now());
+                    self.activate_card(selected);
+                }
+            }
+            MouseAction::PlayTrack(index) if self.view == View::Tracks => {
+                if index < self.results.len() {
+                    self.selected = index;
+                    self.selection_settled = Some(Instant::now());
+                    self.play_selected();
+                }
+            }
+            MouseAction::OpenPlaylist(index) if self.view == View::Playlists => {
+                if index < self.playlists.len() {
+                    self.playlist_selected = index;
+                    self.open_selected_playlist();
+                }
+            }
+            MouseAction::OpenTab(tab) if self.view == View::Playing => {
+                if self.now.as_mut().is_some_and(|now| now.open(tab)) {
+                    self.request_tab();
+                }
+            }
+            MouseAction::OpenPageRow(index) if self.view == View::Playing => {
+                if let Some(now) = self.now.as_mut() {
+                    *now.cursor_mut() = index;
+                }
+                self.open_page_row();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Mouse wheels follow the active view's existing up/down behavior.
+    pub fn handle_mouse_scroll(&mut self, down: bool) -> Result<()> {
+        if self.mode == Mode::Editing {
+            return Ok(());
+        }
+        let code = if down { KeyCode::Down } else { KeyCode::Up };
+        self.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
     fn handle_overlay_key(&mut self, key: KeyEvent) -> Result<()> {

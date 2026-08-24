@@ -93,7 +93,7 @@ Ensure `~/.local/bin` is on `PATH`.
 
 ## First Run
 
-MTUI finds `yt-dlp` on `PATH` or downloads a private copy on first run. If `yt-dlp` cannot find a supported JavaScript runtime, MTUI reuses Deno, Node.js, or Bun from `PATH`, or installs Deno privately. Neither automatic install requires administrator access.
+MTUI finds `yt-dlp` on `PATH` or downloads a private copy on first run. If `yt-dlp` cannot find a supported JavaScript runtime, MTUI reuses Deno, Node.js, or Bun from `PATH`, or installs Deno privately. MTUI also installs a pinned local copy of the GPL-3.0 `bgutil-ytdlp-pot-provider` and its production dependencies so YouTube's protected audio streams can play at normal quality. These automatic installs require network access but not administrator access.
 
 | Experience | Account needed | How to connect |
 |---|---:|---|
@@ -132,6 +132,8 @@ Press `A` again and follow the device-code prompt. MTUI stores refreshed tokens 
 ## Controls
 
 `Ctrl-K` opens the global App Menu. Outside search entry, `.` opens actions for the current page or selection.
+
+The terminal UI also accepts the mouse: use the wheel to navigate, click the search box to edit, and click visible cards, rows, playlists, player tabs, or queue entries to open them.
 
 | Key | Action |
 |---|---|

@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "mtui"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2024"
 description = "A terminal music player for YouTube Music, built to stay small in memory"
 license = "MIT"

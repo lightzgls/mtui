@@ -19,7 +19,7 @@
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -67,6 +67,15 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// fail later, when it is run.
 const MIN_PLAUSIBLE_BYTES: u64 = 1024 * 1024;
 const MIN_DENO_ARCHIVE_BYTES: u64 = 10 * 1024 * 1024;
+
+const POT_VERSION: &str = "1.3.2";
+const POT_PLUGIN_URL: &str = "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/releases/download/1.3.2/bgutil-ytdlp-pot-provider.zip";
+const POT_SOURCE_URL: &str =
+    "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/1.3.2.zip";
+const POT_PLUGIN_ZIP: &str = "bgutil-ytdlp-pot-provider.zip";
+const POT_MARKER: &str = ".version";
+const MIN_POT_PLUGIN_BYTES: u64 = 1024;
+const MIN_POT_SOURCE_BYTES: u64 = 10 * 1024;
 
 #[cfg(windows)]
 const DENO_BIN: &str = "deno.exe";
@@ -127,23 +136,76 @@ pub fn locate() -> Result<YouTube> {
 /// Reuses a supported JavaScript runtime, or installs a private copy of Deno.
 /// A failed install is non-fatal: simpler yt-dlp paths still work without it.
 pub fn with_js_runtime(yt: YouTube) -> Result<YouTube> {
-    for runtime in ["deno", "node", "bun"] {
-        if runtime_supported(runtime) {
-            return Ok(yt.with_js_runtime(Some(runtime.to_string())));
+    let mut selected = ["deno", "node", "bun"]
+        .into_iter()
+        .find(|runtime| runtime_supported(runtime))
+        .map(str::to_string);
+
+    let managed = match bin_dir() {
+        Ok(dir) => dir.join(DENO_BIN),
+        Err(error) => {
+            eprintln!("mtui: could not set up PO token provider: {error:#}");
+            if selected.is_none() {
+                eprintln!("mtui: continuing without a JavaScript runtime");
+            }
+            eprintln!("mtui: continuing without PO token provider");
+            return Ok(yt.with_js_runtime(selected));
+        }
+    };
+
+    if selected.is_none() {
+        if ensure_managed_deno(&managed) {
+            selected = Some(runtime_arg(&managed));
+        } else {
+            eprintln!("mtui: continuing without a JavaScript runtime");
         }
     }
 
-    let managed = bin_dir()?.join(DENO_BIN);
-    if runtime_supported_at("deno", &managed) {
-        return Ok(yt.with_js_runtime(Some(runtime_arg(&managed))));
-    }
+    let mut yt = yt.with_js_runtime(selected.clone());
+    let provider_deno = selected
+        .as_deref()
+        .and_then(deno_executable)
+        .map(PathBuf::from)
+        .or_else(|| ensure_managed_deno(&managed).then(|| managed.clone()));
 
-    if let Err(error) = install_deno(&managed) {
-        eprintln!("mtui: could not install Deno: {error:#}");
-        eprintln!("mtui: continuing without a JavaScript runtime");
-        return Ok(yt);
+    if let Some(deno) = provider_deno {
+        match install_pot_provider(&deno) {
+            Ok((plugin_dir, server_home)) => {
+                yt = yt.with_pot_provider(
+                    plugin_dir.to_string_lossy().into_owned(),
+                    server_home.to_string_lossy().into_owned(),
+                );
+            }
+            Err(error) => {
+                eprintln!("mtui: could not set up PO token provider: {error:#}");
+                eprintln!("mtui: continuing without PO token provider");
+            }
+        }
+    } else {
+        eprintln!("mtui: continuing without PO token provider");
     }
-    Ok(yt.with_js_runtime(Some(runtime_arg(&managed))))
+    Ok(yt)
+}
+
+fn ensure_managed_deno(managed: &Path) -> bool {
+    if runtime_supported_at("deno", managed) {
+        return true;
+    }
+    if let Err(error) = install_deno(managed) {
+        eprintln!("mtui: could not install Deno: {error:#}");
+        return false;
+    }
+    true
+}
+
+fn deno_executable(runtime: &str) -> Option<&str> {
+    if runtime == "deno" {
+        Some(runtime)
+    } else {
+        runtime
+            .strip_prefix("deno:")
+            .filter(|path| !path.is_empty())
+    }
 }
 
 fn runtime_supported(runtime: &str) -> bool {
@@ -193,6 +255,166 @@ fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
 
 fn runtime_arg(path: &Path) -> String {
     format!("deno:{}", path.to_string_lossy())
+}
+
+fn provider_paths(root: &Path) -> (PathBuf, PathBuf) {
+    (root.join("plugins"), root.join("server"))
+}
+
+fn provider_install_valid(root: &Path) -> bool {
+    let (plugin_dir, server_home) = provider_paths(root);
+    marker_matches(&root.join(POT_MARKER))
+        && plugin_dir.join(POT_PLUGIN_ZIP).is_file()
+        && server_home.join("deno.json").is_file()
+        && server_home.join("node_modules").is_dir()
+}
+
+fn marker_matches(marker: &Path) -> bool {
+    fs::read_to_string(marker).is_ok_and(|version| version.trim() == POT_VERSION)
+}
+
+fn install_pot_provider(deno: &Path) -> Result<(PathBuf, PathBuf)> {
+    let root = bin_dir()?.join("pot-provider");
+    if provider_install_valid(&root) {
+        return Ok(provider_paths(&root));
+    }
+
+    let suffix = std::process::id();
+    let staging = root.with_extension(format!("part-{suffix}"));
+    let backup = root.with_extension(format!("old-{suffix}"));
+    let _ = fs::remove_dir_all(&staging);
+    let _ = fs::remove_dir_all(&backup);
+
+    let result = (|| {
+        let (plugin_dir, server_home) = provider_paths(&staging);
+        fs::create_dir_all(&plugin_dir)
+            .with_context(|| format!("could not create {}", plugin_dir.display()))?;
+        download_asset(
+            &plugin_dir.join(POT_PLUGIN_ZIP),
+            POT_PLUGIN_URL,
+            "PO token provider plugin",
+            MIN_POT_PLUGIN_BYTES,
+        )?;
+
+        let source_archive = staging.join("source.zip");
+        download_asset(
+            &source_archive,
+            POT_SOURCE_URL,
+            "PO token provider source",
+            MIN_POT_SOURCE_BYTES,
+        )?;
+        extract_provider_server(&source_archive, &server_home)?;
+        fs::remove_file(&source_archive)
+            .with_context(|| format!("could not remove {}", source_archive.display()))?;
+
+        let status = command(deno)
+            .args([
+                "install",
+                "--allow-scripts=npm:canvas",
+                "--frozen",
+                "--prod",
+            ])
+            .current_dir(&server_home)
+            .stdin(Stdio::null())
+            .status()
+            .context("could not run Deno to install PO token provider dependencies")?;
+        if !status.success() {
+            bail!("Deno failed to install PO token provider dependencies");
+        }
+
+        fs::write(staging.join(POT_MARKER), format!("{POT_VERSION}\n"))
+            .context("could not write PO token provider version marker")?;
+
+        // Another process may have completed while this process was preparing.
+        if provider_install_valid(&root) {
+            return Ok(());
+        }
+        if root.exists() {
+            fs::rename(&root, &backup)
+                .with_context(|| format!("could not replace {}", root.display()))?;
+        }
+        if let Err(error) = fs::rename(&staging, &root) {
+            if backup.exists() {
+                let _ = fs::rename(&backup, &root);
+            }
+            return Err(error)
+                .with_context(|| format!("could not install into {}", root.display()));
+        }
+        let _ = fs::remove_dir_all(&backup);
+        eprintln!("mtui: installed PO token provider {POT_VERSION}");
+        Ok(())
+    })();
+
+    let _ = fs::remove_dir_all(&staging);
+    if result.is_err() && backup.exists() && !root.exists() {
+        let _ = fs::rename(&backup, &root);
+    }
+    result?;
+    Ok(provider_paths(&root))
+}
+
+fn provider_server_relative(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    let root = match components.next()? {
+        Component::Normal(root) => root,
+        _ => return None,
+    };
+    if root != format!("bgutil-ytdlp-pot-provider-{POT_VERSION}").as_str() {
+        return None;
+    }
+    if !matches!(components.next(), Some(Component::Normal(name)) if name == "server") {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for component in components {
+        match component {
+            Component::Normal(part) => relative.push(part),
+            _ => return None,
+        }
+    }
+    Some(relative)
+}
+
+fn extract_provider_server(archive: &Path, server_home: &Path) -> Result<()> {
+    let file =
+        fs::File::open(archive).with_context(|| format!("could not open {}", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(file).context("the provider source was not a zip file")?;
+    fs::create_dir_all(server_home)
+        .with_context(|| format!("could not create {}", server_home.display()))?;
+
+    for index in 0..zip.len() {
+        let mut entry = zip
+            .by_index(index)
+            .context("could not read provider source zip")?;
+        let Some(enclosed) = entry.enclosed_name() else {
+            continue;
+        };
+        let Some(relative) = provider_server_relative(&enclosed) else {
+            continue;
+        };
+        let output = server_home.join(relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&output)
+                .with_context(|| format!("could not create {}", output.display()))?;
+            continue;
+        }
+        if let Some(mode) = entry.unix_mode() {
+            let kind = mode & 0o170000;
+            if kind != 0 && kind != 0o100000 {
+                bail!("provider source contained a non-regular file");
+            }
+        }
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+        let mut file = fs::File::create(&output)
+            .with_context(|| format!("could not create {}", output.display()))?;
+        io::copy(&mut entry, &mut file)
+            .with_context(|| format!("could not extract {}", output.display()))?;
+    }
+    Ok(())
 }
 
 fn deno_download_url() -> Result<&'static str> {
@@ -448,6 +670,63 @@ mod tests {
         assert_eq!(parse_version("24.11.1"), Some((24, 11, 1)));
         assert_eq!(parse_version("1.3.14-canary"), Some((1, 3, 14)));
         assert_eq!(parse_version("not-a-version"), None);
+    }
+
+    #[test]
+    fn deno_runtime_spelling_yields_its_executable() {
+        assert_eq!(deno_executable("deno"), Some("deno"));
+        assert_eq!(
+            deno_executable(r"deno:C:\tools\deno.exe"),
+            Some(r"C:\tools\deno.exe")
+        );
+        assert_eq!(deno_executable("node"), None);
+        assert_eq!(deno_executable("deno:"), None);
+    }
+
+    #[test]
+    fn provider_archive_paths_are_confined_to_server() {
+        let root = format!("bgutil-ytdlp-pot-provider-{POT_VERSION}");
+        assert_eq!(
+            provider_server_relative(&PathBuf::from(&root).join("server/src/main.ts")),
+            Some(PathBuf::from("src/main.ts"))
+        );
+        assert_eq!(
+            provider_server_relative(&PathBuf::from(&root).join("README.md")),
+            None
+        );
+        assert_eq!(
+            provider_server_relative(&PathBuf::from(&root).join("server/../README.md")),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_marker_must_match_the_pinned_version() {
+        let dir =
+            std::env::temp_dir().join(format!("mtui-provider-marker-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(POT_MARKER);
+        fs::write(&marker, format!("{POT_VERSION}\n")).unwrap();
+        assert!(marker_matches(&marker));
+        fs::write(&marker, "different\n").unwrap();
+        assert!(!marker_matches(&marker));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "downloads and prepares the PO token provider"]
+    fn installs_a_working_pot_provider() {
+        let deno = if runtime_supported("deno") {
+            PathBuf::from("deno")
+        } else {
+            let managed = bin_dir().unwrap().join(DENO_BIN);
+            assert!(ensure_managed_deno(&managed));
+            managed
+        };
+        let (plugin_dir, server_home) = install_pot_provider(&deno).unwrap();
+        assert!(plugin_dir.join(POT_PLUGIN_ZIP).is_file());
+        assert!(server_home.join("node_modules").is_dir());
     }
 
     #[test]
