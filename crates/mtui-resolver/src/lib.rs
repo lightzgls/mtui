@@ -42,6 +42,7 @@ const MUSIC_CLIENT_FLAGS: &[&str] = &[
     "--extractor-args",
     "youtube:player_client=web_music;player_skip=webpage,configs",
 ];
+const EMBEDDED_CLIENT_FLAGS: &[&str] = &["--extractor-args", "youtube:player_client=web_embedded"];
 const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player";
 const MUSIC_ORIGIN: &str = "https://music.youtube.com";
 /// Highest-quality formats the compiled AAC/MP4 decoder can consume.
@@ -96,6 +97,7 @@ pub enum ResolveSource {
     InnerTubeAndroidVr,
     YtDlp,
     YtDlpMusic,
+    YtDlpEmbedded,
 }
 
 /// Audio format information known at resolution time.
@@ -336,13 +338,24 @@ impl Resolver {
         }
 
         let mut first_error = None;
+        let mut progressive_fallback = None;
         // The native path above already gave complete Premium AAC its quick
-        // chance. Music's yt-dlp client is the most reliable complete fallback
-        // for art tracks, so try it before spending another process on standard
-        // clients whose signed URLs are commonly capped. Each process gets only
-        // a slice of the overall budget, so a stalled authenticated attempt
-        // cannot starve anonymous playback, or vice versa.
+        // chance. Embedded playback is the first fallback because it currently
+        // serves the same AAC representation whole; Music remains the broadest
+        // compatibility fallback for art tracks. Each process gets only a slice
+        // of the overall budget, so one stalled client cannot starve the rest.
         let mut attempts = Vec::new();
+        // Embedded playback currently yields complete itag 140 URLs without a
+        // GVS proof-of-origin token. It costs a player-JS round trip, but this
+        // runs behind audio already playing and preserves the native stream's
+        // quality at handoff.
+        attempts.push((
+            None,
+            "https://www.youtube.com/watch?v=",
+            AUDIO_FORMAT,
+            EMBEDDED_CLIENT_FLAGS,
+            ResolveSource::YtDlpEmbedded,
+        ));
         if let Some(session) = self.session.as_ref() {
             attempts.push((
                 Some(session),
@@ -350,6 +363,13 @@ impl Resolver {
                 MUSIC_FORMAT,
                 MUSIC_CLIENT_FLAGS,
                 ResolveSource::YtDlpMusic,
+            ));
+            attempts.push((
+                Some(session),
+                "https://www.youtube.com/watch?v=",
+                AUDIO_FORMAT,
+                &[] as &[&str],
+                ResolveSource::YtDlp,
             ));
         }
         attempts.push((
@@ -359,15 +379,6 @@ impl Resolver {
             MUSIC_CLIENT_FLAGS,
             ResolveSource::YtDlpMusic,
         ));
-        if let Some(session) = self.session.as_ref() {
-            attempts.push((
-                Some(session),
-                "https://www.youtube.com/watch?v=",
-                AUDIO_FORMAT,
-                &[] as &[&str],
-                ResolveSource::YtDlp,
-            ));
-        }
         attempts.push((
             None,
             "https://www.youtube.com/watch?v=",
@@ -393,13 +404,20 @@ impl Resolver {
             );
             match candidate {
                 Ok(stream) if serves_whole_file(&self.runtime, &self.client, &stream.url) => {
-                    return Ok(stream);
+                    if stream.format.itag == Some(18) {
+                        progressive_fallback.get_or_insert(stream);
+                    } else {
+                        return Ok(stream);
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
             }
+        }
+        if let Some(stream) = progressive_fallback {
+            return Ok(stream);
         }
         if fallback_started.elapsed() >= FALLBACK_BUDGET {
             return Err(ResolveError::from_message(
@@ -1135,6 +1153,7 @@ mod tests {
         for flag in RESOLVE_FLAGS
             .iter()
             .chain(MUSIC_CLIENT_FLAGS)
+            .chain(EMBEDDED_CLIENT_FLAGS)
             .chain(["--format", "--socket-timeout"].iter())
             .filter(|flag| flag.starts_with("--"))
         {
