@@ -14,8 +14,7 @@
 //!
 //! Consequences worth stating plainly:
 //!
-//! - **Cookie only.** OAuth cannot do this, for the reason
-//!   [`crate::source::sapisid`] documents at length. No `cookies.txt`, no
+//! - **Cookie only.** No saved web session or `cookies.txt`, no
 //!   reporting -- and the caller checks that before it gets here.
 //! - **Undocumented and unversioned.** The shape below is what the web client
 //!   sent when this was written. Nothing here is load-bearing: every failure is
@@ -34,7 +33,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use super::auth::Http;
+use super::http::Http;
 use super::innertube::{MUSIC_CLIENT_NAME, MUSIC_CLIENT_VERSION};
 use super::sapisid;
 use crate::config::Cookies;

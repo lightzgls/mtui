@@ -79,11 +79,8 @@ bytes = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false }
 
 # Already in the tree under reqwest, so declaring it compiles nothing new.
-# Google's OAuth endpoints take `application/x-www-form-urlencoded` bodies, and
-# the Data API takes query parameters with the same escaping rules. reqwest 0.13
-# does not carry `serde_urlencoded`, so `.form()` and `.query()` are not
-# available -- and hand-rolling the escaping is how a client secret containing
-# a `+` becomes an invalid_client no one can debug.
+# LRCLIB query parameters need standards-compliant escaping, while reqwest 0.13
+# does not carry `serde_urlencoded` and therefore has no `.query()` helper.
 form_urlencoded = { version = "1", default-features = false }
 
 # Already in the tree under ratatui, which uses it to measure what it draws.
@@ -93,12 +90,12 @@ form_urlencoded = { version = "1", default-features = false }
 unicode-width = { version = "0.2", default-features = false }
 unicode-segmentation = { version = "1.13", default-features = false }
 
-[target.'cfg(windows)'.dependencies]
-# A first-party sign-in surface for YouTube Music Home. WebView2 uses the Edge
-# runtime included with current Windows installations; no browser profile is
-# inspected and Google owns every credential field.
-tao = { version = "0.36.0", default-features = false, features = ["rwh_06"] }
-wry = { version = "0.56.1", default-features = false }
+[target.'cfg(any(windows, target_os = "linux", target_os = "macos"))'.dependencies]
+# One first-party sign-in surface for YouTube Music Home on every desktop.
+# Wry uses WebView2 on Windows, WebKitGTK on Linux and WKWebView on macOS; no
+# browser profile is inspected and Google owns every credential field.
+tao = { version = "0.36.0", features = ["rwh_06"] }
+wry = { version = "0.56.1", features = ["os-webview"] }
 
 # Test-only. `stream-download` reports every reconnect, gap re-request and
 # download failure through `tracing`, and those events are the only account of

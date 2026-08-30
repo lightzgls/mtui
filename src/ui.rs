@@ -28,7 +28,6 @@ use crate::source::Track;
 use crate::source::artist::{ArtistPage, ArtistSong};
 use crate::source::cover::Cover;
 use crate::source::home::{Card, Shelf};
-use crate::source::library::Playlist;
 
 /// Width reserved for the right-aligned duration column, including padding.
 const DURATION_WIDTH: usize = 8;
@@ -94,10 +93,6 @@ const MIN_QUEUE_TITLE: usize = 16;
 /// becoming the current one does not shift the whole panel sideways.
 const LYRIC_GUTTER: usize = 2;
 
-/// Name width defended in a playlist row before its track count is granted.
-/// Same principle as [`MIN_TITLE_WIDTH`]: the label outranks the metadata.
-const MIN_PLAYLIST_NAME: usize = 8;
-
 /// Most the status bar gives its right-side key hints. The actual column shrinks
 /// to each line, returning every unused cell to the mini-player.
 const HINTS_WIDTH: u16 = 40;
@@ -117,10 +112,6 @@ const MENU_MAX_HEIGHT: u16 = 24;
 const SETTINGS_WIDTH: u16 = 56;
 const SETTINGS_HEIGHT: u16 = 16;
 
-/// Full height of the sign-in panel, borders included. Below this the compact
-/// layout runs instead.
-const SIGN_IN_FULL_HEIGHT: u16 = 13;
-
 /// Floor on the sign-in panel's width. Wide enough that the footer hint reads
 /// as one line, whatever the URL beside it happens to measure.
 const SIGN_IN_MIN_WIDTH: u16 = 48;
@@ -128,17 +119,6 @@ const SIGN_IN_MIN_WIDTH: u16 = 48;
 /// Ceiling on the width of wrapped error text. Only the URL is allowed to push
 /// the panel past this, and only because it cannot be wrapped.
 const SIGN_IN_MAX_WIDTH: u16 = 70;
-
-/// Indent shared by the URL and the code box, aligning both under the text of
-/// the numbered step above them rather than under its number.
-const INDENT: &str = "     ";
-
-/// Columns the code box adds around the code: two borders and two spaces
-/// either side.
-const CODE_BOX_PADDING: u16 = 6;
-
-/// Width reserved for the "expires in m:ss" column.
-const EXPIRY_WIDTH: u16 = 16;
 
 /// Card geometry on the landing page, borders included, per shape.
 ///
@@ -252,11 +232,8 @@ fn luma(r: u8, g: u8, b: u8) -> u32 {
 const MARKER_WIDTH: usize = 2;
 
 /// Heading width defended before the position counter is granted. Same
-/// principle as [`MIN_PLAYLIST_NAME`].
+/// principle as [`MIN_TITLE_WIDTH`].
 const MIN_SHELF_TITLE: usize = 8;
-
-const HINT_HIDE: &str = "  Esc hides this";
-const HINT_HIDE_RUNNING: &str = "  Esc hides this -- the sign-in keeps running";
 
 #[derive(Default)]
 pub struct MouseMap {
@@ -267,7 +244,6 @@ pub struct MouseMap {
 enum MouseTarget {
     Area(Rect, MouseAction),
     TrackRows { area: Rect, first: usize },
-    PlaylistRows { area: Rect, first: usize },
     PageRows { area: Rect, first: usize },
 }
 
@@ -277,9 +253,6 @@ impl MouseMap {
             MouseTarget::Area(area, action) if contains(area, column, row) => Some(action),
             MouseTarget::TrackRows { area, first } if contains(area, column, row) => Some(
                 MouseAction::PlayTrack(first + usize::from(row.saturating_sub(area.y))),
-            ),
-            MouseTarget::PlaylistRows { area, first } if contains(area, column, row) => Some(
-                MouseAction::OpenPlaylist(first + usize::from(row.saturating_sub(area.y))),
             ),
             MouseTarget::PageRows { area, first } if contains(area, column, row) => Some(
                 MouseAction::OpenPageRow(first + usize::from(row.saturating_sub(area.y))),
@@ -320,7 +293,6 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
             match app.view {
                 View::Home => render_home(frame, app, area, mouse),
                 View::Tracks => render_results(frame, app, area, mouse),
-                View::Playlists => render_playlists(frame, app, area, mouse),
                 View::Artist => render_artist(frame, app, area),
                 // Handled above.
                 View::Playing => {}
@@ -343,12 +315,14 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
         app.cover_size
     };
     app.image = match (cover_area, app.cover.as_ref()) {
-        // Sixel pixels are not in ratatui's buffer, so an overlay drawn over
-        // them would not cover them -- the modal would appear with the picture
-        // showing through. Dropping the plan is what puts the existing
-        // clear-and-redraw path to work erasing it.
+        // Protocol image pixels are not in ratatui's buffer, so an overlay
+        // drawn over them would not cover them -- the modal would appear with
+        // the picture showing through. Dropping the plan is what puts the
+        // existing clear-and-redraw path to work erasing it.
         _ if app.overlay.is_open() || app.menu().is_some() => None,
-        (Some(area), Some(cover)) if app.cover_style == CoverStyle::Pixel && app.graphics.sixel => {
+        (Some(area), Some(cover))
+            if app.cover_style == CoverStyle::Pixel && app.graphics.pixels() =>
+        {
             plan_image(frame, cover, area, app.graphics, size)
         }
         (Some(area), Some(cover)) if app.cover_style == CoverStyle::ColoredAscii => {
@@ -374,9 +348,6 @@ fn render_overlay(frame: &mut Frame, app: &App) {
     match &app.overlay {
         Overlay::None => {}
         Overlay::SignIn(phase) => render_sign_in(frame, phase),
-        Overlay::AddTo {
-            title, selected, ..
-        } => render_add_to(frame, app, title, *selected),
         Overlay::Message { body } => render_message(frame, body),
         Overlay::Settings => render_settings(frame, app),
     }
@@ -478,7 +449,7 @@ fn render_menu(frame: &mut Frame, app: &App) {
 fn menu_description(page: MenuPage) -> &'static str {
     match page {
         MenuPage::Root => "Navigate, manage MTUI, or quit.",
-        MenuPage::Account => "Library OAuth and Music Home are separate sessions.",
+        MenuPage::Account => "Sign in for your personalized Music Home.",
         MenuPage::Help => "Reference only; these rows do not run commands.",
         MenuPage::PageActions => "Actions for the current page and selection.",
     }
@@ -807,9 +778,8 @@ fn settings_footer(width: usize) -> String {
 
 /// A multi-line message, sized to its own content.
 ///
-/// Laid out from the text rather than to a fixed box: this carries the OAuth
-/// setup procedure, whose lines are long and must not wrap -- a wrapped console
-/// URL is one the user cannot retype.
+/// Laid out from the text rather than to a fixed box so long diagnostic lines
+/// remain readable.
 fn render_message(frame: &mut Frame, body: &str) {
     let widest = body.lines().map(display_width).max().unwrap_or(0);
     let area = centred(
@@ -840,12 +810,6 @@ fn render_message(frame: &mut Frame, body: &str) {
 /// The sign-in panel, in whichever phase the flow has reached.
 fn render_sign_in(frame: &mut Frame, phase: &SignIn) {
     match phase {
-        SignIn::Connecting { started } => render_connecting(frame, started.elapsed()),
-        SignIn::Waiting {
-            user_code,
-            url,
-            deadline,
-        } => render_waiting(frame, user_code, url, *deadline),
         SignIn::Failed { reason } => render_sign_in_failed(frame, reason),
         SignIn::Music { started } => render_music_sign_in(frame, started.elapsed()),
     }
@@ -853,21 +817,18 @@ fn render_sign_in(frame: &mut Frame, phase: &SignIn) {
 
 fn render_music_sign_in(frame: &mut Frame, elapsed: Duration) {
     let inner = sign_in_panel(frame, SIGN_IN_MIN_WIDTH, 8, Color::Cyan);
+    let action = "  Complete sign-in in the YouTube Music window.";
+    let waiting = "  Waiting for a Music session";
+    let privacy = "  MTUI never receives your password. Esc hides this panel.";
     let lines = vec![
         Line::from(""),
+        Line::from(Span::styled(action, Style::default().fg(Color::White))),
         Line::from(Span::styled(
-            "  Complete sign-in in the YouTube Music window.",
-            Style::default().fg(Color::White),
-        )),
-        Line::from(Span::styled(
-            format!("  Waiting for a Music session{}", ellipsis(elapsed)),
+            format!("{waiting}{}", ellipsis(elapsed)),
             Style::default().fg(Color::Yellow),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            "  MTUI never receives your password. Esc hides this panel.",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled(privacy, Style::default().fg(Color::DarkGray))),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -881,178 +842,13 @@ fn sign_in_panel(frame: &mut Frame, width: u16, height: u16, accent: Color) -> R
     let area = centred(frame.area(), width, height);
     let block = Block::bordered()
         .border_style(Style::default().fg(accent))
-        .title(" sign in with Google ");
+        .title(" YouTube Music session ");
     let inner = block.inner(area);
     // Blanks the cells first: a modal over a list has to hide it, and ratatui
     // draws widgets onto whatever is already in the buffer.
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
     inner
-}
-
-/// Asked Google for a code, waiting on the round trip.
-///
-/// A phase of its own rather than an empty panel: it lasts a network round trip
-/// and is the direct answer to the keypress, so it has to say something.
-fn render_connecting(frame: &mut Frame, elapsed: Duration) {
-    // Four rows of content and two of border. Sized to what it draws, because a
-    // row short here is the footer -- the only way out of a panel whose request
-    // may never come back.
-    let inner = sign_in_panel(frame, SIGN_IN_MIN_WIDTH, 6, Color::Cyan);
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("  asking Google for a code{}", ellipsis(elapsed)),
-            Style::default().fg(Color::White),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            HINT_HIDE,
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
-/// The code is on screen and the thread behind the panel is polling Google.
-///
-/// This is the one screen in the program a user has to copy something *off* of,
-/// so the code is given a box of its own rather than a line among lines: it is
-/// the payload, and everything else here is instructions for using it.
-fn render_waiting(frame: &mut Frame, user_code: &str, url: &str, deadline: Instant) {
-    // Wide enough for the verification URL, which is the one line that must not
-    // wrap -- a user cannot type half a URL.
-    let width = (display_width(url) as u16)
-        .saturating_add(10)
-        .max(SIGN_IN_MIN_WIDTH);
-    let left = deadline.saturating_duration_since(Instant::now());
-
-    // Short terminals get the same content without the framing. Dropping the
-    // code box and the blank rows is a far better failure than letting a fixed
-    // height clip the footer, or the code itself, off the bottom.
-    if frame.area().height < SIGN_IN_FULL_HEIGHT {
-        return render_waiting_compact(frame, user_code, url, left, width);
-    }
-
-    let inner = sign_in_panel(frame, width, SIGN_IN_FULL_HEIGHT, Color::Cyan);
-    let [_, step_1, url_row, _, step_2, code_row, _, waiting, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(3),
-        Constraint::Min(0),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
-
-    frame.render_widget(
-        Paragraph::new(step("1", "open this page in a browser")),
-        step_1,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("{INDENT}{url}"),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::UNDERLINED),
-        ))),
-        url_row,
-    );
-    frame.render_widget(Paragraph::new(step("2", "enter this code")), step_2);
-    render_code_box(frame, user_code, code_row);
-
-    let [spinner, expiry] =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(EXPIRY_WIDTH)]).areas(waiting);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("  waiting for approval{}", ellipsis(left)),
-            Style::default().fg(Color::Yellow),
-        ))),
-        spinner,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("expires in {}", countdown(left)),
-            Style::default().fg(Color::DarkGray),
-        ))),
-        expiry,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            HINT_HIDE_RUNNING,
-            Style::default().fg(Color::DarkGray),
-        ))),
-        footer,
-    );
-}
-
-/// Everything [`render_waiting`] says, in five rows, for a terminal too short
-/// to hold the full panel.
-fn render_waiting_compact(
-    frame: &mut Frame,
-    user_code: &str,
-    url: &str,
-    left: Duration,
-    width: u16,
-) {
-    let inner = sign_in_panel(frame, width, 5, Color::Cyan);
-    let label = Style::default().fg(Color::DarkGray);
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(" open ", label),
-            Span::styled(url.to_string(), Style::default().fg(Color::Cyan)),
-        ]),
-        Line::from(vec![
-            Span::styled(" code ", label),
-            Span::styled(
-                user_code.to_string(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(Span::styled(
-            format!(
-                " waiting for approval{} ({} left)",
-                ellipsis(left),
-                countdown(left)
-            ),
-            Style::default().fg(Color::Yellow),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
-/// The code, boxed and bold.
-///
-/// Boxed because this is the only thing on screen the user has to retype into
-/// another device, and a box is what separates "the string to copy" from the
-/// prose telling them to copy it.
-fn render_code_box(frame: &mut Frame, user_code: &str, row: Rect) {
-    let indent = display_width(INDENT) as u16;
-    let width = (display_width(user_code) as u16)
-        .saturating_add(CODE_BOX_PADDING)
-        .min(row.width.saturating_sub(indent));
-    let area = Rect {
-        x: row.x + indent,
-        y: row.y,
-        width,
-        height: row.height,
-    };
-
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("  {user_code}"),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )))
-        .block(Block::bordered().border_style(Style::default().fg(Color::Cyan))),
-        area,
-    );
 }
 
 /// The flow ended without a session, and says why.
@@ -1083,24 +879,11 @@ fn render_sign_in_failed(frame: &mut Frame, reason: &str) {
     }));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  A OAuth sign-in   M Music sign-in   Esc dismiss",
+        "  M retry sign-in   Esc dismiss",
         Style::default().fg(Color::DarkGray),
     )));
 
     frame.render_widget(Paragraph::new(lines), inner);
-}
-
-/// A numbered instruction: the number in the accent colour, the text beside it.
-fn step(number: &str, text: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("  {number}  "),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(text.to_string(), Style::default().fg(Color::White)),
-    ])
 }
 
 /// A three-state ellipsis, so a panel that is waiting on a person rather than on
@@ -1114,16 +897,6 @@ fn ellipsis(elapsed: Duration) -> &'static str {
         1 => "..",
         _ => "...",
     }
-}
-
-/// `m:ss` left on the clock, rounded up.
-///
-/// Up rather than down so a code with a fraction of a second on it does not
-/// already read `0:00`, and so a ten-minute code reads `10:00` on the frame it
-/// appears rather than `9:59`.
-fn countdown(left: Duration) -> String {
-    let secs = left.as_millis().div_ceil(1000) as u64;
-    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 /// Breaks text onto lines of at most `width` columns, at spaces.
@@ -1192,73 +965,6 @@ fn bounded_wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn render_add_to(frame: &mut Frame, app: &App, title: &str, selected: usize) {
-    let rows = app.playlists.len().clamp(1, 12) as u16;
-    let area = centred(frame.area(), 56, rows + 4);
-
-    let block = Block::bordered()
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" add to playlist ");
-    let inner = block.inner(area);
-    frame.render_widget(Clear, area);
-    frame.render_widget(block, area);
-
-    let [header, list, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
-
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(
-                " {}",
-                truncate(title, inner.width.saturating_sub(2) as usize)
-            ),
-            Style::default().add_modifier(Modifier::BOLD),
-        ))),
-        header,
-    );
-
-    if app.playlists.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                " loading your playlists ...",
-                Style::default().fg(Color::DarkGray),
-            )),
-            list,
-        );
-    } else {
-        // The picker scrolls independently of the library pane behind it, so it
-        // keeps the selection in view itself rather than borrowing that offset.
-        let height = list.height as usize;
-        let offset = selected.saturating_sub(height.saturating_sub(1));
-        let end = (offset + height).min(app.playlists.len());
-        let items: Vec<ListItem> = app.playlists[offset..end]
-            .iter()
-            .enumerate()
-            .map(|(i, playlist)| {
-                ListItem::new(playlist_line(
-                    playlist,
-                    offset + i == selected,
-                    list.width as usize,
-                    ambient(app),
-                ))
-            })
-            .collect();
-        frame.render_widget(List::new(items), list);
-    }
-
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            " Enter add   Esc cancel",
-            Style::default().fg(Color::DarkGray),
-        )),
-        footer,
-    );
-}
-
 /// Centres a box of at most `width` x `height` inside `area`.
 fn centred(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
@@ -1274,7 +980,7 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
 /// Reserves the pane for an image the event loop will paint, and returns where
 /// and how big it should be.
 ///
-/// Nothing is drawn here beyond the frame around it: sixel pixels arrive by
+/// Nothing is drawn here beyond the frame around it: protocol pixels arrive by
 /// escape sequence, outside anything ratatui knows about. The cells underneath
 /// are marked [`CellDiffOption::Skip`] so the next redraw leaves them alone --
 /// without that, ratatui would repaint blanks over the picture every frame.
@@ -2763,109 +2469,6 @@ fn render_hero(frame: &mut Frame, hero: &Hero, area: Rect) {
     frame.render_widget(Paragraph::new(lines), text);
 }
 
-/// The user's playlists, with "Liked songs" pinned at the top.
-fn render_playlists(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMap) {
-    let block = Block::bordered().title(app.list_title());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if app.playlists.is_empty() {
-        let hint = if app.page_pending() {
-            "loading ..."
-        } else if app.signed_in {
-            "no playlists on this account"
-        } else {
-            "press A to sign in with Google"
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
-            inner,
-        );
-        return;
-    }
-
-    let height = inner.height as usize;
-    let accent = ambient(app);
-    app.clamp_playlist_scroll(height);
-
-    // Virtualized on the same principle as the results list.
-    let end = (app.playlist_offset + height).min(app.playlists.len());
-    mouse.targets.push(MouseTarget::PlaylistRows {
-        area: Rect {
-            height: (end - app.playlist_offset) as u16,
-            ..inner
-        },
-        first: app.playlist_offset,
-    });
-    let width = inner.width as usize;
-    let items: Vec<ListItem> = app.playlists[app.playlist_offset..end]
-        .iter()
-        .enumerate()
-        .map(|(i, playlist)| {
-            let selected = app.playlist_offset + i == app.playlist_selected;
-            ListItem::new(playlist_line(playlist, selected, width, accent))
-        })
-        .collect();
-
-    frame.render_widget(List::new(items), inner);
-}
-
-/// One playlist row: name on the left, track count right-aligned.
-///
-/// Shared by the library pane and the add-to picker so the two cannot drift
-/// into showing the same list two different ways.
-fn playlist_line(
-    playlist: &Playlist,
-    selected: bool,
-    width: usize,
-    ambient: Color,
-) -> Line<'static> {
-    let style = if selected {
-        highlight(ambient)
-    } else {
-        Style::default()
-    };
-
-    // Liked songs is not a playlist the user made, and marking it is what
-    // stops it reading as one that happens to sort first.
-    let marker = if playlist.is_liked() { "♥ " } else { "  " };
-    let count = match playlist.count {
-        Some(n) => format!("{n} "),
-        // Liked songs, whose size the API does not report up front.
-        None => String::new(),
-    };
-
-    // One leading space, then the marker.
-    let fixed = 1 + display_width(marker);
-    if width <= fixed {
-        // No room for a name, and a marker with nothing beside it is noise.
-        // Blank cells keep the selection highlight the right width.
-        return Line::from(Span::styled(" ".repeat(width), style));
-    }
-
-    // The count is given up before the name is: a name is what identifies the
-    // row, and a bare number next to a truncated stub identifies nothing.
-    let count = if width >= fixed + MIN_PLAYLIST_NAME + count.len() {
-        count
-    } else {
-        String::new()
-    };
-
-    let name = cell(&playlist.title, width - fixed - count.len());
-
-    Line::from(vec![
-        Span::styled(format!(" {marker}{name}"), style),
-        Span::styled(
-            count,
-            if selected {
-                style
-            } else {
-                Style::default().fg(Color::DarkGray)
-            },
-        ),
-    ])
-}
-
 /// The player page: the cover of what is playing, and beside it the tab the
 /// user has open.
 ///
@@ -3642,12 +3245,10 @@ fn render_results(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut Mous
     if app.results.is_empty() {
         let hint = if app.busy {
             "working ..."
-        } else if app.open_playlist.is_some() {
-            "this playlist is empty"
         } else if app.query.is_empty() {
             // Nothing has been searched yet, so this is the first thing a new
             // user reads. "no results" would be true and useless.
-            "type a search above, or press ^L to open your Google library"
+            "type a search above, or press H for the home feed"
         } else {
             "no results"
         };
@@ -4290,7 +3891,6 @@ mod tests {
                 duration,
                 album: Some("Currents".to_string()),
                 artist_ref: None,
-                playlist_item_id: None,
             },
             plays: Some("120M plays".to_string()),
         }
@@ -4548,6 +4148,7 @@ mod tests {
         let cover = Cover::solid(160, 90);
         let graphics = Graphics {
             sixel: true,
+            kitty: false,
             cell: (10, 20),
         };
         let mut terminal = Terminal::new(TestBackend::new(34, 20)).unwrap();
@@ -4600,6 +4201,7 @@ mod tests {
         let cover = Cover::solid(720, 720);
         let graphics = Graphics {
             sixel: true,
+            kitty: false,
             cell: (10, 20),
         };
         let area = Rect::new(0, 0, 110, 28);
@@ -4731,21 +4333,17 @@ mod tests {
     fn preview_sign_in() {
         let phases = [
             (
-                "connecting",
-                24,
-                SignIn::Connecting {
-                    started: Instant::now(),
-                },
-            ),
-            ("waiting", 24, waiting()),
-            // The same phase in a terminal too short for the full panel.
-            ("waiting, short terminal", 9, waiting()),
-            (
                 "failed",
                 24,
                 SignIn::Failed {
-                    reason: "the saved sign-in is no longer valid -- press A to sign in again"
-                        .to_string(),
+                    reason: "the saved sign-in is no longer valid".to_string(),
+                },
+            ),
+            (
+                "importing",
+                24,
+                SignIn::Music {
+                    started: Instant::now(),
                 },
             ),
         ];
@@ -4755,94 +4353,6 @@ mod tests {
                 println!("{}", row.trim_end());
             }
         }
-    }
-
-    fn playlist(title: &str, count: Option<u64>) -> Playlist {
-        Playlist {
-            id: "PL123".to_string(),
-            title: title.to_string(),
-            count,
-        }
-    }
-
-    fn liked_songs() -> Playlist {
-        Playlist {
-            id: crate::source::library::LIKED_ID.to_string(),
-            title: "Liked songs".to_string(),
-            count: None,
-        }
-    }
-
-    fn text_of(line: &Line) -> String {
-        line.spans.iter().map(|s| s.content.as_ref()).collect()
-    }
-
-    #[test]
-    fn a_playlist_row_fills_its_width_exactly() {
-        // Swept from zero for the same reason the results header is: a row that
-        // overruns pushes the count off the edge, and one that falls short
-        // leaves the selection highlight ragged. Zero included, because a pane
-        // that narrow must draw nothing rather than panic.
-        for width in 0..120 {
-            for row in [playlist("Discovery", Some(14)), liked_songs()] {
-                assert_eq!(
-                    playlist_line(&row, false, width, Color::Cyan).width(),
-                    width,
-                    "{:?} does not fill a {width}-wide pane",
-                    row.title
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_narrow_playlist_row_drops_the_count_before_the_name() {
-        // Wide enough for both.
-        let wide = text_of(&playlist_line(
-            &playlist("Discovery", Some(14)),
-            false,
-            40,
-            Color::Cyan,
-        ));
-        assert!(wide.contains("Discovery") && wide.contains("14"));
-
-        // Not wide enough: the name is what identifies the row, so the count
-        // is what goes.
-        let narrow = text_of(&playlist_line(
-            &playlist("Discovery", Some(14)),
-            false,
-            12,
-            Color::Cyan,
-        ));
-        assert!(!narrow.contains("14"));
-    }
-
-    #[test]
-    fn a_long_playlist_name_is_truncated_rather_than_overflowing() {
-        let long = playlist("a playlist with a preposterously long name", Some(3));
-        let line = playlist_line(&long, false, 24, Color::Cyan);
-        assert_eq!(line.width(), 24);
-        assert!(text_of(&line).contains('…'));
-    }
-
-    #[test]
-    fn liked_songs_is_marked_and_carries_no_count() {
-        // The API does not report how many liked videos there are, and a
-        // made-up number would be worse than none. The marker keys off the
-        // pseudo-id, not the title, so a real playlist called "Liked songs"
-        // does not get it.
-        let text = text_of(&playlist_line(&liked_songs(), false, 40, Color::Cyan));
-        assert!(text.contains('♥'));
-        assert!(text.contains("Liked songs"));
-
-        let impostor = text_of(&playlist_line(
-            &playlist("Liked songs", Some(7)),
-            false,
-            40,
-            Color::Cyan,
-        ));
-        assert!(!impostor.contains('♥'));
-        assert!(impostor.contains('7'));
     }
 
     use crate::source::home::Target;
@@ -5089,7 +4599,6 @@ mod tests {
             duration: Some(Duration::from_secs(secs)),
             album: None,
             artist_ref: None,
-            playlist_item_id: None,
         }
     }
 
@@ -5102,7 +4611,6 @@ mod tests {
             duration: Some(Duration::from_secs(468)),
             album: Some("Currents".to_string()),
             artist_ref: None,
-            playlist_item_id: None,
         });
         now.queue_title = "Let It Happen Mix".to_string();
         now.queue = vec![
@@ -6487,75 +5995,11 @@ mod tests {
             .collect()
     }
 
-    fn waiting() -> SignIn {
-        SignIn::Waiting {
-            user_code: "BPQX-KLNT".to_string(),
-            url: "https://www.google.com/device".to_string(),
-            deadline: Instant::now() + Duration::from_secs(587),
-        }
-    }
-
-    #[test]
-    fn the_sign_in_panel_shows_the_code_the_url_and_the_time_left() {
-        let rows = drawn(70, 24, &waiting()).join("\n");
-        assert!(rows.contains("https://www.google.com/device"), "{rows}");
-        assert!(rows.contains("BPQX-KLNT"), "{rows}");
-        // 587 s, rendered from the deadline rather than carried as a string.
-        assert!(rows.contains("expires in 9:47"), "{rows}");
-        assert!(rows.contains("waiting for approval"), "{rows}");
-    }
-
-    /// The code is the one thing on this screen the user has to copy off it, so
-    /// it gets a box -- and a box that clipped the code would be worse than no
-    /// box at all.
-    #[test]
-    fn the_code_sits_inside_a_box_of_its_own() {
-        let rows = drawn(70, 24, &waiting());
-        let code_row = rows
-            .iter()
-            .find(|row| row.contains("BPQX-KLNT"))
-            .expect("the code is drawn");
-        // Its own border either side of it, inside the panel's.
-        assert!(code_row.contains("│  BPQX-KLNT  │"), "{code_row:?}");
-    }
-
-    /// A URL that wrapped would be one the user cannot retype, so the panel is
-    /// sized from it rather than to a fixed width.
-    #[test]
-    fn a_long_verification_url_is_not_wrapped() {
-        let phase = SignIn::Waiting {
-            user_code: "ABCD-EFGH".to_string(),
-            url: "https://accounts.google.com/o/oauth2/device/usercode".to_string(),
-            deadline: Instant::now() + Duration::from_secs(600),
-        };
-        let rows = drawn(100, 24, &phase);
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("https://accounts.google.com/o/oauth2/device/usercode")),
-            "{rows:#?}"
-        );
-    }
-
-    /// A terminal too short for the full panel must still show the code. The
-    /// full layout is a fixed 13 rows, so without the fallback the bottom of it
-    /// -- including the code box -- would simply be cut off.
-    #[test]
-    fn a_short_terminal_still_gets_the_code_and_the_url() {
-        let rows = drawn(70, 8, &waiting()).join("\n");
-        assert!(rows.contains("BPQX-KLNT"), "{rows}");
-        assert!(rows.contains("https://www.google.com/device"), "{rows}");
-        assert!(rows.contains("9:47"), "{rows}");
-    }
-
     #[test]
     fn the_panel_keeps_one_title_across_every_phase() {
-        // Three phases of one flow, not three windows. A title that changed
+        // Every phase is one flow, not a new window. A title that changed
         // under the user would read as the panel having been replaced.
         for phase in [
-            SignIn::Connecting {
-                started: Instant::now(),
-            },
-            waiting(),
             SignIn::Failed {
                 reason: "sign-in was declined".to_string(),
             },
@@ -6564,7 +6008,7 @@ mod tests {
             },
         ] {
             let rows = drawn(70, 24, &phase).join("\n");
-            assert!(rows.contains("sign in with Google"), "{rows}");
+            assert!(rows.contains("YouTube Music session"), "{rows}");
         }
     }
 
@@ -6577,20 +6021,13 @@ mod tests {
         };
         let rows = drawn(70, 24, &phase).join("\n");
         assert!(rows.contains("sign-in was declined"), "{rows}");
-        assert!(rows.contains("A OAuth sign-in"), "{rows}");
-        assert!(rows.contains("M Music sign-in"), "{rows}");
+        assert!(rows.contains("M retry sign-in"), "{rows}");
     }
 
-    /// Every phase is sized to its own content, and the row that a too-short
-    /// panel loses is the last one -- which in all three cases is the only way
-    /// out of it that the panel names.
+    /// Every phase is sized to its own content and keeps its exit visible.
     #[test]
     fn no_phase_clips_the_key_that_dismisses_it() {
         for phase in [
-            SignIn::Connecting {
-                started: Instant::now(),
-            },
-            waiting(),
             SignIn::Failed {
                 reason: "sign-in was declined".to_string(),
             },
@@ -6608,15 +6045,14 @@ mod tests {
     #[test]
     fn a_long_failure_reason_wraps_rather_than_widening_the_panel() {
         let phase = SignIn::Failed {
-            reason: "the saved sign-in is no longer valid -- press A to sign in again. \
-                     If this happens every week, set the OAuth consent screen's publishing \
-                     status to \"In production\""
+            reason: "the saved session is no longer valid. Sign in to YouTube Music \
+                     in the MTUI window, then press M to try again"
                 .to_string(),
         };
         let rows = drawn(120, 24, &phase);
         let panel = rows
             .iter()
-            .find(|row| row.contains("sign in with Google"))
+            .find(|row| row.contains("YouTube Music session"))
             .expect("the panel is drawn");
         assert!(
             display_width(panel.trim()) <= SIGN_IN_MAX_WIDTH as usize,
@@ -6636,14 +6072,6 @@ mod tests {
         assert_eq!(ellipsis(Duration::from_millis(500)), "..");
         assert_eq!(ellipsis(Duration::from_millis(900)), "...");
         assert_eq!(ellipsis(Duration::from_millis(1300)), ".");
-    }
-
-    #[test]
-    fn the_countdown_pads_its_seconds() {
-        // "9:7" would read as nine minutes and seven-something.
-        assert_eq!(countdown(Duration::from_secs(587)), "9:47");
-        assert_eq!(countdown(Duration::from_secs(67)), "1:07");
-        assert_eq!(countdown(Duration::ZERO), "0:00");
     }
 
     #[test]
@@ -6798,9 +6226,8 @@ mod tests {
     #[test]
     fn the_editing_hint_offers_no_key_the_search_box_would_swallow() {
         // Every printable key is text while typing, so a bare letter here would
-        // name a key that inserts that letter -- the exact trap that made the
-        // library unreachable from a fresh launch. Only Enter, Esc and a
-        // Ctrl-chord survive the search box.
+        // name a key that inserts that letter. Only Enter, Esc and a Ctrl-chord
+        // survive the search box.
         let advertised_keys = HINTS_EDITING
             .split("  ")
             .map(|hint| hint.split_whitespace().next().unwrap_or(""))

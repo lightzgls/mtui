@@ -19,6 +19,7 @@ mod console;
 mod diagnostics;
 mod discord;
 mod graphics;
+mod kitty;
 mod player;
 mod session;
 mod sixel;
@@ -76,6 +77,9 @@ const BUSY_TICK: Duration = Duration::from_millis(50);
 const IDLE_TICK: Duration = Duration::from_millis(500);
 
 fn main() -> Result<()> {
+    if let Some(force) = session::helper_request() {
+        return session::run_helper(force);
+    }
     #[cfg(windows)]
     if console::is_host() {
         diagnostics::init();
@@ -159,7 +163,7 @@ fn run(settings: config::Settings, mut tray: Option<Tray>) -> Result<()> {
     }
 
     // The track that was playing when the user quit. Written here rather than
-    // left to the library worker, which is not joined on the way out -- see
+    // left to the metadata worker, which is not joined on the way out -- see
     // `App::flush_listening`.
     app.flush_listening();
     Ok(())
@@ -209,9 +213,16 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
                 .draw(|frame| ui::render(frame, app, &mut mouse))
                 .context("could not draw the foreground")?;
 
-            // Sixel pixels live outside ratatui's buffer, so nothing it draws
-            // can erase them. Clear and rebuild in the same breath.
+            // Protocol images live outside ratatui's buffer, so nothing it
+            // draws can erase them. Clear and rebuild in the same breath.
             if app.image_needs_clearing() {
+                if app.graphics.kitty {
+                    foreground
+                        .terminal
+                        .backend_mut()
+                        .write_all(&kitty::delete())
+                        .context("could not remove the Kitty cover")?;
+                }
                 foreground
                     .terminal
                     .clear()
@@ -635,7 +646,7 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
     Ok(())
 }
 
-/// Paints the planned cover as sixel pixels, if it is not already on screen.
+/// Paints the planned cover as terminal pixels, if it is not already on screen.
 ///
 /// Encoding runs here rather than in the renderer: it costs tens of
 /// milliseconds and happens once per track, which is fine between frames and
@@ -645,7 +656,23 @@ fn paint_cover(app: &mut App, out: &mut impl Write) -> Result<()> {
         return Ok(());
     };
     let (width, height) = (u32::from(plan.width), u32::from(plan.height));
-    let payload = sixel::encode(&cover.resample(width, height), width, height);
+    let rgb = cover.resample(width, height);
+    let payload = if app.graphics.kitty {
+        // A resize can invalidate the plan without first passing through the
+        // ordinary clear path. Reusing one image number and deleting before
+        // transmission guarantees no stale placement survives underneath it.
+        out.write_all(&kitty::delete())?;
+        let (cell_w, cell_h) = app.graphics.cell;
+        kitty::encode(
+            &rgb,
+            width,
+            height,
+            plan.width / cell_w,
+            plan.height / cell_h,
+        )
+    } else {
+        sixel::encode(&rgb, width, height)
+    };
 
     // Save and restore around the write: drawing an image leaves the cursor
     // after it, and ratatui has already put the cursor where the search box

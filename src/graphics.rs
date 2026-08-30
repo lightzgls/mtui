@@ -38,8 +38,10 @@ const ASSUMED_CELL: (u16, u16) = (8, 16);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Graphics {
-    /// Whether covers can be drawn as real pixels.
+    /// Whether covers can be drawn with Sixel.
     pub sixel: bool,
+    /// Whether covers can be drawn with Kitty's graphics protocol.
+    pub kitty: bool,
     /// Pixel size of one character cell, as `(width, height)`.
     pub cell: (u16, u16),
 }
@@ -49,15 +51,20 @@ impl Graphics {
     pub fn blocks() -> Self {
         Self {
             sixel: false,
+            kitty: false,
             cell: ASSUMED_CELL,
         }
+    }
+
+    pub fn pixels(self) -> bool {
+        self.sixel || self.kitty
     }
 }
 
 /// Asks the terminal what it can do.
 ///
-/// `MTUI_GRAPHICS=blocks` or `=sixel` overrides the answer, which is the escape
-/// hatch for a terminal that lies in either direction.
+/// `MTUI_GRAPHICS=blocks`, `=sixel`, or `=kitty` overrides the answer, which is
+/// the escape hatch for a terminal that lies in either direction.
 pub fn detect() -> Graphics {
     match std::env::var("MTUI_GRAPHICS").as_deref() {
         Ok("blocks") => return Graphics::blocks(),
@@ -65,20 +72,40 @@ pub fn detect() -> Graphics {
             let (_, cell) = parse(&ask().unwrap_or_default());
             return Graphics {
                 sixel: true,
+                kitty: false,
+                cell: cell.unwrap_or(ASSUMED_CELL),
+            };
+        }
+        Ok("kitty") => {
+            let (_, cell) = parse(&ask().unwrap_or_default());
+            return Graphics {
+                sixel: false,
+                kitty: true,
                 cell: cell.unwrap_or(ASSUMED_CELL),
             };
         }
         _ => {}
     }
 
-    let Some(reply) = ask() else {
-        return Graphics::blocks();
-    };
+    let reply = ask().unwrap_or_default();
     let (sixel, cell) = parse(&reply);
+    let kitty = is_kitty();
     Graphics {
-        sixel,
+        sixel: sixel && !kitty,
+        kitty,
         cell: cell.unwrap_or(ASSUMED_CELL),
     }
+}
+
+fn is_kitty() -> bool {
+    // KITTY_WINDOW_ID is inherited by nested terminal emulators, while TERM is
+    // reset for their child shell. Trusting TERM avoids sending Kitty APCs to
+    // an Alacritty or Foot window that happened to be launched from Kitty.
+    kitty_named(std::env::var("TERM").ok().as_deref())
+}
+
+fn kitty_named(term: Option<&str>) -> bool {
+    term == Some("xterm-kitty")
 }
 
 /// Writes both queries and collects whatever comes back within [`BUDGET`].
@@ -246,5 +273,25 @@ mod tests {
         // A terminal reporting zeroes would divide the image maths by one of
         // them; treat it as no answer at all.
         assert_eq!(parse("\x1b[6;0;0t"), (false, None));
+    }
+
+    #[test]
+    fn kitty_is_identified_by_its_terminal_name() {
+        assert!(kitty_named(Some("xterm-kitty")));
+        assert!(!kitty_named(Some("xterm-256color")));
+        assert!(!kitty_named(None));
+    }
+
+    #[test]
+    fn either_pixel_protocol_enables_real_images() {
+        assert!(
+            Graphics {
+                sixel: false,
+                kitty: true,
+                cell: ASSUMED_CELL,
+            }
+            .pixels()
+        );
+        assert!(!Graphics::blocks().pixels());
     }
 }

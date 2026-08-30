@@ -12,10 +12,9 @@
 //! the same queue would let a slow thumbnail sit in front of the resolve that
 //! actually produces audio.
 //!
-//! Library calls get a third thread by the same argument: they are pure HTTPS
-//! against Google's API, and queueing one behind a four-second resolve would
-//! make browsing a playlist feel broken. Sign-ins get transient threads because
-//! they block for as long as the user takes to finish with Google.
+//! Metadata and listening-history calls get a third thread by the same
+//! argument: queueing one behind a four-second resolve would make opening an
+//! album or artist feel broken.
 //!
 //! The player page gets a fifth. Its panels are fetched while music is already
 //! playing and nobody is waiting on them, so they must not be able to delay
@@ -39,24 +38,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use super::artist::{self, ArtistPage};
-use super::auth::{self, Http};
 use super::cover::{self, Cover};
 use super::home::{self, Shelf};
+use super::http::Http;
 use super::innertube::InnerTube;
 use super::journal::{Journal, Play};
-use super::library::{Library, Playlist};
 use super::{ArtistRef, BrowseEndpoint, StreamUrl, Track};
 use super::{lrclib, stats, watch};
-use crate::config::{Cookies, Credentials, Import, Tokens};
+use crate::config::{Cookies, Import};
 use crate::source::youtube::YouTube;
 use mtui_resolver::{PlaybackSession, ResolveRequest, Resolver};
 
-/// Ceiling on how much of a playlist is loaded.
-///
-/// Bounded for the same reason [`crate::source::youtube::MAX_RESULTS`] is: a
-/// long session must not be able to grow the heap without limit. Beyond this,
-/// each further fifty rows is two more round trips for lines nobody scrolls to.
-const MAX_LIBRARY_TRACKS: usize = 200;
 const RECENT_REPLACEMENT: Duration = Duration::from_secs(30);
 
 pub type PageRequestId = u64;
@@ -113,7 +105,7 @@ pub enum Request {
     PersonalHome {
         generation: u64,
     },
-    /// Opens MTUI's WebView2 profile so Google can establish a Music session.
+    /// Establishes a Music session in MTUI's cross-platform sign-in window.
     MusicSignIn {
         force: bool,
     },
@@ -191,39 +183,6 @@ pub enum Request {
     },
     Comments {
         video_id: String,
-    },
-    /// Begin the Google device flow. Answers with [`Response::DeviceCode`]
-    /// almost immediately, then with [`Response::SignedIn`] whenever the user
-    /// gets round to approving it.
-    SignIn,
-    /// Forget the stored tokens. Local only -- it does not revoke the grant.
-    SignOut,
-    /// The signed-in user's playlists.
-    Playlists,
-    /// Contents of one playlist. `title` is carried through so the UI can label
-    /// the list without holding the playlist it came from.
-    OpenPlaylist {
-        request_id: PageRequestId,
-        id: String,
-        title: String,
-    },
-    AddToPlaylist {
-        playlist_id: String,
-        /// For the confirmation message, which is the only feedback a write
-        /// gets -- the row it affects is not on screen.
-        playlist_title: String,
-        video_id: String,
-    },
-    /// Removes one row from the playlist currently open. Takes the playlist
-    /// *item* id, not the video id; see [`Track::playlist_item_id`].
-    RemoveFromPlaylist {
-        playlist_item_id: String,
-        title: String,
-    },
-    /// Likes or unlikes, whichever the current rating is not.
-    ToggleLike {
-        video_id: String,
-        title: String,
     },
     Shutdown,
 }
@@ -339,55 +298,6 @@ pub enum Response {
         key: String,
         art: Option<Cover>,
     },
-    /// The code the user has to approve, and where to approve it. Sent as soon
-    /// as Google issues it, well before the sign-in finishes.
-    DeviceCode {
-        user_code: String,
-        url: String,
-        /// Seconds Google will keep accepting this code. Sent so the panel can
-        /// count down: the user has to leave the terminal to approve it, and
-        /// "this stopped working four minutes ago" is worth knowing before
-        /// typing the code rather than after.
-        expires_in: u64,
-    },
-    SignedIn,
-    SignedOut,
-    /// Stored tokens could not be removed, so the existing session remains.
-    SignOutFailed(String),
-    /// The device flow ended without a session. Separate from [`Self::Failed`]
-    /// so the UI can keep it in the sign-in panel, where the user is already
-    /// looking and where the retry key lives, instead of the status bar.
-    SignInFailed(String),
-    /// A library request arrived with no session. The UI turns this into a
-    /// sign-in rather than an error, since asking for the library is a clear
-    /// enough statement of intent.
-    NeedsSignIn {
-        /// Present when the refused operation was a correlated page request.
-        request_id: Option<PageRequestId>,
-    },
-    Playlists(Vec<Playlist>),
-    /// Contents of an opened playlist. `id` and `title` come back so the UI can
-    /// label the list and know which playlist a later removal applies to.
-    PlaylistTracks {
-        request_id: PageRequestId,
-        id: String,
-        title: String,
-        tracks: Result<Vec<Track>, String>,
-    },
-    /// A row was removed from the open playlist. The id lets the UI drop it
-    /// locally rather than re-fetching the whole playlist to lose one line.
-    Removed {
-        playlist_item_id: String,
-        title: String,
-    },
-    Liked {
-        title: String,
-        liked: bool,
-    },
-    /// A write succeeded. Carries the message to show, already formatted.
-    Done(String),
-    /// Human-readable failure, already formatted for display.
-    Failed(String),
 }
 
 /// Handle to the worker threads. Both answer into one response channel, so the
@@ -395,7 +305,7 @@ pub enum Response {
 pub struct SourceWorker {
     tx: Sender<Request>,
     cover_tx: Sender<Request>,
-    library_tx: Sender<Request>,
+    metadata_tx: Sender<Request>,
     page_tx: Sender<Request>,
     art_tx: Sender<Request>,
     /// Kept so a sign-in thread can be handed somewhere to answer. Sign-in is
@@ -416,7 +326,7 @@ impl SourceWorker {
     pub fn spawn(yt: YouTube) -> Result<Self> {
         let (req_tx, req_rx) = channel::<Request>();
         let (cover_req_tx, cover_req_rx) = channel::<Request>();
-        let (library_req_tx, library_req_rx) = channel::<Request>();
+        let (metadata_req_tx, metadata_req_rx) = channel::<Request>();
         let (page_req_tx, page_req_rx) = channel::<Request>();
         let (art_req_tx, art_req_rx) = channel::<Request>();
         let (complete_tx, complete_rx) = channel::<CompletionRequest>();
@@ -424,7 +334,7 @@ impl SourceWorker {
         let resolves = Arc::new(AtomicU64::new(0));
         let thread_resolves = Arc::clone(&resolves);
         let cover_res_tx = res_tx.clone();
-        let library_res_tx = res_tx.clone();
+        let metadata_res_tx = res_tx.clone();
         let page_res_tx = res_tx.clone();
         let art_res_tx = res_tx.clone();
         let spawn_res_tx = res_tx.clone();
@@ -448,9 +358,9 @@ impl SourceWorker {
             .context("failed to spawn cover worker")?;
 
         thread::Builder::new()
-            .name("mtui-library".to_string())
-            .spawn(move || run_library(library_req_rx, library_res_tx))
-            .context("failed to spawn library worker")?;
+            .name("mtui-metadata".to_string())
+            .spawn(move || run_metadata(metadata_req_rx, metadata_res_tx))
+            .context("failed to spawn metadata worker")?;
 
         thread::Builder::new()
             .name("mtui-page".to_string())
@@ -465,7 +375,7 @@ impl SourceWorker {
         Ok(Self {
             tx: req_tx,
             cover_tx: cover_req_tx,
-            library_tx: library_req_tx,
+            metadata_tx: metadata_req_tx,
             page_tx: page_req_tx,
             art_tx: art_req_tx,
             res_tx: spawn_res_tx,
@@ -504,13 +414,6 @@ impl SourceWorker {
         match req {
             Request::Cover { .. } => self.cover_tx.send(req).context("cover worker is gone"),
             Request::Art { .. } => self.art_tx.send(req).context("artwork worker is gone"),
-            // Not queued anywhere: this one blocks for as long as the user
-            // takes to approve a code, so it gets a thread that exists only for
-            // the duration of the flow.
-            Request::SignIn => {
-                spawn_sign_in(self.res_tx.clone());
-                Ok(())
-            }
             Request::PersonalHome { generation } => {
                 spawn_personal_home(self.res_tx.clone(), generation);
                 Ok(())
@@ -527,17 +430,12 @@ impl SourceWorker {
             | Request::Comments { .. } => {
                 self.page_tx.send(req).context("player page worker is gone")
             }
-            Request::SignOut
-            | Request::ReportPlay { .. }
+            Request::ReportPlay { .. }
             | Request::OpenBrowse { .. }
-            | Request::OpenArtist { .. }
-            | Request::Playlists
-            | Request::OpenPlaylist { .. }
-            | Request::AddToPlaylist { .. }
-            | Request::RemoveFromPlaylist { .. }
-            | Request::ToggleLike { .. } => {
-                self.library_tx.send(req).context("library worker is gone")
-            }
+            | Request::OpenArtist { .. } => self
+                .metadata_tx
+                .send(req)
+                .context("metadata worker is gone"),
             _ => self.tx.send(req).context("source worker is gone"),
         }
     }
@@ -581,13 +479,6 @@ fn name(req: &Request) -> &'static str {
         Request::Lyrics { .. } => "Lyrics",
         Request::Related { .. } => "Related",
         Request::Comments { .. } => "Comments",
-        Request::SignIn => "SignIn",
-        Request::SignOut => "SignOut",
-        Request::Playlists => "Playlists",
-        Request::OpenPlaylist { .. } => "OpenPlaylist",
-        Request::AddToPlaylist { .. } => "AddToPlaylist",
-        Request::RemoveFromPlaylist { .. } => "RemoveFromPlaylist",
-        Request::ToggleLike { .. } => "ToggleLike",
         Request::Shutdown => "Shutdown",
     }
 }
@@ -596,15 +487,13 @@ impl Drop for SourceWorker {
     fn drop(&mut self) {
         let _ = self.tx.send(Request::Shutdown);
         let _ = self.cover_tx.send(Request::Shutdown);
-        let _ = self.library_tx.send(Request::Shutdown);
+        let _ = self.metadata_tx.send(Request::Shutdown);
         let _ = self.page_tx.send(Request::Shutdown);
         // Only the source thread is joined. The cover thread may be most of a
         // ten-second timeout into a fetch, and making the user wait that out to
         // quit -- for a picture that is already off screen -- would be absurd.
-        // The library, page and sign-in threads are the same case, and the
-        // sign-in one may be asleep between polls for another five seconds on
-        // top. None of them owns a subprocess, so letting the process exit
-        // under them is safe.
+        // The metadata and page threads are the same case. None of them owns a
+        // subprocess, so letting the process exit under them is safe.
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -904,38 +793,11 @@ fn search(yt: &YouTube, tube: Option<&InnerTube>, query: &str, limit: usize) -> 
 
 /// The account session available to playback right now. Read immediately before
 /// resolving so Music sign-in, manual cookie change, or stale-session removal
-/// takes effect without copying credentials into worker requests.
+/// takes effect without copying the session into worker requests.
 fn playback_session() -> Option<PlaybackSession> {
     Cookies::available().ok().flatten().map(|cookies| {
         PlaybackSession::new(cookies.header().to_string(), cookies.sapisid().to_string())
     })
-}
-
-/// Runs the Google device flow to completion on a thread of its own.
-///
-/// Detached, and short-lived by construction: it ends when the user approves
-/// the code, declines it, or lets it expire. Nothing joins it, because the only
-/// thing it holds is a socket.
-fn spawn_sign_in(tx: Sender<Response>) {
-    // Cloned before the move so there is still a way to report the one failure
-    // the thread itself cannot: not starting at all. Otherwise the user presses
-    // a key and watches nothing happen.
-    let report = tx.clone();
-    let spawned = thread::Builder::new()
-        .name("mtui-signin".to_string())
-        .spawn(move || {
-            let result = sign_in(&tx);
-            let _ = match result {
-                Ok(()) => tx.send(Response::SignedIn),
-                Err(e) => tx.send(Response::SignInFailed(format!("{e:#}"))),
-            };
-        });
-
-    if spawned.is_err() {
-        let _ = report.send(Response::SignInFailed(
-            "could not start the sign-in thread".to_string(),
-        ));
-    }
 }
 
 fn spawn_personal_home(tx: Sender<Response>, generation: u64) {
@@ -972,7 +834,7 @@ fn spawn_music_sign_in(tx: Sender<Response>, force: bool) {
         .name("mtui-music-signin".to_string())
         .spawn(move || {
             let response = match crate::session::sign_in(force) {
-                Ok(()) => Response::CookiesImported("MTUI WebView2".to_string()),
+                Ok(browser) => Response::CookiesImported(browser),
                 Err(err) => Response::MusicSignInFailed(format!("{err:#}")),
             };
             let _ = tx.send(response);
@@ -985,248 +847,73 @@ fn spawn_music_sign_in(tx: Sender<Response>, force: bool) {
     }
 }
 
-fn sign_in(tx: &Sender<Response>) -> Result<()> {
-    let http = Http::new()?;
-    let creds = Credentials::load()?;
-    let code = auth::start(&http, &creds)?;
-
-    // Sent before the wait, not after: this is the whole point of the device
-    // flow, and the user cannot approve a code they have not been shown.
-    let _ = tx.send(Response::DeviceCode {
-        user_code: code.user_code.clone(),
-        url: code.verification_url.clone(),
-        expires_in: code.expires_in().as_secs(),
-    });
-
-    let tokens = auth::wait_for_approval(&http, &creds, &code)?;
-    tokens.save()
-}
-
-fn sign_out_library(library: Option<&mut Library>) -> Response {
-    match Tokens::forget() {
-        Ok(()) => {
-            if let Some(library) = library {
-                library.sign_out();
-            }
-            Response::SignedOut
-        }
-        Err(e) => Response::SignOutFailed(format!("{e:#}")),
-    }
-}
-
-fn run_library(rx: Receiver<Request>, tx: Sender<Response>) {
-    // Built once so the connection pool and TLS session outlive a single call,
-    // for the same reason `InnerTube` holds its own.
-    let mut library = Library::new();
-    // Read once at launch and owned by this thread alone, which is what lets it
-    // be appended to without a lock: every play is reported here, and every
-    // shelf is built here from what it holds.
+fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
+    let Ok(http) = Http::new() else {
+        return;
+    };
     let mut journal = Journal::load();
 
     while let Ok(req) = rx.recv() {
-        if matches!(req, Request::Shutdown) {
-            break;
-        }
-
-        let library = match library.as_mut() {
-            Ok(library) => library,
-            // Nothing here can work without it, so every request gets the same
-            // honest answer rather than the thread dying silently. Signing out
-            // is the exception: deleting a local token file needs no client.
-            Err(e) => {
-                let reason = format!("{e:#}");
-                let response = match req {
-                    Request::SignOut => sign_out_library(None),
-                    Request::OpenBrowse {
-                        request_id,
-                        endpoint,
-                        title,
-                    } => Response::Browsed {
-                        request_id,
-                        endpoint,
-                        title,
-                        tracks: Err(reason),
-                    },
-                    Request::OpenArtist { request_id, artist } => Response::Artist {
-                        request_id,
-                        browse_id: artist.endpoint.browse_id.clone(),
-                        page: Box::new(Err(reason)),
-                    },
-                    Request::OpenPlaylist {
-                        request_id,
-                        id,
-                        title,
-                    } => Response::PlaylistTracks {
-                        request_id,
-                        id,
-                        title,
-                        tracks: Err(reason),
-                    },
-                    _ => Response::Failed(reason),
-                };
-                if tx.send(response).is_err() {
-                    break;
+        let response = match req {
+            Request::ReportPlay { track, listened } => {
+                // Local first, and unconditionally: this is the half that needs no
+                // account, no cookie and no network, and it is what MTUI's own
+                // shelves are ranked from. A play too short to mean anything is
+                // dropped here rather than tested for twice.
+                if !journal.record(Play::new(&track, listened)) {
+                    continue;
                 }
-                continue;
-            }
-        };
 
-        // The sign-in thread writes tokens to disk rather than passing them
-        // across a channel, so a library that believes it is signed out
-        // re-reads before refusing. This is what makes the first request after
-        // a sign-in succeed without any explicit handshake.
-        if !library.is_signed_in() {
-            let _ = library.reload();
-        }
-
-        let response = match handle_library(library, &mut journal, req) {
-            Ok(Some(response)) => response,
-            // Nothing to report: a shutdown, or a request that answered itself.
-            Ok(None) => continue,
-            Err(e) => Response::Failed(format!("{e:#}")),
-        };
-
-        if tx.send(response).is_err() {
-            break;
-        }
-    }
-}
-
-fn handle_library(
-    library: &mut Library,
-    journal: &mut Journal,
-    req: Request,
-) -> Result<Option<Response>> {
-    // Most of what follows needs a session, so the check is made once here
-    // rather than repeated in each arm. The UI reads this as "start the sign-in
-    // flow", not as an error -- which is exactly why the home feed is exempt:
-    // it is fetched on launch, before the user has asked for anything, and
-    // answering it with a sign-in nobody requested would be an ambush.
-    let exempt = matches!(
-        req,
-        Request::SignOut
-            | Request::PersonalHome { .. }
-            // Journalling needs no session at all, and reporting needs a cookie
-            // rather than a sign-in. Demanding one would mean a user who never
-            // signs in gets no shelves built from their own listening, which is
-            // the one part of this that works without Google's permission.
-            | Request::ReportPlay { .. }
-            | Request::OpenBrowse { .. }
-            | Request::OpenArtist { .. }
-    );
-    if !library.is_signed_in() && !exempt {
-        return Ok(Some(needs_sign_in(&req)));
-    }
-
-    let response = match req {
-        Request::ReportPlay { track, listened } => {
-            // Local first, and unconditionally: this is the half that needs no
-            // account, no cookie and no network, and it is what MTUI's own
-            // shelves are ranked from. A play too short to mean anything is
-            // dropped here rather than tested for twice.
-            if !journal.record(Play::new(&track, listened)) {
-                return Ok(None);
-            }
-
-            // Upstream second, and only with a cookie -- there is no other way
-            // to attribute a play to an account, for the reason
-            // `crate::source::sapisid` documents.
-            if let Some(cookies) = Cookies::available().ok().flatten() {
-                // Swallowed on purpose. The user did not ask for this, the
-                // music already played, and the local journal already has it;
-                // replacing the status line with a tracking-endpoint failure
-                // would be spending something they are using on something they
-                // are not.
-                //
-                // Except for one failure, which is worth acting on rather than
-                // reporting: a player response with no tracking in it means
-                // YouTube did not recognise the session. An imported cookie
-                // that has expired is exactly what that looks like, and the
-                // fix is a fresh Music session. Forgetting it here makes the
-                // next launch open interactive setup.
-                if let Err(why) = stats::report(library.http(), &cookies, &track.id, listened)
-                    && format!("{why:#}").contains(stats::STALE)
-                {
-                    let _ = Import::forget();
+                // Upstream second, and only with a cookie -- there is no other way
+                // to attribute a play to an account, for the reason
+                // `crate::source::sapisid` documents.
+                if let Some(cookies) = Cookies::available().ok().flatten() {
+                    // Swallowed on purpose. The user did not ask for this, the
+                    // music already played, and the local journal already has it;
+                    // replacing the status line with a tracking-endpoint failure
+                    // would be spending something they are using on something they
+                    // are not.
+                    //
+                    // Except for one failure, which is worth acting on rather than
+                    // reporting: a player response with no tracking in it means
+                    // YouTube did not recognise the session. An imported cookie
+                    // that has expired is exactly what that looks like, and the
+                    // fix is a fresh Music session. Forgetting it here makes the
+                    // next launch open interactive setup.
+                    if let Err(why) = stats::report(&http, &cookies, &track.id, listened)
+                        && format!("{why:#}").contains(stats::STALE)
+                    {
+                        let _ = Import::forget();
+                    }
                 }
+                None
             }
-            return Ok(None);
-        }
-        Request::OpenBrowse {
-            request_id,
-            endpoint,
-            title,
-        } => Response::Browsed {
-            request_id,
-            tracks: home::tracks_endpoint(library.http(), &endpoint)
-                .map_err(|error| format!("{error:#}")),
-            endpoint,
-            title,
-        },
-        Request::OpenArtist { request_id, artist } => Response::Artist {
-            request_id,
-            browse_id: artist.endpoint.browse_id.clone(),
-            page: Box::new(
-                artist::fetch(library.http(), artist).map_err(|error| format!("{error:#}")),
-            ),
-        },
-        Request::SignOut => sign_out_library(Some(library)),
-        Request::Playlists => Response::Playlists(library.playlists()?),
-        Request::OpenPlaylist {
-            request_id,
-            id,
-            title,
-        } => Response::PlaylistTracks {
-            request_id,
-            tracks: library
-                .tracks(&id, MAX_LIBRARY_TRACKS)
-                .map_err(|error| format!("{error:#}")),
-            id,
-            title,
-        },
-        Request::AddToPlaylist {
-            playlist_id,
-            playlist_title,
-            video_id,
-        } => {
-            library.add(&playlist_id, &video_id)?;
-            Response::Done(format!("added to {playlist_title}"))
-        }
-        Request::RemoveFromPlaylist {
-            playlist_item_id,
-            title,
-        } => {
-            library.remove(&playlist_item_id)?;
-            Response::Removed {
-                playlist_item_id,
+            Request::OpenBrowse {
+                request_id,
+                endpoint,
                 title,
+            } => Some(Response::Browsed {
+                request_id,
+                tracks: home::tracks_endpoint(&http, &endpoint)
+                    .map_err(|error| format!("{error:#}")),
+                endpoint,
+                title,
+            }),
+            Request::OpenArtist { request_id, artist } => Some(Response::Artist {
+                request_id,
+                browse_id: artist.endpoint.browse_id.clone(),
+                page: Box::new(artist::fetch(&http, artist).map_err(|error| format!("{error:#}"))),
+            }),
+            Request::Shutdown => break,
+            other => {
+                debug_assert!(false, "{} was routed to the metadata thread", name(&other));
+                None
             }
+        };
+        if response.is_some_and(|response| tx.send(response).is_err()) {
+            break;
         }
-        Request::ToggleLike { video_id, title } => {
-            // Read before write, so one key is a real toggle rather than two
-            // keys the user has to keep straight. The read costs 1 quota unit
-            // against the write's 50.
-            let liked = !library.is_liked(&video_id)?;
-            library.set_like(&video_id, liked)?;
-            Response::Liked { title, liked }
-        }
-        // Routed elsewhere by `send`; reaching here would mean that routing and
-        // this match had drifted apart.
-        other => {
-            debug_assert!(false, "{} was routed to the library thread", name(&other));
-            return Ok(None);
-        }
-    };
-
-    Ok(Some(response))
-}
-
-fn needs_sign_in(req: &Request) -> Response {
-    let request_id = match req {
-        Request::OpenPlaylist { request_id, .. } => Some(*request_id),
-        _ => None,
-    };
-    Response::NeedsSignIn { request_id }
+    }
 }
 
 /// Fetches the panels of the player page.
@@ -1237,7 +924,7 @@ fn needs_sign_in(req: &Request) -> Response {
 /// worth taking the status line away from what is playing.
 fn run_pages(rx: Receiver<Request>, tx: Sender<Response>) {
     // Built once, so the connection pool and TLS session survive between
-    // tracks -- the same argument `Library` and `InnerTube` make for theirs.
+    // tracks -- the same argument `InnerTube` makes for its client.
     // Without it there is nothing this thread can do, so it stops rather than
     // answering every request with the same failure.
     let Ok(http) = Http::new() else {
@@ -1456,22 +1143,6 @@ fn run_art(rx: &Receiver<Request>, tx: &Sender<Response>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn playlist_auth_failure_keeps_its_page_request_id() {
-        let response = needs_sign_in(&Request::OpenPlaylist {
-            request_id: 73,
-            id: "PLmine".to_string(),
-            title: "My playlist".to_string(),
-        });
-
-        assert!(matches!(
-            response,
-            Response::NeedsSignIn {
-                request_id: Some(73)
-            }
-        ));
-    }
 
     #[test]
     fn resolver_startup_failure_is_answered_per_playback_request() {

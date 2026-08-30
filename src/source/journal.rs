@@ -11,7 +11,7 @@
 //! over it that turns a pile of events into an opinion: what is in rotation,
 //! what has gone cold, what gets skipped every time it comes up.
 //!
-//! Local and private. It is written to the config directory beside `tokens.json`
+//! Local and private. It is written to the config directory as `plays.jsonl`
 //! and is never uploaded -- reporting a play *to YouTube* is a separate thing
 //! that [`crate::source::stats`] does, over a cookie, only when the user has
 //! saved one. Deleting `plays.jsonl` resets the shelves to their cold-start
@@ -443,7 +443,6 @@ impl Journal {
                     duration: play.duration.map(Duration::from_secs),
                     album: play.album.clone(),
                     artist_ref: None,
-                    playlist_item_id: None,
                 },
                 score: 0.0,
                 plays: 0,
@@ -526,7 +525,7 @@ fn append(path: &std::path::Path, play: &Play) {
 /// Records one play with no [`Journal`] in hand.
 ///
 /// For the single caller that has none: the UI thread on the way out. The
-/// journal lives on the library worker, and that thread is deliberately not
+/// journal lives on the metadata worker, and that thread is deliberately not
 /// joined at exit -- so a play handed to it as the process tears down may never
 /// be written, and the last track of a session is exactly the one worth
 /// keeping. This writes it directly instead.
@@ -598,7 +597,6 @@ mod tests {
             duration: Some(Duration::from_secs(200)),
             album: None,
             artist_ref: None,
-            playlist_item_id: None,
         }
     }
 

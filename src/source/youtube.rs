@@ -84,12 +84,7 @@ impl YouTube {
         self
     }
 
-    /// The binary, lent to [`crate::source::browser`].
-    ///
-    /// Reading cookies out of a browser is not a yt-dlp call in the sense the
-    /// rest of this file means -- nothing is searched for or resolved -- but it
-    /// is the same binary, and locating a second copy of it to run one more
-    /// flag against would be absurd.
+    /// The configured yt-dlp executable.
     pub(super) fn bin(&self) -> &str {
         &self.bin
     }
@@ -171,7 +166,6 @@ impl YouTube {
                 album: None,
                 artist_ref: None,
                 // Search results are not in a playlist.
-                playlist_item_id: None,
                 id: e.id,
             })
             .take(limit)
@@ -361,7 +355,6 @@ mod tests {
             duration: secs.map(Duration::from_secs),
             album: None,
             artist_ref: None,
-            playlist_item_id: None,
         };
         assert_eq!(t(Some(65)).duration_str(), "1:05");
         assert_eq!(t(Some(3725)).duration_str(), "1:02:05");

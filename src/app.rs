@@ -12,7 +12,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::art::ArtCache;
-use crate::config::{self, CoverStyle, IconTheme, Tokens};
+use crate::config::{self, CoverStyle, IconTheme};
 use crate::discord::{Activity, Clock, Presence};
 use crate::graphics::Graphics;
 use crate::player::{Command, PlayState, Player, PlayerEvent, Snapshot};
@@ -20,7 +20,6 @@ use crate::source::artist::{ArtistPage, ArtistSong};
 use crate::source::cover::Cover;
 use crate::source::home::{Card, Shelf, Target};
 use crate::source::journal;
-use crate::source::library::Playlist;
 use crate::source::lrclib;
 use crate::source::watch::{Comments, Lyrics, QueuePage, Watch};
 use crate::source::worker::{PageRequestId, Request, Response, SourceWorker};
@@ -189,8 +188,6 @@ pub enum View {
     Home,
     /// Tracks -- either search results or the contents of an opened playlist.
     Tracks,
-    /// The signed-in user's playlists.
-    Playlists,
     /// A Music artist's top songs and catalogue shelves.
     Artist,
     /// The player page: the cover of what is playing, and beside it the queue,
@@ -205,7 +202,6 @@ pub enum MouseAction {
     EditSearch,
     OpenHomeCard { shelf: usize, card: usize },
     PlayTrack(usize),
-    OpenPlaylist(usize),
     OpenTab(Tab),
     OpenPageRow(usize),
 }
@@ -353,7 +349,6 @@ struct TrackPage {
     offset: usize,
     browsing: Option<String>,
     browsing_endpoint: Option<BrowseEndpoint>,
-    open_playlist: Option<(String, String)>,
     status: String,
 }
 
@@ -363,11 +358,8 @@ enum HistoryEntry {
         status: String,
     },
     Tracks(TrackPage),
-    Playlists {
-        status: String,
-    },
     Artist {
-        artist: ArtistView,
+        artist: Box<ArtistView>,
         status: String,
     },
     Playing {
@@ -381,20 +373,8 @@ impl HistoryEntry {
         match self {
             Self::Home { .. } => View::Home,
             Self::Tracks(_) => View::Tracks,
-            Self::Playlists { .. } => View::Playlists,
             Self::Artist { .. } => View::Artist,
             Self::Playing { .. } => View::Playing,
-        }
-    }
-
-    fn needs_library_session(&self) -> bool {
-        match self {
-            Self::Playlists { .. } => true,
-            Self::Tracks(page) => page.open_playlist.is_some(),
-            Self::Playing { player_back, .. } => player_back
-                .as_deref()
-                .is_some_and(Self::needs_library_session),
-            Self::Home { .. } | Self::Artist { .. } => false,
         }
     }
 }
@@ -403,7 +383,6 @@ impl HistoryEntry {
 enum PageRequestKind {
     Search,
     Browse,
-    Playlist,
     Artist,
 }
 
@@ -856,7 +835,6 @@ impl MenuItem {
 enum MenuAction {
     GoHome,
     BeginSearch,
-    OpenLibrary,
     OpenPlayer,
     OpenAccount,
     OpenSettings,
@@ -864,18 +842,11 @@ enum MenuAction {
     #[cfg(windows)]
     Background,
     Quit,
-    ConnectGoogle,
     ConnectMusic,
-    SignOut,
     OpenHomeSelection,
     RefreshHome,
     PlaySelected,
-    AddTrack,
-    ToggleLike,
-    RemoveSelected,
     OpenArtist,
-    OpenPlaylist,
-    ReloadLibrary,
     OpenArtistSelection,
     ReloadArtist,
     OpenPageSelection,
@@ -897,16 +868,7 @@ pub enum Overlay {
     /// sign-in, which is still running on its own thread and will report when
     /// it finishes.
     SignIn(SignIn),
-    /// Choosing which playlist to add a track to.
-    AddTo {
-        video_id: String,
-        title: String,
-        selected: usize,
-    },
-    /// A message too long for the status bar. In practice this is the OAuth
-    /// setup procedure, which is the single most important thing this feature
-    /// ever has to say and is ten lines long -- the status bar would show the
-    /// user the first of them and hide the rest.
+    /// A message too long for the status bar.
     Message {
         body: String,
     },
@@ -920,35 +882,13 @@ impl Overlay {
     }
 }
 
-/// How far along the Google device flow is.
-///
-/// Three states rather than one, because the panel has something different to
-/// say in each and the user is looking straight at it the whole time. Collapsing
-/// them would mean either a blank window before the code arrives or a failure
-/// that vanishes into the status bar the moment it matters most.
+/// State of the YouTube Music session setup.
 pub enum SignIn {
-    /// Asked, but Google has not handed back a code yet. Put up the instant the
-    /// key is pressed: the request is a round trip, and a keypress with no
-    /// visible effect reads as one that did not register.
-    Connecting {
-        /// Only ever read to animate the panel, which is what distinguishes a
-        /// slow round trip from a hung one.
-        started: Instant,
-    },
-    /// The code is on screen and the sign-in thread is polling for approval.
-    Waiting {
-        user_code: String,
-        url: String,
-        /// When Google stops accepting the code. Counted down on screen because
-        /// the panel is otherwise motionless for however long the user takes to
-        /// walk to another device, which is indistinguishable from frozen.
-        deadline: Instant,
-    },
     /// Terminal failure. Held in the panel rather than dropped into the status
     /// bar: the user is looking here, and the next thing they need is the retry
     /// key -- which this is the only place that offers.
     Failed { reason: String },
-    /// A separate WebView2 window owns Google's Music-session sign-in.
+    /// The shared YouTube Music window is waiting for a valid session.
     Music { started: Instant },
 }
 
@@ -991,8 +931,8 @@ pub struct App {
     /// Visual language used for the current song's large cover.
     pub cover_style: CoverStyle,
     /// Where the renderer wants the cover painted as real pixels, set on every
-    /// frame the sixel path runs. `None` on the half-block path, which needs no
-    /// help from the event loop.
+    /// frame the terminal-image path runs. `None` on the half-block path, which
+    /// needs no help from the event loop.
     pub image: Option<ImagePlan>,
     /// The plan currently on screen. Pixels are not part of ratatui's buffer,
     /// so they persist until something paints over them -- meaning an unchanged
@@ -1051,9 +991,7 @@ pub struct App {
     /// Identifies the latest refresh so late responses cannot mutate it.
     home_generation: u64,
     /// Title of whatever was opened from the landing page, when the track list
-    /// is showing one. Not [`Self::open_playlist`]: these rows belong to a
-    /// YouTube Music album or a stranger's playlist, so there is nothing here
-    /// that removing a row could apply to.
+    /// is showing one.
     pub browsing: Option<String>,
     browsing_endpoint: Option<BrowseEndpoint>,
     /// Dedicated mixed-content artist page. Kept while another view is open so
@@ -1063,16 +1001,6 @@ pub struct App {
     search_page: Option<HistoryEntry>,
     page_request: PageRequestId,
     pending_page_request: Option<(PageRequestId, PageRequestKind)>,
-    /// The signed-in user's playlists, once fetched. Empty until then, which is
-    /// indistinguishable from an account with none -- and both render the same.
-    pub playlists: Vec<Playlist>,
-    /// Index into `playlists`, with its own scroll offset: the two lists are
-    /// navigated independently, so switching views must not lose either place.
-    pub playlist_selected: usize,
-    pub playlist_offset: usize,
-    /// Id and title of the playlist `results` came from, when it came from one.
-    /// `None` means `results` are search results, which have no rows to remove.
-    pub open_playlist: Option<(String, String)>,
     pub overlay: Overlay,
     /// The shared command menu. It stays separate from asynchronous overlays
     /// such as sign-in so neither can accidentally replace the other; input
@@ -1080,15 +1008,6 @@ pub struct App {
     menu: Option<Menu>,
     /// Cursor for the persisted preferences in the Settings modal.
     settings_selected: usize,
-    /// Whether a session exists, as far as the last worker response revealed.
-    /// Only drives what the status bar offers -- the worker is the authority.
-    ///
-    /// Seeded from disk at startup rather than left false until the first
-    /// response: it decides whether the hints offer `A sign in`, and a user who
-    /// signed in last week should not be told to do it again for as long as it
-    /// takes them to open the library.
-    pub signed_in: bool,
-
     /// What is playing and the page around it. `None` before the first play and
     /// after a stop -- there is no player page for silence.
     pub now: Option<NowPlaying>,
@@ -1100,7 +1019,7 @@ pub struct App {
     /// simple fallbacks, while this retains nested Artist and Tracks state.
     player_back: Option<HistoryEntry>,
     /// The page hidden when search editing began. Unlike `back_to`, this also
-    /// covers Home and Library searches that are cancelled before submission.
+    /// covers page searches that are cancelled before submission.
     search_origin: View,
     /// Player state as of the last frame, so a track that has *ended* can be
     /// told from one that was already stopped. The snapshot only says what is
@@ -1138,18 +1057,8 @@ pub struct App {
     imported: bool,
     /// Whether a stale InnerTube session already triggered interactive setup.
     cookie_refresh_attempted: bool,
-    /// Prevents a second OAuth device flow, and keeps it from overlapping the
-    /// separate Music-session WebView after its panel has been hidden.
-    oauth_signing_in: bool,
-    /// Keeps a queued token deletion from overlapping a new OAuth device flow.
-    oauth_signing_out: bool,
-    /// A library request that asked for OAuth while the Music WebView was open.
-    oauth_sign_in_pending: bool,
-    /// Prevents repeated `M` presses from opening duplicate WebView2 windows.
+    /// Prevents repeated `M` presses from opening duplicate session imports.
     music_signing_in: bool,
-    /// A stale Music session discovered while OAuth was running. `true` keeps
-    /// the forced-refresh intent used by that recovery path.
-    music_sign_in_pending: Option<bool>,
 
     /// A track whose stream died, waiting on a fresh URL to carry on with.
     ///
@@ -1279,10 +1188,6 @@ fn page_snapshot_blocked(
         || (busy && !matches!(pending, Some((_, PageRequestKind::Search))))
 }
 
-fn view_needs_library_session(view: View, open_playlist: bool) -> bool {
-    view == View::Playlists || (view == View::Tracks && open_playlist)
-}
-
 impl App {
     pub fn new(
         player: Player,
@@ -1334,18 +1239,9 @@ impl App {
             search_page: None,
             page_request: 0,
             pending_page_request: None,
-            playlists: Vec::new(),
-            playlist_selected: 0,
-            playlist_offset: 0,
-            open_playlist: None,
             overlay: Overlay::None,
             menu: None,
             settings_selected: 0,
-            // A token file that is present but stale still reads as signed in
-            // here. That is the right fidelity for a key hint: the alternative
-            // is a refresh round trip before the first frame, and the worker
-            // corrects this the moment anything actually needs the session.
-            signed_in: Tokens::load().ok().flatten().is_some(),
             now: None,
             back_to: View::Home,
             player_back: None,
@@ -1358,11 +1254,7 @@ impl App {
             seed_rotation: 0,
             imported: false,
             cookie_refresh_attempted: false,
-            oauth_signing_in: false,
-            oauth_signing_out: false,
-            oauth_sign_in_pending: false,
             music_signing_in: false,
-            music_sign_in_pending: None,
             resuming: None,
             // Started whether or not Discord is running and whether or not the
             // switch is on: what this costs while idle is one sleeping thread,
@@ -1381,19 +1273,16 @@ impl App {
 
     /// What the list pane is showing, for its frame title.
     pub fn list_title(&self) -> String {
-        match (self.view, &self.open_playlist, &self.browsing) {
-            (View::Home, _, _) => " home ".to_string(),
-            (View::Playlists, _, _) => " library ".to_string(),
-            (View::Playing, _, _) => " now playing ".to_string(),
-            (View::Artist, _, _) => self
+        match (self.view, &self.browsing) {
+            (View::Home, _) => " home ".to_string(),
+            (View::Playing, _) => " now playing ".to_string(),
+            (View::Artist, _) => self
                 .artist
                 .as_ref()
                 .map(|artist| format!(" {} ", artist.requested.name))
                 .unwrap_or_else(|| " artist ".to_string()),
-            (View::Tracks, Some((_, title)), _) | (View::Tracks, None, Some(title)) => {
-                format!(" {title} ")
-            }
-            (View::Tracks, None, None) => " results ".to_string(),
+            (View::Tracks, Some(title)) => format!(" {title} "),
+            (View::Tracks, None) => " results ".to_string(),
         }
     }
 
@@ -1439,14 +1328,10 @@ impl App {
                 offset: self.offset,
                 browsing: self.browsing.clone(),
                 browsing_endpoint: self.browsing_endpoint.clone(),
-                open_playlist: self.open_playlist.clone(),
                 status: self.status.clone(),
             })),
-            View::Playlists => Some(HistoryEntry::Playlists {
-                status: self.status.clone(),
-            }),
             View::Artist => self.artist.clone().map(|artist| HistoryEntry::Artist {
-                artist,
+                artist: Box::new(artist),
                 status: self.status.clone(),
             }),
             View::Playing => {
@@ -1485,16 +1370,11 @@ impl App {
                 self.offset = page.offset;
                 self.browsing = page.browsing;
                 self.browsing_endpoint = page.browsing_endpoint;
-                self.open_playlist = page.open_playlist;
                 self.status = page.status;
                 self.view = View::Tracks;
             }
-            HistoryEntry::Playlists { status } => {
-                self.status = status;
-                self.view = View::Playlists;
-            }
             HistoryEntry::Artist { artist, status } => {
-                self.artist = Some(artist);
+                self.artist = Some(*artist);
                 self.status = status;
                 self.view = View::Artist;
             }
@@ -1600,7 +1480,8 @@ impl App {
         let mut items = vec![
             MenuItem::action("Home", Some("H"), true, Some("Go to"), MenuAction::GoHome),
             MenuItem::action("Search", Some("/"), true, None, MenuAction::BeginSearch),
-            MenuItem::action("Library", Some("L"), true, None, MenuAction::OpenLibrary),
+        ];
+        items.extend([
             MenuItem::action(
                 "Now Playing",
                 Some("P"),
@@ -1617,7 +1498,7 @@ impl App {
             ),
             MenuItem::action("Settings", Some("S"), true, None, MenuAction::OpenSettings),
             MenuItem::action("Keyboard Help", Some("?"), true, None, MenuAction::OpenHelp),
-        ];
+        ]);
         #[cfg(windows)]
         items.push(MenuItem::action(
             "Continue in notification area",
@@ -1637,40 +1518,17 @@ impl App {
     }
 
     fn account_menu_items(&self) -> Vec<MenuItem> {
-        let mut items = vec![
-            MenuItem::action(
-                if self.signed_in {
-                    "Reconnect Google Library"
-                } else {
-                    "Connect Google Library"
-                },
-                Some("A"),
-                !self.oauth_signing_in && !self.oauth_signing_out && !self.music_signing_in,
-                Some("Accounts"),
-                MenuAction::ConnectGoogle,
-            ),
-            MenuItem::action(
-                if cfg!(windows) {
-                    "Connect YouTube Music"
-                } else {
-                    "Connect YouTube Music (Windows only)"
-                },
-                Some("M"),
-                cfg!(windows) && !self.oauth_signing_in && !self.music_signing_in,
-                None,
-                MenuAction::ConnectMusic,
-            ),
-        ];
-        if self.signed_in {
-            items.push(MenuItem::action(
-                "Sign out Google Library",
-                Some("x"),
-                !self.oauth_signing_in && !self.oauth_signing_out,
-                None,
-                MenuAction::SignOut,
-            ));
-        }
-        items
+        vec![MenuItem::action(
+            if config::Cookies::available().ok().flatten().is_some() {
+                "Refresh YouTube Music session"
+            } else {
+                "Connect YouTube Music"
+            },
+            Some("M"),
+            !self.music_signing_in,
+            Some("Account"),
+            MenuAction::ConnectMusic,
+        )]
     }
 
     fn help_menu_items(&self) -> Vec<MenuItem> {
@@ -1681,7 +1539,6 @@ impl App {
             MenuItem::help("Go back", "Esc", None),
             MenuItem::help("Search", "/ or i", Some("Pages")),
             MenuItem::help("Home", "H", None),
-            MenuItem::help("Library", "L", None),
             MenuItem::help("Now Playing", "P", None),
             MenuItem::help("Pause or resume", "Space", Some("Playback")),
             MenuItem::help("Next or previous", "n / p", None),
@@ -1725,29 +1582,13 @@ impl App {
             }
             View::Tracks => {
                 let selected = self.results.get(self.selected);
-                let mut items = vec![
-                    MenuItem::action(
-                        "Play selected track",
-                        Some("Enter"),
-                        selected.is_some(),
-                        Some("Selected track"),
-                        MenuAction::PlaySelected,
-                    ),
-                    MenuItem::action(
-                        "Add selected track to playlist",
-                        Some("a"),
-                        selected.is_some() && self.signed_in && !self.oauth_signing_out,
-                        None,
-                        MenuAction::AddTrack,
-                    ),
-                    MenuItem::action(
-                        "Like/unlike selected track",
-                        Some("f"),
-                        selected.is_some() && self.signed_in && !self.oauth_signing_out,
-                        None,
-                        MenuAction::ToggleLike,
-                    ),
-                ];
+                let mut items = vec![MenuItem::action(
+                    "Play selected track",
+                    Some("Enter"),
+                    selected.is_some(),
+                    Some("Selected track"),
+                    MenuAction::PlaySelected,
+                )];
                 if selected
                     .and_then(|track| track.artist_ref.as_ref())
                     .is_some()
@@ -1760,36 +1601,9 @@ impl App {
                         MenuAction::OpenArtist,
                     ));
                 }
-                if self.open_playlist.is_some()
-                    && selected.is_some_and(|track| track.playlist_item_id.is_some())
-                {
-                    items.push(MenuItem::action(
-                        "Remove selected track from playlist",
-                        Some("d"),
-                        self.signed_in && !self.oauth_signing_out,
-                        None,
-                        MenuAction::RemoveSelected,
-                    ));
-                }
                 items
             }
             View::Artist => self.artist_action_items(),
-            View::Playlists => vec![
-                MenuItem::action(
-                    "Open selected playlist",
-                    Some("Enter"),
-                    self.playlists.get(self.playlist_selected).is_some() && !self.oauth_signing_out,
-                    Some("Library"),
-                    MenuAction::OpenPlaylist,
-                ),
-                MenuItem::action(
-                    "Reload Library",
-                    Some("r"),
-                    !self.oauth_signing_out,
-                    None,
-                    MenuAction::ReloadLibrary,
-                ),
-            ],
             View::Playing => self.playing_action_items(),
         }
     }
@@ -1823,24 +1637,6 @@ impl App {
             Some("Artist"),
             MenuAction::OpenArtistSelection,
         )];
-        if selected_song.is_some() {
-            items.extend([
-                MenuItem::action(
-                    "Add selected song to playlist",
-                    Some("a"),
-                    self.signed_in && !self.oauth_signing_out,
-                    None,
-                    MenuAction::AddTrack,
-                ),
-                MenuItem::action(
-                    "Like/unlike selected song",
-                    Some("f"),
-                    self.signed_in && !self.oauth_signing_out,
-                    None,
-                    MenuAction::ToggleLike,
-                ),
-            ]);
-        }
         items.push(MenuItem::action(
             "Refresh artist page",
             Some("r"),
@@ -1908,20 +1704,6 @@ impl App {
                 MenuAction::OpenArtist,
             ),
             MenuItem::action(
-                "Add current track to playlist",
-                Some("a"),
-                self.signed_in && !self.oauth_signing_out,
-                None,
-                MenuAction::AddTrack,
-            ),
-            MenuItem::action(
-                "Like/unlike current track",
-                Some("f"),
-                self.signed_in && !self.oauth_signing_out,
-                None,
-                MenuAction::ToggleLike,
-            ),
-            MenuItem::action(
                 if snapshot.state == PlayState::Paused {
                     "Resume current track"
                 } else {
@@ -1979,10 +1761,6 @@ impl App {
         self.busy || self.pending_page_request.is_some() || self.pending.is_some()
     }
 
-    pub fn page_pending(&self) -> bool {
-        self.pending_page_request.is_some()
-    }
-
     /// The cover to paint as pixels, if what the renderer planned is not
     /// already on screen. `None` means the pixels there are correct and
     /// repainting would only cost bandwidth and flicker.
@@ -1999,8 +1777,8 @@ impl App {
     }
 
     /// True when pixels are on screen that no longer belong there: the pane
-    /// went away, or moved out from under them. Erasing sixel means painting
-    /// cells over it, so only a redraw can undo it.
+    /// went away, or moved out from under them. Erasing protocol pixels means
+    /// painting cells over it, so only a redraw can undo it.
     pub fn image_needs_clearing(&self) -> bool {
         self.painted.is_some() && self.painted != self.image
     }
@@ -2073,11 +1851,7 @@ impl App {
         let page_request = match &response {
             Response::Results { request_id, .. }
             | Response::Browsed { request_id, .. }
-            | Response::Artist { request_id, .. }
-            | Response::PlaylistTracks { request_id, .. } => Some(*request_id),
-            Response::NeedsSignIn {
-                request_id: Some(request_id),
-            } => Some(*request_id),
+            | Response::Artist { request_id, .. } => Some(*request_id),
             _ => None,
         };
         // Validate before any shared status, menu or busy state is touched. A
@@ -2096,10 +1870,6 @@ impl App {
                 | Response::Home { .. }
                 | Response::Browsed { .. }
                 | Response::Artist { .. }
-                | Response::SignedOut
-                | Response::Playlists(_)
-                | Response::PlaylistTracks { .. }
-                | Response::Removed { .. }
         ) {
             self.close_page_actions();
         }
@@ -2124,7 +1894,6 @@ impl App {
                 | Response::Results { .. }
                 | Response::Browsed { .. }
                 | Response::Artist { .. }
-                | Response::PlaylistTracks { .. }
                 | Response::Prefetched { .. }
                 | Response::Resolved { .. }
                 | Response::Replacement { .. }
@@ -2158,10 +1927,6 @@ impl App {
                 } else {
                     format!("{} results", tracks.len())
                 };
-                // Search results are not a playlist, so whatever was open no
-                // longer describes what is on screen -- and leaving it set
-                // would offer a removal that applies to the wrong list.
-                self.open_playlist = None;
                 self.browsing = None;
                 self.browsing_endpoint = None;
                 self.view = View::Tracks;
@@ -2219,7 +1984,6 @@ impl App {
                     self.overlay = Overlay::None;
                 }
                 self.request_home();
-                self.resume_deferred_sign_in();
             }
             Response::MusicSignInFailed(msg) => {
                 crate::diagnostics::error("auth", "YouTube Music sign-in failed");
@@ -2250,8 +2014,6 @@ impl App {
                 self.results = tracks;
                 self.selected = 0;
                 self.offset = 0;
-                // Not the user's playlist: `d` has nothing to remove a row from.
-                self.open_playlist = None;
                 self.browsing = Some(title);
                 self.browsing_endpoint = Some(endpoint);
                 self.selection_settled = Some(Instant::now());
@@ -2346,208 +2108,6 @@ impl App {
                 if self.cover_id.as_deref() == Some(id.as_str()) {
                     self.cover = art;
                 }
-            }
-            Response::DeviceCode {
-                user_code,
-                url,
-                expires_in,
-            } => {
-                self.status = "waiting for you to approve the sign-in ...".to_string();
-                self.menu = None;
-                self.overlay = Overlay::SignIn(SignIn::Waiting {
-                    user_code,
-                    url,
-                    deadline: Instant::now() + Duration::from_secs(expires_in),
-                });
-            }
-            Response::SignedIn => {
-                self.oauth_signing_in = false;
-                self.signed_in = true;
-                if matches!(
-                    self.overlay,
-                    Overlay::SignIn(SignIn::Connecting { .. } | SignIn::Waiting { .. })
-                ) {
-                    self.overlay = Overlay::None;
-                }
-                self.status = "signed in".to_string();
-                // Sign-in is only ever reached by asking for something that
-                // needs it, so going straight to the library is what the user
-                // was after. A pending `AddTo` picks itself up when these land.
-                self.request_playlists();
-                self.resume_deferred_sign_in();
-            }
-            Response::SignedOut => {
-                self.oauth_signing_out = false;
-                self.signed_in = false;
-                let current_needs_library =
-                    view_needs_library_session(self.view, self.open_playlist.is_some());
-                self.playlists.clear();
-                self.playlist_selected = 0;
-                self.playlist_offset = 0;
-                // A playlist on screen is no longer the user's to edit.
-                if self.open_playlist.take().is_some() {
-                    self.results.clear();
-                    self.selected = 0;
-                    self.offset = 0;
-                }
-                self.history.retain(|page| !page.needs_library_session());
-                if self
-                    .search_page
-                    .as_ref()
-                    .is_some_and(HistoryEntry::needs_library_session)
-                {
-                    self.search_page = None;
-                    self.search_origin = View::Home;
-                }
-                if self
-                    .player_back
-                    .as_ref()
-                    .is_some_and(HistoryEntry::needs_library_session)
-                {
-                    self.player_back = None;
-                    self.back_to = View::Home;
-                }
-                self.mode = Mode::Browse;
-                if current_needs_library {
-                    if let Some(page) = self.history.pop() {
-                        self.restore_page(page);
-                    } else {
-                        self.view = View::Home;
-                    }
-                }
-                self.status = "signed out (the grant is still listed at \
-                               myaccount.google.com/permissions)"
-                    .to_string();
-                self.resume_deferred_sign_in();
-            }
-            Response::SignOutFailed(msg) => {
-                self.oauth_signing_out = false;
-                self.status = format!("could not sign out: {msg}");
-                self.resume_deferred_sign_in();
-            }
-            Response::NeedsSignIn { request_id } => {
-                self.signed_in = false;
-                // An opened playlist already put Library in history. Return to
-                // that stable page before sign-in rather than leaving a dead
-                // loading list in front of a duplicate Library route.
-                if request_id.is_some() && self.open_playlist.take().is_some() {
-                    if self
-                        .history
-                        .last()
-                        .is_some_and(|page| page.view() == View::Playlists)
-                    {
-                        if let Some(page) = self.history.pop() {
-                            self.restore_page(page);
-                        }
-                    } else {
-                        self.view = View::Playlists;
-                        self.mode = Mode::Browse;
-                    }
-                }
-                // Asking for the library is a clear enough statement of intent
-                // to start the flow, rather than reporting an error and making
-                // the user press a second key to say so again.
-                self.begin_sign_in();
-            }
-            Response::SignInFailed(msg) => {
-                crate::diagnostics::error("auth", "OAuth sign-in failed");
-                self.oauth_signing_in = false;
-                self.signed_in = false;
-                // A multi-line failure is the OAuth setup procedure, which is
-                // six lines of console instructions -- far more than the panel
-                // holds, and not something a retry key can fix. `report` puts
-                // that in the overlay built for it; anything shorter is a
-                // sign-in outcome and belongs in the panel the user is watching.
-                if msg.contains('\n') {
-                    self.report(msg);
-                } else {
-                    self.status = msg.clone();
-                    self.menu = None;
-                    self.overlay = Overlay::SignIn(SignIn::Failed { reason: msg });
-                }
-            }
-            Response::Playlists(playlists) => {
-                self.signed_in = true;
-                self.playlists = playlists;
-                self.playlist_selected = 0;
-                self.playlist_offset = 0;
-
-                // A pending add was only waiting on this list; show the picker
-                // rather than the library the user did not ask for.
-                if let Overlay::AddTo { .. } = self.overlay {
-                    self.status = "choose a playlist".to_string();
-                } else if self.playlists.is_empty() {
-                    self.status = "no playlists".to_string();
-                } else {
-                    self.view = View::Playlists;
-                    // These can land while the keyboard belongs to the search
-                    // box -- the sign-in that produced them runs on its own
-                    // thread, and the user is free to type meanwhile. Putting a
-                    // list on screen without moving focus to it would leave
-                    // j/k typing into the query behind it.
-                    self.mode = Mode::Browse;
-                    self.status = format!("{} playlists", self.playlists.len());
-                }
-            }
-            Response::PlaylistTracks {
-                id, title, tracks, ..
-            } => {
-                let tracks = match tracks {
-                    Ok(tracks) => tracks,
-                    Err(reason) => {
-                        self.report(reason);
-                        return;
-                    }
-                };
-                let status = if tracks.is_empty() {
-                    format!("{title} is empty")
-                } else {
-                    format!("{} tracks in {title}", tracks.len())
-                };
-                if self.view == View::Tracks {
-                    self.status = status;
-                }
-                self.results = tracks;
-                self.selected = 0;
-                self.offset = 0;
-                self.open_playlist = Some((id, title));
-                self.browsing = None;
-                self.browsing_endpoint = None;
-                // Same reason as `Response::Playlists`: the list is the point,
-                // so focus follows it.
-                if self.view == View::Tracks && !self.results.is_empty() {
-                    self.mode = Mode::Browse;
-                }
-                self.selection_settled = Some(Instant::now());
-            }
-            Response::Removed {
-                playlist_item_id,
-                title,
-            } => {
-                // Dropped locally rather than re-fetched: losing one line is
-                // not worth two round trips and the scroll position.
-                self.results
-                    .retain(|t| t.playlist_item_id.as_deref() != Some(playlist_item_id.as_str()));
-                self.selected = self.selected.min(self.results.len().saturating_sub(1));
-                self.status = format!("removed {title}");
-            }
-            Response::Liked { title, liked } => {
-                self.status = if liked {
-                    format!("liked {title}")
-                } else {
-                    format!("unliked {title}")
-                };
-            }
-            Response::Done(msg) => {
-                self.status = msg;
-            }
-            Response::Failed(msg) => {
-                // A home fetch that failed answers here rather than with an
-                // empty `Home`, so this is where the pane stops saying it is
-                // loading. Clearing it for any failure costs nothing: nothing
-                // else can be in flight while it is set except at launch.
-                self.home_pending = false;
-                self.report(msg);
             }
         }
     }
@@ -3363,7 +2923,7 @@ impl App {
 
     /// Writes the play in progress straight to the journal, for the way out.
     ///
-    /// [`Self::finish_listening`] hands the play to the library worker, which is
+    /// [`Self::finish_listening`] hands the play to the metadata worker, which is
     /// the right thread for it -- except at exit, where that thread is not
     /// joined and the process may be gone before it runs. Quitting mid-song is
     /// an ordinary way to end a session, so the track it happens on is worth
@@ -3438,7 +2998,7 @@ impl App {
         self.status = if shelves.is_empty() {
             "nothing came back from YouTube Music".to_string()
         } else {
-            "Enter to play, / to search, L for your library".to_string()
+            "Enter to play, / to search".to_string()
         };
         self.home_scroll = vec![0; shelves.len()];
         self.home = shelves;
@@ -3478,24 +3038,6 @@ impl App {
             {
                 let _ = self.source.send(Request::Art { key, url });
             }
-        }
-    }
-
-    /// Asks for the playlist list, reporting a dead worker rather than leaving
-    /// the UI stuck on `busy`.
-    fn request_playlists(&mut self) {
-        if self.oauth_signing_out {
-            self.status = "wait for Google Library sign-out to finish".to_string();
-            return;
-        }
-        if self.busy {
-            self.status = "wait for the current library request to finish".to_string();
-            return;
-        }
-        self.busy = true;
-        if self.source.send(Request::Playlists).is_err() {
-            self.busy = false;
-            self.status = "source worker is not running".to_string();
         }
     }
 
@@ -3576,7 +3118,6 @@ impl App {
                         })
                     })
             }
-            View::Playlists => None,
         }
     }
 
@@ -3630,21 +3171,6 @@ impl App {
         if let Some(now) = self.now.as_mut() {
             *now.cursor_mut() = offset;
         }
-    }
-
-    /// [`Self::clamp_scroll`] for the playlist list, which scrolls separately.
-    pub fn clamp_playlist_scroll(&mut self, height: usize) {
-        if height == 0 || self.playlists.is_empty() {
-            self.playlist_offset = 0;
-            return;
-        }
-        if self.playlist_selected < self.playlist_offset {
-            self.playlist_offset = self.playlist_selected;
-        } else if self.playlist_selected >= self.playlist_offset + height {
-            self.playlist_offset = self.playlist_selected + 1 - height;
-        }
-        let max_offset = self.playlists.len().saturating_sub(height);
-        self.playlist_offset = self.playlist_offset.min(max_offset);
     }
 
     /// Keeps the semantic home cursor valid after a feed replacement.
@@ -3776,7 +3302,6 @@ impl App {
                 self.go_home();
             }
             MenuAction::BeginSearch => self.begin_search(),
-            MenuAction::OpenLibrary => self.open_library(),
             MenuAction::OpenPlayer => self.open_player(),
             MenuAction::OpenAccount => self.open_menu(MenuPage::Account),
             MenuAction::OpenSettings => self.open_settings(),
@@ -3784,18 +3309,11 @@ impl App {
             #[cfg(windows)]
             MenuAction::Background => self.background(),
             MenuAction::Quit => self.should_quit = true,
-            MenuAction::ConnectGoogle => self.begin_sign_in(),
             MenuAction::ConnectMusic => self.begin_music_sign_in(false),
-            MenuAction::SignOut => self.sign_out(),
             MenuAction::OpenHomeSelection => self.open_card(),
             MenuAction::RefreshHome => self.refresh_home(),
             MenuAction::PlaySelected => self.play_selected(),
-            MenuAction::AddTrack => self.begin_add(),
-            MenuAction::ToggleLike => self.toggle_like(),
-            MenuAction::RemoveSelected => self.remove_selected(),
             MenuAction::OpenArtist => self.open_context_artist(),
-            MenuAction::OpenPlaylist => self.open_selected_playlist(),
-            MenuAction::ReloadLibrary => self.request_playlists(),
             MenuAction::OpenArtistSelection => self.open_artist_selection(),
             MenuAction::ReloadArtist => self.reload_artist(),
             MenuAction::OpenPageSelection => self.open_page_row(),
@@ -3813,7 +3331,7 @@ impl App {
     }
 
     fn open_settings(&mut self) {
-        if self.oauth_signing_in || self.music_signing_in {
+        if self.music_signing_in {
             self.status = "finish the pending sign-in before opening settings".to_string();
             self.menu = None;
             return;
@@ -3835,17 +3353,6 @@ impl App {
             if !self.overlay.is_open() {
                 self.toggle_root_menu();
             }
-            return Ok(());
-        }
-
-        // The library needs a way in that does not depend on which pane has the
-        // keyboard. The program starts in the search box, where every printable
-        // key is text -- a bare `L` there types an L -- so without a modifier
-        // the library would only be reachable after a search had already
-        // returned something, which is not a precondition it actually has.
-        if is_ctrl_key(key, 'l') {
-            self.menu = None;
-            self.open_library();
             return Ok(());
         }
 
@@ -3880,7 +3387,6 @@ impl App {
             Mode::Browse => match self.view {
                 View::Home => self.handle_home_key(key),
                 View::Tracks => self.handle_browse_key(key),
-                View::Playlists => self.handle_playlists_key(key),
                 View::Artist => self.handle_artist_key(key),
                 View::Playing => self.handle_playing_key(key),
             },
@@ -3915,12 +3421,6 @@ impl App {
                     self.play_selected();
                 }
             }
-            MouseAction::OpenPlaylist(index) if self.view == View::Playlists => {
-                if index < self.playlists.len() {
-                    self.playlist_selected = index;
-                    self.open_selected_playlist();
-                }
-            }
             MouseAction::OpenTab(tab) if self.view == View::Playing => {
                 if self.now.as_mut().is_some_and(|now| now.open(tab)) {
                     self.request_tab();
@@ -3949,33 +3449,28 @@ impl App {
     fn handle_overlay_key(&mut self, key: KeyEvent) -> Result<()> {
         match &mut self.overlay {
             Overlay::None => {}
-            // A failed sign-in is the one phase with somewhere to go: the thread
-            // behind it is gone, so `A` here starts a fresh flow rather than
-            // making the user dismiss the panel and find the key again.
+            // A failed session import is the one phase with somewhere to go:
+            // the thread behind it is gone, so `M` starts a fresh attempt.
             Overlay::SignIn(SignIn::Failed { .. }) => match key.code {
-                KeyCode::Char('A') | KeyCode::Char('a') => self.begin_sign_in(),
                 KeyCode::Char('M') | KeyCode::Char('m') => self.begin_music_sign_in(false),
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                     self.overlay = Overlay::None;
-                    self.status = "press A to try signing in again".to_string();
-                    self.resume_deferred_sign_in();
+                    self.status = "press M to try YouTube Music sign-in again".to_string();
                 }
                 _ => {}
             },
-            // Dismissing only hides it. The sign-in thread is still polling and
-            // will report when the user approves -- there is no way to cancel a
-            // device code, and pretending otherwise would be a lie.
-            Overlay::SignIn(_) => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+            // Dismissing only hides an import already running. Its result still
+            // arrives through the worker.
+            Overlay::SignIn(SignIn::Music { .. }) => {
+                if matches!(key.code, KeyCode::Esc) {
                     self.overlay = Overlay::None;
-                    self.status = "sign-in still pending in the background".to_string();
+                    self.status = "session import still pending in the background".to_string();
                 }
             }
             Overlay::Message { .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     self.overlay = Overlay::None;
                     self.status = String::new();
-                    self.resume_deferred_sign_in();
                 }
             }
             Overlay::Settings => match key.code {
@@ -4008,27 +3503,11 @@ impl App {
                 }
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => {
                     self.overlay = Overlay::None;
-                    self.resume_deferred_sign_in();
                 }
                 _ => {}
             },
-            Overlay::AddTo { selected, .. } => {
-                let last = self.playlists.len().saturating_sub(1);
-                match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => *selected = (*selected + 1).min(last),
-                    KeyCode::Char('k') | KeyCode::Up => *selected = selected.saturating_sub(1),
-                    KeyCode::Char('g') | KeyCode::Home => *selected = 0,
-                    KeyCode::Char('G') | KeyCode::End => *selected = last,
-                    KeyCode::Enter => self.confirm_add(),
-                    KeyCode::Esc | KeyCode::Char('q') => {
-                        self.overlay = Overlay::None;
-                        self.status = "cancelled".to_string();
-                        self.resume_deferred_sign_in();
-                    }
-                    _ => {}
-                }
-            }
         }
+
         Ok(())
     }
 
@@ -4064,8 +3543,6 @@ impl App {
             KeyCode::Enter => self.open_card(),
             KeyCode::Char('r') => self.refresh_home(),
             KeyCode::Char('/') | KeyCode::Char('i') => self.begin_search(),
-            KeyCode::Char('L') => self.open_library(),
-            KeyCode::Char('A') => self.begin_sign_in(),
             KeyCode::Char('M') => self.begin_music_sign_in(false),
             KeyCode::Char('P') | KeyCode::Char('p') => self.open_player(),
             KeyCode::Char('B') => self.background(),
@@ -4130,7 +3607,6 @@ impl App {
         self.results.clear();
         self.selected = 0;
         self.offset = 0;
-        self.open_playlist = None;
         self.browsing = Some(title.clone());
         self.browsing_endpoint = Some(endpoint.clone());
         self.view = View::Tracks;
@@ -4207,7 +3683,6 @@ impl App {
                     .or_else(|| artist.selected_card().and_then(card_artist))
             }
             View::Playing => self.now.as_ref()?.artist_ref.clone(),
-            View::Playlists => None,
         }
     }
 
@@ -4248,18 +3723,14 @@ impl App {
             KeyCode::Enter => self.open_artist_selection(),
             KeyCode::Char('r') => self.reload_artist(),
             KeyCode::Char('/') | KeyCode::Char('i') => self.begin_search(),
-            KeyCode::Char('L') => self.open_library(),
             KeyCode::Char('P') | KeyCode::Char('p') => self.open_player(),
             KeyCode::Char('B') => self.background(),
             KeyCode::Char('D') => self.toggle_presence(),
             KeyCode::Char('S') => self.open_settings(),
-            KeyCode::Char('A') => self.begin_sign_in(),
             KeyCode::Char('M') => self.begin_music_sign_in(false),
             KeyCode::Char(' ') => self.toggle_pause(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_volume(VOLUME_STEP),
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_volume(-VOLUME_STEP),
-            KeyCode::Char('a') => self.begin_add(),
-            KeyCode::Char('f') => self.toggle_like(),
             KeyCode::Esc => self.go_back(),
             KeyCode::Char('H') => self.go_home(),
             KeyCode::Char('g') | KeyCode::Home => self.artist_first(),
@@ -4404,10 +3875,6 @@ impl App {
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_volume(-VOLUME_STEP),
             KeyCode::Right => self.seek_relative(5),
             KeyCode::Left => self.seek_relative(-5),
-            KeyCode::Char('a') => self.begin_add(),
-            KeyCode::Char('f') => self.toggle_like(),
-            KeyCode::Char('L') => self.open_library(),
-            KeyCode::Char('A') => self.begin_sign_in(),
             KeyCode::Char('M') => self.begin_music_sign_in(false),
             KeyCode::Char('B') => self.background(),
             KeyCode::Char('D') => self.toggle_presence(),
@@ -4497,53 +3964,6 @@ impl App {
         self.status = "stopped".to_string();
     }
 
-    fn handle_playlists_key(&mut self, key: KeyEvent) -> Result<()> {
-        let last = self.playlists.len().saturating_sub(1);
-        match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.playlist_selected = (self.playlist_selected + 1).min(last);
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.playlist_selected = self.playlist_selected.saturating_sub(1);
-            }
-            KeyCode::Char('g') | KeyCode::Home => self.playlist_selected = 0,
-            KeyCode::Char('G') | KeyCode::End => self.playlist_selected = last,
-            KeyCode::PageDown => self.playlist_selected = (self.playlist_selected + 10).min(last),
-            KeyCode::PageUp => self.playlist_selected = self.playlist_selected.saturating_sub(10),
-            KeyCode::Enter => self.open_selected_playlist(),
-            KeyCode::Char('r') => self.request_playlists(),
-            KeyCode::Char('A') => self.begin_sign_in(),
-            KeyCode::Char('M') => self.begin_music_sign_in(false),
-            KeyCode::Char('P') | KeyCode::Char('p') => self.open_player(),
-            KeyCode::Char('B') => self.background(),
-            KeyCode::Char('D') => self.toggle_presence(),
-            KeyCode::Char('S') => self.open_settings(),
-            KeyCode::Char('x') => self.sign_out(),
-            // Back to whatever the track list was showing before, or to the
-            // landing page when it was showing nothing.
-            KeyCode::Esc | KeyCode::Char('L') | KeyCode::Char('l') if !self.history.is_empty() => {
-                self.go_back();
-            }
-            KeyCode::Esc | KeyCode::Char('L') | KeyCode::Char('l') => {
-                self.view = if self.results.is_empty() {
-                    View::Home
-                } else {
-                    View::Tracks
-                };
-            }
-            KeyCode::Char('H') => self.go_home(),
-            KeyCode::Char('/') | KeyCode::Char('i') => self.begin_search(),
-            // Playback keys stay live here: the library is a list to browse,
-            // not a reason to lose control of what is already playing.
-            KeyCode::Char(' ') => self.toggle_pause(),
-            KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_volume(VOLUME_STEP),
-            KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_volume(-VOLUME_STEP),
-            _ => {}
-        }
-        Ok(())
-    }
-
     fn begin_search(&mut self) {
         if self.snapshot_blocked() {
             self.status = "wait for the current page to finish loading".to_string();
@@ -4571,7 +3991,7 @@ impl App {
                     self.mode = Mode::Browse;
                     self.view = self.search_origin;
                 }
-                self.status = "/ to search, L for your library".to_string();
+                self.status = "/ to search, H for Home".to_string();
             }
             KeyCode::Backspace => {
                 self.query.pop();
@@ -4618,22 +4038,8 @@ impl App {
             KeyCode::Left => self.seek_relative(-5),
             // Both cases: `l` is otherwise unbound here, and a user who reaches
             // for the library is not thinking about the shift key.
-            KeyCode::Char('L') | KeyCode::Char('l') => self.open_library(),
-            // Upper case, and deliberately not next to `a`: this is the key
-            // `auth` names when it tells the user a saved sign-in has expired,
-            // and lower `a` is the add-to-playlist key one row of muscle memory
-            // away. Signing in by mistake is a browser tab the user did not ask
-            // for; adding to a playlist by mistake edits their account.
-            KeyCode::Char('A') => self.begin_sign_in(),
             KeyCode::Char('M') => self.begin_music_sign_in(false),
-            KeyCode::Char('a') => self.begin_add(),
-            KeyCode::Char('d') => self.remove_selected(),
-            KeyCode::Char('f') => self.toggle_like(),
-            // Leaves an open playlist for the library it came from; anything
-            // else falls back to the landing page, which is where every list
-            // in the program can be reached from.
             KeyCode::Esc if !self.history.is_empty() => self.go_back(),
-            KeyCode::Esc if self.open_playlist.is_some() => self.open_library(),
             KeyCode::Esc | KeyCode::Char('H') => self.go_home(),
             _ => {}
         }
@@ -4690,7 +4096,6 @@ impl App {
                     duration: None,
                     album: None,
                     artist_ref: None,
-                    playlist_item_id: None,
                 },
                 false,
             );
@@ -4818,157 +4223,24 @@ impl App {
         format!("{state}{} -- {}", now.title, now.byline())
     }
 
-    /// Shows the library, fetching it if it has not been fetched this session.
-    ///
-    /// A stale list is shown immediately rather than blanked while it refetches:
-    /// playlists change rarely, and `r` reloads on demand. When the user is not
-    /// signed in the worker answers [`Response::NeedsSignIn`], which starts the
-    /// flow -- so this key works whether or not there is a session.
-    fn open_library(&mut self) {
-        if self.snapshot_blocked() {
-            self.status = "wait for the current page to finish loading".to_string();
-            return;
-        }
-
-        // An opened playlist's immediate parent is already Library. Reuse that
-        // route rather than pushing the playlist and creating a duplicate.
-        if self.view == View::Tracks
-            && self.open_playlist.is_some()
-            && self
-                .history
-                .last()
-                .is_some_and(|page| page.view() == View::Playlists)
-        {
-            self.go_back();
-            return;
-        }
-
-        let previous = if self.view == View::Playlists {
-            None
-        } else if self.mode == Mode::Editing {
-            self.search_page.take()
-        } else {
-            self.current_page()
-        };
-        self.cancel_search_request();
-        self.search_page = None;
-        if let Some(page) = previous {
-            self.push_page(page);
-        }
-        self.view = View::Playlists;
-        // Reachable from the search box, where the keyboard belongs to the
-        // query. Without this the list would appear but j/k would type into the
-        // search box behind it.
-        self.mode = Mode::Browse;
-        if self.playlists.is_empty() {
-            self.status = "loading your library ...".to_string();
-            self.request_playlists();
-        }
-    }
-
-    fn open_selected_playlist(&mut self) {
-        if self.oauth_signing_out {
-            self.status = "wait for Google Library sign-out to finish".to_string();
-            return;
-        }
-        if self.snapshot_blocked() {
-            self.status = "wait for the current library request to finish".to_string();
-            return;
-        }
-        let Some(playlist) = self.playlists.get(self.playlist_selected).cloned() else {
-            return;
-        };
-        self.push_current_page();
-        self.status = format!("opening {} ...", playlist.title);
-        self.results.clear();
-        self.selected = 0;
-        self.offset = 0;
-        self.browsing = None;
-        self.browsing_endpoint = None;
-        self.open_playlist = Some((playlist.id.clone(), playlist.title.clone()));
-        self.view = View::Tracks;
-        self.mode = Mode::Browse;
-        let request_id = self.begin_page_request(PageRequestKind::Playlist);
-        let request = Request::OpenPlaylist {
-            request_id,
-            id: playlist.id,
-            title: playlist.title,
-        };
-        if self.source.send(request).is_err() {
-            self.cancel_page_request();
-            self.status = "source worker is not running".to_string();
-        }
-    }
-
-    /// Starts the Google device flow and puts the panel up to say so.
-    ///
-    /// The panel goes up before the request is answered rather than when the
-    /// code arrives: asking Google for one is a round trip over TLS, and until
-    /// it returns there is nothing on screen to show the key did anything.
-    ///
-    /// Not guarded on `signed_in`. A session that exists can still be one Google
-    /// has since invalidated -- that is exactly the case `auth` points at this
-    /// key -- so refusing to re-run the flow would block the only way out of it.
-    fn begin_sign_in(&mut self) {
-        if self.oauth_signing_out {
-            self.status = "wait for Google Library sign-out to finish".to_string();
-            return;
-        }
-        if self.oauth_signing_in {
-            self.status = "the Google Library sign-in is already pending".to_string();
-            return;
-        }
-        if self.music_signing_in {
-            self.oauth_sign_in_pending = true;
-            self.status =
-                "Google Library sign-in will open after YouTube Music finishes".to_string();
-            return;
-        }
-        if self.overlay.is_open() && !matches!(self.overlay, Overlay::SignIn(SignIn::Failed { .. }))
-        {
-            self.oauth_sign_in_pending = true;
-            self.status = "close the current panel to continue Google sign-in".to_string();
-            return;
-        }
-        self.oauth_sign_in_pending = false;
-        self.oauth_signing_in = true;
-        self.status = "signing in with Google ...".to_string();
-        self.menu = None;
-        self.overlay = Overlay::SignIn(SignIn::Connecting {
-            started: Instant::now(),
-        });
-        if self.source.send(Request::SignIn).is_err() {
-            self.oauth_signing_in = false;
-            self.status = "source worker is not running".to_string();
-            self.overlay = Overlay::SignIn(SignIn::Failed {
-                reason: "source worker is not running".to_string(),
-            });
-        }
-    }
-
     fn begin_music_sign_in(&mut self, force: bool) {
         if self.music_signing_in {
-            self.status = "the YouTube Music sign-in window is already open".to_string();
-            return;
-        }
-        if self.oauth_signing_in {
-            self.music_sign_in_pending =
-                Some(self.music_sign_in_pending.is_some_and(|pending| pending) || force);
-            self.status =
-                "YouTube Music sign-in will open after Google Library finishes".to_string();
+            self.status = "the YouTube Music session import is already pending".to_string();
             return;
         }
         if self.overlay.is_open() && !matches!(self.overlay, Overlay::SignIn(SignIn::Failed { .. }))
         {
-            self.music_sign_in_pending =
-                Some(self.music_sign_in_pending.is_some_and(|pending| pending) || force);
-            self.status = "close the current panel to continue YouTube Music sign-in".to_string();
+            self.status = "close the current panel, then press M to open sign-in".to_string();
             return;
         }
-        self.music_sign_in_pending = None;
+        self.menu = None;
+
+        self.request_music_sign_in(force);
+    }
+
+    fn request_music_sign_in(&mut self, force: bool) {
         self.music_signing_in = true;
         self.status = "finish signing in in the YouTube Music window ...".to_string();
-        self.menu = None;
         self.overlay = Overlay::SignIn(SignIn::Music {
             started: Instant::now(),
         });
@@ -4977,207 +4249,6 @@ impl App {
             let reason = "source worker is not running".to_string();
             self.status = reason.clone();
             self.overlay = Overlay::SignIn(SignIn::Failed { reason });
-        }
-    }
-
-    fn resume_deferred_sign_in(&mut self) {
-        if self.oauth_signing_in
-            || self.oauth_signing_out
-            || self.music_signing_in
-            || self.overlay.is_open()
-        {
-            return;
-        }
-        if self.oauth_sign_in_pending {
-            self.oauth_sign_in_pending = false;
-            self.begin_sign_in();
-        } else if let Some(force) = self.music_sign_in_pending.take() {
-            self.begin_music_sign_in(force);
-        }
-    }
-
-    fn sign_out(&mut self) {
-        if self.oauth_signing_out {
-            self.status = "Google Library sign-out is already pending".to_string();
-            return;
-        }
-        if self.busy {
-            self.status = "wait for the current library request to finish".to_string();
-            return;
-        }
-        if self.oauth_signing_in {
-            self.status = "finish the Google Library sign-in before signing out".to_string();
-            return;
-        }
-        // Signing out is an explicit cancellation of any reconnect that was
-        // waiting behind the Music WebView or another modal.
-        self.oauth_sign_in_pending = false;
-        self.oauth_signing_out = true;
-        self.status = "signing out of Google Library ...".to_string();
-        self.menu = None;
-        if self.source.send(Request::SignOut).is_err() {
-            self.oauth_signing_out = false;
-            self.status = "source worker is not running".to_string();
-        }
-    }
-
-    /// Opens the playlist picker for the selected track.
-    ///
-    /// The overlay is put up before the list arrives when the list is not
-    /// already held, so the keypress has a visible effect immediately;
-    /// [`Response::Playlists`] fills it in.
-    fn begin_add(&mut self) {
-        if self.oauth_signing_out {
-            self.status = "wait for Google Library sign-out to finish".to_string();
-            self.menu = None;
-            return;
-        }
-        if self.busy {
-            self.status = "wait for the current library request to finish".to_string();
-            self.menu = None;
-            return;
-        }
-        if self.oauth_signing_in || self.music_signing_in {
-            self.status = "finish the pending sign-in before editing playlists".to_string();
-            self.menu = None;
-            return;
-        }
-        let Some((video_id, title)) = self.acting_on() else {
-            return;
-        };
-        self.menu = None;
-        self.overlay = Overlay::AddTo {
-            video_id,
-            title,
-            selected: 0,
-        };
-
-        if self.playlists.is_empty() {
-            self.status = "loading your playlists ...".to_string();
-            self.request_playlists();
-        } else {
-            self.status = "choose a playlist".to_string();
-        }
-    }
-
-    fn confirm_add(&mut self) {
-        if self.busy {
-            self.status = "wait for the current library request to finish".to_string();
-            return;
-        }
-        let Overlay::AddTo {
-            video_id, selected, ..
-        } = &self.overlay
-        else {
-            return;
-        };
-        let Some(playlist) = self.playlists.get(*selected) else {
-            self.status = "no playlist to add to".to_string();
-            return;
-        };
-
-        let request = Request::AddToPlaylist {
-            playlist_id: playlist.id.clone(),
-            playlist_title: playlist.title.clone(),
-            video_id: video_id.clone(),
-        };
-        self.status = format!("adding to {} ...", playlist.title);
-        self.overlay = Overlay::None;
-        self.busy = true;
-        if self.source.send(request).is_err() {
-            self.busy = false;
-            self.status = "source worker is not running".to_string();
-        }
-        self.resume_deferred_sign_in();
-    }
-
-    /// Removes the selected track from the playlist it is being shown from.
-    ///
-    /// Only meaningful inside a playlist: a search result is not in one, and
-    /// "Liked songs" is not a playlist the API will remove a row from -- `f`
-    /// unlikes there instead.
-    fn remove_selected(&mut self) {
-        if self.oauth_signing_out {
-            self.status = "wait for Google Library sign-out to finish".to_string();
-            return;
-        }
-        if self.busy {
-            self.status = "wait for the current library request to finish".to_string();
-            return;
-        }
-        let Some(track) = self.results.get(self.selected) else {
-            return;
-        };
-        let Some(item_id) = track.playlist_item_id.clone() else {
-            self.status = if self.open_playlist.is_some() {
-                "this row cannot be removed -- press f to unlike".to_string()
-            } else {
-                "not in a playlist -- press L to open one".to_string()
-            };
-            return;
-        };
-
-        let title = track.label();
-        self.status = format!("removing {title} ...");
-        self.busy = true;
-        let request = Request::RemoveFromPlaylist {
-            playlist_item_id: item_id,
-            title,
-        };
-        if self.source.send(request).is_err() {
-            self.busy = false;
-            self.status = "source worker is not running".to_string();
-        }
-    }
-
-    fn toggle_like(&mut self) {
-        if self.oauth_signing_out {
-            self.status = "wait for Google Library sign-out to finish".to_string();
-            return;
-        }
-        if self.busy {
-            self.status = "wait for the current library request to finish".to_string();
-            return;
-        }
-        let Some((video_id, title)) = self.acting_on() else {
-            return;
-        };
-        self.status = format!("rating {title} ...");
-        self.busy = true;
-        let request = Request::ToggleLike { video_id, title };
-        if self.source.send(request).is_err() {
-            self.busy = false;
-            self.status = "source worker is not running".to_string();
-        }
-    }
-
-    /// The track `a` and `f` apply to: the selected row in the track list, and
-    /// on the player page the track that is playing.
-    ///
-    /// The page keeps a cursor of its own, but liking the row it happens to
-    /// rest on is not what `f` means there -- the whole view is about one song,
-    /// and that song is the one on screen.
-    fn acting_on(&self) -> Option<(String, String)> {
-        match self.view {
-            View::Playing => {
-                let now = self.now.as_ref()?;
-                let artist = &now.artist;
-                let label = if artist.is_empty() || artist == crate::source::UNKNOWN_ARTIST {
-                    now.title.clone()
-                } else {
-                    format!("{} — {artist}", now.title)
-                };
-                Some((now.video_id.clone(), label))
-            }
-            View::Tracks => {
-                let track = self.results.get(self.selected)?;
-                Some((track.id.clone(), track.label()))
-            }
-            View::Artist => {
-                let track = self.artist.as_ref()?.selected_track()?;
-                Some((track.id.clone(), track.label()))
-            }
-            View::Home | View::Playlists => None,
         }
     }
 
@@ -5258,11 +4329,6 @@ mod tests {
             false
         ));
         assert!(page_snapshot_blocked(
-            Some((3, PageRequestKind::Playlist)),
-            true,
-            false
-        ));
-        assert!(page_snapshot_blocked(
             Some((4, PageRequestKind::Artist)),
             true,
             false
@@ -5287,42 +4353,6 @@ mod tests {
     }
 
     #[test]
-    fn sign_out_identifies_every_route_back_to_the_library() {
-        let playlist = HistoryEntry::Tracks(TrackPage {
-            results: Vec::new(),
-            selected: 0,
-            offset: 0,
-            browsing: None,
-            browsing_endpoint: None,
-            open_playlist: Some(("PLmine".to_string(), "Private".to_string())),
-            status: "private playlist".to_string(),
-        });
-        let player = HistoryEntry::Playing {
-            back_to: View::Tracks,
-            player_back: Some(Box::new(playlist.clone())),
-        };
-
-        assert!(playlist.needs_library_session());
-        assert!(player.needs_library_session());
-        assert!(
-            HistoryEntry::Playlists {
-                status: "library".to_string()
-            }
-            .needs_library_session()
-        );
-        assert!(
-            !HistoryEntry::Home {
-                status: "home".to_string()
-            }
-            .needs_library_session()
-        );
-        assert!(view_needs_library_session(View::Playlists, false));
-        assert!(view_needs_library_session(View::Tracks, true));
-        assert!(!view_needs_library_session(View::Tracks, false));
-        assert!(!view_needs_library_session(View::Artist, false));
-    }
-
-    #[test]
     fn page_history_drops_the_oldest_route_at_its_bound() {
         let mut history = Vec::new();
         for selected in 0..PAGE_HISTORY + 3 {
@@ -5334,7 +4364,6 @@ mod tests {
                     offset: selected,
                     browsing: None,
                     browsing_endpoint: None,
-                    open_playlist: None,
                     status: format!("page {selected}"),
                 }),
             );
@@ -5360,7 +4389,6 @@ mod tests {
             duration: Some(Duration::from_secs(468)),
             album: Some("Currents".to_string()),
             artist_ref: Some(artist.clone()),
-            playlist_item_id: None,
         };
         let mut view = ArtistView {
             requested: artist.clone(),
@@ -5427,7 +4455,6 @@ mod tests {
             duration: None,
             album: None,
             artist_ref: None,
-            playlist_item_id: None,
         });
         now.queue = vec![Track {
             id: "JhulBGMA7G4".to_string(),
@@ -5436,7 +4463,6 @@ mod tests {
             duration: Some(Duration::from_secs(224)),
             album: Some("Discovery".to_string()),
             artist_ref: Some(artist.clone()),
-            playlist_item_id: None,
         }];
         now.playing = Some(0);
 
@@ -5477,8 +4503,8 @@ mod tests {
     fn a_search_started_on_player_returns_to_the_page_behind_player() {
         assert_eq!(page_behind_search(View::Home, View::Tracks), View::Home);
         assert_eq!(
-            page_behind_search(View::Playing, View::Playlists),
-            View::Playlists
+            page_behind_search(View::Playing, View::Artist),
+            View::Artist
         );
     }
 
@@ -5490,7 +4516,6 @@ mod tests {
             duration: Some(Duration::from_secs(468)),
             album: Some("Currents".to_string()),
             artist_ref: None,
-            playlist_item_id: None,
         })
     }
 
@@ -5579,7 +4604,6 @@ mod tests {
             duration: Some(Duration::from_secs(180)),
             album: None,
             artist_ref: None,
-            playlist_item_id: None,
         }
     }
 

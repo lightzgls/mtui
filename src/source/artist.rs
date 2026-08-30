@@ -8,8 +8,8 @@
 use anyhow::{Result, bail};
 use serde_json::Value;
 
-use super::auth::Http;
 use super::home::{self, Shelf};
+use super::http::Http;
 use super::innertube::{flex_column, flex_runs, parse_duration};
 use super::{ArtistRef, Track, UNKNOWN_ARTIST};
 
@@ -203,7 +203,6 @@ fn parse_song(row: &Value) -> Option<ArtistSong> {
             duration,
             album,
             artist_ref: flex_runs(row, 1).and_then(home::artist_ref),
-            playlist_item_id: None,
         },
         plays,
     })

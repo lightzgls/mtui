@@ -12,13 +12,12 @@ env:
 
 jobs:
   test:
-    # Both, deliberately. Windows is what MTUI ships for; Linux is what keeps
-    # the `#[cfg(not(windows))]` halves of `tray` and `console` from rotting
-    # unnoticed, since nothing else ever compiles them.
+    # Every desktop, deliberately: sign-in uses the native webview on each and
+    # platform-specific code must not be allowed to rot unnoticed.
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -32,11 +31,11 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
 
-      # rodio's `playback` feature pulls cpal, which links ALSA on Linux. No
-      # audio device is needed to build or test -- only the headers.
-      - name: Install ALSA headers
+      # Audio links ALSA and the shared sign-in window links WebKitGTK on Linux.
+      # No display or audio device is needed to build or test -- only headers.
+      - name: Install Linux development libraries
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libwebkit2gtk-4.1-dev
 
       - name: Cache cargo
         uses: actions/cache@v4

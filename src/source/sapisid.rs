@@ -1,10 +1,7 @@
 //! The `SAPISIDHASH` scheme Google's own web clients authenticate with.
 //!
-//! This is the one way into a personalised YouTube Music feed. OAuth is not:
-//! a Bearer token on an InnerTube call is routed through Google's API gateway
-//! and refused with `INVALID_ARGUMENT`, whatever client identity travels with
-//! it. Google's web players do not use OAuth for this either -- they sign each
-//! request with a hash over a cookie, which is what this file computes.
+//! Google's web players sign each private request with a hash over a cookie,
+//! which is what this file computes.
 //!
 //! The scheme is unauthenticated in the cryptographic sense: it proves only
 //! that the caller knows `SAPISID`, which is a cookie the user copied out of
@@ -14,7 +11,7 @@
 //! SHA-1 is hand-rolled rather than pulled in. `sha1` costs five transitive
 //! crates (`digest`, `block-buffer`, `crypto-common`, `generic-array`,
 //! `typenum`) for one function, and this is the same trade the ISO-8601 parser
-//! in [`crate::source::library`] already makes. It is checked against the
+//! elsewhere in the source layer already makes. It is checked against the
 //! published vectors below.
 
 use std::time::{SystemTime, UNIX_EPOCH};

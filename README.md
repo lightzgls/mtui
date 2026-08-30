@@ -35,10 +35,10 @@
 | Personalized Home shelves | Continuous queues and prefetching | Pixel or colored ASCII covers |
 | Dedicated artist pages | Synced lyrics and comments | Four original app icon themes |
 | Albums, playlists, and recommendations | Related music and queue expansion | Discord Rich Presence |
-| Search by title, URL, or video ID | Liked songs and playlist editing | Windows notification-area controls |
+| Search by title, URL, or video ID | Listening history and personalized picks | Windows notification-area controls |
 
 ```text
-Home / Search / Library
+Home / Search
           |
           v
  Artist -> Album / Playlist -> Track
@@ -47,7 +47,7 @@ Home / Search / Library
                     Queue / Lyrics / Related / Comments
 ```
 
-Search and playback work without an account. Personalized Home and Google Library access are optional and use separate sign-ins.
+Search and playback work without an account. Personalized Home is optional and uses a YouTube Music session created in MTUI's sign-in window.
 
 Discord Rich Presence is off by default. MTUI publishes playback details only after you enable it with `D` or in Settings.
 
@@ -65,18 +65,24 @@ The executable is self-contained. Personalized Home sign-in uses the Microsoft E
 
 ### Linux
 
-Install Rust and the native audio and TLS development packages.
+Install Rust and the native audio, TLS, and WebKitGTK development packages.
 
 Debian or Ubuntu:
 
 ```sh
-sudo apt install build-essential pkg-config libssl-dev libasound2-dev
+sudo apt install build-essential pkg-config libssl-dev libasound2-dev libwebkit2gtk-4.1-dev
 ```
 
 Fedora:
 
 ```sh
-sudo dnf install gcc pkgconf-pkg-config openssl-devel alsa-lib-devel
+sudo dnf install gcc pkgconf-pkg-config openssl-devel alsa-lib-devel webkit2gtk4.1-devel
+```
+
+Arch Linux:
+
+```sh
+sudo pacman -S --needed base-devel pkgconf openssl alsa-lib webkit2gtk-4.1
 ```
 
 Build and install MTUI:
@@ -91,6 +97,10 @@ mtui
 
 Ensure `~/.local/bin` is on `PATH`.
 
+### macOS
+
+Install the Xcode command-line tools and Rust, then use the same `cargo build --release` command. WKWebView is provided by macOS, so no browser or keyring package is required for sign-in.
+
 ## First Run
 
 MTUI finds `yt-dlp` on `PATH` or downloads a private copy on first run. If `yt-dlp` cannot find a supported JavaScript runtime, MTUI reuses Deno, Node.js, or Bun from `PATH`, or installs Deno privately. MTUI also installs a pinned local copy of the GPL-3.0 `bgutil-ytdlp-pot-provider` and its production dependencies so YouTube's protected audio streams can play at normal quality. These automatic installs require network access but not administrator access.
@@ -98,42 +108,21 @@ MTUI finds `yt-dlp` on `PATH` or downloads a private copy on first run. If `yt-d
 | Experience | Account needed | How to connect |
 |---|---:|---|
 | Search and playback | No | Start typing with `/` or `i` |
-| Personalized Home | Optional | Press `M` on Windows |
-| Liked songs and playlists | Optional | Configure Google OAuth, then press `A` |
+| Personalized Home | Optional | Press `M` and sign in |
 
 ## Sign In
 
 ### Personalized Home
 
-On Windows, press `M` and complete sign-in in MTUI's YouTube Music window. MTUI opens the real `music.youtube.com` page, never receives form values or passwords, and stores only the resulting YouTube session cookies in its private configuration directory.
+Press `M` on Linux, Windows, or macOS. MTUI opens the real `music.youtube.com` page in its own sign-in window, using WebKitGTK, WebView2, or WKWebView respectively. The visible flow is the same on every desktop: complete Google's sign-in and the window closes when the personalized session is ready. MTUI stores only the resulting YouTube session cookies in its private configuration directory and never receives form values or passwords.
 
-MTUI prompts for this session automatically when Home has no usable session. OAuth tokens cannot authenticate YouTube Music's private Home feed.
-
-The embedded Home sign-in is currently Windows-only. A session can instead be supplied manually by placing the complete `Cookie` request header from a signed-in `music.youtube.com` request in `cookies.txt` inside the configuration directory. Treat this file like a password.
-
-### Google Library
-
-Press `A` to connect liked songs, playlists, and playlist editing through the YouTube Data API. This requires your own Google OAuth client:
-
-1. Create a project in the [Google Cloud Console](https://console.cloud.google.com/) and enable **YouTube Data API v3**.
-2. Configure the OAuth consent screen and add your account as a user. Publishing the app avoids Google's seven-day token expiry for apps left in testing.
-3. Create an OAuth client with application type **TV and Limited Input devices**.
-4. Create `client.json` in MTUI's configuration directory:
-
-```json
-{
-  "client_id": "your-client-id",
-  "client_secret": "your-client-secret"
-}
-```
-
-Press `A` again and follow the device-code prompt. MTUI stores refreshed tokens locally and does not bundle a shared Google client.
+MTUI opens the same sign-in window automatically when Home has no usable session or YouTube rejects the saved one. Linux packages must provide WebKitGTK 4.1; current Windows and macOS installations include their system webviews. A complete `Cookie` request-header value can still be placed manually in `cookies.txt` as a compatibility fallback. Treat that file like a password.
 
 ## Controls
 
 `Ctrl-K` opens the global App Menu. Outside search entry, `.` opens actions for the current page or selection.
 
-The terminal UI also accepts the mouse: use the wheel to navigate, click the search box to edit, and click visible cards, rows, playlists, player tabs, or queue entries to open them.
+The terminal UI also accepts the mouse: use the wheel to navigate, click the search box to edit, and click visible cards, rows, player tabs, or queue entries to open them.
 
 | Key | Action |
 |---|---|
@@ -147,17 +136,13 @@ The terminal UI also accepts the mouse: use the wheel to navigate, click the sea
 | `/` or `i` | Search |
 | `Esc` or `H` | Back or Home |
 | `P` | Open the player |
-| `L` or `Ctrl-L` | Open the library |
 | `Space` | Pause or resume |
 | `+` / `-` | Change volume |
 | Left / Right | Seek five seconds while browsing tracks or the player |
 | `n` / `p` | Next or previous track on the player |
 | `1`-`4` or `Tab` | Open Queue, Lyrics, Related, or Comments |
-| `a` | Add the selected track to a playlist |
-| `f` | Like or unlike the selected track |
 | `c` | Change cover-art size |
-| `A` | Start Google Library sign-in |
-| `M` | Start personalized Home sign-in |
+| `M` | Import or refresh the personalized Home session |
 | `D` | Toggle Discord Rich Presence directly |
 | `S` or `Ctrl-S` | Open settings for tray, song cover, app icon, and Discord presence |
 | `B` | Continue in the Windows notification area |
@@ -178,7 +163,7 @@ Enable **Keep notification-area icon** under Settings to retain the icon while t
 
 Downloaded tools are kept separately under `%LOCALAPPDATA%\mtui` on Windows or `$XDG_CACHE_HOME/mtui` on Linux.
 
-MTUI detects sixel support automatically. Set `MTUI_GRAPHICS=blocks` to force terminal-cell rendering or `MTUI_GRAPHICS=sixel` to force sixel output. The Settings panel switches song covers between pixel art and colored ASCII.
+MTUI detects Kitty graphics and Sixel support automatically. Set `MTUI_GRAPHICS=blocks` to force terminal-cell rendering, `MTUI_GRAPHICS=kitty` to force Kitty graphics, or `MTUI_GRAPHICS=sixel` to force Sixel output. The Settings panel switches song covers between pixel art and colored ASCII.
 
 ### Diagnostics
 
