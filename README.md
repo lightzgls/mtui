@@ -28,6 +28,9 @@
     <a href="https://github.com/lightzgls/mtui/issues/new?labels=enhancement">Request Feature</a>
   </p>
 </div>
+<img width="1901" height="1025" alt="image" src="https://github.com/user-attachments/assets/fdbfd164-ec9a-4e50-a0da-1b33ae060bd8" />
+<img width="1906" height="1023" alt="image" src="https://github.com/user-attachments/assets/97d485f4-91df-4344-b6cf-2028758b75f6" />
+<img width="1893" height="1020" alt="image" src="https://github.com/user-attachments/assets/c1f943fb-cae9-460c-afb8-241e93f9425f" />
 
 > [!NOTE]
 > MTUI is a personal, unofficial project built in public. It is not affiliated
@@ -341,11 +344,7 @@ Windows releases use the MSVC target so WebView2's loader is linked into
 `mtui.exe`. GNU Windows builds remain supported, but require the generated
 `WebView2Loader.dll` beside the executable.
 
-### Top contributors
 
-<a href="https://github.com/lightzgls/mtui/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=lightzgls/mtui" alt="contrib.rocks image" />
-</a>
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
