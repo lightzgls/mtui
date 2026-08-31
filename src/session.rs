@@ -7,9 +7,8 @@
 //! retains the single-file release: the main executable also handles the
 //! private helper invocation there.
 
-use std::path::Path;
 #[cfg(not(windows))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
