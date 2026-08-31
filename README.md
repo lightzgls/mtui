@@ -5,14 +5,6 @@
 *** Reference-style links are collected at the bottom of this file.
 -->
 
-<!-- PROJECT SHIELDS -->
-[![CI][ci-shield]][ci-url]
-[![Latest release][release-shield]][release-url]
-[![Stargazers][stars-shield]][stars-url]
-[![Issues][issues-shield]][issues-url]
-[![MIT License][license-shield]][license-url]
-[![Rust 1.85+][rust-shield]][rust-url]
-
 <!-- PROJECT LOGO -->
 <br />
 <div align="center">
@@ -118,13 +110,12 @@ Home / Search
 
 ### Built With
 
-[![Rust][rust-badge]][rust-url]
-[![ratatui][ratatui-badge]][ratatui-url]
-[![crossterm][crossterm-badge]][crossterm-url]
-[![Tokio][tokio-badge]][tokio-url]
-[![rodio][rodio-badge]][rodio-url]
-[![reqwest][reqwest-badge]][reqwest-url]
-[![wry][wry-badge]][wry-url]
+- [Rust][rust-url] (2024 edition)
+- [ratatui][ratatui-url] and [crossterm][crossterm-url] for the terminal UI
+- [Tokio][tokio-url] for the streaming runtime
+- [rodio][rodio-url] for native AAC playback
+- [reqwest][reqwest-url] for HTTP
+- [wry / tao][wry-url] for the sign-in window
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -382,34 +373,15 @@ Project Link: [https://github.com/lightzgls/mtui](https://github.com/lightzgls/m
 - [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
 - [ratatui](https://ratatui.rs)
 - [rodio](https://github.com/RustAudio/rodio)
-- [Img Shields](https://shields.io)
 - [contrib.rocks](https://contrib.rocks)
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 <!-- MARKDOWN LINKS & IMAGES -->
-[ci-shield]: https://github.com/lightzgls/mtui/actions/workflows/ci.yml/badge.svg
-[ci-url]: https://github.com/lightzgls/mtui/actions/workflows/ci.yml
-[release-shield]: https://img.shields.io/github/v/release/lightzgls/mtui?color=49d7f2
-[release-url]: https://github.com/lightzgls/mtui/releases/latest
-[stars-shield]: https://img.shields.io/github/stars/lightzgls/mtui?style=flat
-[stars-url]: https://github.com/lightzgls/mtui/stargazers
-[issues-shield]: https://img.shields.io/github/issues/lightzgls/mtui
-[issues-url]: https://github.com/lightzgls/mtui/issues
-[license-shield]: https://img.shields.io/badge/license-MIT-65f5b5
-[license-url]: https://github.com/lightzgls/mtui/blob/main/LICENSE
-[rust-shield]: https://img.shields.io/badge/rust-1.85%2B-f5a97f
 [rust-url]: https://www.rust-lang.org
-[rust-badge]: https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white
-[ratatui-badge]: https://img.shields.io/badge/ratatui-000000?style=for-the-badge
 [ratatui-url]: https://ratatui.rs
-[crossterm-badge]: https://img.shields.io/badge/crossterm-4A5568?style=for-the-badge
 [crossterm-url]: https://github.com/crossterm-rs/crossterm
-[tokio-badge]: https://img.shields.io/badge/Tokio-141414?style=for-the-badge&logo=rust&logoColor=white
 [tokio-url]: https://tokio.rs
-[rodio-badge]: https://img.shields.io/badge/rodio-CC5500?style=for-the-badge
 [rodio-url]: https://github.com/RustAudio/rodio
-[reqwest-badge]: https://img.shields.io/badge/reqwest-2B6CB0?style=for-the-badge
 [reqwest-url]: https://github.com/seanmonstar/reqwest
-[wry-badge]: https://img.shields.io/badge/wry%20%2F%20tao-1A1A1A?style=for-the-badge
 [wry-url]: https://github.com/tauri-apps/wry

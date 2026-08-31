@@ -22,7 +22,7 @@ fn arguments() -> Result<(PathBuf, bool)> {
     let mut profile = None;
     let mut force = false;
     while let Some(arg) = args.next() {
-        if arg == PROFILE_ARG {
+        if arg == std::ffi::OsStr::new(PROFILE_ARG) {
             let value = args
                 .next()
                 .context("the sign-in helper needs a profile path")?;
