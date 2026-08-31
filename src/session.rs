@@ -1,41 +1,37 @@
 //! One YouTube Music sign-in flow on every desktop.
 //!
 //! MTUI owns a small persistent webview profile and opens Google's real
-//! `music.youtube.com` page in a separate helper process. Wry supplies the
-//! native engine on each platform: WebView2 on Windows, WebKitGTK on Linux and
-//! WKWebView on macOS. The user sees the same window and MTUI never receives a
-//! password or form value; it reads the resulting YouTube cookies only after
-//! Google has completed sign-in.
-//!
-//! The helper process is important rather than decorative. GTK and AppKit both
-//! require their window event loop on the process's main thread, while session
-//! setup is requested from MTUI's source worker. Spawning the same executable
-//! in helper mode satisfies that rule without moving the terminal UI or audio
-//! player onto a GUI event loop.
+//! `music.youtube.com` page in a separate helper process. On Unix that helper
+//! is a companion executable, so the player never links WebKitGTK/WKWebView
+//! and pays their memory cost only while the sign-in window exists. Windows
+//! retains the single-file release: the main executable also handles the
+//! private helper invocation there.
 
-use std::cell::RefCell;
+use std::path::Path;
+#[cfg(not(windows))]
+use std::path::PathBuf;
 use std::process::Stdio;
-use std::rc::Rc;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use tao::dpi::LogicalSize;
-use tao::event::{Event, StartCause, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tao::platform::run_return::EventLoopExtRunReturn;
-use tao::window::WindowBuilder;
-use wry::{WebContext, WebViewBuilder};
 
 use crate::config::{Cookies, Import};
 use crate::source::sapisid;
 
-const MUSIC: &str = "https://music.youtube.com/";
-const POLL: Duration = Duration::from_secs(1);
-const HELPER_ARG: &str = "--mtui-music-sign-in-helper";
+#[cfg(windows)]
+#[path = "session_helper.rs"]
+mod helper;
+
 const FORCE_ARG: &str = "--clear-session";
+#[cfg(not(windows))]
+const PROFILE_ARG: &str = "--profile";
+#[cfg(windows)]
+const HELPER_ARG: &str = "--mtui-music-sign-in-helper";
+#[cfg(not(windows))]
+const HELPER_NAME: &str = "mtui-sign-in";
 const SESSION_NAME: &str = "MTUI sign-in window";
 
 /// Recognises the private child-process invocation before terminal setup.
+#[cfg(windows)]
 pub fn helper_request() -> Option<bool> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     args.iter()
@@ -43,18 +39,37 @@ pub fn helper_request() -> Option<bool> {
         .then(|| args.iter().any(|arg| arg == FORCE_ARG))
 }
 
-/// Starts the cross-platform sign-in helper and waits for its persisted
-/// session. Called on a worker thread, so the terminal remains responsive.
+/// Runs the embedded Windows helper, where the process main thread is free for
+/// the native window event loop. Its stdout is a private pipe owned by the
+/// parent MTUI process.
+#[cfg(windows)]
+pub fn run_helper(force: bool) -> Result<()> {
+    let profile = crate::config::dir()?.join("webview");
+    let header = helper::run(profile, force)?;
+    println!("{header}");
+    Ok(())
+}
+
+/// Starts the cross-platform sign-in helper and waits for its session. Called
+/// on a worker thread, so the terminal remains responsive.
 pub fn sign_in(force: bool) -> Result<String> {
     let executable = std::env::current_exe().context("could not locate the MTUI executable")?;
-    let mut process = std::process::Command::new(executable);
-    process.arg(HELPER_ARG);
+    #[cfg(not(windows))]
+    let profile = crate::config::dir()?.join("webview");
+    #[cfg(windows)]
+    let mut process = {
+        let mut process = std::process::Command::new(&executable);
+        process.arg(HELPER_ARG);
+        process
+    };
+    #[cfg(not(windows))]
+    let mut process = sign_in_command(&executable, &profile)?;
     if force {
         process.arg(FORCE_ARG);
     }
     let output = process
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .context("could not start the YouTube Music sign-in window")?;
@@ -67,98 +82,34 @@ pub fn sign_in(force: bool) -> Result<String> {
             .trim();
         bail!("{reason}");
     }
+
+    let header = String::from_utf8(output.stdout)
+        .context("the YouTube Music sign-in window returned an invalid session")?;
+    save(header.trim())?;
     Cookies::available()
         .context("could not read the imported YouTube Music session")?
         .context("the sign-in window closed without a YouTube Music session")?;
     Ok(SESSION_NAME.to_string())
 }
 
-/// Runs inside the private child process, where this is the main thread.
-pub fn run_helper(force: bool) -> Result<()> {
-    let profile = crate::config::dir()?.join("webview");
-    std::fs::create_dir_all(&profile)
-        .with_context(|| format!("could not create {}", profile.display()))?;
-
-    let mut event_loop = EventLoopBuilder::new().build();
-    let window = WindowBuilder::new()
-        .with_title("MTUI - Sign in to YouTube Music")
-        .with_inner_size(LogicalSize::new(980.0, 720.0))
-        .with_min_inner_size(LogicalSize::new(640.0, 520.0))
-        .build(&event_loop)
-        .context("could not create the YouTube Music sign-in window")?;
-    let mut context = WebContext::new(Some(profile));
-    let builder = WebViewBuilder::new_with_web_context(&mut context)
-        .with_devtools(false)
-        .with_hotkeys_zoom(false);
-    #[cfg(target_os = "linux")]
-    let webview = {
-        use tao::platform::unix::WindowExtUnix;
-        use wry::WebViewBuilderExtUnix;
-
-        let container = window
-            .default_vbox()
-            .context("the Linux sign-in window has no GTK container")?;
-        builder
-            .build_gtk(container)
-            .context("could not start the system webview")?
-    };
-    #[cfg(not(target_os = "linux"))]
-    let webview = builder
-        .build(&window)
-        .context("could not start the system webview")?;
-    if force {
-        webview
-            .clear_all_browsing_data()
-            .context("could not clear the expired YouTube Music session")?;
+#[cfg(not(windows))]
+fn sign_in_command(executable: &Path, profile: &Path) -> Result<std::process::Command> {
+    let helper = helper_path(executable);
+    if !helper.is_file() {
+        bail!(
+            "the YouTube Music sign-in helper is missing; install {} beside {}",
+            helper.display(),
+            executable.display()
+        );
     }
-    webview
-        .load_url(MUSIC)
-        .context("could not open YouTube Music")?;
-
-    let outcome: Rc<RefCell<Option<Result<()>>>> = Rc::new(RefCell::new(None));
-    let result = Rc::clone(&outcome);
-    event_loop.run_return(move |event, _, control_flow| {
-        *control_flow = ControlFlow::WaitUntil(Instant::now() + POLL);
-        match event {
-            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => match capture(&webview) {
-                Ok(Some(header)) => {
-                    *result.borrow_mut() = Some(save(&header));
-                    *control_flow = ControlFlow::Exit;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    *result.borrow_mut() = Some(Err(error));
-                    *control_flow = ControlFlow::Exit;
-                }
-            },
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => {
-                *result.borrow_mut() =
-                    Some(Err(anyhow::anyhow!("YouTube Music sign-in was cancelled")));
-                *control_flow = ControlFlow::Exit;
-            }
-            _ => {}
-        }
-    });
-
-    outcome
-        .borrow_mut()
-        .take()
-        .unwrap_or_else(|| Err(anyhow::anyhow!("YouTube Music sign-in ended unexpectedly")))
+    let mut process = std::process::Command::new(helper);
+    process.arg(PROFILE_ARG).arg(profile);
+    Ok(process)
 }
 
-fn capture(webview: &wry::WebView) -> Result<Option<String>> {
-    let cookies = webview
-        .cookies_for_url(MUSIC)
-        .context("could not read the YouTube Music session")?;
-    let header = cookies
-        .iter()
-        .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
-        .collect::<Vec<_>>()
-        .join("; ");
-    Ok(Cookies::from_header(&header).map(|_| header))
+#[cfg(not(windows))]
+fn helper_path(executable: &Path) -> PathBuf {
+    executable.with_file_name(format!("{HELPER_NAME}{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn save(header: &str) -> Result<()> {
@@ -173,13 +124,44 @@ fn save(header: &str) -> Result<()> {
     .save()
 }
 
+/// Removes every local route back into the signed-in Music session.
+///
+/// The credential files are the logout boundary. A WebView profile that could
+/// not be removed is reported as a warning rather than turning a completed
+/// logout into a failure; no authenticated request can be made without the
+/// files that were removed first.
+pub fn sign_out() -> Result<Option<String>> {
+    Cookies::forget()?;
+    let profile = crate::config::dir()?.join("webview");
+    match std::fs::remove_dir_all(&profile) {
+        Ok(()) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Ok(Some(format!(
+            "could not clear the sign-in window data at {}: {error}",
+            profile.display()
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn helper_flag_is_private_and_unambiguous() {
         assert!(HELPER_ARG.starts_with("--mtui-"));
         assert_ne!(HELPER_ARG, FORCE_ARG);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn companion_lives_beside_the_player() {
+        let player = Path::new("/opt/mtui/bin/mtui");
+        assert_eq!(
+            helper_path(player),
+            Path::new("/opt/mtui/bin")
+                .join(format!("{HELPER_NAME}{}", std::env::consts::EXE_SUFFIX))
+        );
     }
 }

@@ -12,7 +12,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::art::ArtCache;
-use crate::config::{self, CoverStyle, IconTheme};
+use crate::config::{self, CoverStyle, IconTheme, ImageRenderer};
 use crate::discord::{Activity, Clock, Presence};
 use crate::graphics::Graphics;
 use crate::player::{Command, PlayState, Player, PlayerEvent, Snapshot};
@@ -89,6 +89,30 @@ pub struct ImagePlan {
     /// Size in pixels. A whole number of cells by construction.
     pub width: u16,
     pub height: u16,
+    /// The cell dimension Kitty should hold fixed. Supplying only one axis
+    /// makes the terminal derive the other from the source aspect ratio rather
+    /// than stretching a square into an inaccurately reported cell box.
+    pub bound: ImageBound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageBound {
+    Columns(u16),
+    Rows(u16),
+}
+
+/// Which cached bitmap a terminal-image placement paints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageSource {
+    Playing,
+    Card(String),
+}
+
+/// One bitmap placement in the current frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedImage {
+    pub source: ImageSource,
+    pub plan: ImagePlan,
 }
 
 /// How many results to request. Bounded by [`MAX_RESULTS`] at the source.
@@ -110,7 +134,7 @@ const VOLUME_STEP: f32 = 0.05;
 /// Exact pages retained for Back. A cap keeps nested artist browsing bounded
 /// even when someone walks through a long chain of related artists.
 const PAGE_HISTORY: usize = 12;
-const SETTINGS_ITEMS: usize = 4;
+const SETTINGS_ITEMS: usize = 5;
 
 /// Tracks the queue may skip past in a row before it gives up.
 ///
@@ -843,6 +867,7 @@ enum MenuAction {
     Background,
     Quit,
     ConnectMusic,
+    LogOutMusic,
     OpenHomeSelection,
     RefreshHome,
     PlaySelected,
@@ -930,14 +955,17 @@ pub struct App {
     pub cover_size: CoverSize,
     /// Visual language used for the current song's large cover.
     pub cover_style: CoverStyle,
+    /// User-selected terminal bitmap backend.
+    pub image_renderer: ImageRenderer,
     /// Where the renderer wants the cover painted as real pixels, set on every
     /// frame the terminal-image path runs. `None` on the half-block path, which
     /// needs no help from the event loop.
-    pub image: Option<ImagePlan>,
+    pub images: Vec<PlannedImage>,
     /// The plan currently on screen. Pixels are not part of ratatui's buffer,
     /// so they persist until something paints over them -- meaning an unchanged
     /// pane must *not* be repainted every frame.
-    painted: Option<ImagePlan>,
+    painted: Vec<PlannedImage>,
+    painted_with_kitty: bool,
     /// When the selection last moved, for the prefetch debounce. `None` once
     /// the current selection has been dealt with, which is what stops the
     /// prefetch from being re-sent on every following frame.
@@ -1216,8 +1244,10 @@ impl App {
             graphics,
             cover_size: CoverSize::default(),
             cover_style: settings.cover_style,
-            image: None,
-            painted: None,
+            image_renderer: settings.image_renderer,
+            images: Vec::new(),
+            painted: Vec::new(),
+            painted_with_kitty: false,
             selection_settled: None,
             prefetching: None,
             ready: None,
@@ -1476,6 +1506,25 @@ impl App {
         self.cover_style
     }
 
+    pub fn image_renderer(&self) -> ImageRenderer {
+        self.image_renderer
+    }
+
+    /// Kitty is used automatically when detected, or explicitly when a
+    /// multiplexer hides the terminal name from capability detection.
+    pub fn kitty_images(&self) -> bool {
+        self.image_renderer == ImageRenderer::Kitty
+            || (self.image_renderer == ImageRenderer::Automatic && self.graphics.kitty)
+    }
+
+    pub fn sixel_images(&self) -> bool {
+        self.image_renderer == ImageRenderer::Automatic && self.graphics.sixel
+    }
+
+    pub fn protocol_images(&self) -> bool {
+        self.kitty_images() || self.sixel_images()
+    }
+
     fn root_menu_items(&self) -> Vec<MenuItem> {
         let mut items = vec![
             MenuItem::action("Home", Some("H"), true, Some("Go to"), MenuAction::GoHome),
@@ -1518,17 +1567,8 @@ impl App {
     }
 
     fn account_menu_items(&self) -> Vec<MenuItem> {
-        vec![MenuItem::action(
-            if config::Cookies::available().ok().flatten().is_some() {
-                "Refresh YouTube Music session"
-            } else {
-                "Connect YouTube Music"
-            },
-            Some("M"),
-            !self.music_signing_in,
-            Some("Account"),
-            MenuAction::ConnectMusic,
-        )]
+        let connected = config::Cookies::available().ok().flatten().is_some();
+        account_menu_items(connected, self.music_signing_in)
     }
 
     fn help_menu_items(&self) -> Vec<MenuItem> {
@@ -1764,29 +1804,47 @@ impl App {
     /// The cover to paint as pixels, if what the renderer planned is not
     /// already on screen. `None` means the pixels there are correct and
     /// repainting would only cost bandwidth and flicker.
-    pub fn image_to_paint(&self) -> Option<(&Cover, ImagePlan)> {
-        let plan = self.image?;
-        if self.painted == Some(plan) {
-            return None;
+    pub fn images_to_paint(&self) -> Vec<(&Cover, &PlannedImage)> {
+        if self.painted == self.images {
+            return Vec::new();
         }
-        Some((self.cover.as_ref()?, plan))
+        self.images
+            .iter()
+            .filter_map(|image| {
+                let art = match &image.source {
+                    ImageSource::Playing => self.cover.as_ref(),
+                    ImageSource::Card(key) => self.art.get(key),
+                }?;
+                Some((art, image))
+            })
+            .collect()
     }
 
-    pub fn mark_painted(&mut self) {
-        self.painted = self.image;
+    pub fn mark_painted(&mut self, kitty: bool) {
+        self.painted.clone_from(&self.images);
+        self.painted_with_kitty = kitty;
     }
 
     /// True when pixels are on screen that no longer belong there: the pane
     /// went away, or moved out from under them. Erasing protocol pixels means
     /// painting cells over it, so only a redraw can undo it.
     pub fn image_needs_clearing(&self) -> bool {
-        self.painted.is_some() && self.painted != self.image
+        !self.painted.is_empty() && self.painted != self.images
+    }
+
+    pub fn painted_image_count(&self) -> usize {
+        self.painted.len()
+    }
+
+    pub fn painted_with_kitty(&self) -> bool {
+        self.painted_with_kitty
     }
 
     /// Forgets what is on screen so the next frame repaints it. For events that
     /// can destroy the pixels without changing the plan, such as a resize.
     pub fn invalidate_image(&mut self) {
-        self.painted = None;
+        self.painted.clear();
+        self.painted_with_kitty = false;
     }
 
     /// Drains completed source work. Called once per frame.
@@ -2772,6 +2830,7 @@ impl App {
             start_in_tray: enabled,
             icon_theme: self.icon_theme,
             cover_style: self.cover_style,
+            image_renderer: self.image_renderer,
         };
         match settings.save() {
             Ok(()) => {
@@ -2799,6 +2858,7 @@ impl App {
             start_in_tray: self.start_in_tray,
             icon_theme: theme,
             cover_style: self.cover_style,
+            image_renderer: self.image_renderer,
         };
         match settings.save() {
             Ok(()) => {
@@ -2822,12 +2882,38 @@ impl App {
             start_in_tray: self.start_in_tray,
             icon_theme: self.icon_theme,
             cover_style: style,
+            image_renderer: self.image_renderer,
         };
         match settings.save() {
             Ok(()) => {
                 self.cover_style = style;
-                self.image = None;
+                self.images.clear();
                 self.status = format!("song covers set to {}", style.label());
+            }
+            Err(err) => {
+                crate::diagnostics::error("config", &format!("could not save settings: {err:#}"));
+                self.status = format!("could not save settings: {err:#}");
+            }
+        }
+    }
+
+    fn cycle_image_renderer(&mut self, forward: bool) {
+        let renderer = if forward {
+            self.image_renderer.next()
+        } else {
+            self.image_renderer.previous()
+        };
+        let settings = config::Settings {
+            start_in_tray: self.start_in_tray,
+            icon_theme: self.icon_theme,
+            cover_style: self.cover_style,
+            image_renderer: renderer,
+        };
+        match settings.save() {
+            Ok(()) => {
+                self.image_renderer = renderer;
+                self.images.clear();
+                self.status = format!("image renderer set to {}", renderer.label());
             }
             Err(err) => {
                 crate::diagnostics::error("config", &format!("could not save settings: {err:#}"));
@@ -3310,6 +3396,7 @@ impl App {
             MenuAction::Background => self.background(),
             MenuAction::Quit => self.should_quit = true,
             MenuAction::ConnectMusic => self.begin_music_sign_in(false),
+            MenuAction::LogOutMusic => self.log_out_music(),
             MenuAction::OpenHomeSelection => self.open_card(),
             MenuAction::RefreshHome => self.refresh_home(),
             MenuAction::PlaySelected => self.play_selected(),
@@ -3485,20 +3572,27 @@ impl App {
                 KeyCode::Char(' ') | KeyCode::Enter => match self.settings_selected() {
                     0 => self.toggle_start_in_tray(),
                     1 => self.toggle_presence(),
-                    2 => self.cycle_cover_style(true),
-                    3 => self.cycle_icon_theme(true),
+                    2 => self.cycle_image_renderer(true),
+                    3 => self.cycle_cover_style(true),
+                    4 => self.cycle_icon_theme(true),
                     _ => {}
                 },
                 KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 2 => {
-                    self.cycle_cover_style(false);
+                    self.cycle_image_renderer(false);
                 }
                 KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 2 => {
-                    self.cycle_cover_style(true);
+                    self.cycle_image_renderer(true);
                 }
                 KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 3 => {
-                    self.cycle_icon_theme(false);
+                    self.cycle_cover_style(false);
                 }
                 KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 3 => {
+                    self.cycle_cover_style(true);
+                }
+                KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 4 => {
+                    self.cycle_icon_theme(false);
+                }
+                KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 4 => {
                     self.cycle_icon_theme(true);
                 }
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => {
@@ -4252,6 +4346,37 @@ impl App {
         }
     }
 
+    fn log_out_music(&mut self) {
+        self.menu = None;
+        match crate::session::sign_out() {
+            Ok(warning) => {
+                // Any personalized response already in flight belongs to the
+                // session that just ended and must not repopulate Home.
+                self.home_generation = self.home_generation.wrapping_add(1);
+                self.home_attempts = 0;
+                self.home_pending = false;
+                self.cookie_refresh_attempted = false;
+                // Suppress the first-run auto-prompt. Logging out is an
+                // explicit request to remain signed out until M is pressed.
+                self.imported = true;
+                self.home.clear();
+                self.home_scroll.clear();
+                self.home_shelf = 0;
+                self.home_card = 0;
+                self.home_top = 0;
+                self.selection_settled = None;
+                self.art = ArtCache::default();
+                self.status = match warning {
+                    Some(warning) => format!("logged out; {warning}"),
+                    None => "logged out of YouTube Music -- press M to sign in".to_string(),
+                };
+            }
+            Err(error) => {
+                self.status = format!("could not log out of YouTube Music: {error:#}");
+            }
+        }
+    }
+
     fn nudge_volume(&mut self, delta: f32) {
         let volume = (self.snapshot().volume + delta).clamp(0.0, 2.0);
         let _ = self.player.send(Command::SetVolume(volume));
@@ -4277,11 +4402,51 @@ impl App {
     }
 }
 
+fn account_menu_items(connected: bool, signing_in: bool) -> Vec<MenuItem> {
+    let mut items = vec![MenuItem::action(
+        if connected {
+            "Refresh YouTube Music session"
+        } else {
+            "Connect YouTube Music"
+        },
+        Some("M"),
+        !signing_in,
+        Some("Account"),
+        MenuAction::ConnectMusic,
+    )];
+    if connected {
+        items.push(MenuItem::action(
+            "Log out of YouTube Music",
+            None,
+            !signing_in,
+            None,
+            MenuAction::LogOutMusic,
+        ));
+    }
+    items
+}
+
 /// Pure state tests. [`App`] itself is not constructed because it owns live
 /// audio and source workers.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logout_is_offered_only_for_a_connected_session() {
+        let disconnected = account_menu_items(false, false);
+        assert_eq!(disconnected.len(), 1);
+        assert_eq!(disconnected[0].label, "Connect YouTube Music");
+
+        let connected = account_menu_items(true, false);
+        assert_eq!(connected.len(), 2);
+        assert_eq!(connected[0].label, "Refresh YouTube Music session");
+        assert_eq!(connected[1].label, "Log out of YouTube Music");
+        assert!(connected[1].enabled);
+
+        let pending = account_menu_items(true, true);
+        assert!(pending.iter().all(|item| !item.enabled));
+    }
 
     #[test]
     fn menu_cursor_movement_clamps_at_both_ends() {

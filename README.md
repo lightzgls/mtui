@@ -85,13 +85,13 @@ Arch Linux:
 sudo pacman -S --needed base-devel pkgconf openssl alsa-lib webkit2gtk-4.1
 ```
 
-Build and install MTUI:
+Build and install MTUI with one command. Cargo installs the player and its
+on-demand sign-in helper together; users do not need to manage them separately:
 
 ```sh
 git clone https://github.com/lightzgls/mtui.git
 cd mtui
-cargo build --release
-install -Dm755 target/release/mtui ~/.local/bin/mtui
+cargo install --path . --bins --root ~/.local --locked --force
 mtui
 ```
 
@@ -99,7 +99,7 @@ Ensure `~/.local/bin` is on `PATH`.
 
 ### macOS
 
-Install the Xcode command-line tools and Rust, then use the same `cargo build --release` command. WKWebView is provided by macOS, so no browser or keyring package is required for sign-in.
+Install the Xcode command-line tools and Rust, then use the same single `cargo install` command. WKWebView is provided by macOS, so no browser or keyring package is required for sign-in.
 
 ## First Run
 
@@ -117,6 +117,8 @@ MTUI finds `yt-dlp` on `PATH` or downloads a private copy on first run. If `yt-d
 Press `M` on Linux, Windows, or macOS. MTUI opens the real `music.youtube.com` page in its own sign-in window, using WebKitGTK, WebView2, or WKWebView respectively. The visible flow is the same on every desktop: complete Google's sign-in and the window closes when the personalized session is ready. MTUI stores only the resulting YouTube session cookies in its private configuration directory and never receives form values or passwords.
 
 MTUI opens the same sign-in window automatically when Home has no usable session or YouTube rejects the saved one. Linux packages must provide WebKitGTK 4.1; current Windows and macOS installations include their system webviews. A complete `Cookie` request-header value can still be placed manually in `cookies.txt` as a compatibility fallback. Treat that file like a password.
+
+To log out, open **App Menu → Account & Sessions → Log out of YouTube Music**. MTUI removes its saved session, the manual-cookie fallback, and its private sign-in profile without stopping current playback.
 
 ## Controls
 
@@ -163,7 +165,7 @@ Enable **Keep notification-area icon** under Settings to retain the icon while t
 
 Downloaded tools are kept separately under `%LOCALAPPDATA%\mtui` on Windows or `$XDG_CACHE_HOME/mtui` on Linux.
 
-MTUI detects Kitty graphics and Sixel support automatically. Set `MTUI_GRAPHICS=blocks` to force terminal-cell rendering, `MTUI_GRAPHICS=kitty` to force Kitty graphics, or `MTUI_GRAPHICS=sixel` to force Sixel output. The Settings panel switches song covers between pixel art and colored ASCII.
+MTUI detects Kitty graphics and Sixel support automatically. The Settings panel's **Image renderer** choice can keep automatic detection, force Kitty (useful when a multiplexer hides terminal capabilities), or use universal terminal-cell pixel art. Kitty rendering applies to artwork throughout the home feed, artist pages, and player. **Song cover** separately switches the large current-song cover between bitmap/pixel rendering and colored ASCII. Artwork is center-cropped to a square sleeve. `MTUI_GRAPHICS=blocks`, `MTUI_GRAPHICS=kitty`, and `MTUI_GRAPHICS=sixel` remain available as startup overrides for automatic detection.
 
 ### Diagnostics
 

@@ -55,10 +55,6 @@ impl Graphics {
             cell: ASSUMED_CELL,
         }
     }
-
-    pub fn pixels(self) -> bool {
-        self.sixel || self.kitty
-    }
 }
 
 /// Asks the terminal what it can do.
@@ -280,18 +276,5 @@ mod tests {
         assert!(kitty_named(Some("xterm-kitty")));
         assert!(!kitty_named(Some("xterm-256color")));
         assert!(!kitty_named(None));
-    }
-
-    #[test]
-    fn either_pixel_protocol_enables_real_images() {
-        assert!(
-            Graphics {
-                sixel: false,
-                kitty: true,
-                cell: ASSUMED_CELL,
-            }
-            .pixels()
-        );
-        assert!(!Graphics::blocks().pixels());
     }
 }

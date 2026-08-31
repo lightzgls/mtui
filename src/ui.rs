@@ -17,8 +17,8 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{
-    App, CardShape, CoverSize, ImagePlan, MenuItem, MenuPage, Mode, MouseAction, NowPlaying,
-    Overlay, Panel, RelatedRow, SignIn, Tab, View,
+    App, CardShape, CoverSize, ImageBound, ImagePlan, ImageSource, MenuItem, MenuPage, Mode,
+    MouseAction, NowPlaying, Overlay, Panel, PlannedImage, RelatedRow, SignIn, Tab, View,
 };
 use crate::art::ArtCache;
 use crate::config::CoverStyle;
@@ -110,7 +110,7 @@ const HINTS_PLAYING: &str = "Tab panels  Esc back  ^K menu  . actions";
 const MENU_MAX_WIDTH: u16 = 56;
 const MENU_MAX_HEIGHT: u16 = 24;
 const SETTINGS_WIDTH: u16 = 56;
-const SETTINGS_HEIGHT: u16 = 16;
+const SETTINGS_HEIGHT: u16 = 19;
 
 /// Floor on the sign-in panel's width. Wide enough that the footer hint reads
 /// as one line, whatever the URL beside it happens to measure.
@@ -271,6 +271,7 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
 
 pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
     mouse.targets.clear();
+    app.images.clear();
     let [search_area, main_area, status_area] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
@@ -314,14 +315,14 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
     } else {
         app.cover_size
     };
-    app.image = match (cover_area, app.cover.as_ref()) {
+    let image = match (cover_area, app.cover.as_ref()) {
         // Protocol image pixels are not in ratatui's buffer, so an overlay
         // drawn over them would not cover them -- the modal would appear with
         // the picture showing through. Dropping the plan is what puts the
         // existing clear-and-redraw path to work erasing it.
         _ if app.overlay.is_open() || app.menu().is_some() => None,
         (Some(area), Some(cover))
-            if app.cover_style == CoverStyle::Pixel && app.graphics.pixels() =>
+            if app.cover_style == CoverStyle::Pixel && app.protocol_images() =>
         {
             plan_image(frame, cover, area, app.graphics, size)
         }
@@ -335,6 +336,12 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
         }
         _ => None,
     };
+    if let Some(plan) = image {
+        app.images.push(PlannedImage {
+            source: ImageSource::Playing,
+            plan,
+        });
+    }
 
     // Over everything, including the cover pane's cells.
     render_overlay(frame, app);
@@ -449,7 +456,7 @@ fn render_menu(frame: &mut Frame, app: &App) {
 fn menu_description(page: MenuPage) -> &'static str {
     match page {
         MenuPage::Root => "Navigate, manage MTUI, or quit.",
-        MenuPage::Account => "Sign in for your personalized Music Home.",
+        MenuPage::Account => "Manage your YouTube Music session.",
         MenuPage::Help => "Reference only; these rows do not run commands.",
         MenuPage::PageActions => "Actions for the current page and selection.",
     }
@@ -687,9 +694,21 @@ fn render_settings(frame: &mut Frame, app: &App) {
         muted_detail("Shares the current track and playback state.", width),
         Line::from(""),
         choice_line(
+            "Image renderer",
+            app.image_renderer().label(),
+            app.settings_selected() == 2,
+            width,
+            ambient(app),
+        ),
+        muted_detail(
+            "Auto detects support; Kitty can be forced; Pixel art is universal.",
+            width,
+        ),
+        Line::from(""),
+        choice_line(
             "Song cover",
             app.cover_style().label(),
-            app.settings_selected() == 2,
+            app.settings_selected() == 3,
             width,
             ambient(app),
         ),
@@ -698,7 +717,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
         choice_line(
             "App icon",
             app.icon_theme().label(),
-            app.settings_selected() == 3,
+            app.settings_selected() == 4,
             width,
             ambient(app),
         ),
@@ -992,7 +1011,8 @@ fn plan_image(
     size: CoverSize,
 ) -> Option<ImagePlan> {
     let (cell_w, cell_h) = graphics.cell;
-    let (cols, rows) = fit_cells(cover, usable(area, size), graphics.cell);
+    let maximum = usable(area, size);
+    let (cols, rows) = fit_cells(cover, maximum, graphics.cell);
     if cols == 0 || rows == 0 {
         return None;
     }
@@ -1009,6 +1029,11 @@ fn plan_image(
         row,
         width: cols * cell_w,
         height: rows * cell_h,
+        bound: if cols == maximum.0 {
+            ImageBound::Columns(cols)
+        } else {
+            ImageBound::Rows(rows)
+        },
     })
 }
 
@@ -1182,6 +1207,11 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMa
                     duration: now.duration,
                 },
                 strip,
+                if app.kitty_images() && !app.overlay.is_open() && app.menu().is_none() {
+                    Some((&mut app.images, app.graphics))
+                } else {
+                    None
+                },
             );
             shelves
         }
@@ -1238,6 +1268,11 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMa
     // are on screen falls out of laying them out, and deriving it twice is two
     // chances for the pictures and the cards to disagree about what is visible.
     let mut wanted = Vec::new();
+    let tile_images = if app.kitty_images() && !app.overlay.is_open() && app.menu().is_none() {
+        Some((&mut app.images, app.graphics))
+    } else {
+        None
+    };
     render_feed(
         frame,
         &app.home,
@@ -1248,6 +1283,7 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMa
             shape: CardShape::Text,
             art: &app.art,
             wanted: &mut wanted,
+            images: tile_images,
         },
     );
     app.want_art(wanted);
@@ -1261,7 +1297,10 @@ fn render_artist(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(block, area);
 
     let accent = ambient(app);
+    let use_kitty = app.kitty_images() && !app.overlay.is_open() && app.menu().is_none();
+    let graphics = app.graphics;
     let art = &app.art;
+    let images = &mut app.images;
     let mut wanted = Vec::new();
     {
         let Some(view) = app.artist.as_mut() else {
@@ -1308,7 +1347,14 @@ fn render_artist(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             None
         };
-        render_artist_header(frame, page, header_art, header, accent);
+        render_artist_header(
+            frame,
+            page,
+            header_art,
+            header,
+            accent,
+            use_kitty.then_some((&mut *images, graphics)),
+        );
 
         let has_songs = !page.top_songs.is_empty();
         let sections = page.shelves.len() + usize::from(has_songs);
@@ -1361,6 +1407,7 @@ fn render_artist(frame: &mut Frame, app: &mut App, area: Rect) {
                         shape: layout.shape,
                         art,
                         wanted: &mut wanted,
+                        images: use_kitty.then_some((&mut *images, graphics)),
                     };
                     render_shelf(
                         frame,
@@ -1403,6 +1450,7 @@ fn render_artist_header(
     art: Option<&Cover>,
     area: Rect,
     accent: Color,
+    images: Option<(&mut Vec<PlannedImage>, Graphics)>,
 ) {
     if area.is_empty() {
         return;
@@ -1413,7 +1461,18 @@ fn render_artist_header(
     let [art_area, text_area] =
         Layout::horizontal([Constraint::Length(art_width), Constraint::Min(0)]).areas(area);
     if let Some(art) = art.filter(|_| art_width > 0) {
-        render_cover(frame, art, art_area, CoverSize::Full);
+        let planned = images.is_some_and(|(images, graphics)| {
+            plan_kitty_image(
+                frame,
+                ImageSource::Card(page.art_key()),
+                art_area,
+                images,
+                graphics,
+            )
+        });
+        if !planned {
+            render_cover(frame, art, art_area, CoverSize::Full);
+        }
     }
 
     let mut lines = vec![Line::from(Span::styled(
@@ -1884,18 +1943,9 @@ struct Tiles<'a> {
     /// Key and optional URL of every visible picture. Cached URL-less duplicates
     /// still keep their shared key recent; only real misses need the URL.
     wanted: &'a mut Vec<(String, Option<String>)>,
-}
-
-impl Tiles<'_> {
-    /// The picture for a card, noting the miss when there is not one.
-    fn art(&mut self, card: &Card) -> Option<&Cover> {
-        let key = card.art_key();
-        let art = self.art.get(key);
-        if art.is_some() || card.art.is_some() {
-            self.wanted.push((key.to_string(), card.art.clone()));
-        }
-        art
-    }
+    /// Kitty can place many independent images in one frame. Sixel is kept to
+    /// the single player cover because it has no comparable placement IDs.
+    images: Option<(&'a mut Vec<PlannedImage>, Graphics)>,
 }
 
 /// Stacks the visible shelves down the pane.
@@ -2042,7 +2092,22 @@ fn heading_line(shelf: &Shelf, cursor: ShelfCursor, width: usize) -> Line<'stati
 /// window is too small to give it one.
 fn render_card(frame: &mut Frame, card: &Card, area: Rect, selected: bool, tiles: &mut Tiles) {
     let shape = tiles.shape;
-    let art = tiles.art(card);
+    let art_key = card.art_key().to_string();
+    let picture_cols = |rows: u16| {
+        tiles
+            .images
+            .as_ref()
+            .map_or(rows.saturating_mul(2), |(_, graphics)| {
+                let (cell_w, cell_h) = (u32::from(graphics.cell.0), u32::from(graphics.cell.1));
+                ((u32::from(rows) * cell_h + cell_w / 2) / cell_w)
+                    .max(1)
+                    .min(u32::from(u16::MAX)) as u16
+            })
+    };
+    let art = tiles.art.get(&art_key);
+    if art.is_some() || card.art.is_some() {
+        tiles.wanted.push((art_key.clone(), card.art.clone()));
+    }
     // The card takes its colour from its own sleeve. This is the whole reason
     // the accent is computed at all: a page bordered in one colour says nothing
     // about what is on it, and a page that borrows each record's own is a page
@@ -2081,14 +2146,16 @@ fn render_card(frame: &mut Frame, card: &Card, area: Rect, selected: bool, tiles
         CardShape::Text => inner,
         CardShape::Tile => {
             let rows = inner.height;
-            let cols = (rows * 2).min(inner.width);
+            let cols = picture_cols(rows).min(inner.width);
             render_tile(
                 frame,
                 art,
+                &art_key,
                 Rect {
                     width: cols,
                     ..inner
                 },
+                &mut tiles.images,
             );
             Rect {
                 x: inner.x + cols + 1,
@@ -2101,10 +2168,11 @@ fn render_card(frame: &mut Frame, card: &Card, area: Rect, selected: bool, tiles
         // text is the same either way.
         CardShape::Poster | CardShape::Gallery => {
             let rows = inner.height.saturating_sub(CARD_TEXT_ROWS);
-            let cols = (rows * 2).min(inner.width);
+            let cols = picture_cols(rows).min(inner.width);
             render_tile(
                 frame,
                 art,
+                &art_key,
                 Rect {
                     // Centred: a card stretched wider than its nominal width
                     // must not leave its sleeve pinned to the left edge with a
@@ -2114,6 +2182,7 @@ fn render_card(frame: &mut Frame, card: &Card, area: Rect, selected: bool, tiles
                     height: rows,
                     ..inner
                 },
+                &mut tiles.images,
             );
             Rect {
                 y: inner.y + rows,
@@ -2280,11 +2349,35 @@ fn badge_spans(card: &Card, accent: Color) -> Vec<Span<'static>> {
 /// them is not a grid. So a 16:9 video thumbnail loses its sides here and every
 /// tile is the same square.
 ///
-/// Half-blocks, on every terminal, including the ones that can do better. The
-/// sixel path costs tens of milliseconds per image to encode -- fine once per
-/// track, and a third of a second per keypress for a screenful of cards, which
-/// would make the grid unusable to make it prettier.
-fn render_tile(frame: &mut Frame, art: Option<&Cover>, area: Rect) {
+/// Kitty placements are used when selected; the universal fallback is made of
+/// half-blocks. Sixel remains limited to the large player cover because a
+/// screenful of separately encoded sixels would make navigation stutter.
+fn render_tile(
+    frame: &mut Frame,
+    art: Option<&Cover>,
+    key: &str,
+    area: Rect,
+    images: &mut Option<(&mut Vec<PlannedImage>, Graphics)>,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if art.is_some()
+        && let Some((images, graphics)) = images.as_mut()
+        && plan_kitty_image(
+            frame,
+            ImageSource::Card(key.to_string()),
+            area,
+            images,
+            *graphics,
+        )
+    {
+        return;
+    }
+    render_tile_blocks(frame, art, area);
+}
+
+fn render_tile_blocks(frame: &mut Frame, art: Option<&Cover>, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -2324,6 +2417,52 @@ fn render_tile(frame: &mut Frame, art: Option<&Cover>, area: Rect) {
         .collect();
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn plan_kitty_image(
+    frame: &mut Frame,
+    source: ImageSource,
+    area: Rect,
+    images: &mut Vec<PlannedImage>,
+    graphics: Graphics,
+) -> bool {
+    if area.width == 0 || area.height == 0 {
+        return false;
+    }
+    let (cell_w, cell_h) = graphics.cell;
+    let (pixel_w, pixel_h) = (
+        u32::from(area.width) * u32::from(cell_w),
+        u32::from(area.height) * u32::from(cell_h),
+    );
+    let (cols, rows, bound) = if pixel_w > pixel_h {
+        let cols = ((pixel_h + u32::from(cell_w) / 2) / u32::from(cell_w))
+            .max(1)
+            .min(u32::from(area.width)) as u16;
+        (cols, area.height, ImageBound::Rows(area.height))
+    } else {
+        let rows = ((pixel_w + u32::from(cell_h) / 2) / u32::from(cell_h))
+            .max(1)
+            .min(u32::from(area.height)) as u16;
+        (area.width, rows, ImageBound::Columns(area.width))
+    };
+    let col = area.x + (area.width - cols) / 2;
+    let row = area.y + (area.height - rows) / 2;
+    for y in row..row + rows {
+        for x in col..col + cols {
+            frame.buffer_mut()[(x, y)].set_diff_option(CellDiffOption::Skip);
+        }
+    }
+    images.push(PlannedImage {
+        source,
+        plan: ImagePlan {
+            col,
+            row,
+            width: cols * cell_w,
+            height: rows * cell_h,
+            bound,
+        },
+    });
+    true
 }
 
 /// The window of a cover that fills a tile without distorting it: the largest
@@ -2405,7 +2544,12 @@ struct Hero<'a> {
 /// makes the user go and look somewhere else for it. This is the same
 /// information the status bar carries in one line, given the room to be read at
 /// a glance instead -- and the picture, which the status bar has nowhere to put.
-fn render_hero(frame: &mut Frame, hero: &Hero, area: Rect) {
+fn render_hero(
+    frame: &mut Frame,
+    hero: &Hero,
+    area: Rect,
+    images: Option<(&mut Vec<PlannedImage>, Graphics)>,
+) {
     let accent = hero.art.map_or(NO_ART, |cover| cover.accent);
     let accent = Color::Rgb(accent.0, accent.1, accent.2);
 
@@ -2420,14 +2564,17 @@ fn render_hero(frame: &mut Frame, hero: &Hero, area: Rect) {
 
     // The sleeve, square, as tall as the strip is inside.
     let cols = (inner.height * 2).min(inner.width);
-    render_tile(
-        frame,
-        hero.art,
-        Rect {
-            width: cols,
-            ..inner
-        },
-    );
+    let art_area = Rect {
+        width: cols,
+        ..inner
+    };
+    let planned = hero.art.is_some()
+        && images.is_some_and(|(images, graphics)| {
+            plan_kitty_image(frame, ImageSource::Playing, art_area, images, graphics)
+        });
+    if !planned {
+        render_tile_blocks(frame, hero.art, art_area);
+    }
 
     let text = Rect {
         x: inner.x + cols + 1,
@@ -3958,7 +4105,14 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 3)).unwrap();
         terminal
             .draw(|frame| {
-                render_artist_header(frame, &page, None, Rect::new(0, 0, 40, 3), Color::Cyan)
+                render_artist_header(
+                    frame,
+                    &page,
+                    None,
+                    Rect::new(0, 0, 40, 3),
+                    Color::Cyan,
+                    None,
+                )
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -4181,6 +4335,7 @@ mod tests {
 
         // 32 usable columns at 10 px, and the row count that keeps 16:9.
         assert_eq!((plan.width, plan.height), (320, 180));
+        assert_eq!(plan.bound, ImageBound::Columns(32));
         assert_eq!((plan.col, plan.row), (1, 1));
         assert_eq!(reserved, 32 * 9, "every cell under the image is reserved");
 
@@ -4215,6 +4370,7 @@ mod tests {
         // No frame at full size, so all 28 rows are picture: 560 px, and the
         // width follows to keep it square.
         assert_eq!((plan.width, plan.height), (560, 560));
+        assert_eq!(plan.bound, ImageBound::Rows(28));
         assert_eq!((plan.col, plan.row), ((110 - 56) / 2, 0), "centred");
     }
 
@@ -4475,6 +4631,7 @@ mod tests {
                             shape,
                             art: &art,
                             wanted: &mut wanted,
+                            images: None,
                         },
                     );
                 })
@@ -4513,7 +4670,7 @@ mod tests {
             );
             let mut terminal = Terminal::new(TestBackend::new(width, HERO_HEIGHT)).unwrap();
             terminal
-                .draw(|frame| render_hero(frame, &hero, Rect::new(0, 0, width, HERO_HEIGHT)))
+                .draw(|frame| render_hero(frame, &hero, Rect::new(0, 0, width, HERO_HEIGHT), None))
                 .unwrap();
             let buf = terminal.backend().buffer();
             for y in 0..HERO_HEIGHT {
@@ -4541,7 +4698,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(60, HERO_HEIGHT)).unwrap();
         terminal
-            .draw(|frame| render_hero(frame, &hero, Rect::new(0, 0, 60, HERO_HEIGHT)))
+            .draw(|frame| render_hero(frame, &hero, Rect::new(0, 0, 60, HERO_HEIGHT), None))
             .unwrap();
         let buf = terminal.backend().buffer();
         let text: String = (0..HERO_HEIGHT)
@@ -4575,7 +4732,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(60, HERO_HEIGHT)).unwrap();
         terminal
-            .draw(|frame| render_hero(frame, &hero, Rect::new(0, 0, 60, HERO_HEIGHT)))
+            .draw(|frame| render_hero(frame, &hero, Rect::new(0, 0, 60, HERO_HEIGHT), None))
             .unwrap();
         let buf = terminal.backend().buffer();
         let text: String = (0..HERO_HEIGHT)
@@ -5417,6 +5574,7 @@ mod tests {
                         shape,
                         art: &art,
                         wanted: &mut wanted,
+                        images: None,
                     },
                 );
             })
@@ -5677,6 +5835,7 @@ mod tests {
                         shape: CardShape::Text,
                         art: &art,
                         wanted: &mut wanted,
+                        images: None,
                     },
                 );
             })
@@ -5722,6 +5881,7 @@ mod tests {
                         shape: CardShape::Text,
                         art: &art,
                         wanted: &mut wanted,
+                        images: None,
                     },
                 );
             })
@@ -5855,6 +6015,7 @@ mod tests {
                         shape: CardShape::Text,
                         art: &art,
                         wanted: &mut wanted,
+                        images: None,
                     },
                 );
             })
@@ -5889,6 +6050,7 @@ mod tests {
                         shape: CardShape::Text,
                         art: &art,
                         wanted: &mut wanted,
+                        images: None,
                     },
                 );
             })

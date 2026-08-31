@@ -130,6 +130,18 @@ impl Cookies {
     pub fn sapisid(&self) -> &str {
         &self.sapisid
     }
+
+    /// Removes the hand-written compatibility session as part of an explicit
+    /// logout. Unlike an automatic stale-session cleanup, logout means every
+    /// credential MTUI can fall back to must go or the next request would sign
+    /// straight back in from `cookies.txt`.
+    pub fn forget() -> Result<()> {
+        let path = dir()?.join(COOKIE_FILE);
+        let manual =
+            remove_optional(&path).with_context(|| format!("could not remove {}", path.display()));
+        let imported = Import::forget();
+        manual.and(imported)
+    }
 }
 
 /// A session established by interactive setup, and which surface created it.
@@ -172,11 +184,15 @@ impl Import {
     /// Forgets the session, so the next launch asks the user to sign in again.
     pub fn forget() -> Result<()> {
         let path = dir()?.join(IMPORT_FILE);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("could not remove {}", path.display())),
-        }
+        remove_optional(&path).with_context(|| format!("could not remove {}", path.display()))
+    }
+}
+
+fn remove_optional(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -258,6 +274,46 @@ pub enum CoverStyle {
     ColoredAscii,
 }
 
+/// How bitmap artwork is sent to the terminal.
+///
+/// Automatic keeps the safe capability probe as the default. Kitty is an
+/// explicit escape hatch for multiplexers and terminals whose `$TERM` does not
+/// advertise the protocol, while PixelArt never emits graphics escapes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImageRenderer {
+    #[default]
+    Automatic,
+    Kitty,
+    PixelArt,
+}
+
+impl ImageRenderer {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Automatic => "Automatic",
+            Self::Kitty => "Kitty",
+            Self::PixelArt => "Pixel art",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Automatic => Self::Kitty,
+            Self::Kitty => Self::PixelArt,
+            Self::PixelArt => Self::Automatic,
+        }
+    }
+
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Automatic => Self::PixelArt,
+            Self::Kitty => Self::Automatic,
+            Self::PixelArt => Self::Kitty,
+        }
+    }
+}
+
 impl CoverStyle {
     pub const fn label(self) -> &'static str {
         match self {
@@ -325,6 +381,7 @@ pub struct Settings {
     pub start_in_tray: bool,
     pub icon_theme: IconTheme,
     pub cover_style: CoverStyle,
+    pub image_renderer: ImageRenderer,
 }
 
 impl Settings {
@@ -428,11 +485,13 @@ mod tests {
         assert!(!settings.start_in_tray);
         assert_eq!(settings.icon_theme, IconTheme::Signal);
         assert_eq!(settings.cover_style, CoverStyle::Pixel);
+        assert_eq!(settings.image_renderer, ImageRenderer::Automatic);
 
         let legacy: Settings = serde_json::from_str(r#"{"start_in_tray":true}"#).unwrap();
         assert!(legacy.start_in_tray);
         assert_eq!(legacy.icon_theme, IconTheme::Signal);
         assert_eq!(legacy.cover_style, CoverStyle::Pixel);
+        assert_eq!(legacy.image_renderer, ImageRenderer::Automatic);
     }
 
     #[test]
@@ -441,12 +500,14 @@ mod tests {
             start_in_tray: true,
             icon_theme: IconTheme::Wave,
             cover_style: CoverStyle::ColoredAscii,
+            image_renderer: ImageRenderer::Kitty,
         })
         .unwrap();
         let settings: Settings = serde_json::from_str(&body).unwrap();
         assert!(settings.start_in_tray);
         assert_eq!(settings.icon_theme, IconTheme::Wave);
         assert_eq!(settings.cover_style, CoverStyle::ColoredAscii);
+        assert_eq!(settings.image_renderer, ImageRenderer::Kitty);
     }
 
     #[test]
@@ -457,6 +518,18 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&CoverStyle::ColoredAscii).unwrap(),
             "\"colored-ascii\""
+        );
+    }
+
+    #[test]
+    fn image_renderers_cycle_and_use_stable_config_names() {
+        assert_eq!(ImageRenderer::Automatic.next(), ImageRenderer::Kitty);
+        assert_eq!(ImageRenderer::Kitty.next(), ImageRenderer::PixelArt);
+        assert_eq!(ImageRenderer::PixelArt.next(), ImageRenderer::Automatic);
+        assert_eq!(ImageRenderer::Automatic.previous(), ImageRenderer::PixelArt);
+        assert_eq!(
+            serde_json::to_string(&ImageRenderer::PixelArt).unwrap(),
+            "\"pixel-art\""
         );
     }
 

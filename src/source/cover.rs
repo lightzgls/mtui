@@ -27,15 +27,12 @@ use jpeg_decoder::PixelFormat;
 
 /// Longest edge kept after downscaling, in image pixels.
 ///
-/// Set to keep everything YouTube actually has. The largest thumbnail it serves
-/// is 1280x720, so this discards nothing: square album art arrives pillarboxed
-/// inside that canvas and comes out of [`trim_bars`] at 720x720, while a 16:9
-/// cover keeps all 1280 columns instead of being squashed to 720 before the
-/// renderer has said how big a pane it has. Anything lower would mean upscaling
-/// a shrunken copy back up for a full-window cover, which is throwing away
-/// detail and then inventing it again.
+/// Set to keep everything in YouTube's largest square sleeve. The largest
+/// thumbnail is 1280x720: album art arrives pillarboxed inside it, while a
+/// full-bleed video frame is centre-cropped. Both therefore retain a 720x720
+/// square before the renderer says how large its pane is.
 ///
-/// The cost is honest and worth naming: a 1280x720 cover is 2.7 MB of RGB,
+/// The cost is honest and worth naming: a 720x720 cover is 1.5 MB of RGB,
 /// resident only while a track is playing and dropped the moment one stops.
 /// That is the price of a picture rather than a mosaic.
 const MAX_EDGE: u32 = 1280;
@@ -66,10 +63,9 @@ const ART_CONCURRENCY: usize = 16;
 
 /// Thumbnail names to try, largest first.
 ///
-/// What matters is how many pixels survive [`trim_bars`], since every one of
-/// these is the source frame fitted into a fixed canvas: square album art comes
-/// out of the first two at 720x720, out of `sddefault` at 480x480, and out of
-/// `hqdefault` at 360x360.
+/// What matters is how many pixels survive padding removal and the square crop:
+/// album art comes out of the first two at 720x720, out of `sddefault` at
+/// 480x480, and out of `hqdefault` at 360x360.
 ///
 /// `maxresdefault` and `hq720` are the same 1280x720 image under two names, and
 /// both are here because neither is generated for every upload -- an older or
@@ -381,8 +377,8 @@ async fn read(client: &reqwest::Client, url: &str, timeout: Duration) -> Result<
     Ok(body.to_vec())
 }
 
-/// Decodes a JPEG, trims the padding YouTube fitted it into, and shrinks what
-/// is left to `edge` on its longest side.
+/// Decodes a JPEG, trims the padding YouTube fitted it into, centre-crops the
+/// artwork to a square sleeve, and shrinks it to `edge`.
 ///
 /// `edge` is a parameter rather than [`MAX_EDGE`] because the two callers want
 /// different pictures from the same code: the cover pane wants every pixel
@@ -416,9 +412,15 @@ fn decode(jpeg: &[u8], edge: u32) -> Result<Cover> {
         bail!("thumbnail pixel data does not match its {width}x{height} header");
     }
 
-    let (x, y, w, h) = trim_bars(width, height, &rgb);
-    let cropped = crop(width, &rgb, x, y, w, h);
-    Ok(shrink(w, h, &cropped, edge))
+    let square = square_crop(trim_bars(width, height, &rgb));
+    let cropped = crop(width, &rgb, square.0, square.1, square.2, square.3);
+    let side = square.2;
+    Ok(shrink(side, side, &cropped, edge))
+}
+
+fn square_crop((x, y, width, height): (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+    let side = width.min(height);
+    (x + (width - side) / 2, y + (height - side) / 2, side, side)
 }
 
 /// Finds the picture inside YouTube's padding, as an `(x, y, width, height)`
@@ -668,6 +670,13 @@ mod tests {
             }
         }
         assert_eq!(trim_bars(20, 10, &rgb), (0, 3, 20, 4));
+    }
+
+    #[test]
+    fn artwork_is_centre_cropped_to_a_square() {
+        assert_eq!(square_crop((0, 0, 16, 9)), (3, 0, 9, 9));
+        assert_eq!(square_crop((2, 4, 8, 14)), (2, 7, 8, 8));
+        assert_eq!(square_crop((5, 6, 10, 10)), (5, 6, 10, 10));
     }
 
     #[test]

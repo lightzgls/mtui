@@ -5,6 +5,7 @@ resolver = "3"
 [package]
 name = "mtui"
 version = "0.6.4"
+default-run = "mtui"
 edition = "2024"
 description = "A terminal music player for YouTube Music, built to stay small in memory"
 license = "MIT"
@@ -92,8 +93,9 @@ unicode-segmentation = { version = "1.13", default-features = false }
 
 [target.'cfg(any(windows, target_os = "linux", target_os = "macos"))'.dependencies]
 # One first-party sign-in surface for YouTube Music Home on every desktop.
-# Wry uses WebView2 on Windows, WebKitGTK on Linux and WKWebView on macOS; no
-# browser profile is inspected and Google owns every credential field.
+# On Unix these are referenced only by the mtui-sign-in companion, keeping the
+# player free of the WebKit runtime. Windows embeds the same helper module so
+# its published download remains one file.
 tao = { version = "0.36.0", features = ["rwh_06"] }
 wry = { version = "0.56.1", features = ["os-webview"] }
 
