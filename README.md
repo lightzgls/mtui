@@ -5,11 +5,11 @@
 <h1 align="center">MTUI</h1>
 
 <p align="center">
-  <strong>YouTube Music in the terminal, without turning your terminal into a browser.</strong>
+  <strong>A small, native YouTube Music player for your terminal.</strong>
 </p>
 
 <p align="center">
-  A keyboard-driven Rust music player built for responsive navigation, bounded memory use, and long listening sessions.
+  Fast navigation, native audio playback, bounded caches, and an optional browser window used only while signing in.
 </p>
 
 <p align="center">
@@ -28,14 +28,13 @@
 > [!NOTE]
 > MTUI is a personal, unofficial project built in public. It is not affiliated with or endorsed by YouTube, Google, or Discord. Ideas, bug reports, documentation improvements, and pull requests are welcome.
 
-## At A Glance
+## Highlights
 
-| Discover | Listen | Make It Yours |
+| Browse | Play | Personalize |
 |---|---|---|
-| Personalized Home shelves | Continuous queues and prefetching | Pixel or colored ASCII covers |
-| Dedicated artist pages | Synced lyrics and comments | Four original app icon themes |
-| Albums, playlists, and recommendations | Related music and queue expansion | Discord Rich Presence |
-| Search by title, URL, or video ID | Listening history and personalized picks | Windows notification-area controls |
+| Home, search, artists, albums, and playlists | Native AAC playback with bounded buffering | Kitty images, pixel art, or colored ASCII |
+| Personalized shelves with optional sign-in | Continuous queues, prefetching, and seeking | Discord Rich Presence and four icon themes |
+| Synced lyrics, comments, and related music | One current cover and bounded artwork cache | Windows notification-area controls |
 
 ```text
 Home / Search
@@ -47,7 +46,7 @@ Home / Search
                     Queue / Lyrics / Related / Comments
 ```
 
-Search and playback work without an account. Personalized Home is optional and uses a YouTube Music session created in MTUI's sign-in window.
+Search and playback work without an account. Signing in adds your personalized YouTube Music Home.
 
 Discord Rich Presence is off by default. MTUI publishes playback details only after you enable it with `D` or in Settings.
 
@@ -85,8 +84,7 @@ Arch Linux:
 sudo pacman -S --needed base-devel pkgconf openssl alsa-lib webkit2gtk-4.1
 ```
 
-Build and install MTUI with one command. Cargo installs the player and its
-on-demand sign-in helper together; users do not need to manage them separately:
+Clone the repository, then build and install MTUI with one Cargo command:
 
 ```sh
 git clone https://github.com/lightzgls/mtui.git
@@ -95,11 +93,13 @@ cargo install --path . --bins --root ~/.local --locked --force
 mtui
 ```
 
-Ensure `~/.local/bin` is on `PATH`.
+Cargo installs the player and its private sign-in helper together. You never need
+to launch or install the helper separately. Ensure `~/.local/bin` is on `PATH`.
 
 ### macOS
 
-Install the Xcode command-line tools and Rust, then use the same single `cargo install` command. WKWebView is provided by macOS, so no browser or keyring package is required for sign-in.
+Install the Xcode command-line tools and Rust, then use the same clone and
+`cargo install` commands. WKWebView is provided by macOS.
 
 ## First Run
 
@@ -114,9 +114,21 @@ MTUI finds `yt-dlp` on `PATH` or downloads a private copy on first run. If `yt-d
 
 ### Personalized Home
 
-Press `M` on Linux, Windows, or macOS. MTUI opens the real `music.youtube.com` page in its own sign-in window, using WebKitGTK, WebView2, or WKWebView respectively. The visible flow is the same on every desktop: complete Google's sign-in and the window closes when the personalized session is ready. MTUI stores only the resulting YouTube session cookies in its private configuration directory and never receives form values or passwords.
+Press `M`. MTUI opens `music.youtube.com` in a temporary native sign-in window.
+Complete Google's flow and the window closes as soon as the session is ready.
+MTUI stores the resulting YouTube session cookies in its private configuration
+directory; it does not receive the password entered into the page.
 
-MTUI opens the same sign-in window automatically when Home has no usable session or YouTube rejects the saved one. Linux packages must provide WebKitGTK 4.1; current Windows and macOS installations include their system webviews. A complete `Cookie` request-header value can still be placed manually in `cookies.txt` as a compatibility fallback. Treat that file like a password.
+On Linux and macOS, the WebKit sign-in code lives in the small
+`mtui-sign-in` companion installed automatically with MTUI. It runs only during
+sign-in and exits immediately afterward, keeping the long-running player free
+of the browser runtime. Windows keeps the same behavior inside its single
+published executable.
+
+MTUI can open the same window automatically when Home has no usable session or
+YouTube rejects the saved one. A complete `Cookie` request-header value may
+still be placed manually in `cookies.txt` as a compatibility fallback. Treat
+that file like a password.
 
 To log out, open **App Menu → Account & Sessions → Log out of YouTube Music**. MTUI removes its saved session, the manual-cookie fallback, and its private sign-in profile without stopping current playback.
 
@@ -164,6 +176,15 @@ Enable **Keep notification-area icon** under Settings to retain the icon while t
 | Linux | `$XDG_CONFIG_HOME/mtui`, or `~/.config/mtui` |
 
 Downloaded tools are kept separately under `%LOCALAPPDATA%\mtui` on Windows or `$XDG_CACHE_HOME/mtui` on Linux.
+
+### Resource Use
+
+Playback uses a fixed 1 MiB audio ring buffer rather than downloading a whole
+song into memory. MTUI holds one current cover, and its Home/artist artwork LRU
+is capped at 32 images with a raw RGB budget of about 6 MiB. Late image replies
+for evicted cards are discarded. Process monitors may report additional shared
+audio, TLS, and system-library pages as resident memory, but caches do not grow
+with the number of songs played.
 
 MTUI detects Kitty graphics and Sixel support automatically. The Settings panel's **Image renderer** choice can keep automatic detection, force Kitty (useful when a multiplexer hides terminal capabilities), or use universal terminal-cell pixel art. Kitty rendering applies to artwork throughout the home feed, artist pages, and player. **Song cover** separately switches the large current-song cover between bitmap/pixel rendering and colored ASCII. Artwork is center-cropped to a square sleeve. `MTUI_GRAPHICS=blocks`, `MTUI_GRAPHICS=kitty`, and `MTUI_GRAPHICS=sixel` remain available as startup overrides for automatic detection.
 
