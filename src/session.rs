@@ -35,8 +35,8 @@ const SESSION_NAME: &str = "MTUI sign-in window";
 pub fn helper_request() -> Option<bool> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     args.iter()
-        .any(|arg| arg == HELPER_ARG)
-        .then(|| args.iter().any(|arg| arg == FORCE_ARG))
+        .any(|arg| arg == std::ffi::OsStr::new(HELPER_ARG))
+        .then(|| args.iter().any(|arg| arg == std::ffi::OsStr::new(FORCE_ARG)))
 }
 
 /// Runs the embedded Windows helper, where the process main thread is free for
