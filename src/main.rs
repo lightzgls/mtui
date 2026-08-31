@@ -19,6 +19,7 @@ mod console;
 mod diagnostics;
 mod discord;
 mod graphics;
+mod kitty;
 mod player;
 mod session;
 mod sixel;
@@ -76,6 +77,10 @@ const BUSY_TICK: Duration = Duration::from_millis(50);
 const IDLE_TICK: Duration = Duration::from_millis(500);
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    if let Some(force) = session::helper_request() {
+        return session::run_helper(force);
+    }
     #[cfg(windows)]
     if console::is_host() {
         diagnostics::init();
@@ -159,7 +164,7 @@ fn run(settings: config::Settings, mut tray: Option<Tray>) -> Result<()> {
     }
 
     // The track that was playing when the user quit. Written here rather than
-    // left to the library worker, which is not joined on the way out -- see
+    // left to the metadata worker, which is not joined on the way out -- see
     // `App::flush_listening`.
     app.flush_listening();
     Ok(())
@@ -209,9 +214,18 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
                 .draw(|frame| ui::render(frame, app, &mut mouse))
                 .context("could not draw the foreground")?;
 
-            // Sixel pixels live outside ratatui's buffer, so nothing it draws
-            // can erase them. Clear and rebuild in the same breath.
+            // Protocol images live outside ratatui's buffer, so nothing it
+            // draws can erase them. Clear and rebuild in the same breath.
             if app.image_needs_clearing() {
+                if app.painted_with_kitty() {
+                    for index in 0..app.painted_image_count() {
+                        foreground
+                            .terminal
+                            .backend_mut()
+                            .write_all(&kitty::delete(kitty::image_id(index)))
+                            .context("could not remove a Kitty image")?;
+                    }
+                }
                 foreground
                     .terminal
                     .clear()
@@ -495,6 +509,7 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
                     start_in_tray: false,
                     icon_theme: app.icon_theme(),
                     cover_style: app.cover_style(),
+                    image_renderer: app.image_renderer(),
                 })
                 .save()
                 {
@@ -523,6 +538,7 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
             start_in_tray: false,
             icon_theme: app.icon_theme(),
             cover_style: app.cover_style(),
+            image_renderer: app.image_renderer(),
         })
         .save()
         {
@@ -635,26 +651,37 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
     Ok(())
 }
 
-/// Paints the planned cover as sixel pixels, if it is not already on screen.
+/// Paints the planned cover as terminal pixels, if it is not already on screen.
 ///
 /// Encoding runs here rather than in the renderer: it costs tens of
 /// milliseconds and happens once per track, which is fine between frames and
 /// would not be fine inside one.
 fn paint_cover(app: &mut App, out: &mut impl Write) -> Result<()> {
-    let Some((cover, plan)) = app.image_to_paint() else {
+    let images = app.images_to_paint();
+    if images.is_empty() {
         return Ok(());
-    };
-    let (width, height) = (u32::from(plan.width), u32::from(plan.height));
-    let payload = sixel::encode(&cover.resample(width, height), width, height);
+    }
+    let kitty_enabled = app.kitty_images();
+    for (index, (cover, image)) in images.iter().enumerate() {
+        let plan = image.plan;
+        let (width, height) = (u32::from(plan.width), u32::from(plan.height));
+        let rgb = cover.resample(width, height);
+        let payload = if kitty_enabled {
+            let id = kitty::image_id(index);
+            out.write_all(&kitty::delete(id))?;
+            kitty::encode(&rgb, width, height, plan.bound, id)
+        } else {
+            sixel::encode(&rgb, width, height)
+        };
 
-    // Save and restore around the write: drawing an image leaves the cursor
-    // after it, and ratatui has already put the cursor where the search box
-    // wants it.
-    queue!(out, SavePosition, MoveTo(plan.col, plan.row))?;
-    out.write_all(&payload)?;
-    queue!(out, RestorePosition)?;
+        // Save and restore around each write: drawing an image leaves the
+        // cursor after it, and ratatui has already placed the input cursor.
+        queue!(out, SavePosition, MoveTo(plan.col, plan.row))?;
+        out.write_all(&payload)?;
+        queue!(out, RestorePosition)?;
+    }
     out.flush()?;
-
-    app.mark_painted();
+    drop(images);
+    app.mark_painted(kitty_enabled);
     Ok(())
 }

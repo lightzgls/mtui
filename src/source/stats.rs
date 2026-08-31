@@ -14,8 +14,7 @@
 //!
 //! Consequences worth stating plainly:
 //!
-//! - **Cookie only.** OAuth cannot do this, for the reason
-//!   [`crate::source::sapisid`] documents at length. No `cookies.txt`, no
+//! - **Cookie only.** No saved web session or `cookies.txt`, no
 //!   reporting -- and the caller checks that before it gets here.
 //! - **Undocumented and unversioned.** The shape below is what the web client
 //!   sent when this was written. Nothing here is load-bearing: every failure is
@@ -29,12 +28,13 @@
 //! This writes to the user's real account, so it is opt-in twice over: they have
 //! to have saved a cookie, and they have to have left reporting on.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use super::auth::Http;
+use super::http::Http;
 use super::innertube::{MUSIC_CLIENT_NAME, MUSIC_CLIENT_VERSION};
 use super::sapisid;
 use crate::config::Cookies;
@@ -219,16 +219,25 @@ fn ping(
 /// *distinct*: the nonce ties two pings to one play, and reusing one across
 /// plays is what would make two songs look like one.
 ///
-/// Seeded from the clock in nanoseconds and stirred with xorshift64. Two plays
-/// cannot start in the same nanosecond, so they cannot collide.
+/// Seeded from the clock in nanoseconds, mixed with a monotonic per-process
+/// counter, and stirred with xorshift64. The clock alone is not enough: its
+/// granularity is far coarser than a call on most platforms, so two nonces made
+/// in the same tick would seed identically. The counter is what guarantees a
+/// distinct seed -- and the odd Weyl multiplier spreads its low bits across the
+/// whole word so even the first few nonces of a run differ in every position.
 fn nonce() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let mut state = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_nanos() as u64)
         .unwrap_or(0x2545_F491_4F6C_DD1D)
-        // A zero seed is a fixed point of xorshift and would yield the same
-        // nonce forever. Only reachable from a clock at the epoch, but free.
-        | 1;
+        ^ SEQ
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    // A zero seed is a fixed point of xorshift and would yield the same nonce
+    // forever. Only reachable from a clock at the epoch, but free.
+    state |= 1;
 
     (0..CPN_LENGTH)
         .map(|_| {

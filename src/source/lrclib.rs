@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::source::UNKNOWN_ARTIST;
-use crate::source::auth::Http;
+use crate::source::http::Http;
 use crate::source::watch::{MAX_TIMED_LINES, TimedLine};
 
 /// The exact-match endpoint: artist, title and length, answering 404 unless it

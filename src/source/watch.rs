@@ -32,8 +32,8 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use serde_json::Value;
 
-use super::auth::Http;
 use super::home::{self, Shelf};
+use super::http::Http;
 use super::innertube::parse_duration;
 use super::journal::Journal;
 use super::sapisid;
@@ -644,7 +644,6 @@ fn parse_queue_row(row: &Value) -> Option<Track> {
             .pointer("/longBylineText/runs")
             .and_then(home::artist_ref),
         // A radio queue is nobody's playlist, so there is no row to remove.
-        playlist_item_id: None,
     })
 }
 

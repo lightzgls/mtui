@@ -1,19 +1,16 @@
 //! Music sources.
 //!
-//! Search and library modules turn provider responses into tracks. Playback URL
+//! Source modules turn provider responses into tracks. Playback URL
 //! resolution lives in `mtui-resolver`, while the worker here decides when that
 //! potentially blocking work may run.
 
 pub mod artist;
-pub mod auth;
 pub mod bootstrap;
-#[cfg(test)]
-pub mod browser;
 pub mod cover;
 pub mod home;
+pub mod http;
 pub mod innertube;
 pub mod journal;
-pub mod library;
 pub mod lrclib;
 pub mod sapisid;
 pub mod stats;
@@ -118,9 +115,6 @@ pub struct Track {
     /// stable artist identities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artist_ref: Option<ArtistRef>,
-    /// Identifies this row within one playlist. Only playlist listings have it.
-    #[serde(default)]
-    pub playlist_item_id: Option<String>,
 }
 
 impl Track {
@@ -151,7 +145,7 @@ impl Track {
 #[cfg(test)]
 mod live_quality {
     #[test]
-    #[ignore = "uses the saved YouTube Music browser session"]
+    #[ignore = "uses the saved YouTube Music web session"]
     fn saved_session_resolves_a_complete_stream_quickly() {
         use std::time::{Duration, Instant};
 
@@ -159,7 +153,7 @@ mod live_quality {
         let yt = super::bootstrap::with_js_runtime(yt).expect("runtime setup should succeed");
         let cookies = crate::config::Cookies::available()
             .expect("saved cookies should parse")
-            .expect("no saved browser session is available");
+            .expect("no saved YouTube Music session is available");
         let mut resolver = mtui_resolver::Resolver::new(yt.bin()).expect("resolver should build");
         resolver.set_js_runtime(yt.js_runtime().map(str::to_string));
         resolver.set_pot_provider(

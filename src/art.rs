@@ -11,8 +11,8 @@
 //! So this is a cache, and being a cache it has to be bounded -- in entries,
 //! and more importantly in how big an entry can get. Both bounds are set for
 //! the same reason the rest of this program is the size it is: see [`EDGE`] and
-//! [`CAPACITY`] for the arithmetic. Full together they come to roughly a
-//! megabyte, which is a third of what a single full-size cover costs.
+//! [`CAPACITY`] for the arithmetic. Full together they stay around six
+//! megabytes, while retaining enough detail for terminal bitmap protocols.
 //!
 //! Nothing here fetches. The cache records what is wanted, the worker's art
 //! thread answers, and [`ArtCache::store`] puts the answer away -- so a slow or
@@ -24,19 +24,23 @@ use crate::source::cover::Cover;
 
 /// Longest edge an entry is kept at, in image pixels.
 ///
-/// A card tile is drawn with half-block cells -- one pixel per column, two per
-/// row -- so even a poster card on a wide terminal is about forty pixels
-/// across. Sixty-four is comfortable headroom over that and costs 12 KB per
-/// entry, where keeping the 226-pixel copy YouTube serves would cost 150 KB to
-/// draw the same forty pixels.
-pub const EDGE: u32 = 64;
+/// Half-block rendering needs very little source detail, but Kitty paints the
+/// cached bitmap directly and commonly gives a gallery sleeve 150--250 physical
+/// pixels. Keeping 256 pixels avoids permanently throwing that detail away at
+/// decode time, without retaining the much larger player-cover source.
+pub const EDGE: u32 = 256;
 
 /// Entries kept before the least recently wanted is dropped.
 ///
-/// Two or three screenfuls of a wide terminal: enough that scrolling down a
-/// page and back finds the tiles still there, and far short of the whole feed.
-/// At [`EDGE`] that is about 800 KB.
-pub(crate) const CAPACITY: usize = 64;
+/// Roughly two screenfuls of a wide terminal: enough that scrolling down a page
+/// and back finds the tiles still there, and far short of the whole feed. At
+/// [`EDGE`] the raw RGB pixel budget is 6 MiB.
+pub(crate) const CAPACITY: usize = 32;
+
+const _: () = {
+    assert!(EDGE >= 192);
+    assert!(EDGE as usize * EDGE as usize * 3 * CAPACITY <= 8 * 1024 * 1024);
+};
 
 #[derive(Default)]
 pub struct ArtCache {
@@ -69,17 +73,28 @@ impl ArtCache {
     /// than a hundred.
     pub fn want(&mut self, key: &str) -> bool {
         self.touch(key);
-        self.asked.insert(key.to_string())
+        let newly_asked = self.asked.insert(key.to_string());
+        // Bound requests immediately, not only when their answers arrive. A
+        // user can scroll through several screens before the first CDN request
+        // completes, and that burst must not make `recent` or `asked` grow
+        // beyond the same limit as the decoded pictures.
+        self.evict();
+        newly_asked
     }
 
     /// Files an answer from the art thread. `None` means there was no usable
     /// picture, which needs nothing stored: [`Self::asked`] already records
     /// that the question was put.
     pub fn store(&mut self, key: String, art: Option<Cover>) {
+        // The request may have fallen out of the LRU while the CDN was still
+        // answering. Keeping that late picture would put it in `art` without a
+        // matching `recent` entry, where no future eviction could find it.
+        if !self.asked.contains(&key) {
+            return;
+        }
         if let Some(cover) = art {
             self.art.insert(key.clone(), cover);
         }
-        self.asked.insert(key);
         self.evict();
     }
 
@@ -159,6 +174,34 @@ mod tests {
             cache.store(key, Some(cover()));
         }
         assert!(cache.art.len() <= CAPACITY, "held {}", cache.art.len());
+        assert!(cache.asked.len() <= CAPACITY);
+        assert_eq!(cache.recent.len(), CAPACITY);
+    }
+
+    #[test]
+    fn unanswered_requests_are_bounded_too() {
+        let mut cache = ArtCache::default();
+        for i in 0..CAPACITY * 2 {
+            cache.want(&i.to_string());
+        }
+
+        assert_eq!(cache.asked.len(), CAPACITY);
+        assert_eq!(cache.recent.len(), CAPACITY);
+    }
+
+    #[test]
+    fn a_late_answer_cannot_escape_the_lru() {
+        let mut cache = ArtCache::default();
+        for i in 0..CAPACITY {
+            cache.want(&i.to_string());
+        }
+
+        cache.want("fresh");
+        assert!(!cache.asked.contains("0"), "the oldest request was evicted");
+        cache.store("0".to_string(), Some(cover()));
+
+        assert!(cache.get("0").is_none(), "a stale image was retained");
+        assert!(cache.art.len() <= CAPACITY);
         assert!(cache.asked.len() <= CAPACITY);
         assert_eq!(cache.recent.len(), CAPACITY);
     }

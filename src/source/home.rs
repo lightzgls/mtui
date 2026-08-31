@@ -26,8 +26,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use super::auth::Http;
 use super::cover;
+use super::http::Http;
 use super::innertube::{
     MUSIC_CLIENT_NAME, MUSIC_CLIENT_VERSION, flex_column, flex_runs, parse_duration,
 };
@@ -56,8 +56,8 @@ pub(super) const NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next";
 /// The home feed, personalised when the request carries a session.
 const HOME_ID: &str = "FEmusic_home";
 
-/// Home is startup work, unlike OAuth's user-paced device flow. A dead endpoint
-/// must yield to the anonymous fallback promptly.
+/// Home is startup work. A dead endpoint must yield to the anonymous fallback
+/// promptly.
 const HOME_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Every shelf is kept in YouTube's order. Cards remain bounded so one unusually
@@ -200,7 +200,6 @@ impl Card {
             duration: self.duration,
             album: None,
             artist_ref: self.artist_ref.clone(),
-            playlist_item_id: None,
         })
     }
 
@@ -1063,7 +1062,6 @@ fn parse_row(row: &Value) -> Option<Track> {
         artist_ref: flex_runs(row, 1).and_then(artist_ref),
         // These rows are not the user's to remove; only a Data API listing
         // knows an id that could be.
-        playlist_item_id: None,
     })
 }
 
@@ -1577,7 +1575,6 @@ mod tests {
         assert_eq!(track.album.as_deref(), Some("Discovery"));
         assert_eq!(track.duration, Some(Duration::from_secs(227)));
         // These rows are not the user's to remove.
-        assert!(track.playlist_item_id.is_none());
     }
 
     #[test]
@@ -1755,7 +1752,6 @@ mod tests {
             duration: None,
             album: None,
             artist_ref: None,
-            playlist_item_id: None,
         }
     }
 
@@ -1838,7 +1834,7 @@ mod tests {
         let http = Http::new().expect("client should build");
         let cookies = Cookies::available()
             .expect("the saved cookies should parse")
-            .expect("a saved browser session should exist");
+            .expect("a saved YouTube Music session should exist");
         let shelves = fetch_personalised(&http, &cookies)
             .expect("home should answer")
             .unwrap_or_else(|| fetch_public(&http).expect("public home should answer"));
@@ -1862,188 +1858,6 @@ mod tests {
             start.elapsed().as_secs_f64()
         );
         assert!(loaded > 0);
-    }
-
-    /// Records what OAuth does here, so nobody spends an afternoon rediscovering
-    /// it. The tokens work perfectly against the Data API and are refused by
-    /// InnerTube, which is not a distinction any documentation draws.
-    ///
-    /// `cargo test oauth_is_refused -- --ignored --nocapture`
-    #[test]
-    #[ignore = "hits the live YouTube Music API with the saved sign-in"]
-    fn oauth_is_refused_by_innertube() {
-        use super::super::auth::Session;
-
-        let http = Http::new().expect("client should build");
-        let Some(mut session) = Session::load().ok().flatten() else {
-            println!("not signed in -- nothing to check");
-            return;
-        };
-        let token = session
-            .access_token(&http)
-            .expect("the saved sign-in should refresh")
-            .to_string();
-
-        let request = http
-            .client()
-            .post(BROWSE_URL)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-            .body(
-                serde_json::to_vec(&serde_json::json!({
-                    "browseId": HOME_ID,
-                    "context": { "client": {
-                        "clientName": MUSIC_CLIENT_NAME,
-                        "clientVersion": MUSIC_CLIENT_VERSION,
-                        "hl": "en",
-                    } }
-                }))
-                .unwrap(),
-            );
-
-        let (status, _) = http.send(request).expect("the request should complete");
-        println!("Bearer-authenticated InnerTube browse: HTTP {status}");
-        assert_eq!(
-            status, 400,
-            "OAuth started working against InnerTube -- if this ever passes, the \
-             cookie file stops being the only way to a personalised feed"
-        );
-    }
-
-    /// The living-room client Google ships in its own TV app.
-    ///
-    /// Publicly known, and used by `ytmusicapi` among others. It is here for one
-    /// question only: [`oauth_is_refused_by_innertube`] proves that a token from
-    /// a *user-registered* Cloud Console client is refused, and the hypothesis is
-    /// that the refusal is about which client asked rather than about OAuth
-    /// itself. Same protocol, same scope, different client identity.
-    const TV_CLIENT_ID: &str =
-        "861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com";
-    const TV_CLIENT_SECRET: &str = "SboVhoG9s0rNafixCSGGKXAT";
-
-    /// The TV client identity, for the InnerTube request itself. A token issued
-    /// to the living-room client is plausibly only honoured on calls that look
-    /// like they came from it, so both are tried below rather than assumed.
-    const TV_INNERTUBE_NAME: &str = "TVHTML5";
-    const TV_INNERTUBE_VERSION: &str = "7.20241201.15.00";
-
-    /// Whether a TV-client OAuth token reaches the personalised feed.
-    ///
-    /// **It does not.** Measured 2026-08-05 against a live account: the code is
-    /// issued, the user approves it, Google returns a perfectly good access
-    /// token -- and InnerTube answers `400` to it, under the living-room client
-    /// identity and under `WEB_REMIX` alike.
-    ///
-    /// That is the third refusal on record, after [`oauth_is_refused_by_innertube`]
-    /// with a user-registered Cloud Console client. The pattern is now clear
-    /// enough to design around: InnerTube refuses Bearer authentication as such,
-    /// not any particular client asking. There is no OAuth route to a
-    /// personalised feed, and the cookie is the only door.
-    ///
-    /// Kept, and asserted rather than printed, because the cost of being wrong
-    /// about this later is high: if Google ever does open it up, this is what
-    /// says so. It is the only test here that needs a phone.
-    ///
-    /// Read-only -- it browses the home feed and writes nothing. It does create
-    /// a real OAuth grant, which is worth removing again at
-    /// myaccount.google.com/permissions once it has failed.
-    ///
-    /// `cargo test tv_client -- --ignored --nocapture`
-    #[test]
-    #[ignore = "opens a device-code sign-in that has to be approved on a phone"]
-    fn tv_client_oauth_against_innertube() {
-        use super::super::auth;
-        use crate::config::Credentials;
-
-        let http = Http::new().expect("client should build");
-        let creds = Credentials {
-            client_id: TV_CLIENT_ID.to_string(),
-            client_secret: TV_CLIENT_SECRET.to_string(),
-        };
-
-        let code = auth::start(&http, &creds).expect("the TV client should be issued a code");
-        println!(
-            "\n  go to {} and enter    {}\n  waiting ...",
-            code.verification_url, code.user_code
-        );
-
-        let tokens =
-            auth::wait_for_approval(&http, &creds, &code).expect("the code should be approved");
-        println!("  approved\n");
-
-        // Both identities, because a token issued to the living-room client may
-        // only be honoured on a request that presents as one.
-        for (name, version) in [
-            (TV_INNERTUBE_NAME, TV_INNERTUBE_VERSION),
-            (MUSIC_CLIENT_NAME, MUSIC_CLIENT_VERSION),
-        ] {
-            let request = http
-                .client()
-                .post(BROWSE_URL)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .header(
-                    reqwest::header::AUTHORIZATION,
-                    format!("Bearer {}", tokens.access_token),
-                )
-                .body(
-                    serde_json::to_vec(&serde_json::json!({
-                        "browseId": HOME_ID,
-                        "context": { "client": {
-                            "clientName": name,
-                            "clientVersion": version,
-                            "hl": "en",
-                        } }
-                    }))
-                    .unwrap(),
-                );
-
-            let (status, raw) = http.send(request).expect("the request should complete");
-            print!("  {name:<10} HTTP {status}");
-            if !(200..300).contains(&status) {
-                println!("  -- refused");
-                // The recorded outcome. A pass here would mean the whole
-                // cookie apparatus could be deleted, so it is worth failing
-                // loudly rather than quietly printing a surprise.
-                assert_eq!(
-                    status, 400,
-                    "InnerTube answered {name} with {status} rather than the \
-                     expected 400 -- something about Bearer auth has changed"
-                );
-                continue;
-            }
-
-            let json: Value = match serde_json::from_slice(&raw) {
-                Ok(json) => json,
-                Err(_) => {
-                    println!("  -- accepted but the body is not JSON");
-                    continue;
-                }
-            };
-            let shelves = parse_shelves(&json);
-            let found: Vec<&str> = PERSONAL
-                .iter()
-                .copied()
-                .filter(|name| shelves.iter().any(|s| s.title.starts_with(name)))
-                .collect();
-
-            println!("  {} shelves, personal: {found:?}", shelves.len());
-            for shelf in shelves.iter().take(8) {
-                println!("      {}", shelf.title);
-            }
-
-            // Never reached as of the measurement above. If it ever is, the
-            // distinction below is the one that decides the design:
-            // accepted-but-generic looks like success and is worth nothing.
-            if found.is_empty() {
-                println!("      ^ authenticated, but this is the signed-out feed");
-            } else {
-                panic!(
-                    "TV-client OAuth now reaches the personalised feed under \
-                     {name} -- the cookie has stopped being the only door, and \
-                     the sign-in should be rebuilt on this"
-                );
-            }
-        }
     }
 
     /// Hits the live API, like the resolver's and the search's own live tests.
@@ -2091,7 +1905,6 @@ mod tests {
 #[cfg(test)]
 mod live_personal {
     use super::*;
-    use crate::source::library::{LIKED_ID, Library};
 
     /// The shelves built from this account's listening, end to end, against the
     /// real journal on this machine.
@@ -2103,35 +1916,20 @@ mod live_personal {
     ///
     /// `cargo test built_shelves -- --ignored --nocapture`
     #[test]
-    #[ignore = "hits the live APIs with the saved sign-in"]
+    #[ignore = "hits the live API using the local listening journal"]
     fn built_shelves_against_the_live_account() {
         use std::time::Instant;
 
         use crate::source::journal::Journal;
 
-        let mut library = Library::new().expect("library should build");
+        let http = Http::new().expect("client should build");
         let journal = Journal::load();
-
-        let likes = if library.is_signed_in() {
-            let start = Instant::now();
-            let likes = library
-                .tracks(LIKED_ID, 100)
-                .expect("liked songs should load");
-            println!(
-                "{} liked songs in {:.2}s",
-                likes.len(),
-                start.elapsed().as_secs_f64()
-            );
-            likes
-        } else {
-            println!("not signed in -- building from the journal alone");
-            Vec::new()
-        };
+        let likes = Vec::new();
 
         let mut pages = Vec::new();
         for rotation in [0, 1] {
             let start = Instant::now();
-            let shelves = personal(library.http(), &likes, &journal, rotation);
+            let shelves = personal(&http, &likes, &journal, rotation);
             println!(
                 "\n=== rotation {rotation}: {} shelves in {:.2}s ===",
                 shelves.len(),

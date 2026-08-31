@@ -186,7 +186,6 @@ fn parse_track(item: &serde_json::Value) -> Option<Track> {
         album,
         artist_ref: flex_runs(item, 1).and_then(home::artist_ref),
         // A search result is not a playlist row.
-        playlist_item_id: None,
     })
 }
 
