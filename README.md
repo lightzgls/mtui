@@ -11,14 +11,6 @@
 <p align="center">
   A keyboard-driven Rust music player built for responsive navigation, bounded memory use, and long listening sessions.
 </p>
-
-<p align="center">
-  <a href="https://github.com/lightzgls/mtui/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/lightzgls/mtui/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="https://github.com/lightzgls/mtui/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/lightzgls/mtui?color=49d7f2"></a>
-  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-65f5b5"></a>
-  <img alt="Rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-f5a97f">
-</p>
-
 <!-- README_DEMO: Replace this paragraph with the GitHub video attachment URL on its own line. -->
 <p align="center">
   <strong>Demo video coming soon.</strong><br>
