@@ -42,7 +42,7 @@ use super::cover::{self, Cover};
 use super::home::{self, Shelf};
 use super::http::Http;
 use super::innertube::InnerTube;
-use super::journal::{Journal, Play};
+use super::journal::{Journal, Play, ReportQueue};
 use super::{ArtistRef, BrowseEndpoint, StreamUrl, Track};
 use super::{lrclib, stats, watch};
 use crate::config::{Cookies, Import};
@@ -119,6 +119,10 @@ pub enum Request {
         track: Track,
         listened: Duration,
     },
+    /// Retries the durable playback outbox after a Music session is imported.
+    RetryReports,
+    /// Clears account-bound pending reports on explicit logout.
+    ClearReports,
     /// Tracks behind a card that browses rather than plays -- an album, a
     /// playlist or an artist. `title` is carried through to label the list.
     OpenBrowse {
@@ -431,6 +435,8 @@ impl SourceWorker {
                 self.page_tx.send(req).context("player page worker is gone")
             }
             Request::ReportPlay { .. }
+            | Request::RetryReports
+            | Request::ClearReports
             | Request::OpenBrowse { .. }
             | Request::OpenArtist { .. } => self
                 .metadata_tx
@@ -471,6 +477,8 @@ fn name(req: &Request) -> &'static str {
         Request::PersonalHome { .. } => "PersonalHome",
         Request::MusicSignIn { .. } => "MusicSignIn",
         Request::ReportPlay { .. } => "ReportPlay",
+        Request::RetryReports => "RetryReports",
+        Request::ClearReports => "ClearReports",
         Request::OpenBrowse { .. } => "OpenBrowse",
         Request::OpenArtist { .. } => "OpenArtist",
         Request::Watch { .. } => "Watch",
@@ -852,6 +860,8 @@ fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
         return;
     };
     let mut journal = Journal::load();
+    let mut reports = ReportQueue::load();
+    retry_reports(&http, &mut reports);
 
     while let Ok(req) = rx.recv() {
         let response = match req {
@@ -860,32 +870,22 @@ fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
                 // account, no cookie and no network, and it is what MTUI's own
                 // shelves are ranked from. A play too short to mean anything is
                 // dropped here rather than tested for twice.
-                if !journal.record(Play::new(&track, listened)) {
-                    continue;
+                let play = Play::new(&track, listened);
+                if journal.record(play.clone()) {
+                    // Queue first, then try the network. A missing cookie, a
+                    // stale session, an offline machine or a process killed
+                    // mid-request all leave the same recoverable state on disk.
+                    reports.enqueue(&play);
+                    retry_reports(&http, &mut reports);
                 }
-
-                // Upstream second, and only with a cookie -- there is no other way
-                // to attribute a play to an account, for the reason
-                // `crate::source::sapisid` documents.
-                if let Some(cookies) = Cookies::available().ok().flatten() {
-                    // Swallowed on purpose. The user did not ask for this, the
-                    // music already played, and the local journal already has it;
-                    // replacing the status line with a tracking-endpoint failure
-                    // would be spending something they are using on something they
-                    // are not.
-                    //
-                    // Except for one failure, which is worth acting on rather than
-                    // reporting: a player response with no tracking in it means
-                    // YouTube did not recognise the session. An imported cookie
-                    // that has expired is exactly what that looks like, and the
-                    // fix is a fresh Music session. Forgetting it here makes the
-                    // next launch open interactive setup.
-                    if let Err(why) = stats::report(&http, &cookies, &track.id, listened)
-                        && format!("{why:#}").contains(stats::STALE)
-                    {
-                        let _ = Import::forget();
-                    }
-                }
+                None
+            }
+            Request::RetryReports => {
+                retry_reports(&http, &mut reports);
+                None
+            }
+            Request::ClearReports => {
+                reports.clear();
                 None
             }
             Request::OpenBrowse {
@@ -912,6 +912,44 @@ fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
         };
         if response.is_some_and(|response| tx.send(response).is_err()) {
             break;
+        }
+    }
+}
+
+fn retry_reports(http: &Http, reports: &mut ReportQueue) {
+    let Some(cookies) = Cookies::available().ok().flatten() else {
+        return;
+    };
+
+    while let Some(report) = reports.front().cloned() {
+        match stats::report_with_cpn(
+            http,
+            &cookies,
+            &report.video_id,
+            Duration::from_secs(report.listened),
+            &report.cpn,
+        ) {
+            Ok(()) => {
+                if !reports.acknowledge_front() {
+                    return;
+                }
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                let stale = reason.contains(stats::STALE);
+                crate::diagnostics::error(
+                    "history",
+                    if stale {
+                        "playback report retained: the YouTube Music session is stale"
+                    } else {
+                        "playback report retained: YouTube tracking is unavailable"
+                    },
+                );
+                if stale {
+                    let _ = Import::forget();
+                }
+                return;
+            }
         }
     }
 }
