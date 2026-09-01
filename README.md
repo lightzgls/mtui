@@ -76,7 +76,7 @@
 <!-- ABOUT THE PROJECT -->
 ## About The Project
 
-<!-- README_DEMO: replace this block with the GitHub video attachment URL on its own line. -->
+https://github.com/user-attachments/assets/a3d9dbd8-00c8-46a5-a17b-6cd748d18673
 <p align="center">
   <strong>Demo video coming soon.</strong><br>
   <sub>Search, artist pages, colored ASCII covers, and Now Playing.</sub>
