@@ -47,6 +47,8 @@ pub(super) const MIN_REPORTABLE: Duration = Duration::from_secs(30);
 
 /// The tracking protocol version the web client sends. Both pings carry it.
 const TRACKING_VERSION: &str = "2";
+const TRACKING_CLIENT_PARAM: &str = "web_remix";
+const TRACKING_FORMAT: &str = "251";
 
 /// Identity and player-script timestamp currently published by YouTube Music's
 /// web client. Unlike browsing, a player request is rejected as `UNPLAYABLE`
@@ -202,24 +204,12 @@ fn ping(
     cpn: &str,
     listened: Option<Duration>,
 ) -> Result<()> {
-    // The base URL already carries its own query string -- `docid`, `ei` and a
-    // signature among them -- so ours is appended to it rather than started.
-    let separator = if base.contains('?') { '&' } else { '?' };
-    let mut url =
-        format!("{base}{separator}ver={TRACKING_VERSION}&cpn={cpn}&cver={TRACKING_CLIENT_VERSION}");
-
-    if let Some(listened) = listened {
-        let secs = listened.as_secs();
-        // Start time and end time, in seconds. Reported as one continuous span
-        // from zero: MTUI plays a track through rather than seeking around it,
-        // so a single span is not a simplification of what happened.
-        url.push_str(&format!("&st=0&et={secs}&state=playing"));
-    }
+    let url = ping_url(base, cpn, listened)?;
 
     let now = sapisid::unix_now();
     let request = http
         .client()
-        .get(&url)
+        .get(url)
         .header(reqwest::header::ORIGIN, ORIGIN)
         .header(reqwest::header::REFERER, ORIGIN)
         .header(reqwest::header::COOKIE, cookies.header())
@@ -235,6 +225,48 @@ fn ping(
         bail!("YouTube refused a playback ping: HTTP {status}");
     }
     Ok(())
+}
+
+/// Builds the same stats URL as the Music web client.
+///
+/// A successful response does not mean YouTube accepted the event: these
+/// endpoints also return 204 for incomplete telemetry and silently discard it.
+/// The client identity, playback format and timing fields are therefore part of
+/// the protocol rather than optional analytics decoration.
+fn ping_url(base: &str, cpn: &str, listened: Option<Duration>) -> Result<reqwest::Url> {
+    // YouTube returns `s.youtube.com`; its Music client deliberately sends the
+    // same signed path through the Music origin instead.
+    let base = base.replacen("https://s.", "https://music.", 1);
+    let mut url = reqwest::Url::parse(&base).context("YouTube returned an invalid tracking URL")?;
+
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("ver", TRACKING_VERSION)
+            .append_pair("c", TRACKING_CLIENT_PARAM)
+            .append_pair("cbrver", TRACKING_CLIENT_VERSION)
+            .append_pair("cver", TRACKING_CLIENT_VERSION)
+            .append_pair("cpn", cpn);
+
+        match listened {
+            None => {
+                query
+                    .append_pair("fmt", TRACKING_FORMAT)
+                    .append_pair("rtn", "0")
+                    .append_pair("rt", "0");
+            }
+            Some(listened) => {
+                let position = format!("{}.000", listened.as_secs());
+                query
+                    .append_pair("st", &position)
+                    .append_pair("et", &position)
+                    .append_pair("cmt", &position)
+                    .append_pair("final", "1");
+            }
+        }
+    }
+
+    Ok(url)
 }
 
 /// A client playback nonce: 16 characters identifying this one play.
@@ -278,6 +310,12 @@ pub(super) fn nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn query(url: &reqwest::Url) -> std::collections::HashMap<String, String> {
+        url.query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect()
+    }
 
     #[test]
     fn tracking_request_carries_a_real_player_timestamp() {
@@ -325,6 +363,47 @@ mod tests {
 
         assert_eq!(tracking.playback, "https://example.test/start");
         assert_eq!(tracking.watchtime, "https://example.test/time");
+    }
+
+    #[test]
+    fn playback_ping_matches_the_music_web_client() {
+        let url = ping_url(
+            "https://s.youtube.com/api/stats/playback?docid=video&ei=event",
+            "abcdefghijklmnop",
+            None,
+        )
+        .expect("tracking URL should parse");
+        let query = query(&url);
+
+        assert_eq!(url.host_str(), Some("music.youtube.com"));
+        assert_eq!(url.path(), "/api/stats/playback");
+        assert_eq!(query.get("docid").map(String::as_str), Some("video"));
+        assert_eq!(query.get("c").map(String::as_str), Some("web_remix"));
+        assert_eq!(query.get("fmt").map(String::as_str), Some("251"));
+        assert_eq!(query.get("rt").map(String::as_str), Some("0"));
+        assert_eq!(query.get("rtn").map(String::as_str), Some("0"));
+        assert_eq!(
+            query.get("cpn").map(String::as_str),
+            Some("abcdefghijklmnop")
+        );
+    }
+
+    #[test]
+    fn final_watchtime_ping_carries_the_playback_position() {
+        let url = ping_url(
+            "https://s.youtube.com/api/stats/watchtime?docid=video",
+            "abcdefghijklmnop",
+            Some(Duration::from_secs(187)),
+        )
+        .expect("tracking URL should parse");
+        let query = query(&url);
+
+        assert_eq!(url.host_str(), Some("music.youtube.com"));
+        assert_eq!(query.get("st").map(String::as_str), Some("187.000"));
+        assert_eq!(query.get("et").map(String::as_str), Some("187.000"));
+        assert_eq!(query.get("cmt").map(String::as_str), Some("187.000"));
+        assert_eq!(query.get("final").map(String::as_str), Some("1"));
+        assert!(!query.contains_key("fmt"));
     }
 
     #[test]
