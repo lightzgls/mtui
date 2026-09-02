@@ -35,7 +35,10 @@ pub fn helper_request() -> Option<bool> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     args.iter()
         .any(|arg| arg == std::ffi::OsStr::new(HELPER_ARG))
-        .then(|| args.iter().any(|arg| arg == std::ffi::OsStr::new(FORCE_ARG)))
+        .then(|| {
+            args.iter()
+                .any(|arg| arg == std::ffi::OsStr::new(FORCE_ARG))
+        })
 }
 
 /// Runs the embedded Windows helper, where the process main thread is free for
@@ -131,14 +134,25 @@ fn save(header: &str) -> Result<()> {
 /// files that were removed first.
 pub fn sign_out() -> Result<Option<String>> {
     Cookies::forget()?;
+    // Pending reports were collected under the account being left (or before
+    // it signed in). A later account must not inherit that listening history.
+    let pending_warning = crate::source::journal::forget_pending_reports()
+        .err()
+        .map(|error| format!("could not clear pending playback reports: {error}"));
     let profile = crate::config::dir()?.join("webview");
     match std::fs::remove_dir_all(&profile) {
-        Ok(()) => Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Ok(Some(format!(
-            "could not clear the sign-in window data at {}: {error}",
-            profile.display()
-        ))),
+        Ok(()) => Ok(pending_warning),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(pending_warning),
+        Err(error) => {
+            let profile_warning = format!(
+                "could not clear the sign-in window data at {}: {error}",
+                profile.display()
+            );
+            Ok(Some(match pending_warning {
+                Some(pending) => format!("{pending}; {profile_warning}"),
+                None => profile_warning,
+            }))
+        }
     }
 }
 

@@ -2041,6 +2041,9 @@ impl App {
                 if matches!(self.overlay, Overlay::SignIn(SignIn::Music { .. })) {
                     self.overlay = Overlay::None;
                 }
+                // A valid session is the missing half of any reports queued
+                // while signed out or while the previous cookie was stale.
+                let _ = self.source.send(Request::RetryReports);
                 self.request_home();
             }
             Response::MusicSignInFailed(msg) => {
@@ -2987,7 +2990,7 @@ impl App {
     /// cookie saved -- reports it to YouTube.
     ///
     /// Idempotent by construction: the track is taken, so the several paths that
-    /// can end a play (the queue advancing, a new choice, a stop, quitting) may
+    /// can end a play (the queue advancing, a new choice, or a stop) may
     /// all call this and only the first does anything.
     ///
     /// Nothing is reported for a track that never produced sound, which is what
@@ -4348,6 +4351,9 @@ impl App {
 
     fn log_out_music(&mut self) {
         self.menu = None;
+        // Clear the worker's in-memory copy even if removing credentials or
+        // the durable outbox reports an error below.
+        let _ = self.source.send(Request::ClearReports);
         match crate::session::sign_out() {
             Ok(warning) => {
                 // Any personalized response already in flight belongs to the

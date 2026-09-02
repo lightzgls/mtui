@@ -14,19 +14,18 @@
 //!
 //! Consequences worth stating plainly:
 //!
-//! - **Cookie only.** No saved web session or `cookies.txt`, no
-//!   reporting -- and the caller checks that before it gets here.
+//! - **Cookie only.** No saved web session or `cookies.txt`, no immediate
+//!   reporting. The caller keeps the play in a durable outbox until sign-in.
 //! - **Undocumented and unversioned.** The shape below is what the web client
-//!   sent when this was written. Nothing here is load-bearing: every failure is
-//!   swallowed by the caller, and a play that fails to report is still played,
-//!   still journalled, and still on MTUI's own shelves.
+//!   sent when this was written. A failure never costs the local play and stays
+//!   queued for a later authenticated attempt.
 //! - **Not verifiable from here.** A ping that is accepted and a ping that is
 //!   quietly discarded both come back `204`. The only real check is whether
 //!   YouTube Music's history actually fills up, which is what the ignored test
 //!   at the bottom is for.
 //!
-//! This writes to the user's real account, so it is opt-in twice over: they have
-//! to have saved a cookie, and they have to have left reporting on.
+//! This writes to the user's real account, so it requires an explicit Music
+//! sign-in and a YouTube account whose watch history is enabled.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -44,7 +43,7 @@ const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player";
 
 /// Below this, nothing is reported. The same threshold the journal calls a
 /// play, so the two histories cannot disagree about what happened.
-const MIN_REPORTABLE: Duration = Duration::from_secs(30);
+pub(super) const MIN_REPORTABLE: Duration = Duration::from_secs(30);
 
 /// The tracking protocol version the web client sends. Both pings carry it.
 const TRACKING_VERSION: &str = "2";
@@ -73,18 +72,37 @@ const CPN_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 ///
 /// Two round trips on top of the play itself, which is why this is called from
 /// the worker after the fact rather than anywhere near the audio path.
+#[cfg(test)]
 pub fn report(http: &Http, cookies: &Cookies, video_id: &str, listened: Duration) -> Result<()> {
     if listened < MIN_REPORTABLE {
         return Ok(());
     }
 
     let cpn = nonce();
-    let tracking = tracking_urls(http, cookies, video_id, &cpn)?;
+    report_with_cpn(http, cookies, video_id, listened, &cpn)
+}
+
+/// Reports a queued play with the nonce assigned before its first attempt.
+/// Reusing it makes a retry describe the same playback instead of inventing a
+/// second one after a crash between YouTube accepting the ping and our local
+/// acknowledgement reaching disk.
+pub(super) fn report_with_cpn(
+    http: &Http,
+    cookies: &Cookies,
+    video_id: &str,
+    listened: Duration,
+    cpn: &str,
+) -> Result<()> {
+    if listened < MIN_REPORTABLE {
+        return Ok(());
+    }
+
+    let tracking = tracking_urls(http, cookies, video_id, cpn)?;
 
     // Start first, then duration. The order is the protocol: a watchtime ping
     // for a playback that was never announced has nothing to attach itself to.
-    ping(http, cookies, &tracking.playback, &cpn, None)?;
-    ping(http, cookies, &tracking.watchtime, &cpn, Some(listened))?;
+    ping(http, cookies, &tracking.playback, cpn, None)?;
+    ping(http, cookies, &tracking.watchtime, cpn, Some(listened))?;
     Ok(())
 }
 
@@ -225,7 +243,7 @@ fn ping(
 /// in the same tick would seed identically. The counter is what guarantees a
 /// distinct seed -- and the odd Weyl multiplier spreads its low bits across the
 /// whole word so even the first few nonces of a run differ in every position.
-fn nonce() -> String {
+pub(super) fn nonce() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     let mut state = std::time::SystemTime::now()

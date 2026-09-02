@@ -22,7 +22,7 @@
 //! last record instead of corrupting the file. A line that will not parse is
 //! skipped rather than fatal, for the same reason.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -32,6 +32,11 @@ use super::sapisid::unix_now;
 use super::{Track, UNKNOWN_ARTIST};
 
 const JOURNAL_FILE: &str = "plays.jsonl";
+
+/// Durable upstream-report outbox. Kept separate from [`JOURNAL_FILE`] because
+/// the listening journal is a history, while this is a queue: successful
+/// delivery removes work from the latter without erasing what was heard.
+const REPORT_FILE: &str = "pending-plays.jsonl";
 
 /// How much of a track has to be heard before it is a play rather than a
 /// glance. Thirty seconds is the scrobbling convention and it is a good one: it
@@ -86,6 +91,11 @@ const MAX_RECORDS: usize = 5_000;
 /// The gap is slack: compacting on every append would rewrite the whole journal
 /// once per song.
 const COMPACT_AT: usize = 7_500;
+
+/// Delivery events tolerated before the append-only outbox is folded back to
+/// only the reports that are still pending. Compaction happens while loading,
+/// before playback can append a final report from the UI thread.
+const REPORT_COMPACT_AT: usize = 7_500;
 
 /// Strong candidates considered when choosing the seed for community playlist
 /// discovery. Bounded so refreshes vary the recommendation without eventually
@@ -142,6 +152,186 @@ impl Play {
     pub fn is_skip(&self) -> bool {
         self.duration
             .is_some_and(|total| (self.listened as f64) < total as f64 * SKIP_FRACTION)
+    }
+}
+
+/// One playback report waiting to be accepted by YouTube.
+///
+/// `cpn` is the client playback nonce. Persisting it with the report means a
+/// retry after a crash identifies itself as the same playback rather than a
+/// second listen.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingReport {
+    pub video_id: String,
+    pub listened: u64,
+    pub at: u64,
+    pub cpn: String,
+}
+
+impl PendingReport {
+    fn new(play: &Play) -> Self {
+        Self {
+            video_id: play.id.clone(),
+            listened: play.listened,
+            at: play.at,
+            cpn: super::stats::nonce(),
+        }
+    }
+}
+
+/// An append-only outbox event. Acknowledgements are events rather than
+/// in-place edits so a process killed during delivery cannot corrupt the queue.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+enum ReportEvent {
+    Pending {
+        #[serde(flatten)]
+        report: PendingReport,
+    },
+    Sent {
+        cpn: String,
+    },
+}
+
+/// Playback reports which still need an authenticated upstream delivery.
+pub struct ReportQueue {
+    path: Option<PathBuf>,
+    pending: VecDeque<PendingReport>,
+}
+
+impl ReportQueue {
+    /// Loads and folds the append-only event log into its pending reports.
+    ///
+    /// Infallible for the same reason as [`Journal::load`]: a broken outbox
+    /// must not stop playback. Failures are diagnosed and new reports remain
+    /// usable in memory for this process.
+    pub fn load() -> Self {
+        let Ok(path) = crate::config::dir().map(|dir| dir.join(REPORT_FILE)) else {
+            return Self {
+                path: None,
+                pending: VecDeque::new(),
+            };
+        };
+        Self::load_path(path)
+    }
+
+    fn load_path(path: PathBuf) -> Self {
+        let mut pending: VecDeque<PendingReport> = VecDeque::new();
+        let mut events = 0;
+        if let Ok(file) = fs::File::open(&path) {
+            for line in BufReader::new(file).lines().map_while(Result::ok) {
+                let Ok(event) = serde_json::from_str::<ReportEvent>(&line) else {
+                    continue;
+                };
+                events += 1;
+                match event {
+                    ReportEvent::Pending { report } => {
+                        if !pending.iter().any(|held| held.cpn == report.cpn) {
+                            pending.push_back(report);
+                        }
+                    }
+                    ReportEvent::Sent { cpn } => pending.retain(|held| held.cpn != cpn),
+                }
+            }
+        }
+
+        let queue = Self {
+            path: Some(path),
+            pending,
+        };
+        if events > REPORT_COMPACT_AT {
+            queue.compact();
+        }
+        queue
+    }
+
+    /// Durably queues a meaningful play before any network request is made.
+    /// Returns false for a glance which YouTube would not report anyway.
+    pub fn enqueue(&mut self, play: &Play) -> bool {
+        if play.listened < super::stats::MIN_REPORTABLE.as_secs() {
+            return false;
+        }
+
+        let report = PendingReport::new(play);
+        if let Some(path) = &self.path
+            && let Err(error) = append_report(
+                path,
+                &ReportEvent::Pending {
+                    report: report.clone(),
+                },
+            )
+        {
+            crate::diagnostics::error(
+                "history",
+                &format!("could not persist a playback report for retry: {error}"),
+            );
+        }
+        self.pending.push_back(report);
+        true
+    }
+
+    pub fn front(&self) -> Option<&PendingReport> {
+        self.pending.front()
+    }
+
+    /// Records successful delivery before removing it from memory. A failed
+    /// acknowledgement leaves the item pending so a later attempt can recover.
+    pub fn acknowledge_front(&mut self) -> bool {
+        let Some(report) = self.pending.front() else {
+            return true;
+        };
+        if let Some(path) = &self.path
+            && let Err(error) = append_report(
+                path,
+                &ReportEvent::Sent {
+                    cpn: report.cpn.clone(),
+                },
+            )
+        {
+            crate::diagnostics::error(
+                "history",
+                &format!("could not acknowledge a delivered playback report: {error}"),
+            );
+            return false;
+        }
+        self.pending.pop_front();
+        true
+    }
+
+    /// Drops both durable and in-memory work on explicit account logout.
+    pub fn clear(&mut self) {
+        self.pending.clear();
+        let Some(path) = &self.path else {
+            return;
+        };
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => crate::diagnostics::error(
+                "history",
+                &format!("could not clear pending playback reports: {error}"),
+            ),
+        }
+    }
+
+    fn compact(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let temp = path.with_extension("part");
+        let mut body = String::new();
+        for report in &self.pending {
+            let event = ReportEvent::Pending {
+                report: report.clone(),
+            };
+            if let Ok(line) = serde_json::to_string(&event) {
+                body.push_str(&line);
+                body.push('\n');
+            }
+        }
+        if fs::write(&temp, body).is_ok() && fs::rename(&temp, path).is_err() {
+            let _ = fs::remove_file(&temp);
+        }
     }
 }
 
@@ -522,6 +712,33 @@ fn append(path: &std::path::Path, play: &Play) {
     }
 }
 
+fn append_report(path: &std::path::Path, event: &ReportEvent) -> std::io::Result<()> {
+    let mut line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+    line.push('\n');
+
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(line.as_bytes())
+}
+
+/// Clears reports which have not yet been attributed to an account.
+///
+/// Called only by explicit logout. A stale-session refresh deliberately keeps
+/// the outbox because it signs the same user back in; logout may be followed by
+/// a different account, which must never inherit the first account's listens.
+pub fn forget_pending_reports() -> std::io::Result<()> {
+    let path = crate::config::dir()
+        .map_err(std::io::Error::other)?
+        .join(REPORT_FILE);
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Records one play with no [`Journal`] in hand.
 ///
 /// For the single caller that has none: the UI thread on the way out. The
@@ -534,9 +751,9 @@ fn append(path: &std::path::Path, play: &Play) {
 /// does: append one line. It deliberately does *not* compact, which is the only
 /// operation that rewrites the file and the only one two writers could tear.
 ///
-/// No upstream report goes with it. That is two round trips, and holding a quit
-/// open for them would trade something the user asked for against something
-/// they did not.
+/// The upstream report is queued beside it. Delivery remains asynchronous on
+/// the next launch, so quitting never waits on two network round trips and the
+/// last track of a session is no longer silently local-only.
 pub fn record_final(track: &Track, listened: Duration) {
     let play = Play::new(track, listened);
     if play.listened < NOISE {
@@ -546,6 +763,17 @@ pub fn record_final(track: &Track, listened: Duration) {
         return;
     };
     append(&path, &play);
+
+    if play.listened >= super::stats::MIN_REPORTABLE.as_secs() {
+        let report = PendingReport::new(&play);
+        let report_path = path.with_file_name(REPORT_FILE);
+        if let Err(error) = append_report(&report_path, &ReportEvent::Pending { report }) {
+            crate::diagnostics::error(
+                "history",
+                &format!("could not queue the final playback report: {error}"),
+            );
+        }
+    }
 }
 
 /// What a track is worth on the landing page.
@@ -931,6 +1159,53 @@ mod tests {
 
         assert!(journal.record(play("a", "A", 60, 0)));
         assert_eq!(journal.plays.len(), 1);
+    }
+
+    #[test]
+    fn playback_outbox_survives_restart_until_acknowledged() {
+        let path = std::env::temp_dir().join(format!(
+            "mtui-report-{}-{}.jsonl",
+            std::process::id(),
+            super::super::stats::nonce()
+        ));
+        let mut reports = ReportQueue {
+            path: Some(path.clone()),
+            pending: VecDeque::new(),
+        };
+
+        assert!(!reports.enqueue(&play("glance", "A", 29, 1)));
+        assert!(!path.exists(), "a glance created an upstream report");
+        assert!(reports.enqueue(&play("heard", "A", 120, 2)));
+        let original = reports.front().cloned().unwrap();
+        drop(reports);
+
+        let mut reloaded = ReportQueue::load_path(path.clone());
+        assert_eq!(reloaded.front(), Some(&original));
+        assert!(reloaded.acknowledge_front());
+        drop(reloaded);
+
+        let delivered = ReportQueue::load_path(path.clone());
+        assert!(delivered.front().is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn explicit_logout_clears_durable_and_in_memory_reports() {
+        let path = std::env::temp_dir().join(format!(
+            "mtui-report-clear-{}-{}.jsonl",
+            std::process::id(),
+            super::super::stats::nonce()
+        ));
+        let mut reports = ReportQueue {
+            path: Some(path.clone()),
+            pending: VecDeque::new(),
+        };
+        assert!(reports.enqueue(&play("heard", "A", 120, 2)));
+        assert!(path.exists());
+
+        reports.clear();
+        assert!(reports.front().is_none());
+        assert!(!path.exists());
     }
 
     #[test]
