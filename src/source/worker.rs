@@ -45,7 +45,7 @@ use super::innertube::InnerTube;
 use super::journal::{Journal, Play, ReportQueue};
 use super::{ArtistRef, BrowseEndpoint, StreamUrl, Track};
 use super::{lrclib, stats, watch};
-use crate::config::{Cookies, Import};
+use crate::config::Cookies;
 use crate::source::youtube::YouTube;
 use mtui_resolver::{PlaybackSession, ResolveRequest, Resolver};
 
@@ -934,20 +934,11 @@ fn retry_reports(http: &Http, reports: &mut ReportQueue) {
                     return;
                 }
             }
-            Err(error) => {
-                let reason = format!("{error:#}");
-                let stale = reason.contains(stats::STALE);
+            Err(_) => {
                 crate::diagnostics::error(
                     "history",
-                    if stale {
-                        "playback report retained: the YouTube Music session is stale"
-                    } else {
-                        "playback report retained: YouTube tracking is unavailable"
-                    },
+                    "playback report retained: YouTube tracking is unavailable",
                 );
-                if stale {
-                    let _ = Import::forget();
-                }
                 return;
             }
         }
