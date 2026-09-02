@@ -249,7 +249,6 @@ pub fn fetch(http: &Http, cookies: Option<&Cookies>) -> Result<(Vec<Shelf>, bool
     Ok((fetch_public(http)?, false))
 }
 
-#[cfg(test)]
 pub fn fetch_public(http: &Http) -> Result<Vec<Shelf>> {
     let shelves = parse_shelves(&browse(http, None, HOME_ID)?);
     if shelves.is_empty() {
