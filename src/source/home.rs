@@ -58,6 +58,10 @@ const HOME_ID: &str = "FEmusic_home";
 /// The public regional charts page, used only to supply the song shelf that the
 /// anonymous Home response no longer includes.
 const CHARTS_ID: &str = "FEmusic_charts";
+/// YouTube Music's anonymous new-releases page. The public response currently
+/// exposes its video carousel; albums and singles are not currently exposed to
+/// anonymous clients.
+const NEW_RELEASES_ID: &str = "FEmusic_new_releases";
 
 /// Home is startup work. A dead endpoint must yield to the anonymous fallback
 /// promptly.
@@ -68,6 +72,9 @@ const HOME_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CARDS: usize = 24;
 /// Enough chart depth to scroll without retaining all twenty regional entries.
 const TRENDING_DEPTH: usize = 12;
+/// One screenful plus a little scrolling, without retaining the endpoint's
+/// complete release carousel.
+const NEW_MUSIC_DEPTH: usize = 12;
 
 /// Ceiling on the rows taken from an opened playlist or album, matching the
 /// library's own limit on the same thing.
@@ -259,17 +266,41 @@ pub fn fetch_public(http: &Http) -> Result<Vec<Shelf>> {
         bail!("YouTube Music returned no home feed");
     }
 
-    // YouTube's anonymous Home currently offers only playlist carousels. The
-    // public Charts page still carries a regional, playable Trending list, so
-    // add that one missing music shelf without changing the two Home gave us.
-    // Each response is parsed into owned cards before the next request starts,
-    // keeping only one JSON tree alive at a time.
+    // YouTube's anonymous Home currently offers only playlist carousels. Its
+    // public new-releases page still carries a playable music-video carousel,
+    // and Charts carries a regional Trending list, so restore those two music
+    // shelves without changing the Home carousels themselves. Each response is
+    // parsed into owned cards before the next request starts, keeping only one
+    // JSON tree alive at a time.
+    if !shelves.iter().any(|shelf| is_new_music(&shelf.title))
+        && let Some(new_music) = fetch_new_music(http)
+    {
+        shelves.insert(0, new_music);
+    }
     if !shelves.iter().any(|shelf| is_trending_songs(&shelf.title))
         && let Some(trending) = fetch_trending(http)
     {
         shelves.insert(0, trending);
     }
     Ok(shelves)
+}
+
+fn fetch_new_music(http: &Http) -> Option<Shelf> {
+    let json = browse(http, None, NEW_RELEASES_ID).ok()?;
+    new_music_shelf(&json)
+}
+
+fn new_music_shelf(json: &Value) -> Option<Shelf> {
+    let mut shelf = parse_shelves(json)
+        .into_iter()
+        .find(|shelf| is_new_music(&shelf.title))?;
+    shelf.title = "New music videos".to_string();
+    shelf.cards.truncate(NEW_MUSIC_DEPTH);
+    Some(shelf)
+}
+
+fn is_new_music(title: &str) -> bool {
+    title.to_ascii_lowercase().contains("music video")
 }
 
 fn fetch_trending(http: &Http) -> Option<Shelf> {
@@ -1502,6 +1533,29 @@ mod tests {
     }
 
     #[test]
+    fn new_music_video_cards_are_playable_and_bounded() {
+        let cards: Vec<Value> = (0..NEW_MUSIC_DEPTH + 4)
+            .map(|index| {
+                card(
+                    &format!("Video {index}"),
+                    "Video • Artist",
+                    serde_json::json!({
+                        "watchEndpoint": { "videoId": format!("{index:011}") }
+                    }),
+                )
+            })
+            .collect();
+        let json = shelf("Music videos", cards);
+
+        let shelf =
+            new_music_shelf(&json).expect("the public release carousel should make a shelf");
+
+        assert_eq!(shelf.title, "New music videos");
+        assert_eq!(shelf.cards.len(), NEW_MUSIC_DEPTH);
+        assert!(shelf.cards.iter().all(Card::is_playable));
+    }
+
+    #[test]
     fn primary_home_sections_have_one_stable_order() {
         let make = |title: &str| Shelf {
             title: title.to_string(),
@@ -2005,6 +2059,13 @@ mod tests {
             .expect("signed-out Home should carry the regional Trending chart");
         assert!(trending.cards.len() <= TRENDING_DEPTH);
         assert!(trending.cards.iter().all(Card::is_playable));
+
+        let new_music = shelves
+            .iter()
+            .find(|shelf| shelf.title == "New music videos")
+            .expect("signed-out Home should carry the public new music videos");
+        assert!(new_music.cards.len() <= NEW_MUSIC_DEPTH);
+        assert!(new_music.cards.iter().all(Card::is_playable));
     }
 }
 
