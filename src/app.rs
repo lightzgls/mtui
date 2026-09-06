@@ -15,7 +15,7 @@ use crate::art::ArtCache;
 use crate::config::{self, CoverStyle, IconTheme, ImageRenderer};
 use crate::discord::{Activity, Clock, Presence};
 use crate::graphics::Graphics;
-use crate::player::{Command, PlayState, Player, PlayerEvent, Snapshot};
+use crate::player::{Command, OutputDevice, PlayState, Player, PlayerEvent, Snapshot};
 use crate::source::artist::{ArtistPage, ArtistSong};
 use crate::source::cover::Cover;
 use crate::source::home::{Card, Shelf, Target};
@@ -134,7 +134,7 @@ const VOLUME_STEP: f32 = 0.05;
 /// Exact pages retained for Back. A cap keeps nested artist browsing bounded
 /// even when someone walks through a long chain of related artists.
 const PAGE_HISTORY: usize = 12;
-const SETTINGS_ITEMS: usize = 5;
+const SETTINGS_ITEMS: usize = 6;
 
 /// Tracks the queue may skip past in a row before it gives up.
 ///
@@ -957,6 +957,10 @@ pub struct App {
     pub cover_style: CoverStyle,
     /// User-selected terminal bitmap backend.
     pub image_renderer: ImageRenderer,
+    /// Outputs currently advertised by the operating system.
+    output_devices: Vec<OutputDevice>,
+    /// Stable id of the selected output, or `None` to follow the system default.
+    output_device: Option<String>,
     /// Where the renderer wants the cover painted as real pixels, set on every
     /// frame the terminal-image path runs. `None` on the half-block path, which
     /// needs no help from the event loop.
@@ -1223,6 +1227,17 @@ impl App {
         graphics: Graphics,
         settings: config::Settings,
     ) -> Self {
+        let output_devices = match crate::player::available_output_devices() {
+            Ok(devices) => devices,
+            Err(error) => {
+                crate::diagnostics::warn(
+                    "player",
+                    &format!("could not list audio outputs: {error:#}"),
+                );
+                Vec::new()
+            }
+        };
+        let output_device = settings.output_device.clone();
         let mut app = Self {
             // Browse, not Editing: the program now opens on a page there is
             // something to do with, and the keys that move around it are bare
@@ -1245,6 +1260,8 @@ impl App {
             cover_size: CoverSize::default(),
             cover_style: settings.cover_style,
             image_renderer: settings.image_renderer,
+            output_devices,
+            output_device,
             images: Vec::new(),
             painted: Vec::new(),
             painted_with_kitty: false,
@@ -1508,6 +1525,21 @@ impl App {
 
     pub fn image_renderer(&self) -> ImageRenderer {
         self.image_renderer
+    }
+
+    pub fn output_device_id(&self) -> Option<&str> {
+        self.output_device.as_deref()
+    }
+
+    pub fn output_device_label(&self) -> &str {
+        let Some(id) = self.output_device.as_deref() else {
+            return "System default";
+        };
+        self.output_devices
+            .iter()
+            .find(|output| output.id == id)
+            .map(|output| output.name.as_str())
+            .unwrap_or("Unavailable output")
     }
 
     /// Kitty is used automatically when detected, or explicitly when a
@@ -1869,6 +1901,29 @@ impl App {
         while let Some(event) = self.player.poll_event() {
             match event {
                 PlayerEvent::NeedsUrl { id, from } => self.resume_track(id, from),
+                PlayerEvent::OutputChanged { id, name } => {
+                    self.output_device = id;
+                    self.refresh_output_devices();
+                    let settings = config::Settings {
+                        start_in_tray: self.start_in_tray,
+                        icon_theme: self.icon_theme,
+                        cover_style: self.cover_style,
+                        image_renderer: self.image_renderer,
+                        volume: self.snapshot().volume,
+                        output_device: self.output_device.clone(),
+                    };
+                    self.status = match settings.save() {
+                        Ok(()) => format!("audio output set to {name}"),
+                        Err(error) => {
+                            crate::diagnostics::error(
+                                "config",
+                                &format!("could not save audio output: {error:#}"),
+                            );
+                            format!("audio output changed, but could not be saved: {error:#}")
+                        }
+                    };
+                }
+                PlayerEvent::OutputChangeFailed { why } => self.status = why,
             }
         }
     }
@@ -2834,6 +2889,8 @@ impl App {
             icon_theme: self.icon_theme,
             cover_style: self.cover_style,
             image_renderer: self.image_renderer,
+            volume: self.snapshot().volume,
+            output_device: self.output_device.clone(),
         };
         match settings.save() {
             Ok(()) => {
@@ -2862,6 +2919,8 @@ impl App {
             icon_theme: theme,
             cover_style: self.cover_style,
             image_renderer: self.image_renderer,
+            volume: self.snapshot().volume,
+            output_device: self.output_device.clone(),
         };
         match settings.save() {
             Ok(()) => {
@@ -2886,6 +2945,8 @@ impl App {
             icon_theme: self.icon_theme,
             cover_style: style,
             image_renderer: self.image_renderer,
+            volume: self.snapshot().volume,
+            output_device: self.output_device.clone(),
         };
         match settings.save() {
             Ok(()) => {
@@ -2911,6 +2972,8 @@ impl App {
             icon_theme: self.icon_theme,
             cover_style: self.cover_style,
             image_renderer: renderer,
+            volume: self.snapshot().volume,
+            output_device: self.output_device.clone(),
         };
         match settings.save() {
             Ok(()) => {
@@ -2922,6 +2985,35 @@ impl App {
                 crate::diagnostics::error("config", &format!("could not save settings: {err:#}"));
                 self.status = format!("could not save settings: {err:#}");
             }
+        }
+    }
+
+    fn refresh_output_devices(&mut self) {
+        match crate::player::available_output_devices() {
+            Ok(devices) => self.output_devices = devices,
+            Err(error) => crate::diagnostics::warn(
+                "player",
+                &format!("could not refresh audio outputs: {error:#}"),
+            ),
+        }
+    }
+
+    fn cycle_audio_output(&mut self, forward: bool) {
+        self.refresh_output_devices();
+        let next = next_output_device(self.output_device.as_deref(), &self.output_devices, forward);
+        if next.as_deref() == self.output_device.as_deref() {
+            self.status = "no other audio outputs are available".to_string();
+            return;
+        }
+        let label = next
+            .as_deref()
+            .and_then(|id| self.output_devices.iter().find(|output| output.id == id))
+            .map(|output| output.name.as_str())
+            .unwrap_or("System default")
+            .to_string();
+        match self.player.send(Command::SetOutput(next)) {
+            Ok(()) => self.status = format!("switching audio output to {label} ..."),
+            Err(error) => self.status = format!("could not switch audio output: {error:#}"),
         }
     }
 
@@ -3427,6 +3519,7 @@ impl App {
             return;
         }
         self.menu = None;
+        self.refresh_output_devices();
         self.settings_selected = 0;
         self.overlay = Overlay::Settings;
     }
@@ -3575,27 +3668,34 @@ impl App {
                 KeyCode::Char(' ') | KeyCode::Enter => match self.settings_selected() {
                     0 => self.toggle_start_in_tray(),
                     1 => self.toggle_presence(),
-                    2 => self.cycle_image_renderer(true),
-                    3 => self.cycle_cover_style(true),
-                    4 => self.cycle_icon_theme(true),
+                    2 => self.cycle_audio_output(true),
+                    3 => self.cycle_image_renderer(true),
+                    4 => self.cycle_cover_style(true),
+                    5 => self.cycle_icon_theme(true),
                     _ => {}
                 },
                 KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 2 => {
-                    self.cycle_image_renderer(false);
+                    self.cycle_audio_output(false);
                 }
                 KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 2 => {
-                    self.cycle_image_renderer(true);
+                    self.cycle_audio_output(true);
                 }
                 KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 3 => {
-                    self.cycle_cover_style(false);
+                    self.cycle_image_renderer(false);
                 }
                 KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 3 => {
-                    self.cycle_cover_style(true);
+                    self.cycle_image_renderer(true);
                 }
                 KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 4 => {
-                    self.cycle_icon_theme(false);
+                    self.cycle_cover_style(false);
                 }
                 KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 4 => {
+                    self.cycle_cover_style(true);
+                }
+                KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 5 => {
+                    self.cycle_icon_theme(false);
+                }
+                KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 5 => {
                     self.cycle_icon_theme(true);
                 }
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => {
@@ -4385,8 +4485,28 @@ impl App {
 
     fn nudge_volume(&mut self, delta: f32) {
         let volume = (self.snapshot().volume + delta).clamp(0.0, 2.0);
-        let _ = self.player.send(Command::SetVolume(volume));
-        self.status = format!("volume {:.0}%", volume * 100.0);
+        if let Err(error) = self.player.send(Command::SetVolume(volume)) {
+            self.status = format!("could not change volume: {error:#}");
+            return;
+        }
+        let settings = config::Settings {
+            start_in_tray: self.start_in_tray,
+            icon_theme: self.icon_theme,
+            cover_style: self.cover_style,
+            image_renderer: self.image_renderer,
+            volume,
+            output_device: self.output_device.clone(),
+        };
+        self.status = match settings.save() {
+            Ok(()) => format!("volume {:.0}%", volume * 100.0),
+            Err(error) => {
+                crate::diagnostics::error("config", &format!("could not save volume: {error:#}"));
+                format!(
+                    "volume {:.0}%; could not save it: {error:#}",
+                    volume * 100.0
+                )
+            }
+        };
     }
 
     /// Seeks relative to the current position, clamped at zero.
@@ -4406,6 +4526,25 @@ impl App {
         };
         let _ = self.player.send(Command::Seek(target));
     }
+}
+
+fn next_output_device(
+    current: Option<&str>,
+    outputs: &[OutputDevice],
+    forward: bool,
+) -> Option<String> {
+    let choices = outputs.len() + 1;
+    let current = current
+        .and_then(|id| outputs.iter().position(|output| output.id == id))
+        .map_or(0, |index| index + 1);
+    let next = if forward {
+        (current + 1) % choices
+    } else {
+        (current + choices - 1) % choices
+    };
+    next.checked_sub(1)
+        .and_then(|index| outputs.get(index))
+        .map(|output| output.id.clone())
 }
 
 fn account_menu_items(connected: bool, signing_in: bool) -> Vec<MenuItem> {
@@ -4919,6 +5058,39 @@ mod tests {
         now.playing = None;
 
         assert_eq!(now.remaining(), 0);
+    }
+
+    #[test]
+    fn audio_outputs_cycle_through_the_system_default() {
+        let outputs = vec![
+            OutputDevice {
+                id: "speakers".to_string(),
+                name: "Speakers".to_string(),
+            },
+            OutputDevice {
+                id: "headphones".to_string(),
+                name: "Headphones".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            next_output_device(None, &outputs, true).as_deref(),
+            Some("speakers")
+        );
+        assert_eq!(
+            next_output_device(Some("speakers"), &outputs, true).as_deref(),
+            Some("headphones")
+        );
+        assert_eq!(next_output_device(Some("headphones"), &outputs, true), None);
+        assert_eq!(
+            next_output_device(None, &outputs, false).as_deref(),
+            Some("headphones")
+        );
+        // A disconnected saved device starts cycling from the usable default.
+        assert_eq!(
+            next_output_device(Some("missing"), &outputs, true).as_deref(),
+            Some("speakers")
+        );
     }
 
     /// A continuation that carried the queue forward is trusted about where the

@@ -244,7 +244,7 @@ sign-in profile without stopping current playback.
 | `c` | Change cover-art size |
 | `M` | Import or refresh the personalized Home session |
 | `D` | Toggle Discord Rich Presence directly |
-| `S` or `Ctrl-S` | Open settings for tray, song cover, app icon, and Discord presence |
+| `S` or `Ctrl-S` | Open settings for audio output, tray, song cover, app icon, and Discord presence |
 | `B` | Continue in the Windows notification area |
 | `q` or `Ctrl-C` | Quit |
 

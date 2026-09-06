@@ -110,7 +110,7 @@ const HINTS_PLAYING: &str = "Tab panels  Esc back  ^K menu  . actions";
 const MENU_MAX_WIDTH: u16 = 56;
 const MENU_MAX_HEIGHT: u16 = 24;
 const SETTINGS_WIDTH: u16 = 56;
-const SETTINGS_HEIGHT: u16 = 19;
+const SETTINGS_HEIGHT: u16 = 22;
 
 /// Floor on the sign-in panel's width. Wide enough that the footer hint reads
 /// as one line, whatever the URL beside it happens to measure.
@@ -694,9 +694,18 @@ fn render_settings(frame: &mut Frame, app: &App) {
         muted_detail("Shares the current track and playback state.", width),
         Line::from(""),
         choice_line(
+            "Audio output",
+            app.output_device_label(),
+            app.settings_selected() == 2,
+            width,
+            ambient(app),
+        ),
+        muted_detail("System default follows changes made in the OS.", width),
+        Line::from(""),
+        choice_line(
             "Image renderer",
             app.image_renderer().label(),
-            app.settings_selected() == 2,
+            app.settings_selected() == 3,
             width,
             ambient(app),
         ),
@@ -708,7 +717,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
         choice_line(
             "Song cover",
             app.cover_style().label(),
-            app.settings_selected() == 3,
+            app.settings_selected() == 4,
             width,
             ambient(app),
         ),
@@ -717,7 +726,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
         choice_line(
             "App icon",
             app.icon_theme().label(),
-            app.settings_selected() == 4,
+            app.settings_selected() == 5,
             width,
             ambient(app),
         ),
@@ -6356,6 +6365,16 @@ mod tests {
         let cover = choice_line("Song cover", "Colored ASCII", true, 40, Color::Magenta);
         assert!(line_text(&cover).contains("Song cover: < Colored ASCII >"));
         assert_eq!(cover.spans[0].style.bg, Some(Color::Magenta));
+
+        let output = choice_line(
+            "Audio output",
+            "Living room speakers",
+            true,
+            36,
+            Color::Blue,
+        );
+        assert!(line_text(&output).contains("Audio output: < Living room"));
+        assert_eq!(display_width(&line_text(&output)), 36);
 
         let footer = settings_footer(54);
         assert!(footer.contains("↑↓"));

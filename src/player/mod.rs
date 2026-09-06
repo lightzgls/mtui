@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use mtui_resolver::AudioFormat;
 use rodio::Source;
+use rodio::cpal::traits::{DeviceTrait, HostTrait};
 
 use chunked::{StreamFault, StreamLink};
 
@@ -94,6 +95,8 @@ pub enum Command {
     Seek(Duration),
     /// Clamped to 0.0..=2.0 by the player thread.
     SetVolume(f32),
+    /// `None` follows the operating-system default; `Some` names a CPAL device id.
+    SetOutput(Option<String>),
     Shutdown,
 }
 
@@ -116,6 +119,35 @@ pub enum PlayerEvent {
     /// whole cascade, cap check included -- a cheaper answer can hand back a URL
     /// with the same ceiling as the one being recovered from.
     NeedsUrl { id: String, from: Duration },
+    /// A requested speaker change was committed and is safe to persist.
+    OutputChanged { id: Option<String>, name: String },
+    /// The old speaker is still active because the requested one could not open.
+    OutputChangeFailed { why: String },
+}
+
+/// A selectable audio output exposed to the settings UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputDevice {
+    pub id: String,
+    pub name: String,
+}
+
+/// Lists the output devices currently advertised by the operating system.
+pub fn available_output_devices() -> Result<Vec<OutputDevice>> {
+    let host = rodio::cpal::default_host();
+    let devices = host
+        .output_devices()
+        .context("could not list audio output devices")?;
+    let mut outputs = devices
+        .filter_map(|device| {
+            let id = device.id().ok()?.to_string();
+            let name = device.description().ok()?.name().to_string();
+            Some(OutputDevice { id, name })
+        })
+        .collect::<Vec<_>>();
+    outputs.sort_by_cached_key(|output| output.name.to_lowercase());
+    outputs.dedup_by(|left, right| left.id == right.id);
+    Ok(outputs)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -151,18 +183,27 @@ pub struct Player {
 
 impl Player {
     /// Spawns the player thread and its private tokio runtime.
-    pub fn spawn() -> Result<Self> {
+    pub fn spawn(initial_volume: f32, output_device: Option<String>) -> Result<Self> {
         let (tx, rx) = channel();
         let (events_tx, events) = channel();
+        let initial_volume = normalized_volume(initial_volume);
         let snapshot = Arc::new(Mutex::new(Snapshot {
-            volume: 1.0,
+            volume: initial_volume,
             ..Default::default()
         }));
 
         let thread_snapshot = Arc::clone(&snapshot);
         let handle = thread::Builder::new()
             .name("mtui-player".to_string())
-            .spawn(move || run(rx, events_tx, thread_snapshot))
+            .spawn(move || {
+                run(
+                    rx,
+                    events_tx,
+                    thread_snapshot,
+                    initial_volume,
+                    output_device,
+                )
+            })
             .context("failed to spawn player thread")?;
 
         Ok(Self {
@@ -366,7 +407,13 @@ fn clock(d: Duration) -> String {
 }
 
 /// Player thread body. Owns the output device, the decoder, and the runtime.
-fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<Snapshot>>) {
+fn run(
+    rx: Receiver<Command>,
+    events: Sender<PlayerEvent>,
+    snapshot: Arc<Mutex<Snapshot>>,
+    initial_volume: f32,
+    output_device: Option<String>,
+) {
     // One worker thread, dedicated to stream-download's downloader task.
     //
     // This must be a multi-thread runtime even though there is only ever one
@@ -388,17 +435,38 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
 
     // Opening the device can fail on a machine with no audio output at all.
     // Report it and idle rather than killing the app.
-    let mut device = match rodio::DeviceSinkBuilder::open_default_sink() {
-        Ok(d) => d,
+    let mut device = match open_output(output_device.as_deref()) {
+        Ok((device, _)) => device,
+        Err(selected_error) if output_device.is_some() => {
+            crate::diagnostics::warn(
+                "player",
+                &format!("saved audio output is unavailable: {selected_error:#}"),
+            );
+            update(&snapshot, |s| {
+                s.error = Some("saved audio output unavailable; using system default".to_string());
+            });
+            match open_output(None) {
+                Ok((device, _)) => device,
+                Err(default_error) => {
+                    set_error(
+                        &snapshot,
+                        format!("no audio output device: {default_error:#}"),
+                    );
+                    return;
+                }
+            }
+        }
         Err(e) => {
-            set_error(&snapshot, format!("no audio output device: {e}"));
+            set_error(&snapshot, format!("no audio output device: {e:#}"));
             return;
         }
     };
     // rodio otherwise prints a notice to stderr when the sink drops, which
     // would scribble over the alternate screen on exit.
     device.log_on_drop(false);
-    let player = rodio::Player::connect_new(device.mixer());
+    let mut player = rodio::Player::connect_new(device.mixer());
+    let mut volume = initial_volume;
+    player.set_volume(volume);
 
     // Wake at least every TICK even with no commands pending, so the published
     // position stays live and end-of-track is noticed. A purely command-driven
@@ -639,9 +707,29 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
                     }
                 }
                 Command::SetVolume(v) => {
-                    let v = v.clamp(0.0, 2.0);
-                    player.set_volume(v);
-                    update(&snapshot, |s| s.volume = v);
+                    volume = normalized_volume(v);
+                    player.set_volume(volume);
+                    update(&snapshot, |s| s.volume = volume);
+                }
+                Command::SetOutput(id) => {
+                    match switch_output(
+                        &runtime,
+                        &mut device,
+                        &mut player,
+                        &mut track,
+                        state,
+                        volume,
+                        id.as_deref(),
+                    ) {
+                        Ok(name) => {
+                            let _ = events.send(PlayerEvent::OutputChanged { id, name });
+                        }
+                        Err(error) => {
+                            let why = format!("could not switch audio output: {error:#}");
+                            crate::diagnostics::warn("player", &why);
+                            let _ = events.send(PlayerEvent::OutputChangeFailed { why });
+                        }
+                    }
                 }
                 Command::Shutdown => break,
             }
@@ -747,6 +835,98 @@ fn run(rx: Receiver<Command>, events: Sender<PlayerEvent>, snapshot: Arc<Mutex<S
     }
 
     player.stop();
+}
+
+fn normalized_volume(volume: f32) -> f32 {
+    if volume.is_finite() {
+        volume.clamp(0.0, 2.0)
+    } else {
+        1.0
+    }
+}
+
+/// Opens the named device without disturbing the current one.
+fn open_output(id: Option<&str>) -> Result<(rodio::MixerDeviceSink, String)> {
+    let (mut sink, name) = match id {
+        Some(id) => {
+            let id = id
+                .parse::<rodio::cpal::DeviceId>()
+                .with_context(|| format!("invalid audio output id `{id}`"))?;
+            let host = rodio::cpal::default_host();
+            let device = host
+                .device_by_id(&id)
+                .with_context(|| format!("audio output `{id}` is not connected"))?;
+            let name = device
+                .description()
+                .map(|description| description.name().to_string())
+                .unwrap_or_else(|_| "Selected output".to_string());
+            let sink = rodio::DeviceSinkBuilder::from_device(device)
+                .context("could not read the audio output configuration")?
+                .open_sink_or_fallback()
+                .context("could not open the selected audio output")?;
+            (sink, name)
+        }
+        None => (
+            rodio::DeviceSinkBuilder::open_default_sink()
+                .context("could not open the system audio output")?,
+            "System default".to_string(),
+        ),
+    };
+    // Rodio otherwise prints a notice over the alternate screen when a sink is
+    // replaced or dropped on exit.
+    sink.log_on_drop(false);
+    Ok((sink, name))
+}
+
+/// Commits a new output only after both its sink and the current track reopen.
+fn switch_output(
+    runtime: &tokio::runtime::Runtime,
+    device: &mut rodio::MixerDeviceSink,
+    player: &mut rodio::Player,
+    track: &mut Option<Track>,
+    state: PlayState,
+    volume: f32,
+    id: Option<&str>,
+) -> Result<String> {
+    let (next_device, name) = open_output(id)?;
+    let next_player = rodio::Player::connect_new(next_device.mixer());
+    next_player.set_volume(volume);
+
+    if matches!(state, PlayState::Playing | PlayState::Paused) {
+        let url = track
+            .as_ref()
+            .context("the playing track has no stream to move")?
+            .url
+            .clone();
+        // Leave the current device audible while the replacement stream opens.
+        let (decoder, total, link) = open_stream(runtime, &url)?;
+        let from = track
+            .as_ref()
+            .map(|cur| cur.offset + player.get_pos())
+            .unwrap_or_default();
+
+        if let Some(cur) = track.as_mut() {
+            cur.link.decline();
+            cur.link = link;
+            if total.is_some() {
+                cur.total = total;
+            }
+            cur.offset = from;
+            cur.position = from;
+            cur.seeking_to = None;
+        }
+        player.stop();
+        play_source(&next_player, decoder, from);
+        if state == PlayState::Paused {
+            next_player.pause();
+        }
+    } else {
+        player.stop();
+    }
+
+    *player = next_player;
+    *device = next_device;
+    Ok(name)
 }
 
 /// Whether byte offsets in two resolved URLs name the same media bytes.
@@ -1319,6 +1499,12 @@ mod tests {
         assert!(!drain(&rx, &mut queued));
         assert_eq!(queued.len(), 1);
 
+        // Moving the same track to another speaker is likewise applied after
+        // the open; it does not make the chosen track stale.
+        tx.send(Command::SetOutput(None)).unwrap();
+        assert!(!drain(&rx, &mut queued));
+        assert_eq!(queued.len(), 2);
+
         // The user chose something else while this was opening.
         tx.send(Command::Load {
             title: "another".into(),
@@ -1327,9 +1513,18 @@ mod tests {
         assert!(drain(&rx, &mut queued));
         // Everything drained is kept in order: the commands still have to run,
         // it is only the stream in hand that is thrown away.
-        assert_eq!(queued.len(), 2);
+        assert_eq!(queued.len(), 3);
         assert!(matches!(queued[0], Command::SetVolume(_)));
-        assert!(matches!(queued[1], Command::Load { .. }));
+        assert!(matches!(queued[1], Command::SetOutput(None)));
+        assert!(matches!(queued[2], Command::Load { .. }));
+    }
+
+    #[test]
+    fn volume_initialization_rejects_invalid_gain() {
+        assert_eq!(normalized_volume(-0.5), 0.0);
+        assert_eq!(normalized_volume(0.8), 0.8);
+        assert_eq!(normalized_volume(3.0), 2.0);
+        assert_eq!(normalized_volume(f32::INFINITY), 1.0);
     }
 
     #[test]
