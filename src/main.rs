@@ -78,8 +78,8 @@ const IDLE_TICK: Duration = Duration::from_millis(500);
 
 fn main() -> Result<()> {
     #[cfg(windows)]
-    if let Some(force) = session::helper_request() {
-        return session::run_helper(force);
+    if let Some(recover) = session::helper_request() {
+        return session::run_helper(recover);
     }
     #[cfg(windows)]
     if console::is_host() {

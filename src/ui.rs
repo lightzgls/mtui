@@ -839,15 +839,28 @@ fn render_message(frame: &mut Frame, body: &str) {
 fn render_sign_in(frame: &mut Frame, phase: &SignIn) {
     match phase {
         SignIn::Failed { reason } => render_sign_in_failed(frame, reason),
-        SignIn::Music { started } => render_music_sign_in(frame, started.elapsed()),
+        SignIn::Music {
+            started,
+            recovering,
+        } => render_music_sign_in(frame, started.elapsed(), *recovering),
     }
 }
 
-fn render_music_sign_in(frame: &mut Frame, elapsed: Duration) {
+fn render_music_sign_in(frame: &mut Frame, elapsed: Duration, recovering: bool) {
     let inner = sign_in_panel(frame, SIGN_IN_MIN_WIDTH, 8, Color::Cyan);
-    let action = "  Complete sign-in in the YouTube Music window.";
-    let waiting = "  Waiting for a Music session";
-    let privacy = "  MTUI never receives your password. Esc hides this panel.";
+    let (action, waiting, privacy) = if recovering {
+        (
+            "  Renewing your saved YouTube Music session.",
+            "  Checking the saved browser session",
+            "  Esc hides this. Sign-in opens only if needed.",
+        )
+    } else {
+        (
+            "  Complete sign-in in the YouTube Music window.",
+            "  Waiting for a Music session",
+            "  MTUI never receives your password. Esc hides this panel.",
+        )
+    };
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(action, Style::default().fg(Color::White))),
@@ -4509,6 +4522,7 @@ mod tests {
                 24,
                 SignIn::Music {
                     started: Instant::now(),
+                    recovering: false,
                 },
             ),
         ];
@@ -6176,6 +6190,7 @@ mod tests {
             },
             SignIn::Music {
                 started: Instant::now(),
+                recovering: false,
             },
         ] {
             let rows = drawn(70, 24, &phase).join("\n");
@@ -6195,6 +6210,18 @@ mod tests {
         assert!(rows.contains("M retry sign-in"), "{rows}");
     }
 
+    #[test]
+    fn recovery_does_not_claim_a_sign_in_window_is_already_open() {
+        let phase = SignIn::Music {
+            started: Instant::now(),
+            recovering: true,
+        };
+        let rows = drawn(70, 24, &phase).join("\n");
+        assert!(rows.contains("Renewing your saved"), "{rows}");
+        assert!(rows.contains("opens only if needed"), "{rows}");
+        assert!(!rows.contains("Complete sign-in"), "{rows}");
+    }
+
     /// Every phase is sized to its own content and keeps its exit visible.
     #[test]
     fn no_phase_clips_the_key_that_dismisses_it() {
@@ -6204,6 +6231,7 @@ mod tests {
             },
             SignIn::Music {
                 started: Instant::now(),
+                recovering: false,
             },
         ] {
             let rows = drawn(70, 24, &phase).join("\n");

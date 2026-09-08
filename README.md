@@ -157,12 +157,16 @@ by macOS.
 
 ### Installation
 
-**Windows** — download `mtui.exe` from the
-[latest release](https://github.com/lightzgls/mtui/releases/latest), then run:
+**Windows** — download and run `MTUI-<version>-Setup-x64.exe` from the
+[latest release](https://github.com/lightzgls/mtui/releases/latest). The
+per-user installer needs no administrator permission. It gives MTUI a stable
+home under `%LOCALAPPDATA%\Programs\MTUI`, adds Start-menu and uninstall
+entries, and offers an optional desktop shortcut.
 
-```powershell
-.\mtui.exe
-```
+Upgrading or uninstalling the program does not erase account sessions,
+preferences, or listening history in `%APPDATA%\mtui`. An existing portable
+copy uses that same data automatically. A standalone portable executable is
+still attached to each release for users who explicitly want one.
 
 **Linux and macOS** — clone the repository, then build and install MTUI with one
 Cargo command:
@@ -213,10 +217,11 @@ companion installed automatically with MTUI. It runs only during sign-in and
 exits immediately afterward, keeping the long-running player free of the browser
 runtime. Windows keeps the same behavior inside its single published executable.
 
-MTUI can open the same window automatically when Home has no usable session or
-YouTube rejects the saved one. A complete `Cookie` request-header value may still
-be placed manually in `cookies.txt` as a compatibility fallback. Treat that file
-like a password.
+When YouTube rejects the saved cookie snapshot, MTUI first opens its persistent
+browser profile out of sight and lets YouTube renew the session. The window is
+shown only if Google actually needs attention. A complete `Cookie`
+request-header value may still be placed manually in `cookies.txt` as a
+compatibility fallback. Treat that file like a password.
 
 To log out, open **App Menu → Account & Sessions → Log out of YouTube Music**.
 MTUI removes its saved session, the manual-cookie fallback, and its private
@@ -343,6 +348,10 @@ Network and live-account tests are ignored by default.
 Windows releases use the MSVC target so WebView2's loader is linked into
 `mtui.exe`. GNU Windows builds remain supported, but require the generated
 `WebView2Loader.dll` beside the executable.
+
+Tagged releases also compile `installer/mtui.iss` with Inno Setup. The older
+`scripts/install-shortcut.ps1` remains a development convenience for pointing a
+Start-menu shortcut at a local build; it is not the release installer.
 
 
 

@@ -30,6 +30,7 @@ jobs:
           if ("v$version" -ne "${{ github.ref_name }}") {
             throw "Tag ${{ github.ref_name }} does not match Cargo version $version"
           }
+          "MTUI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Test
         run: cargo test --workspace --all-targets --locked
@@ -54,8 +55,33 @@ jobs:
             throw "mtui.exe still imports WebView2Loader.dll"
           }
 
+      - name: Install installer compiler
+        shell: pwsh
+        run: choco install innosetup --version=6.7.1 --no-progress --yes
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $compiler)) {
+            throw "Inno Setup compiler was not installed at $compiler"
+          }
+          & $compiler "/DMyAppVersion=$env:MTUI_VERSION" installer/mtui.iss
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup failed with exit code $LASTEXITCODE"
+          }
+          $setup = "dist/MTUI-$env:MTUI_VERSION-Setup-x64.exe"
+          if (-not (Test-Path -LiteralPath $setup)) {
+            throw "Installer was not created at $setup"
+          }
+          Copy-Item target/release/mtui.exe "dist/MTUI-$env:MTUI_VERSION-windows-x64-portable.exe"
+
       - name: Publish release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" "target/release/mtui.exe#MTUI for Windows (x64)" --generate-notes --verify-tag
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "dist/MTUI-$env:MTUI_VERSION-Setup-x64.exe#MTUI installer for Windows (x64)" `
+            "dist/MTUI-$env:MTUI_VERSION-windows-x64-portable.exe#Portable MTUI for Windows (x64)" `
+            --generate-notes --verify-tag

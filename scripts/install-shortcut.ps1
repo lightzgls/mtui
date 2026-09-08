@@ -3,6 +3,10 @@
     Puts MTUI in the Start menu, so it can be pinned to the taskbar.
 
 .DESCRIPTION
+    Development helper for a local build. Release users should install MTUI
+    with the Setup executable, which copies the program to a stable location
+    and registers an uninstaller.
+
     Windows will not let a program pin itself. The "Pin to taskbar" verb was
     taken away from scripts and installers in Windows 10 1809 and has not come
     back, so pinning is something only a person clicking can do -- and what they

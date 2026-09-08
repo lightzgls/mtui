@@ -107,7 +107,7 @@ pub enum Request {
     },
     /// Establishes a Music session in MTUI's cross-platform sign-in window.
     MusicSignIn {
-        force: bool,
+        recover: bool,
     },
     /// A finished play: how far the user actually got through a track.
     ///
@@ -422,8 +422,8 @@ impl SourceWorker {
                 spawn_personal_home(self.res_tx.clone(), generation);
                 Ok(())
             }
-            Request::MusicSignIn { force } => {
-                spawn_music_sign_in(self.res_tx.clone(), force);
+            Request::MusicSignIn { recover } => {
+                spawn_music_sign_in(self.res_tx.clone(), recover);
                 Ok(())
             }
             Request::Watch { .. }
@@ -836,12 +836,12 @@ fn spawn_personal_home(tx: Sender<Response>, generation: u64) {
     }
 }
 
-fn spawn_music_sign_in(tx: Sender<Response>, force: bool) {
+fn spawn_music_sign_in(tx: Sender<Response>, recover: bool) {
     let report = tx.clone();
     if thread::Builder::new()
         .name("mtui-music-signin".to_string())
         .spawn(move || {
-            let response = match crate::session::sign_in(force) {
+            let response = match crate::session::sign_in(recover) {
                 Ok(browser) => Response::CookiesImported(browser),
                 Err(err) => Response::MusicSignInFailed(format!("{err:#}")),
             };

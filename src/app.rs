@@ -913,8 +913,10 @@ pub enum SignIn {
     /// bar: the user is looking here, and the next thing they need is the retry
     /// key -- which this is the only place that offers.
     Failed { reason: String },
-    /// The shared YouTube Music window is waiting for a valid session.
-    Music { started: Instant },
+    /// The shared YouTube Music profile is waiting for a valid session. During
+    /// automatic recovery it begins hidden and appears only if Google needs the
+    /// user to authenticate again.
+    Music { started: Instant, recovering: bool },
 }
 
 pub struct App {
@@ -4420,7 +4422,7 @@ impl App {
         format!("{state}{} -- {}", now.title, now.byline())
     }
 
-    fn begin_music_sign_in(&mut self, force: bool) {
+    fn begin_music_sign_in(&mut self, recover: bool) {
         if self.music_signing_in {
             self.status = "the YouTube Music session import is already pending".to_string();
             return;
@@ -4432,16 +4434,21 @@ impl App {
         }
         self.menu = None;
 
-        self.request_music_sign_in(force);
+        self.request_music_sign_in(recover);
     }
 
-    fn request_music_sign_in(&mut self, force: bool) {
+    fn request_music_sign_in(&mut self, recover: bool) {
         self.music_signing_in = true;
-        self.status = "finish signing in in the YouTube Music window ...".to_string();
+        self.status = if recover {
+            "renewing the saved YouTube Music session ...".to_string()
+        } else {
+            "finish signing in in the YouTube Music window ...".to_string()
+        };
         self.overlay = Overlay::SignIn(SignIn::Music {
             started: Instant::now(),
+            recovering: recover,
         });
-        if self.source.send(Request::MusicSignIn { force }).is_err() {
+        if self.source.send(Request::MusicSignIn { recover }).is_err() {
             self.music_signing_in = false;
             let reason = "source worker is not running".to_string();
             self.status = reason.clone();
