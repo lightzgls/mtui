@@ -2988,7 +2988,14 @@ fn render_up_next(frame: &mut Frame, now: &NowPlaying, area: Rect, ambient: Colo
             format!(" {}", truncate(&now.queue_title, width.saturating_sub(1))),
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(""),
+        if now.repeat.label() == "off" {
+            Line::from("")
+        } else {
+            Line::from(Span::styled(
+                format!(" Repeat {}", now.repeat.label()),
+                Style::default().fg(ambient),
+            ))
+        },
     ];
     debug_assert_eq!(lines.len(), UP_NEXT_HEADER);
 
@@ -4036,6 +4043,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+    use crate::app::RepeatMode;
     use crate::source::watch::{Comment, Comments, Lyrics, TimedLine};
     use crate::source::{ArtistRef, BrowseEndpoint};
 
@@ -4955,6 +4963,16 @@ mod tests {
             !rows.iter().any(|row| row.contains("The Moment")),
             "and the rows above it should have scrolled off: {rows:#?}"
         );
+    }
+
+    #[test]
+    fn active_repeat_mode_is_visible_in_the_queue_heading() {
+        let mut now = playing();
+        now.repeat = RepeatMode::All;
+
+        let rows = drawn_panel(&now, 44, 9);
+
+        assert!(rows[4].contains("Repeat all"), "{rows:#?}");
     }
 
     #[test]

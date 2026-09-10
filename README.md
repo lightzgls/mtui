@@ -245,6 +245,10 @@ sign-in profile without stopping current playback.
 | `+` / `-` | Change volume |
 | Left / Right | Seek five seconds while browsing tracks or the player |
 | `n` / `p` | Next or previous track on the player |
+| `R` | Cycle repeat off, all, or one |
+| `d` | Remove the selected upcoming queue track |
+| `K` / `J` | Move the selected upcoming queue track |
+| `z` / `C` | Shuffle or clear upcoming tracks |
 | `1`-`4` or `Tab` | Open Queue, Lyrics, Related, or Comments |
 | `c` | Change cover-art size |
 | `M` | Import or refresh the personalized Home session |

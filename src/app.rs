@@ -243,6 +243,33 @@ pub enum Tab {
     Comments,
 }
 
+/// What automatic advancement does when the current track ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    All,
+    One,
+}
+
+impl RepeatMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::All => "all",
+            Self::One => "one",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::One,
+            Self::One => Self::Off,
+        }
+    }
+}
+
 impl Tab {
     /// In the order they are drawn, which is the order the keys `1`-`4` and the
     /// Tab key walk them in.
@@ -472,6 +499,7 @@ pub struct NowPlaying {
     /// Where in `queue` the playing track is. `None` until the queue lands, or
     /// when what is playing is not in it.
     pub playing: Option<usize>,
+    pub repeat: RepeatMode,
     pub tab: Tab,
     /// One cursor per tab, so switching away and back returns to where the user
     /// left off. For the two list tabs this is the selected row; for lyrics and
@@ -524,6 +552,7 @@ impl NowPlaying {
             topup_failures: 0,
             dropped: VecDeque::new(),
             playing: None,
+            repeat: RepeatMode::Off,
             tab: Tab::UpNext,
             cursor: [0; Tab::ALL.len()],
             follow_lyrics: true,
@@ -635,6 +664,21 @@ impl NowPlaying {
         self.queue.get(self.playing? + 1)
     }
 
+    fn advanced_index(&self, delta: isize, auto: bool) -> Option<usize> {
+        let current = self.playing?;
+        if auto && delta > 0 && self.repeat == RepeatMode::One {
+            return Some(current);
+        }
+        let index = usize::try_from(current as isize + delta).ok();
+        if index.is_some_and(|index| index < self.queue.len()) {
+            return index;
+        }
+        if self.repeat == RepeatMode::All && !self.topping_up && !self.queue.is_empty() {
+            return Some(if delta > 0 { 0 } else { self.queue.len() - 1 });
+        }
+        None
+    }
+
     /// Inserts an explicit user choice while preserving the queue's fixed
     /// memory window. When the ahead window is full, its farthest item yields
     /// to the requested track; no user action can grow the queue past the same
@@ -659,6 +703,73 @@ impl NowPlaying {
             self.queue.push(track);
         }
         true
+    }
+
+    /// Removes only a future track. Played rows and the track producing sound
+    /// are history, not editable queue entries.
+    fn remove_selected_upcoming(&mut self) -> Option<Track> {
+        let playing = self.playing?;
+        let selected = self.cursor[Tab::UpNext.index()];
+        if selected <= playing || selected >= self.queue.len() {
+            return None;
+        }
+        let removed = self.queue.remove(selected);
+        self.cursor[Tab::UpNext.index()] = selected.min(self.queue.len().saturating_sub(1));
+        Some(removed)
+    }
+
+    /// Moves one future row without letting it cross the currently playing
+    /// track. Returns false at either edge or outside the upcoming queue.
+    fn move_selected_upcoming(&mut self, delta: isize) -> bool {
+        let Some(playing) = self.playing else {
+            return false;
+        };
+        let selected = self.cursor[Tab::UpNext.index()];
+        if selected <= playing || selected >= self.queue.len() {
+            return false;
+        }
+        let first = playing + 1;
+        let last = self.queue.len() - 1;
+        let moved = selected.saturating_add_signed(delta).clamp(first, last);
+        if moved == selected {
+            return false;
+        }
+        self.queue.swap(selected, moved);
+        self.cursor[Tab::UpNext.index()] = moved;
+        true
+    }
+
+    fn clear_upcoming(&mut self) -> usize {
+        let Some(playing) = self.playing else {
+            return 0;
+        };
+        let removed = self.queue.len().saturating_sub(playing + 1);
+        self.queue.truncate(playing + 1);
+        self.cursor[Tab::UpNext.index()] = playing;
+        removed
+    }
+
+    /// Shuffles only what has not played, keeping the current track and the
+    /// cursor's selected song stable.
+    fn shuffle_upcoming(&mut self) -> usize {
+        let Some(first) = self.playing.map(|playing| playing + 1) else {
+            return 0;
+        };
+        let count = self.queue.len().saturating_sub(first);
+        if count < 2 {
+            return 0;
+        }
+        let selected_id = self
+            .queue
+            .get(self.cursor[Tab::UpNext.index()])
+            .map(|track| track.id.clone());
+        shuffle_tracks(&mut self.queue[first..]);
+        if let Some(id) = selected_id
+            && let Some(index) = self.queue.iter().position(|track| track.id == id)
+        {
+            self.cursor[Tab::UpNext.index()] = index;
+        }
+        count
     }
 
     /// How many tracks are left ahead of the one playing.
@@ -906,6 +1017,12 @@ enum MenuAction {
     OpenArtistSelection,
     ReloadArtist,
     OpenPageSelection,
+    RemoveQueueSelection,
+    MoveQueueSelectionUp,
+    MoveQueueSelectionDown,
+    ClearUpcomingQueue,
+    ShuffleUpcomingQueue,
+    CycleRepeat,
     FollowLyrics,
     TogglePause,
     Next,
@@ -1658,6 +1775,10 @@ impl App {
             MenuItem::help("Now Playing", "P", None),
             MenuItem::help("Pause or resume", "Space", Some("Playback")),
             MenuItem::help("Next or previous", "n / p", None),
+            MenuItem::help("Repeat off / all / one", "R", None),
+            MenuItem::help("Queue: remove / shuffle", "d / z", None),
+            MenuItem::help("Queue: move row", "K / J", None),
+            MenuItem::help("Queue: clear upcoming", "C", None),
             MenuItem::help("Seek", "Left/Right", None),
             MenuItem::help("Change volume", "+ / -", None),
             MenuItem::help("Stop", "s", None),
@@ -1820,13 +1941,58 @@ impl App {
         };
 
         match now.tab {
-            Tab::UpNext => items.push(MenuItem::action(
-                "Play selected queue track",
-                Some("Enter"),
-                now.queue.get(now.cursor()).is_some(),
-                Some("Selection"),
-                MenuAction::OpenPageSelection,
-            )),
+            Tab::UpNext => {
+                let cursor = now.cursor();
+                let playing = now.playing;
+                let upcoming =
+                    playing.is_some_and(|index| cursor > index && cursor < now.queue.len());
+                let can_move_up = playing.is_some_and(|index| cursor > index + 1);
+                let can_move_down = upcoming && cursor + 1 < now.queue.len();
+                items.extend([
+                    MenuItem::action(
+                        "Play selected queue track",
+                        Some("Enter"),
+                        now.queue.get(cursor).is_some(),
+                        Some("Selection"),
+                        MenuAction::OpenPageSelection,
+                    ),
+                    MenuItem::action(
+                        "Remove from queue",
+                        Some("d"),
+                        upcoming,
+                        None,
+                        MenuAction::RemoveQueueSelection,
+                    ),
+                    MenuItem::action(
+                        "Move up",
+                        Some("K"),
+                        can_move_up,
+                        None,
+                        MenuAction::MoveQueueSelectionUp,
+                    ),
+                    MenuItem::action(
+                        "Move down",
+                        Some("J"),
+                        can_move_down,
+                        None,
+                        MenuAction::MoveQueueSelectionDown,
+                    ),
+                    MenuItem::action(
+                        "Shuffle upcoming",
+                        Some("z"),
+                        now.remaining() > 1,
+                        Some("Queue"),
+                        MenuAction::ShuffleUpcomingQueue,
+                    ),
+                    MenuItem::action(
+                        "Clear upcoming",
+                        Some("C"),
+                        now.remaining() > 0,
+                        None,
+                        MenuAction::ClearUpcomingQueue,
+                    ),
+                ]);
+            }
             Tab::Related => {
                 let (label, enabled) = match now.related_rows().get(now.cursor()) {
                     Some(RelatedRow::Card(card)) if matches!(&card.target, Target::Play { .. }) => {
@@ -1893,6 +2059,13 @@ impl App {
                 can_previous,
                 None,
                 MenuAction::Previous,
+            ),
+            MenuItem::action(
+                format!("Repeat: {}", now.repeat.label()),
+                Some("R"),
+                current.is_some(),
+                None,
+                MenuAction::CycleRepeat,
             ),
             MenuItem::action("Stop playback", Some("s"), true, None, MenuAction::Stop),
             MenuItem::action(
@@ -2543,7 +2716,7 @@ impl App {
         // `advance` declines to move for the same reason. This covers the
         // empty queue before the first watch response too, which must not be
         // seeded from the journal on top of the station already on its way.
-        if now.playing.is_none() {
+        if now.playing.is_none() || now.repeat == RepeatMode::All {
             return;
         }
         // Still deep enough, already asking, or given up asking.
@@ -2700,8 +2873,10 @@ impl App {
         // every track: what the user was reading is a choice about the session,
         // not about the song.
         let tab = self.now.as_ref().map_or(Tab::UpNext, |now| now.tab);
+        let repeat = self.now.as_ref().map_or(RepeatMode::Off, |now| now.repeat);
         let mut page = NowPlaying::new(&track);
         page.tab = tab;
+        page.repeat = repeat;
         // The queue survives moving *within* it -- that is what makes advancing
         // through a radio keep one stable "Up next" rather than reshuffling on
         // every track. Playing something from outside it drops it instead of
@@ -2729,7 +2904,9 @@ impl App {
             // Now that the queue has moved forward, whatever has fallen out of
             // the window behind it can go. This is the only place the queue
             // grows a position, so it is the only place that has to shrink.
-            page.trim();
+            if page.repeat != RepeatMode::All {
+                page.trim();
+            }
         }
         self.now = Some(page);
         if !keep_page {
@@ -3103,6 +3280,95 @@ impl App {
         self.cover_size = self.cover_size.toggled();
     }
 
+    fn remove_queue_selection(&mut self) {
+        let Some(removed) = self
+            .now
+            .as_mut()
+            .and_then(NowPlaying::remove_selected_upcoming)
+        else {
+            return;
+        };
+        self.status = format!("removed {} from the queue", removed.label());
+    }
+
+    fn move_queue_selection(&mut self, delta: isize) {
+        let moved = self
+            .now
+            .as_mut()
+            .is_some_and(|now| now.move_selected_upcoming(delta));
+        if !moved {
+            return;
+        }
+        self.prefetch_queue_next();
+        self.status = if delta < 0 {
+            "moved queue track up".to_string()
+        } else {
+            "moved queue track down".to_string()
+        };
+    }
+
+    fn clear_upcoming_queue(&mut self) {
+        let removed = self.now.as_mut().map_or(0, NowPlaying::clear_upcoming);
+        if removed == 0 {
+            return;
+        }
+        // A continuation already in flight belongs to the queue before the
+        // explicit clear. Minting a new epoch makes its late answer harmless.
+        self.queue_epoch = self.queue_epoch.wrapping_add(1);
+        if let Some(now) = self.now.as_mut() {
+            now.queue_epoch = self.queue_epoch;
+            now.continuation = None;
+            now.topping_up = false;
+            now.topup_failures = MAX_TOPUP_FAILURES;
+        }
+        self.status = format!("cleared {removed} upcoming tracks");
+    }
+
+    fn shuffle_upcoming_queue(&mut self) {
+        let shuffled = self.now.as_mut().map_or(0, NowPlaying::shuffle_upcoming);
+        if shuffled == 0 {
+            return;
+        }
+        self.prefetch_queue_next();
+        self.status = format!("shuffled {shuffled} upcoming tracks");
+    }
+
+    fn prefetch_queue_next(&self) {
+        let next = self
+            .now
+            .as_ref()
+            .and_then(NowPlaying::next_in_queue)
+            .map(|track| track.id.clone());
+        if let Some(id) = next {
+            let _ = self.source.send(Request::Prefetch { id });
+        }
+    }
+
+    fn cycle_repeat(&mut self) {
+        let Some(repeat) = self.now.as_ref().map(|now| now.repeat.next()) else {
+            return;
+        };
+        if repeat == RepeatMode::All {
+            // Freeze this bounded window. A continuation already on its way is
+            // invalidated by the new epoch; its token remains available if
+            // repeat is later switched off.
+            self.queue_epoch = self.queue_epoch.wrapping_add(1);
+        }
+        if let Some(now) = self.now.as_mut() {
+            now.repeat = repeat;
+            if repeat == RepeatMode::All {
+                now.queue_epoch = self.queue_epoch;
+                now.topping_up = false;
+            } else if now.topup_failures >= MAX_TOPUP_FAILURES {
+                now.topup_failures = 0;
+            }
+        }
+        self.status = format!("repeat {}", repeat.label());
+        if repeat != RepeatMode::All {
+            self.top_up_queue();
+        }
+    }
+
     /// Moves `delta` tracks through the queue and plays what it lands on.
     ///
     /// Silent at either end: there is nothing before the first track, and a
@@ -3119,13 +3385,7 @@ impl App {
         let Some(now) = self.now.as_ref() else {
             return;
         };
-        let Some(current) = now.playing else {
-            return;
-        };
-        let Ok(index) = usize::try_from(current as isize + delta) else {
-            return;
-        };
-        let Some(track) = now.queue.get(index).cloned() else {
+        let Some(index) = now.advanced_index(delta, auto) else {
             if delta > 0 {
                 // A page is on its way, so this is not the end -- only the gap
                 // between running out and hearing back. `apply_more_queue`
@@ -3137,6 +3397,9 @@ impl App {
                     "end of the queue".to_string()
                 };
             }
+            return;
+        };
+        let Some(track) = now.queue.get(index).cloned() else {
             return;
         };
 
@@ -3576,6 +3839,12 @@ impl App {
             MenuAction::OpenArtistSelection => self.open_artist_selection(),
             MenuAction::ReloadArtist => self.reload_artist(),
             MenuAction::OpenPageSelection => self.open_page_row(),
+            MenuAction::RemoveQueueSelection => self.remove_queue_selection(),
+            MenuAction::MoveQueueSelectionUp => self.move_queue_selection(-1),
+            MenuAction::MoveQueueSelectionDown => self.move_queue_selection(1),
+            MenuAction::ClearUpcomingQueue => self.clear_upcoming_queue(),
+            MenuAction::ShuffleUpcomingQueue => self.shuffle_upcoming_queue(),
+            MenuAction::CycleRepeat => self.cycle_repeat(),
             MenuAction::FollowLyrics => {
                 if let Some(now) = self.now.as_mut() {
                     now.open(Tab::Lyrics);
@@ -4222,6 +4491,12 @@ impl App {
             // each of them is -- clamp it to the last one.
             KeyCode::Char('G') | KeyCode::End => self.jump_page(usize::MAX),
             KeyCode::Enter => self.open_page_row(),
+            KeyCode::Char('d') if tab == Some(Tab::UpNext) => self.remove_queue_selection(),
+            KeyCode::Char('K') if tab == Some(Tab::UpNext) => self.move_queue_selection(-1),
+            KeyCode::Char('J') if tab == Some(Tab::UpNext) => self.move_queue_selection(1),
+            KeyCode::Char('C') if tab == Some(Tab::UpNext) => self.clear_upcoming_queue(),
+            KeyCode::Char('z') if tab == Some(Tab::UpNext) => self.shuffle_upcoming_queue(),
+            KeyCode::Char('R') => self.cycle_repeat(),
             KeyCode::Char('n') => self.advance(1, false),
             KeyCode::Char('p') => self.advance(-1, false),
             KeyCode::Char(' ') => self.toggle_pause(),
@@ -5145,6 +5420,122 @@ mod tests {
         assert_eq!(now.queue.last().unwrap().id, "9");
         assert!(!now.insert_user_track(numbered(9), true));
         assert_eq!(now.queue.iter().filter(|track| track.id == "9").count(), 1);
+    }
+
+    #[test]
+    fn queue_edits_apply_only_after_the_playing_track() {
+        let mut now = playing();
+        now.queue = queued(6);
+        now.playing = Some(2);
+
+        now.cursor[Tab::UpNext.index()] = 2;
+        assert!(now.remove_selected_upcoming().is_none());
+        assert!(!now.move_selected_upcoming(1));
+
+        now.cursor[Tab::UpNext.index()] = 4;
+        assert_eq!(now.remove_selected_upcoming().unwrap().id, "4");
+        assert_eq!(
+            now.queue
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0", "1", "2", "3", "5"]
+        );
+
+        assert!(now.move_selected_upcoming(-1));
+        assert_eq!(now.cursor(), 3);
+        assert_eq!(now.queue[3].id, "5");
+        assert!(
+            !now.move_selected_upcoming(-1),
+            "an upcoming row cannot cross the current track"
+        );
+    }
+
+    #[test]
+    fn clearing_upcoming_keeps_history_and_the_current_track() {
+        let mut now = playing();
+        now.queue = queued(8);
+        now.playing = Some(3);
+        now.cursor[Tab::UpNext.index()] = 7;
+
+        assert_eq!(now.clear_upcoming(), 4);
+        assert_eq!(
+            now.queue
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0", "1", "2", "3"]
+        );
+        assert_eq!(now.playing, Some(3));
+        assert_eq!(now.cursor(), 3);
+    }
+
+    #[test]
+    fn shuffling_upcoming_keeps_current_and_selected_tracks() {
+        let mut now = playing();
+        now.queue = queued(12);
+        now.playing = Some(3);
+        now.cursor[Tab::UpNext.index()] = 8;
+
+        let before = now
+            .queue
+            .iter()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(now.shuffle_upcoming(), 8);
+        assert_eq!(
+            now.queue[..=3]
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0", "1", "2", "3"]
+        );
+        assert_eq!(now.queue[now.cursor()].id, "8");
+
+        let mut after = now
+            .queue
+            .iter()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
+        let mut before = before;
+        before.sort();
+        after.sort();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn repeat_modes_cycle_in_the_order_shown_to_the_user() {
+        let mut repeat = RepeatMode::Off;
+        repeat = repeat.next();
+        assert_eq!((repeat, repeat.label()), (RepeatMode::All, "all"));
+        repeat = repeat.next();
+        assert_eq!((repeat, repeat.label()), (RepeatMode::One, "one"));
+        assert_eq!(repeat.next(), RepeatMode::Off);
+    }
+
+    #[test]
+    fn repeat_modes_change_only_automatic_queue_edges() {
+        let mut now = playing();
+        now.queue = queued(4);
+        now.playing = Some(3);
+
+        now.repeat = RepeatMode::One;
+        assert_eq!(now.advanced_index(1, true), Some(3));
+        assert_eq!(now.advanced_index(-1, false), Some(2));
+        assert_eq!(now.advanced_index(1, false), None);
+
+        now.repeat = RepeatMode::All;
+        assert_eq!(now.advanced_index(1, true), Some(0));
+        now.playing = Some(0);
+        assert_eq!(now.advanced_index(-1, false), Some(3));
+
+        now.topping_up = true;
+        now.playing = Some(3);
+        assert_eq!(
+            now.advanced_index(1, true),
+            None,
+            "a late page should land before repeat-all wraps"
+        );
     }
 
     #[test]
