@@ -100,8 +100,9 @@ pub enum Request {
         key: String,
         url: String,
     },
-    /// The authenticated form of the same FEmusic_home route. Queued after the
-    /// public response so a slow session cannot leave the pane blank.
+    /// Home from the best session available. The worker tries the personalized
+    /// route first and falls back to the public route sequentially, avoiding a
+    /// second response tree and card collection in memory.
     PersonalHome {
         generation: u64,
     },
@@ -201,13 +202,8 @@ pub enum Response {
         generation: u64,
         shelves: Vec<Shelf>,
     },
-    /// One of the concurrent Home requests failed transiently. Kept separate
-    /// from `Failed` so the other attempt can still fill the page without a raw
-    /// HTTP error replacing the status line.
+    /// The one bounded Home request failed transiently.
     HomeFailed {
-        generation: u64,
-    },
-    HomeSessionStale {
         generation: u64,
     },
     /// A YouTube Music web session was established successfully.
@@ -814,17 +810,23 @@ fn spawn_personal_home(tx: Sender<Response>, generation: u64) {
         .name("mtui-personal-home".to_string())
         .spawn(move || {
             let response = (|| -> Result<Response> {
-                let Some(cookies) = Cookies::available().ok().flatten() else {
-                    return Ok(Response::HomeFailed { generation });
-                };
                 let http = Http::new()?;
-                Ok(match home::fetch_personalised(&http, &cookies) {
-                    Ok(Some(shelves)) => Response::Home {
+                // One feed at a time. A signed-in request gets first choice;
+                // the public page is fetched only when there is no session or
+                // the personalized endpoint cannot produce a usable page.
+                // This avoids keeping two JSON trees and two card collections
+                // alive during startup just to race them.
+                let shelves = Cookies::available()
+                    .ok()
+                    .flatten()
+                    .and_then(|cookies| home::fetch_personalised(&http, &cookies).ok().flatten())
+                    .or_else(|| home::fetch_public(&http).ok());
+                Ok(match shelves {
+                    Some(shelves) => Response::Home {
                         generation,
                         shelves,
                     },
-                    Ok(None) => Response::HomeSessionStale { generation },
-                    Err(_) => Response::HomeFailed { generation },
+                    None => Response::HomeFailed { generation },
                 })
             })()
             .unwrap_or(Response::HomeFailed { generation });

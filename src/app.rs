@@ -6,7 +6,7 @@
 //! event loop never stalls.
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -635,6 +635,32 @@ impl NowPlaying {
         self.queue.get(self.playing? + 1)
     }
 
+    /// Inserts an explicit user choice while preserving the queue's fixed
+    /// memory window. When the ahead window is full, its farthest item yields
+    /// to the requested track; no user action can grow the queue past the same
+    /// bound used by radio continuations.
+    fn insert_user_track(&mut self, track: Track, next: bool) -> bool {
+        let Some(playing) = self.playing else {
+            return false;
+        };
+        if self.queue.iter().any(|held| held.id == track.id) {
+            return false;
+        }
+
+        let ceiling = playing + 1 + QUEUE_AHEAD;
+        if self.queue.len() >= ceiling {
+            self.queue.pop();
+        }
+        self.dropped.retain(|id| *id != track.id);
+        if next {
+            self.queue
+                .insert((playing + 1).min(self.queue.len()), track);
+        } else {
+            self.queue.push(track);
+        }
+        true
+    }
+
     /// How many tracks are left ahead of the one playing.
     ///
     /// Zero when nothing here is playing inside this queue, rather than the
@@ -869,6 +895,11 @@ enum MenuAction {
     ConnectMusic,
     LogOutMusic,
     OpenHomeSelection,
+    StartHomeRadio,
+    PlayHomeNext,
+    QueueHomeTrack,
+    PlayHomeShelf,
+    ShuffleHomeShelf,
     RefreshHome,
     PlaySelected,
     OpenArtist,
@@ -1019,8 +1050,8 @@ pub struct App {
     /// waiting on. What it is actually for is the difference between "loading"
     /// and "there is no feed", which are the same empty pane.
     pub home_pending: bool,
-    /// Public and authenticated FEmusic_home run concurrently. Fail the pane
-    /// only after both have answered without shelves.
+    /// Number of Home requests still in flight. Home deliberately uses one
+    /// worker at a time so no second feed is retained just to race the first.
     home_attempts: u8,
     /// Identifies the latest refresh so late responses cannot mutate it.
     home_generation: u64,
@@ -1086,11 +1117,6 @@ pub struct App {
     /// The *furthest*, not the latest: seeking backwards must not shorten what
     /// the user is recorded as having heard.
     listening: Option<(Track, Duration)>,
-    /// Whether interactive Music sign-in has been opened this process. Once
-    /// only automatically; `M` can still open it explicitly.
-    imported: bool,
-    /// Whether a stale InnerTube session already triggered interactive setup.
-    cookie_refresh_attempted: bool,
     /// Prevents repeated `M` presses from opening duplicate session imports.
     music_signing_in: bool,
 
@@ -1138,6 +1164,24 @@ fn moved_cursor(selected: usize, delta: isize, len: usize) -> usize {
         selected.saturating_sub(delta.unsigned_abs())
     } else {
         selected.saturating_add(delta as usize).min(last)
+    }
+}
+
+/// Fisher-Yates with a tiny local xorshift state. Pulling a random-number
+/// crate into the player solely to reorder at most 66 already-held tracks
+/// would cost more code and dependency surface than the feature warrants.
+fn shuffle_tracks(tracks: &mut [Track]) {
+    let mut state = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+        ^ tracks.len() as u64;
+    for end in (1..tracks.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let index = (state as usize) % (end + 1);
+        tracks.swap(end, index);
     }
 }
 
@@ -1301,8 +1345,6 @@ impl App {
             listening: None,
             queue_epoch: 0,
             seed_rotation: 0,
-            imported: false,
-            cookie_refresh_attempted: false,
             music_signing_in: false,
             resuming: None,
             // Started whether or not Discord is running and whether or not the
@@ -1630,13 +1672,21 @@ impl App {
     fn page_action_items(&self) -> Vec<MenuItem> {
         match self.view {
             View::Home => {
-                let (label, enabled) = match self.home_card() {
+                let selected = self.home_card();
+                let (label, enabled) = match selected {
                     Some(card) if matches!(&card.target, Target::Play { .. }) => {
                         ("Play selected item", true)
                     }
                     Some(_) => ("Open selected item", true),
                     None => ("Open selected item", false),
                 };
+                let playable = selected.is_some_and(Card::is_playable);
+                let queue_ready =
+                    playable && self.now.as_ref().is_some_and(|now| now.playing.is_some());
+                let artist = selected.and_then(card_artist).is_some();
+                let playable_in_shelf = self.home.get(self.home_shelf).map_or(0, |shelf| {
+                    shelf.cards.iter().filter(|card| card.is_playable()).count()
+                });
                 vec![
                     MenuItem::action(
                         label,
@@ -1646,10 +1696,52 @@ impl App {
                         MenuAction::OpenHomeSelection,
                     ),
                     MenuItem::action(
+                        "Start radio from selected song",
+                        None,
+                        playable,
+                        None,
+                        MenuAction::StartHomeRadio,
+                    ),
+                    MenuItem::action(
+                        "Play next",
+                        None,
+                        queue_ready,
+                        None,
+                        MenuAction::PlayHomeNext,
+                    ),
+                    MenuItem::action(
+                        "Add to queue",
+                        None,
+                        queue_ready,
+                        None,
+                        MenuAction::QueueHomeTrack,
+                    ),
+                    MenuItem::action(
+                        "Open selected artist",
+                        None,
+                        artist,
+                        None,
+                        MenuAction::OpenArtist,
+                    ),
+                    MenuItem::action(
+                        "Play this shelf",
+                        None,
+                        playable_in_shelf > 0,
+                        Some("Current shelf"),
+                        MenuAction::PlayHomeShelf,
+                    ),
+                    MenuItem::action(
+                        "Shuffle this shelf",
+                        None,
+                        playable_in_shelf > 1,
+                        None,
+                        MenuAction::ShuffleHomeShelf,
+                    ),
+                    MenuItem::action(
                         "Refresh Home",
                         Some("r"),
                         !self.home_pending,
-                        None,
+                        Some("Home"),
                         MenuAction::RefreshHome,
                     ),
                 ]
@@ -2019,7 +2111,6 @@ impl App {
                 | Response::Comments { .. }
                 | Response::Home { .. }
                 | Response::HomeFailed { .. }
-                | Response::HomeSessionStale { .. }
                 | Response::CookiesImported(_)
         ) {
             self.busy = false;
@@ -2067,21 +2158,6 @@ impl App {
                 self.apply_home(shelves);
             }
             Response::HomeFailed { generation } => {
-                if generation != self.home_generation {
-                    return;
-                }
-                self.home_attempts = self.home_attempts.saturating_sub(1);
-                self.finish_home_attempts();
-            }
-            Response::HomeSessionStale { generation }
-                if generation == self.home_generation && !self.cookie_refresh_attempted =>
-            {
-                self.home_attempts = self.home_attempts.saturating_sub(1);
-                self.cookie_refresh_attempted = true;
-                self.finish_home_attempts();
-                self.begin_music_sign_in(true);
-            }
-            Response::HomeSessionStale { generation } => {
                 if generation != self.home_generation {
                     return;
                 }
@@ -3131,12 +3207,6 @@ impl App {
         self.home_generation = self.home_generation.wrapping_add(1);
         let generation = self.home_generation;
         self.home_attempts = 0;
-        if config::Cookies::available().ok().flatten().is_none() && !self.imported {
-            self.imported = true;
-            self.home_pending = false;
-            self.begin_music_sign_in(false);
-            return;
-        }
         if self
             .source
             .send(Request::PersonalHome { generation })
@@ -3495,6 +3565,11 @@ impl App {
             MenuAction::ConnectMusic => self.begin_music_sign_in(false),
             MenuAction::LogOutMusic => self.log_out_music(),
             MenuAction::OpenHomeSelection => self.open_card(),
+            MenuAction::StartHomeRadio => self.start_home_radio(),
+            MenuAction::PlayHomeNext => self.queue_home_track(true),
+            MenuAction::QueueHomeTrack => self.queue_home_track(false),
+            MenuAction::PlayHomeShelf => self.play_home_shelf(false),
+            MenuAction::ShuffleHomeShelf => self.play_home_shelf(true),
             MenuAction::RefreshHome => self.refresh_home(),
             MenuAction::PlaySelected => self.play_selected(),
             MenuAction::OpenArtist => self.open_context_artist(),
@@ -3782,6 +3857,88 @@ impl App {
             return;
         };
         self.activate_card(card);
+    }
+
+    /// Starts the ordinary endless station for the selected song. This shares
+    /// the same watch request as a normal play; the separate action is an
+    /// explicit promise about what will follow the seed, not another fetch or
+    /// another queue held in memory.
+    fn start_home_radio(&mut self) {
+        let Some(track) = self.home_card().and_then(Card::track) else {
+            return;
+        };
+        self.play_track(track, false);
+    }
+
+    /// Inserts the selected song into the active queue. The queue owns the
+    /// bound and evicts only its farthest-ahead recommendation when full, so
+    /// repeated actions cannot turn a long session into a growing heap.
+    fn queue_home_track(&mut self, next: bool) {
+        let Some(track) = self.home_card().and_then(Card::track) else {
+            return;
+        };
+        let label = track.label();
+        let Some(now) = self.now.as_mut().filter(|now| now.playing.is_some()) else {
+            self.status = "wait for Up next to finish loading".to_string();
+            return;
+        };
+        if !now.insert_user_track(track.clone(), next) {
+            self.status = format!("{} is already in the queue", track.title);
+            return;
+        }
+
+        if next {
+            let _ = self.source.send(Request::Prefetch {
+                id: track.id.clone(),
+            });
+            self.status = format!("playing {label} next");
+        } else {
+            self.status = format!("added {label} to the queue");
+        }
+    }
+
+    /// Plays the playable cards in the current shelf as one finite queue. The
+    /// cards already hold all metadata needed here; no collection page is
+    /// fetched, and the queue is capped at the same fixed ahead window as a
+    /// radio page.
+    fn play_home_shelf(&mut self, shuffle: bool) {
+        let Some(shelf) = self.home.get(self.home_shelf) else {
+            return;
+        };
+        let title = shelf.title.clone();
+        let mut tracks: Vec<Track> = shelf
+            .cards
+            .iter()
+            .filter_map(Card::track)
+            .take(QUEUE_AHEAD + 1)
+            .collect();
+        if tracks.is_empty() {
+            self.status = "this shelf has nothing directly playable".to_string();
+            return;
+        }
+        if shuffle {
+            shuffle_tracks(&mut tracks);
+        }
+
+        let first = tracks[0].clone();
+        self.play_track(first, false);
+        self.queue_epoch = self.queue_epoch.wrapping_add(1);
+        if let Some(now) = self.now.as_mut() {
+            now.queue_title = title.clone();
+            now.queue = tracks;
+            now.queue_epoch = self.queue_epoch;
+            now.continuation = None;
+            now.topping_up = false;
+            now.topup_failures = 0;
+            now.dropped.clear();
+            now.playing = Some(0);
+            now.cursor[Tab::UpNext.index()] = 0;
+        }
+        self.status = if shuffle {
+            format!("shuffling {title}")
+        } else {
+            format!("playing {title}")
+        };
     }
 
     fn activate_card(&mut self, card: Card) {
@@ -4468,10 +4625,6 @@ impl App {
                 self.home_generation = self.home_generation.wrapping_add(1);
                 self.home_attempts = 0;
                 self.home_pending = false;
-                self.cookie_refresh_attempted = false;
-                // Suppress the first-run auto-prompt. Logging out is an
-                // explicit request to remain signed out until M is pressed.
-                self.imported = true;
                 self.home.clear();
                 self.home_scroll.clear();
                 self.home_shelf = 0;
@@ -4479,10 +4632,11 @@ impl App {
                 self.home_top = 0;
                 self.selection_settled = None;
                 self.art = ArtCache::default();
-                self.status = match warning {
-                    Some(warning) => format!("logged out; {warning}"),
-                    None => "logged out of YouTube Music -- press M to sign in".to_string(),
-                };
+                self.status = warning.map_or_else(
+                    || "logged out of YouTube Music -- loading guest Home".to_string(),
+                    |warning| format!("logged out; {warning}"),
+                );
+                self.request_home();
             }
             Err(error) => {
                 self.status = format!("could not log out of YouTube Music: {error:#}");
@@ -4962,6 +5116,63 @@ mod tests {
         page.drain(..2);
         assert_eq!(now.absorb(page), 2);
         assert_eq!(now.queue.len(), 5);
+    }
+
+    #[test]
+    fn explicit_queue_actions_share_the_radio_memory_bound() {
+        let mut now = playing();
+        now.queue = queued(QUEUE_BEHIND + 1 + QUEUE_AHEAD);
+        now.playing = Some(QUEUE_BEHIND);
+        let old_tail = now.queue.last().unwrap().id.clone();
+
+        assert!(now.insert_user_track(numbered(999), true));
+
+        assert_eq!(now.queue.len(), QUEUE_BEHIND + 1 + QUEUE_AHEAD);
+        assert_eq!(now.queue[QUEUE_BEHIND + 1].id, "999");
+        assert!(
+            now.queue.iter().all(|track| track.id != old_tail),
+            "the farthest recommendation should yield to the user choice"
+        );
+    }
+
+    #[test]
+    fn adding_to_queue_uses_the_tail_and_rejects_duplicates() {
+        let mut now = playing();
+        now.queue = queued(4);
+        now.playing = Some(0);
+
+        assert!(now.insert_user_track(numbered(9), false));
+        assert_eq!(now.queue.last().unwrap().id, "9");
+        assert!(!now.insert_user_track(numbered(9), true));
+        assert_eq!(now.queue.iter().filter(|track| track.id == "9").count(), 1);
+    }
+
+    #[test]
+    fn a_queue_still_loading_does_not_accept_an_orphaned_track() {
+        let mut now = playing();
+        now.queue = queued(2);
+
+        assert!(!now.insert_user_track(numbered(9), true));
+        assert_eq!(
+            now.queue
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0", "1"]
+        );
+    }
+
+    #[test]
+    fn shelf_shuffle_keeps_exactly_the_same_bounded_tracks() {
+        let mut tracks = queued(QUEUE_AHEAD + 1);
+        let mut ids: Vec<String> = tracks.iter().map(|track| track.id.clone()).collect();
+
+        shuffle_tracks(&mut tracks);
+
+        let mut shuffled: Vec<String> = tracks.into_iter().map(|track| track.id).collect();
+        ids.sort();
+        shuffled.sort();
+        assert_eq!(shuffled, ids);
     }
 
     /// The window is what keeps an endless queue from being an endless `Vec`.
