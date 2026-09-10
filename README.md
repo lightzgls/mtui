@@ -76,12 +76,6 @@
 <!-- ABOUT THE PROJECT -->
 ## About The Project
 
-<!-- README_DEMO: replace this block with the GitHub video attachment URL on its own line. -->
-<p align="center">
-  <strong>Demo video coming soon.</strong><br>
-  <sub>Search, artist pages, colored ASCII covers, and Now Playing.</sub>
-</p>
-
 MTUI is a terminal music player for YouTube Music, built to stay small in memory.
 It offers fast navigation, native AAC playback, bounded caches, colored ASCII or
 image covers, and an optional native browser window that is used only while you
