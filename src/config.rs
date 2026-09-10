@@ -374,14 +374,31 @@ impl IconTheme {
     }
 }
 
-/// Preferences changed from MTUI's Settings panel.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+/// Preferences changed from MTUI's Settings panel or the playback controls.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub start_in_tray: bool,
     pub icon_theme: IconTheme,
     pub cover_style: CoverStyle,
     pub image_renderer: ImageRenderer,
+    /// Player gain, where `1.0` is 100% and `2.0` is the supported maximum.
+    pub volume: f32,
+    /// Stable CPAL device id. `None` follows the operating-system default.
+    pub output_device: Option<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            start_in_tray: false,
+            icon_theme: IconTheme::default(),
+            cover_style: CoverStyle::default(),
+            image_renderer: ImageRenderer::default(),
+            volume: 1.0,
+            output_device: None,
+        }
+    }
 }
 
 impl Settings {
@@ -389,18 +406,29 @@ impl Settings {
         let Some(path) = dir().ok().map(|dir| dir.join(SETTINGS_FILE)) else {
             return Self::default();
         };
-        fs::read(path)
+        let mut settings: Self = fs::read(path)
             .ok()
             .and_then(|raw| serde_json::from_slice(&raw).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        settings.volume = normalize_volume(settings.volume);
+        settings
     }
 
-    pub fn save(self) -> Result<()> {
+    pub fn save(mut self) -> Result<()> {
+        self.volume = normalize_volume(self.volume);
         let dir = dir()?;
         fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
         let path = dir.join(SETTINGS_FILE);
         let body = serde_json::to_vec_pretty(&self).context("could not encode settings")?;
         fs::write(&path, body).with_context(|| format!("could not write {}", path.display()))
+    }
+}
+
+fn normalize_volume(volume: f32) -> f32 {
+    if volume.is_finite() {
+        volume.clamp(0.0, 2.0)
+    } else {
+        1.0
     }
 }
 
@@ -486,12 +514,16 @@ mod tests {
         assert_eq!(settings.icon_theme, IconTheme::Signal);
         assert_eq!(settings.cover_style, CoverStyle::Pixel);
         assert_eq!(settings.image_renderer, ImageRenderer::Automatic);
+        assert_eq!(settings.volume, 1.0);
+        assert_eq!(settings.output_device, None);
 
         let legacy: Settings = serde_json::from_str(r#"{"start_in_tray":true}"#).unwrap();
         assert!(legacy.start_in_tray);
         assert_eq!(legacy.icon_theme, IconTheme::Signal);
         assert_eq!(legacy.cover_style, CoverStyle::Pixel);
         assert_eq!(legacy.image_renderer, ImageRenderer::Automatic);
+        assert_eq!(legacy.volume, 1.0);
+        assert_eq!(legacy.output_device, None);
     }
 
     #[test]
@@ -501,6 +533,8 @@ mod tests {
             icon_theme: IconTheme::Wave,
             cover_style: CoverStyle::ColoredAscii,
             image_renderer: ImageRenderer::Kitty,
+            volume: 0.65,
+            output_device: Some("Wasapi:test-output".to_string()),
         })
         .unwrap();
         let settings: Settings = serde_json::from_str(&body).unwrap();
@@ -508,6 +542,19 @@ mod tests {
         assert_eq!(settings.icon_theme, IconTheme::Wave);
         assert_eq!(settings.cover_style, CoverStyle::ColoredAscii);
         assert_eq!(settings.image_renderer, ImageRenderer::Kitty);
+        assert_eq!(settings.volume, 0.65);
+        assert_eq!(
+            settings.output_device.as_deref(),
+            Some("Wasapi:test-output")
+        );
+    }
+
+    #[test]
+    fn volume_is_kept_inside_the_players_supported_range() {
+        assert_eq!(normalize_volume(-1.0), 0.0);
+        assert_eq!(normalize_volume(0.75), 0.75);
+        assert_eq!(normalize_volume(3.0), 2.0);
+        assert_eq!(normalize_volume(f32::NAN), 1.0);
     }
 
     #[test]

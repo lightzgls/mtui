@@ -110,7 +110,7 @@ const HINTS_PLAYING: &str = "Tab panels  Esc back  ^K menu  . actions";
 const MENU_MAX_WIDTH: u16 = 56;
 const MENU_MAX_HEIGHT: u16 = 24;
 const SETTINGS_WIDTH: u16 = 56;
-const SETTINGS_HEIGHT: u16 = 19;
+const SETTINGS_HEIGHT: u16 = 22;
 
 /// Floor on the sign-in panel's width. Wide enough that the footer hint reads
 /// as one line, whatever the URL beside it happens to measure.
@@ -694,9 +694,18 @@ fn render_settings(frame: &mut Frame, app: &App) {
         muted_detail("Shares the current track and playback state.", width),
         Line::from(""),
         choice_line(
+            "Audio output",
+            app.output_device_label(),
+            app.settings_selected() == 2,
+            width,
+            ambient(app),
+        ),
+        muted_detail("System default follows changes made in the OS.", width),
+        Line::from(""),
+        choice_line(
             "Image renderer",
             app.image_renderer().label(),
-            app.settings_selected() == 2,
+            app.settings_selected() == 3,
             width,
             ambient(app),
         ),
@@ -708,7 +717,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
         choice_line(
             "Song cover",
             app.cover_style().label(),
-            app.settings_selected() == 3,
+            app.settings_selected() == 4,
             width,
             ambient(app),
         ),
@@ -717,7 +726,7 @@ fn render_settings(frame: &mut Frame, app: &App) {
         choice_line(
             "App icon",
             app.icon_theme().label(),
-            app.settings_selected() == 4,
+            app.settings_selected() == 5,
             width,
             ambient(app),
         ),
@@ -830,15 +839,28 @@ fn render_message(frame: &mut Frame, body: &str) {
 fn render_sign_in(frame: &mut Frame, phase: &SignIn) {
     match phase {
         SignIn::Failed { reason } => render_sign_in_failed(frame, reason),
-        SignIn::Music { started } => render_music_sign_in(frame, started.elapsed()),
+        SignIn::Music {
+            started,
+            recovering,
+        } => render_music_sign_in(frame, started.elapsed(), *recovering),
     }
 }
 
-fn render_music_sign_in(frame: &mut Frame, elapsed: Duration) {
+fn render_music_sign_in(frame: &mut Frame, elapsed: Duration, recovering: bool) {
     let inner = sign_in_panel(frame, SIGN_IN_MIN_WIDTH, 8, Color::Cyan);
-    let action = "  Complete sign-in in the YouTube Music window.";
-    let waiting = "  Waiting for a Music session";
-    let privacy = "  MTUI never receives your password. Esc hides this panel.";
+    let (action, waiting, privacy) = if recovering {
+        (
+            "  Renewing your saved YouTube Music session.",
+            "  Checking the saved browser session",
+            "  Esc hides this. Sign-in opens only if needed.",
+        )
+    } else {
+        (
+            "  Complete sign-in in the YouTube Music window.",
+            "  Waiting for a Music session",
+            "  MTUI never receives your password. Esc hides this panel.",
+        )
+    };
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(action, Style::default().fg(Color::White))),
@@ -2966,7 +2988,14 @@ fn render_up_next(frame: &mut Frame, now: &NowPlaying, area: Rect, ambient: Colo
             format!(" {}", truncate(&now.queue_title, width.saturating_sub(1))),
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(""),
+        if now.repeat.label() == "off" {
+            Line::from("")
+        } else {
+            Line::from(Span::styled(
+                format!(" Repeat {}", now.repeat.label()),
+                Style::default().fg(ambient),
+            ))
+        },
     ];
     debug_assert_eq!(lines.len(), UP_NEXT_HEADER);
 
@@ -4014,6 +4043,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+    use crate::app::RepeatMode;
     use crate::source::watch::{Comment, Comments, Lyrics, TimedLine};
     use crate::source::{ArtistRef, BrowseEndpoint};
 
@@ -4500,6 +4530,7 @@ mod tests {
                 24,
                 SignIn::Music {
                     started: Instant::now(),
+                    recovering: false,
                 },
             ),
         ];
@@ -4932,6 +4963,16 @@ mod tests {
             !rows.iter().any(|row| row.contains("The Moment")),
             "and the rows above it should have scrolled off: {rows:#?}"
         );
+    }
+
+    #[test]
+    fn active_repeat_mode_is_visible_in_the_queue_heading() {
+        let mut now = playing();
+        now.repeat = RepeatMode::All;
+
+        let rows = drawn_panel(&now, 44, 9);
+
+        assert!(rows[4].contains("Repeat all"), "{rows:#?}");
     }
 
     #[test]
@@ -6167,6 +6208,7 @@ mod tests {
             },
             SignIn::Music {
                 started: Instant::now(),
+                recovering: false,
             },
         ] {
             let rows = drawn(70, 24, &phase).join("\n");
@@ -6186,6 +6228,18 @@ mod tests {
         assert!(rows.contains("M retry sign-in"), "{rows}");
     }
 
+    #[test]
+    fn recovery_does_not_claim_a_sign_in_window_is_already_open() {
+        let phase = SignIn::Music {
+            started: Instant::now(),
+            recovering: true,
+        };
+        let rows = drawn(70, 24, &phase).join("\n");
+        assert!(rows.contains("Renewing your saved"), "{rows}");
+        assert!(rows.contains("opens only if needed"), "{rows}");
+        assert!(!rows.contains("Complete sign-in"), "{rows}");
+    }
+
     /// Every phase is sized to its own content and keeps its exit visible.
     #[test]
     fn no_phase_clips_the_key_that_dismisses_it() {
@@ -6195,6 +6249,7 @@ mod tests {
             },
             SignIn::Music {
                 started: Instant::now(),
+                recovering: false,
             },
         ] {
             let rows = drawn(70, 24, &phase).join("\n");
@@ -6356,6 +6411,16 @@ mod tests {
         let cover = choice_line("Song cover", "Colored ASCII", true, 40, Color::Magenta);
         assert!(line_text(&cover).contains("Song cover: < Colored ASCII >"));
         assert_eq!(cover.spans[0].style.bg, Some(Color::Magenta));
+
+        let output = choice_line(
+            "Audio output",
+            "Living room speakers",
+            true,
+            36,
+            Color::Blue,
+        );
+        assert!(line_text(&output).contains("Audio output: < Living room"));
+        assert_eq!(display_width(&line_text(&output)), 36);
 
         let footer = settings_footer(54);
         assert!(footer.contains("↑↓"));

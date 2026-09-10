@@ -20,7 +20,7 @@ use crate::source::sapisid;
 #[path = "session_helper.rs"]
 mod helper;
 
-const FORCE_ARG: &str = "--clear-session";
+const RECOVER_ARG: &str = "--recover-session";
 #[cfg(not(windows))]
 const PROFILE_ARG: &str = "--profile";
 #[cfg(windows)]
@@ -35,23 +35,26 @@ pub fn helper_request() -> Option<bool> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     args.iter()
         .any(|arg| arg == std::ffi::OsStr::new(HELPER_ARG))
-        .then(|| args.iter().any(|arg| arg == std::ffi::OsStr::new(FORCE_ARG)))
+        .then(|| {
+            args.iter()
+                .any(|arg| arg == std::ffi::OsStr::new(RECOVER_ARG))
+        })
 }
 
 /// Runs the embedded Windows helper, where the process main thread is free for
 /// the native window event loop. Its stdout is a private pipe owned by the
 /// parent MTUI process.
 #[cfg(windows)]
-pub fn run_helper(force: bool) -> Result<()> {
+pub fn run_helper(recover: bool) -> Result<()> {
     let profile = crate::config::dir()?.join("webview");
-    let header = helper::run(profile, force)?;
+    let header = helper::run(profile, recover)?;
     println!("{header}");
     Ok(())
 }
 
 /// Starts the cross-platform sign-in helper and waits for its session. Called
 /// on a worker thread, so the terminal remains responsive.
-pub fn sign_in(force: bool) -> Result<String> {
+pub fn sign_in(recover: bool) -> Result<String> {
     let executable = std::env::current_exe().context("could not locate the MTUI executable")?;
     #[cfg(not(windows))]
     let profile = crate::config::dir()?.join("webview");
@@ -63,8 +66,8 @@ pub fn sign_in(force: bool) -> Result<String> {
     };
     #[cfg(not(windows))]
     let mut process = sign_in_command(&executable, &profile)?;
-    if force {
-        process.arg(FORCE_ARG);
+    if recover {
+        process.arg(RECOVER_ARG);
     }
     let output = process
         .stdin(Stdio::null())
@@ -131,14 +134,25 @@ fn save(header: &str) -> Result<()> {
 /// files that were removed first.
 pub fn sign_out() -> Result<Option<String>> {
     Cookies::forget()?;
+    // Pending reports were collected under the account being left (or before
+    // it signed in). A later account must not inherit that listening history.
+    let pending_warning = crate::source::journal::forget_pending_reports()
+        .err()
+        .map(|error| format!("could not clear pending playback reports: {error}"));
     let profile = crate::config::dir()?.join("webview");
     match std::fs::remove_dir_all(&profile) {
-        Ok(()) => Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Ok(Some(format!(
-            "could not clear the sign-in window data at {}: {error}",
-            profile.display()
-        ))),
+        Ok(()) => Ok(pending_warning),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(pending_warning),
+        Err(error) => {
+            let profile_warning = format!(
+                "could not clear the sign-in window data at {}: {error}",
+                profile.display()
+            );
+            Ok(Some(match pending_warning {
+                Some(pending) => format!("{pending}; {profile_warning}"),
+                None => profile_warning,
+            }))
+        }
     }
 }
 
@@ -150,7 +164,7 @@ mod tests {
     #[test]
     fn helper_flag_is_private_and_unambiguous() {
         assert!(HELPER_ARG.starts_with("--mtui-"));
-        assert_ne!(HELPER_ARG, FORCE_ARG);
+        assert_ne!(HELPER_ARG, RECOVER_ARG);
     }
 
     #[cfg(not(windows))]

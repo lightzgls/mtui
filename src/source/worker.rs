@@ -42,10 +42,10 @@ use super::cover::{self, Cover};
 use super::home::{self, Shelf};
 use super::http::Http;
 use super::innertube::InnerTube;
-use super::journal::{Journal, Play};
+use super::journal::{Journal, Play, ReportQueue};
 use super::{ArtistRef, BrowseEndpoint, StreamUrl, Track};
 use super::{lrclib, stats, watch};
-use crate::config::{Cookies, Import};
+use crate::config::Cookies;
 use crate::source::youtube::YouTube;
 use mtui_resolver::{PlaybackSession, ResolveRequest, Resolver};
 
@@ -100,14 +100,15 @@ pub enum Request {
         key: String,
         url: String,
     },
-    /// The authenticated form of the same FEmusic_home route. Queued after the
-    /// public response so a slow session cannot leave the pane blank.
+    /// Home from the best session available. The worker tries the personalized
+    /// route first and falls back to the public route sequentially, avoiding a
+    /// second response tree and card collection in memory.
     PersonalHome {
         generation: u64,
     },
     /// Establishes a Music session in MTUI's cross-platform sign-in window.
     MusicSignIn {
-        force: bool,
+        recover: bool,
     },
     /// A finished play: how far the user actually got through a track.
     ///
@@ -119,6 +120,10 @@ pub enum Request {
         track: Track,
         listened: Duration,
     },
+    /// Retries the durable playback outbox after a Music session is imported.
+    RetryReports,
+    /// Clears account-bound pending reports on explicit logout.
+    ClearReports,
     /// Tracks behind a card that browses rather than plays -- an album, a
     /// playlist or an artist. `title` is carried through to label the list.
     OpenBrowse {
@@ -197,13 +202,8 @@ pub enum Response {
         generation: u64,
         shelves: Vec<Shelf>,
     },
-    /// One of the concurrent Home requests failed transiently. Kept separate
-    /// from `Failed` so the other attempt can still fill the page without a raw
-    /// HTTP error replacing the status line.
+    /// The one bounded Home request failed transiently.
     HomeFailed {
-        generation: u64,
-    },
-    HomeSessionStale {
         generation: u64,
     },
     /// A YouTube Music web session was established successfully.
@@ -418,8 +418,8 @@ impl SourceWorker {
                 spawn_personal_home(self.res_tx.clone(), generation);
                 Ok(())
             }
-            Request::MusicSignIn { force } => {
-                spawn_music_sign_in(self.res_tx.clone(), force);
+            Request::MusicSignIn { recover } => {
+                spawn_music_sign_in(self.res_tx.clone(), recover);
                 Ok(())
             }
             Request::Watch { .. }
@@ -431,6 +431,8 @@ impl SourceWorker {
                 self.page_tx.send(req).context("player page worker is gone")
             }
             Request::ReportPlay { .. }
+            | Request::RetryReports
+            | Request::ClearReports
             | Request::OpenBrowse { .. }
             | Request::OpenArtist { .. } => self
                 .metadata_tx
@@ -471,6 +473,8 @@ fn name(req: &Request) -> &'static str {
         Request::PersonalHome { .. } => "PersonalHome",
         Request::MusicSignIn { .. } => "MusicSignIn",
         Request::ReportPlay { .. } => "ReportPlay",
+        Request::RetryReports => "RetryReports",
+        Request::ClearReports => "ClearReports",
         Request::OpenBrowse { .. } => "OpenBrowse",
         Request::OpenArtist { .. } => "OpenArtist",
         Request::Watch { .. } => "Watch",
@@ -806,17 +810,23 @@ fn spawn_personal_home(tx: Sender<Response>, generation: u64) {
         .name("mtui-personal-home".to_string())
         .spawn(move || {
             let response = (|| -> Result<Response> {
-                let Some(cookies) = Cookies::available().ok().flatten() else {
-                    return Ok(Response::HomeFailed { generation });
-                };
                 let http = Http::new()?;
-                Ok(match home::fetch_personalised(&http, &cookies) {
-                    Ok(Some(shelves)) => Response::Home {
+                // One feed at a time. A signed-in request gets first choice;
+                // the public page is fetched only when there is no session or
+                // the personalized endpoint cannot produce a usable page.
+                // This avoids keeping two JSON trees and two card collections
+                // alive during startup just to race them.
+                let shelves = Cookies::available()
+                    .ok()
+                    .flatten()
+                    .and_then(|cookies| home::fetch_personalised(&http, &cookies).ok().flatten())
+                    .or_else(|| home::fetch_public(&http).ok());
+                Ok(match shelves {
+                    Some(shelves) => Response::Home {
                         generation,
                         shelves,
                     },
-                    Ok(None) => Response::HomeSessionStale { generation },
-                    Err(_) => Response::HomeFailed { generation },
+                    None => Response::HomeFailed { generation },
                 })
             })()
             .unwrap_or(Response::HomeFailed { generation });
@@ -828,12 +838,12 @@ fn spawn_personal_home(tx: Sender<Response>, generation: u64) {
     }
 }
 
-fn spawn_music_sign_in(tx: Sender<Response>, force: bool) {
+fn spawn_music_sign_in(tx: Sender<Response>, recover: bool) {
     let report = tx.clone();
     if thread::Builder::new()
         .name("mtui-music-signin".to_string())
         .spawn(move || {
-            let response = match crate::session::sign_in(force) {
+            let response = match crate::session::sign_in(recover) {
                 Ok(browser) => Response::CookiesImported(browser),
                 Err(err) => Response::MusicSignInFailed(format!("{err:#}")),
             };
@@ -852,6 +862,8 @@ fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
         return;
     };
     let mut journal = Journal::load();
+    let mut reports = ReportQueue::load();
+    retry_reports(&http, &mut reports);
 
     while let Ok(req) = rx.recv() {
         let response = match req {
@@ -860,32 +872,22 @@ fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
                 // account, no cookie and no network, and it is what MTUI's own
                 // shelves are ranked from. A play too short to mean anything is
                 // dropped here rather than tested for twice.
-                if !journal.record(Play::new(&track, listened)) {
-                    continue;
+                let play = Play::new(&track, listened);
+                if journal.record(play.clone()) {
+                    // Queue first, then try the network. A missing cookie, a
+                    // stale session, an offline machine or a process killed
+                    // mid-request all leave the same recoverable state on disk.
+                    reports.enqueue(&play);
+                    retry_reports(&http, &mut reports);
                 }
-
-                // Upstream second, and only with a cookie -- there is no other way
-                // to attribute a play to an account, for the reason
-                // `crate::source::sapisid` documents.
-                if let Some(cookies) = Cookies::available().ok().flatten() {
-                    // Swallowed on purpose. The user did not ask for this, the
-                    // music already played, and the local journal already has it;
-                    // replacing the status line with a tracking-endpoint failure
-                    // would be spending something they are using on something they
-                    // are not.
-                    //
-                    // Except for one failure, which is worth acting on rather than
-                    // reporting: a player response with no tracking in it means
-                    // YouTube did not recognise the session. An imported cookie
-                    // that has expired is exactly what that looks like, and the
-                    // fix is a fresh Music session. Forgetting it here makes the
-                    // next launch open interactive setup.
-                    if let Err(why) = stats::report(&http, &cookies, &track.id, listened)
-                        && format!("{why:#}").contains(stats::STALE)
-                    {
-                        let _ = Import::forget();
-                    }
-                }
+                None
+            }
+            Request::RetryReports => {
+                retry_reports(&http, &mut reports);
+                None
+            }
+            Request::ClearReports => {
+                reports.clear();
                 None
             }
             Request::OpenBrowse {
@@ -912,6 +914,35 @@ fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
         };
         if response.is_some_and(|response| tx.send(response).is_err()) {
             break;
+        }
+    }
+}
+
+fn retry_reports(http: &Http, reports: &mut ReportQueue) {
+    let Some(cookies) = Cookies::available().ok().flatten() else {
+        return;
+    };
+
+    while let Some(report) = reports.front().cloned() {
+        match stats::report_with_cpn(
+            http,
+            &cookies,
+            &report.video_id,
+            Duration::from_secs(report.listened),
+            &report.cpn,
+        ) {
+            Ok(()) => {
+                if !reports.acknowledge_front() {
+                    return;
+                }
+            }
+            Err(_) => {
+                crate::diagnostics::error(
+                    "history",
+                    "playback report retained: YouTube tracking is unavailable",
+                );
+                return;
+            }
         }
     }
 }

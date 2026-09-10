@@ -78,8 +78,8 @@ const IDLE_TICK: Duration = Duration::from_millis(500);
 
 fn main() -> Result<()> {
     #[cfg(windows)]
-    if let Some(force) = session::helper_request() {
-        return session::run_helper(force);
+    if let Some(recover) = session::helper_request() {
+        return session::run_helper(recover);
     }
     #[cfg(windows)]
     if console::is_host() {
@@ -145,7 +145,7 @@ fn run(settings: config::Settings, mut tray: Option<Tray>) -> Result<()> {
     // the middle of a drawn frame.
     let graphics = graphics::detect();
 
-    let player = Player::spawn()?;
+    let player = Player::spawn(settings.volume, settings.output_device.clone())?;
     let source = SourceWorker::spawn(yt)?;
     let mut app = App::new(player, source, graphics, settings);
 
@@ -510,6 +510,8 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
                     icon_theme: app.icon_theme(),
                     cover_style: app.cover_style(),
                     image_renderer: app.image_renderer(),
+                    volume: app.snapshot().volume,
+                    output_device: app.output_device_id().map(str::to_string),
                 })
                 .save()
                 {
@@ -539,6 +541,8 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
             icon_theme: app.icon_theme(),
             cover_style: app.cover_style(),
             image_renderer: app.image_renderer(),
+            volume: app.snapshot().volume,
+            output_device: app.output_device_id().map(str::to_string),
         })
         .save()
         {

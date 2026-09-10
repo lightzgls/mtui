@@ -6,7 +6,7 @@
 //! event loop never stalls.
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -15,7 +15,7 @@ use crate::art::ArtCache;
 use crate::config::{self, CoverStyle, IconTheme, ImageRenderer};
 use crate::discord::{Activity, Clock, Presence};
 use crate::graphics::Graphics;
-use crate::player::{Command, PlayState, Player, PlayerEvent, Snapshot};
+use crate::player::{Command, OutputDevice, PlayState, Player, PlayerEvent, Snapshot};
 use crate::source::artist::{ArtistPage, ArtistSong};
 use crate::source::cover::Cover;
 use crate::source::home::{Card, Shelf, Target};
@@ -134,7 +134,7 @@ const VOLUME_STEP: f32 = 0.05;
 /// Exact pages retained for Back. A cap keeps nested artist browsing bounded
 /// even when someone walks through a long chain of related artists.
 const PAGE_HISTORY: usize = 12;
-const SETTINGS_ITEMS: usize = 5;
+const SETTINGS_ITEMS: usize = 6;
 
 /// Tracks the queue may skip past in a row before it gives up.
 ///
@@ -241,6 +241,33 @@ pub enum Tab {
     Lyrics,
     Related,
     Comments,
+}
+
+/// What automatic advancement does when the current track ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    All,
+    One,
+}
+
+impl RepeatMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::All => "all",
+            Self::One => "one",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::One,
+            Self::One => Self::Off,
+        }
+    }
 }
 
 impl Tab {
@@ -472,6 +499,7 @@ pub struct NowPlaying {
     /// Where in `queue` the playing track is. `None` until the queue lands, or
     /// when what is playing is not in it.
     pub playing: Option<usize>,
+    pub repeat: RepeatMode,
     pub tab: Tab,
     /// One cursor per tab, so switching away and back returns to where the user
     /// left off. For the two list tabs this is the selected row; for lyrics and
@@ -524,6 +552,7 @@ impl NowPlaying {
             topup_failures: 0,
             dropped: VecDeque::new(),
             playing: None,
+            repeat: RepeatMode::Off,
             tab: Tab::UpNext,
             cursor: [0; Tab::ALL.len()],
             follow_lyrics: true,
@@ -633,6 +662,114 @@ impl NowPlaying {
     /// The track the queue would play next, if there is one.
     fn next_in_queue(&self) -> Option<&Track> {
         self.queue.get(self.playing? + 1)
+    }
+
+    fn advanced_index(&self, delta: isize, auto: bool) -> Option<usize> {
+        let current = self.playing?;
+        if auto && delta > 0 && self.repeat == RepeatMode::One {
+            return Some(current);
+        }
+        let index = usize::try_from(current as isize + delta).ok();
+        if index.is_some_and(|index| index < self.queue.len()) {
+            return index;
+        }
+        if self.repeat == RepeatMode::All && !self.topping_up && !self.queue.is_empty() {
+            return Some(if delta > 0 { 0 } else { self.queue.len() - 1 });
+        }
+        None
+    }
+
+    /// Inserts an explicit user choice while preserving the queue's fixed
+    /// memory window. When the ahead window is full, its farthest item yields
+    /// to the requested track; no user action can grow the queue past the same
+    /// bound used by radio continuations.
+    fn insert_user_track(&mut self, track: Track, next: bool) -> bool {
+        let Some(playing) = self.playing else {
+            return false;
+        };
+        if self.queue.iter().any(|held| held.id == track.id) {
+            return false;
+        }
+
+        let ceiling = playing + 1 + QUEUE_AHEAD;
+        if self.queue.len() >= ceiling {
+            self.queue.pop();
+        }
+        self.dropped.retain(|id| *id != track.id);
+        if next {
+            self.queue
+                .insert((playing + 1).min(self.queue.len()), track);
+        } else {
+            self.queue.push(track);
+        }
+        true
+    }
+
+    /// Removes only a future track. Played rows and the track producing sound
+    /// are history, not editable queue entries.
+    fn remove_selected_upcoming(&mut self) -> Option<Track> {
+        let playing = self.playing?;
+        let selected = self.cursor[Tab::UpNext.index()];
+        if selected <= playing || selected >= self.queue.len() {
+            return None;
+        }
+        let removed = self.queue.remove(selected);
+        self.cursor[Tab::UpNext.index()] = selected.min(self.queue.len().saturating_sub(1));
+        Some(removed)
+    }
+
+    /// Moves one future row without letting it cross the currently playing
+    /// track. Returns false at either edge or outside the upcoming queue.
+    fn move_selected_upcoming(&mut self, delta: isize) -> bool {
+        let Some(playing) = self.playing else {
+            return false;
+        };
+        let selected = self.cursor[Tab::UpNext.index()];
+        if selected <= playing || selected >= self.queue.len() {
+            return false;
+        }
+        let first = playing + 1;
+        let last = self.queue.len() - 1;
+        let moved = selected.saturating_add_signed(delta).clamp(first, last);
+        if moved == selected {
+            return false;
+        }
+        self.queue.swap(selected, moved);
+        self.cursor[Tab::UpNext.index()] = moved;
+        true
+    }
+
+    fn clear_upcoming(&mut self) -> usize {
+        let Some(playing) = self.playing else {
+            return 0;
+        };
+        let removed = self.queue.len().saturating_sub(playing + 1);
+        self.queue.truncate(playing + 1);
+        self.cursor[Tab::UpNext.index()] = playing;
+        removed
+    }
+
+    /// Shuffles only what has not played, keeping the current track and the
+    /// cursor's selected song stable.
+    fn shuffle_upcoming(&mut self) -> usize {
+        let Some(first) = self.playing.map(|playing| playing + 1) else {
+            return 0;
+        };
+        let count = self.queue.len().saturating_sub(first);
+        if count < 2 {
+            return 0;
+        }
+        let selected_id = self
+            .queue
+            .get(self.cursor[Tab::UpNext.index()])
+            .map(|track| track.id.clone());
+        shuffle_tracks(&mut self.queue[first..]);
+        if let Some(id) = selected_id
+            && let Some(index) = self.queue.iter().position(|track| track.id == id)
+        {
+            self.cursor[Tab::UpNext.index()] = index;
+        }
+        count
     }
 
     /// How many tracks are left ahead of the one playing.
@@ -869,12 +1006,23 @@ enum MenuAction {
     ConnectMusic,
     LogOutMusic,
     OpenHomeSelection,
+    StartHomeRadio,
+    PlayHomeNext,
+    QueueHomeTrack,
+    PlayHomeShelf,
+    ShuffleHomeShelf,
     RefreshHome,
     PlaySelected,
     OpenArtist,
     OpenArtistSelection,
     ReloadArtist,
     OpenPageSelection,
+    RemoveQueueSelection,
+    MoveQueueSelectionUp,
+    MoveQueueSelectionDown,
+    ClearUpcomingQueue,
+    ShuffleUpcomingQueue,
+    CycleRepeat,
     FollowLyrics,
     TogglePause,
     Next,
@@ -913,8 +1061,10 @@ pub enum SignIn {
     /// bar: the user is looking here, and the next thing they need is the retry
     /// key -- which this is the only place that offers.
     Failed { reason: String },
-    /// The shared YouTube Music window is waiting for a valid session.
-    Music { started: Instant },
+    /// The shared YouTube Music profile is waiting for a valid session. During
+    /// automatic recovery it begins hidden and appears only if Google needs the
+    /// user to authenticate again.
+    Music { started: Instant, recovering: bool },
 }
 
 pub struct App {
@@ -957,6 +1107,10 @@ pub struct App {
     pub cover_style: CoverStyle,
     /// User-selected terminal bitmap backend.
     pub image_renderer: ImageRenderer,
+    /// Outputs currently advertised by the operating system.
+    output_devices: Vec<OutputDevice>,
+    /// Stable id of the selected output, or `None` to follow the system default.
+    output_device: Option<String>,
     /// Where the renderer wants the cover painted as real pixels, set on every
     /// frame the terminal-image path runs. `None` on the half-block path, which
     /// needs no help from the event loop.
@@ -1013,8 +1167,8 @@ pub struct App {
     /// waiting on. What it is actually for is the difference between "loading"
     /// and "there is no feed", which are the same empty pane.
     pub home_pending: bool,
-    /// Public and authenticated FEmusic_home run concurrently. Fail the pane
-    /// only after both have answered without shelves.
+    /// Number of Home requests still in flight. Home deliberately uses one
+    /// worker at a time so no second feed is retained just to race the first.
     home_attempts: u8,
     /// Identifies the latest refresh so late responses cannot mutate it.
     home_generation: u64,
@@ -1080,11 +1234,6 @@ pub struct App {
     /// The *furthest*, not the latest: seeking backwards must not shorten what
     /// the user is recorded as having heard.
     listening: Option<(Track, Duration)>,
-    /// Whether interactive Music sign-in has been opened this process. Once
-    /// only automatically; `M` can still open it explicitly.
-    imported: bool,
-    /// Whether a stale InnerTube session already triggered interactive setup.
-    cookie_refresh_attempted: bool,
     /// Prevents repeated `M` presses from opening duplicate session imports.
     music_signing_in: bool,
 
@@ -1132,6 +1281,24 @@ fn moved_cursor(selected: usize, delta: isize, len: usize) -> usize {
         selected.saturating_sub(delta.unsigned_abs())
     } else {
         selected.saturating_add(delta as usize).min(last)
+    }
+}
+
+/// Fisher-Yates with a tiny local xorshift state. Pulling a random-number
+/// crate into the player solely to reorder at most 66 already-held tracks
+/// would cost more code and dependency surface than the feature warrants.
+fn shuffle_tracks(tracks: &mut [Track]) {
+    let mut state = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+        ^ tracks.len() as u64;
+    for end in (1..tracks.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let index = (state as usize) % (end + 1);
+        tracks.swap(end, index);
     }
 }
 
@@ -1223,6 +1390,17 @@ impl App {
         graphics: Graphics,
         settings: config::Settings,
     ) -> Self {
+        let output_devices = match crate::player::available_output_devices() {
+            Ok(devices) => devices,
+            Err(error) => {
+                crate::diagnostics::warn(
+                    "player",
+                    &format!("could not list audio outputs: {error:#}"),
+                );
+                Vec::new()
+            }
+        };
+        let output_device = settings.output_device.clone();
         let mut app = Self {
             // Browse, not Editing: the program now opens on a page there is
             // something to do with, and the keys that move around it are bare
@@ -1245,6 +1423,8 @@ impl App {
             cover_size: CoverSize::default(),
             cover_style: settings.cover_style,
             image_renderer: settings.image_renderer,
+            output_devices,
+            output_device,
             images: Vec::new(),
             painted: Vec::new(),
             painted_with_kitty: false,
@@ -1282,8 +1462,6 @@ impl App {
             listening: None,
             queue_epoch: 0,
             seed_rotation: 0,
-            imported: false,
-            cookie_refresh_attempted: false,
             music_signing_in: false,
             resuming: None,
             // Started whether or not Discord is running and whether or not the
@@ -1510,6 +1688,21 @@ impl App {
         self.image_renderer
     }
 
+    pub fn output_device_id(&self) -> Option<&str> {
+        self.output_device.as_deref()
+    }
+
+    pub fn output_device_label(&self) -> &str {
+        let Some(id) = self.output_device.as_deref() else {
+            return "System default";
+        };
+        self.output_devices
+            .iter()
+            .find(|output| output.id == id)
+            .map(|output| output.name.as_str())
+            .unwrap_or("Unavailable output")
+    }
+
     /// Kitty is used automatically when detected, or explicitly when a
     /// multiplexer hides the terminal name from capability detection.
     pub fn kitty_images(&self) -> bool {
@@ -1582,6 +1775,10 @@ impl App {
             MenuItem::help("Now Playing", "P", None),
             MenuItem::help("Pause or resume", "Space", Some("Playback")),
             MenuItem::help("Next or previous", "n / p", None),
+            MenuItem::help("Repeat off / all / one", "R", None),
+            MenuItem::help("Queue: remove / shuffle", "d / z", None),
+            MenuItem::help("Queue: move row", "K / J", None),
+            MenuItem::help("Queue: clear upcoming", "C", None),
             MenuItem::help("Seek", "Left/Right", None),
             MenuItem::help("Change volume", "+ / -", None),
             MenuItem::help("Stop", "s", None),
@@ -1596,13 +1793,21 @@ impl App {
     fn page_action_items(&self) -> Vec<MenuItem> {
         match self.view {
             View::Home => {
-                let (label, enabled) = match self.home_card() {
+                let selected = self.home_card();
+                let (label, enabled) = match selected {
                     Some(card) if matches!(&card.target, Target::Play { .. }) => {
                         ("Play selected item", true)
                     }
                     Some(_) => ("Open selected item", true),
                     None => ("Open selected item", false),
                 };
+                let playable = selected.is_some_and(Card::is_playable);
+                let queue_ready =
+                    playable && self.now.as_ref().is_some_and(|now| now.playing.is_some());
+                let artist = selected.and_then(card_artist).is_some();
+                let playable_in_shelf = self.home.get(self.home_shelf).map_or(0, |shelf| {
+                    shelf.cards.iter().filter(|card| card.is_playable()).count()
+                });
                 vec![
                     MenuItem::action(
                         label,
@@ -1612,10 +1817,52 @@ impl App {
                         MenuAction::OpenHomeSelection,
                     ),
                     MenuItem::action(
+                        "Start radio from selected song",
+                        None,
+                        playable,
+                        None,
+                        MenuAction::StartHomeRadio,
+                    ),
+                    MenuItem::action(
+                        "Play next",
+                        None,
+                        queue_ready,
+                        None,
+                        MenuAction::PlayHomeNext,
+                    ),
+                    MenuItem::action(
+                        "Add to queue",
+                        None,
+                        queue_ready,
+                        None,
+                        MenuAction::QueueHomeTrack,
+                    ),
+                    MenuItem::action(
+                        "Open selected artist",
+                        None,
+                        artist,
+                        None,
+                        MenuAction::OpenArtist,
+                    ),
+                    MenuItem::action(
+                        "Play this shelf",
+                        None,
+                        playable_in_shelf > 0,
+                        Some("Current shelf"),
+                        MenuAction::PlayHomeShelf,
+                    ),
+                    MenuItem::action(
+                        "Shuffle this shelf",
+                        None,
+                        playable_in_shelf > 1,
+                        None,
+                        MenuAction::ShuffleHomeShelf,
+                    ),
+                    MenuItem::action(
                         "Refresh Home",
                         Some("r"),
                         !self.home_pending,
-                        None,
+                        Some("Home"),
                         MenuAction::RefreshHome,
                     ),
                 ]
@@ -1694,13 +1941,58 @@ impl App {
         };
 
         match now.tab {
-            Tab::UpNext => items.push(MenuItem::action(
-                "Play selected queue track",
-                Some("Enter"),
-                now.queue.get(now.cursor()).is_some(),
-                Some("Selection"),
-                MenuAction::OpenPageSelection,
-            )),
+            Tab::UpNext => {
+                let cursor = now.cursor();
+                let playing = now.playing;
+                let upcoming =
+                    playing.is_some_and(|index| cursor > index && cursor < now.queue.len());
+                let can_move_up = playing.is_some_and(|index| cursor > index + 1);
+                let can_move_down = upcoming && cursor + 1 < now.queue.len();
+                items.extend([
+                    MenuItem::action(
+                        "Play selected queue track",
+                        Some("Enter"),
+                        now.queue.get(cursor).is_some(),
+                        Some("Selection"),
+                        MenuAction::OpenPageSelection,
+                    ),
+                    MenuItem::action(
+                        "Remove from queue",
+                        Some("d"),
+                        upcoming,
+                        None,
+                        MenuAction::RemoveQueueSelection,
+                    ),
+                    MenuItem::action(
+                        "Move up",
+                        Some("K"),
+                        can_move_up,
+                        None,
+                        MenuAction::MoveQueueSelectionUp,
+                    ),
+                    MenuItem::action(
+                        "Move down",
+                        Some("J"),
+                        can_move_down,
+                        None,
+                        MenuAction::MoveQueueSelectionDown,
+                    ),
+                    MenuItem::action(
+                        "Shuffle upcoming",
+                        Some("z"),
+                        now.remaining() > 1,
+                        Some("Queue"),
+                        MenuAction::ShuffleUpcomingQueue,
+                    ),
+                    MenuItem::action(
+                        "Clear upcoming",
+                        Some("C"),
+                        now.remaining() > 0,
+                        None,
+                        MenuAction::ClearUpcomingQueue,
+                    ),
+                ]);
+            }
             Tab::Related => {
                 let (label, enabled) = match now.related_rows().get(now.cursor()) {
                     Some(RelatedRow::Card(card)) if matches!(&card.target, Target::Play { .. }) => {
@@ -1767,6 +2059,13 @@ impl App {
                 can_previous,
                 None,
                 MenuAction::Previous,
+            ),
+            MenuItem::action(
+                format!("Repeat: {}", now.repeat.label()),
+                Some("R"),
+                current.is_some(),
+                None,
+                MenuAction::CycleRepeat,
             ),
             MenuItem::action("Stop playback", Some("s"), true, None, MenuAction::Stop),
             MenuItem::action(
@@ -1869,6 +2168,29 @@ impl App {
         while let Some(event) = self.player.poll_event() {
             match event {
                 PlayerEvent::NeedsUrl { id, from } => self.resume_track(id, from),
+                PlayerEvent::OutputChanged { id, name } => {
+                    self.output_device = id;
+                    self.refresh_output_devices();
+                    let settings = config::Settings {
+                        start_in_tray: self.start_in_tray,
+                        icon_theme: self.icon_theme,
+                        cover_style: self.cover_style,
+                        image_renderer: self.image_renderer,
+                        volume: self.snapshot().volume,
+                        output_device: self.output_device.clone(),
+                    };
+                    self.status = match settings.save() {
+                        Ok(()) => format!("audio output set to {name}"),
+                        Err(error) => {
+                            crate::diagnostics::error(
+                                "config",
+                                &format!("could not save audio output: {error:#}"),
+                            );
+                            format!("audio output changed, but could not be saved: {error:#}")
+                        }
+                    };
+                }
+                PlayerEvent::OutputChangeFailed { why } => self.status = why,
             }
         }
     }
@@ -1962,7 +2284,6 @@ impl App {
                 | Response::Comments { .. }
                 | Response::Home { .. }
                 | Response::HomeFailed { .. }
-                | Response::HomeSessionStale { .. }
                 | Response::CookiesImported(_)
         ) {
             self.busy = false;
@@ -2016,21 +2337,6 @@ impl App {
                 self.home_attempts = self.home_attempts.saturating_sub(1);
                 self.finish_home_attempts();
             }
-            Response::HomeSessionStale { generation }
-                if generation == self.home_generation && !self.cookie_refresh_attempted =>
-            {
-                self.home_attempts = self.home_attempts.saturating_sub(1);
-                self.cookie_refresh_attempted = true;
-                self.finish_home_attempts();
-                self.begin_music_sign_in(true);
-            }
-            Response::HomeSessionStale { generation } => {
-                if generation != self.home_generation {
-                    return;
-                }
-                self.home_attempts = self.home_attempts.saturating_sub(1);
-                self.finish_home_attempts();
-            }
             Response::CookiesImported(browser) => {
                 // The page on screen was built without a session. There is a
                 // better one available now, so it is asked for again -- this is
@@ -2041,6 +2347,9 @@ impl App {
                 if matches!(self.overlay, Overlay::SignIn(SignIn::Music { .. })) {
                     self.overlay = Overlay::None;
                 }
+                // A valid session is the missing half of any reports queued
+                // while signed out or while the previous cookie was stale.
+                let _ = self.source.send(Request::RetryReports);
                 self.request_home();
             }
             Response::MusicSignInFailed(msg) => {
@@ -2407,7 +2716,7 @@ impl App {
         // `advance` declines to move for the same reason. This covers the
         // empty queue before the first watch response too, which must not be
         // seeded from the journal on top of the station already on its way.
-        if now.playing.is_none() {
+        if now.playing.is_none() || now.repeat == RepeatMode::All {
             return;
         }
         // Still deep enough, already asking, or given up asking.
@@ -2564,8 +2873,10 @@ impl App {
         // every track: what the user was reading is a choice about the session,
         // not about the song.
         let tab = self.now.as_ref().map_or(Tab::UpNext, |now| now.tab);
+        let repeat = self.now.as_ref().map_or(RepeatMode::Off, |now| now.repeat);
         let mut page = NowPlaying::new(&track);
         page.tab = tab;
+        page.repeat = repeat;
         // The queue survives moving *within* it -- that is what makes advancing
         // through a radio keep one stable "Up next" rather than reshuffling on
         // every track. Playing something from outside it drops it instead of
@@ -2593,7 +2904,9 @@ impl App {
             // Now that the queue has moved forward, whatever has fallen out of
             // the window behind it can go. This is the only place the queue
             // grows a position, so it is the only place that has to shrink.
-            page.trim();
+            if page.repeat != RepeatMode::All {
+                page.trim();
+            }
         }
         self.now = Some(page);
         if !keep_page {
@@ -2831,6 +3144,8 @@ impl App {
             icon_theme: self.icon_theme,
             cover_style: self.cover_style,
             image_renderer: self.image_renderer,
+            volume: self.snapshot().volume,
+            output_device: self.output_device.clone(),
         };
         match settings.save() {
             Ok(()) => {
@@ -2859,6 +3174,8 @@ impl App {
             icon_theme: theme,
             cover_style: self.cover_style,
             image_renderer: self.image_renderer,
+            volume: self.snapshot().volume,
+            output_device: self.output_device.clone(),
         };
         match settings.save() {
             Ok(()) => {
@@ -2883,6 +3200,8 @@ impl App {
             icon_theme: self.icon_theme,
             cover_style: style,
             image_renderer: self.image_renderer,
+            volume: self.snapshot().volume,
+            output_device: self.output_device.clone(),
         };
         match settings.save() {
             Ok(()) => {
@@ -2908,6 +3227,8 @@ impl App {
             icon_theme: self.icon_theme,
             cover_style: self.cover_style,
             image_renderer: renderer,
+            volume: self.snapshot().volume,
+            output_device: self.output_device.clone(),
         };
         match settings.save() {
             Ok(()) => {
@@ -2922,12 +3243,130 @@ impl App {
         }
     }
 
+    fn refresh_output_devices(&mut self) {
+        match crate::player::available_output_devices() {
+            Ok(devices) => self.output_devices = devices,
+            Err(error) => crate::diagnostics::warn(
+                "player",
+                &format!("could not refresh audio outputs: {error:#}"),
+            ),
+        }
+    }
+
+    fn cycle_audio_output(&mut self, forward: bool) {
+        self.refresh_output_devices();
+        let next = next_output_device(self.output_device.as_deref(), &self.output_devices, forward);
+        if next.as_deref() == self.output_device.as_deref() {
+            self.status = "no other audio outputs are available".to_string();
+            return;
+        }
+        let label = next
+            .as_deref()
+            .and_then(|id| self.output_devices.iter().find(|output| output.id == id))
+            .map(|output| output.name.as_str())
+            .unwrap_or("System default")
+            .to_string();
+        match self.player.send(Command::SetOutput(next)) {
+            Ok(()) => self.status = format!("switching audio output to {label} ..."),
+            Err(error) => self.status = format!("could not switch audio output: {error:#}"),
+        }
+    }
+
     fn toggle_pause(&mut self) {
         let _ = self.player.send(Command::TogglePause);
     }
 
     fn toggle_cover_size(&mut self) {
         self.cover_size = self.cover_size.toggled();
+    }
+
+    fn remove_queue_selection(&mut self) {
+        let Some(removed) = self
+            .now
+            .as_mut()
+            .and_then(NowPlaying::remove_selected_upcoming)
+        else {
+            return;
+        };
+        self.status = format!("removed {} from the queue", removed.label());
+    }
+
+    fn move_queue_selection(&mut self, delta: isize) {
+        let moved = self
+            .now
+            .as_mut()
+            .is_some_and(|now| now.move_selected_upcoming(delta));
+        if !moved {
+            return;
+        }
+        self.prefetch_queue_next();
+        self.status = if delta < 0 {
+            "moved queue track up".to_string()
+        } else {
+            "moved queue track down".to_string()
+        };
+    }
+
+    fn clear_upcoming_queue(&mut self) {
+        let removed = self.now.as_mut().map_or(0, NowPlaying::clear_upcoming);
+        if removed == 0 {
+            return;
+        }
+        // A continuation already in flight belongs to the queue before the
+        // explicit clear. Minting a new epoch makes its late answer harmless.
+        self.queue_epoch = self.queue_epoch.wrapping_add(1);
+        if let Some(now) = self.now.as_mut() {
+            now.queue_epoch = self.queue_epoch;
+            now.continuation = None;
+            now.topping_up = false;
+            now.topup_failures = MAX_TOPUP_FAILURES;
+        }
+        self.status = format!("cleared {removed} upcoming tracks");
+    }
+
+    fn shuffle_upcoming_queue(&mut self) {
+        let shuffled = self.now.as_mut().map_or(0, NowPlaying::shuffle_upcoming);
+        if shuffled == 0 {
+            return;
+        }
+        self.prefetch_queue_next();
+        self.status = format!("shuffled {shuffled} upcoming tracks");
+    }
+
+    fn prefetch_queue_next(&self) {
+        let next = self
+            .now
+            .as_ref()
+            .and_then(NowPlaying::next_in_queue)
+            .map(|track| track.id.clone());
+        if let Some(id) = next {
+            let _ = self.source.send(Request::Prefetch { id });
+        }
+    }
+
+    fn cycle_repeat(&mut self) {
+        let Some(repeat) = self.now.as_ref().map(|now| now.repeat.next()) else {
+            return;
+        };
+        if repeat == RepeatMode::All {
+            // Freeze this bounded window. A continuation already on its way is
+            // invalidated by the new epoch; its token remains available if
+            // repeat is later switched off.
+            self.queue_epoch = self.queue_epoch.wrapping_add(1);
+        }
+        if let Some(now) = self.now.as_mut() {
+            now.repeat = repeat;
+            if repeat == RepeatMode::All {
+                now.queue_epoch = self.queue_epoch;
+                now.topping_up = false;
+            } else if now.topup_failures >= MAX_TOPUP_FAILURES {
+                now.topup_failures = 0;
+            }
+        }
+        self.status = format!("repeat {}", repeat.label());
+        if repeat != RepeatMode::All {
+            self.top_up_queue();
+        }
     }
 
     /// Moves `delta` tracks through the queue and plays what it lands on.
@@ -2946,13 +3385,7 @@ impl App {
         let Some(now) = self.now.as_ref() else {
             return;
         };
-        let Some(current) = now.playing else {
-            return;
-        };
-        let Ok(index) = usize::try_from(current as isize + delta) else {
-            return;
-        };
-        let Some(track) = now.queue.get(index).cloned() else {
+        let Some(index) = now.advanced_index(delta, auto) else {
             if delta > 0 {
                 // A page is on its way, so this is not the end -- only the gap
                 // between running out and hearing back. `apply_more_queue`
@@ -2964,6 +3397,9 @@ impl App {
                     "end of the queue".to_string()
                 };
             }
+            return;
+        };
+        let Some(track) = now.queue.get(index).cloned() else {
             return;
         };
 
@@ -2987,7 +3423,7 @@ impl App {
     /// cookie saved -- reports it to YouTube.
     ///
     /// Idempotent by construction: the track is taken, so the several paths that
-    /// can end a play (the queue advancing, a new choice, a stop, quitting) may
+    /// can end a play (the queue advancing, a new choice, or a stop) may
     /// all call this and only the first does anything.
     ///
     /// Nothing is reported for a track that never produced sound, which is what
@@ -3034,12 +3470,6 @@ impl App {
         self.home_generation = self.home_generation.wrapping_add(1);
         let generation = self.home_generation;
         self.home_attempts = 0;
-        if config::Cookies::available().ok().flatten().is_none() && !self.imported {
-            self.imported = true;
-            self.home_pending = false;
-            self.begin_music_sign_in(false);
-            return;
-        }
         if self
             .source
             .send(Request::PersonalHome { generation })
@@ -3398,12 +3828,23 @@ impl App {
             MenuAction::ConnectMusic => self.begin_music_sign_in(false),
             MenuAction::LogOutMusic => self.log_out_music(),
             MenuAction::OpenHomeSelection => self.open_card(),
+            MenuAction::StartHomeRadio => self.start_home_radio(),
+            MenuAction::PlayHomeNext => self.queue_home_track(true),
+            MenuAction::QueueHomeTrack => self.queue_home_track(false),
+            MenuAction::PlayHomeShelf => self.play_home_shelf(false),
+            MenuAction::ShuffleHomeShelf => self.play_home_shelf(true),
             MenuAction::RefreshHome => self.refresh_home(),
             MenuAction::PlaySelected => self.play_selected(),
             MenuAction::OpenArtist => self.open_context_artist(),
             MenuAction::OpenArtistSelection => self.open_artist_selection(),
             MenuAction::ReloadArtist => self.reload_artist(),
             MenuAction::OpenPageSelection => self.open_page_row(),
+            MenuAction::RemoveQueueSelection => self.remove_queue_selection(),
+            MenuAction::MoveQueueSelectionUp => self.move_queue_selection(-1),
+            MenuAction::MoveQueueSelectionDown => self.move_queue_selection(1),
+            MenuAction::ClearUpcomingQueue => self.clear_upcoming_queue(),
+            MenuAction::ShuffleUpcomingQueue => self.shuffle_upcoming_queue(),
+            MenuAction::CycleRepeat => self.cycle_repeat(),
             MenuAction::FollowLyrics => {
                 if let Some(now) = self.now.as_mut() {
                     now.open(Tab::Lyrics);
@@ -3424,6 +3865,7 @@ impl App {
             return;
         }
         self.menu = None;
+        self.refresh_output_devices();
         self.settings_selected = 0;
         self.overlay = Overlay::Settings;
     }
@@ -3572,27 +4014,34 @@ impl App {
                 KeyCode::Char(' ') | KeyCode::Enter => match self.settings_selected() {
                     0 => self.toggle_start_in_tray(),
                     1 => self.toggle_presence(),
-                    2 => self.cycle_image_renderer(true),
-                    3 => self.cycle_cover_style(true),
-                    4 => self.cycle_icon_theme(true),
+                    2 => self.cycle_audio_output(true),
+                    3 => self.cycle_image_renderer(true),
+                    4 => self.cycle_cover_style(true),
+                    5 => self.cycle_icon_theme(true),
                     _ => {}
                 },
                 KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 2 => {
-                    self.cycle_image_renderer(false);
+                    self.cycle_audio_output(false);
                 }
                 KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 2 => {
-                    self.cycle_image_renderer(true);
+                    self.cycle_audio_output(true);
                 }
                 KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 3 => {
-                    self.cycle_cover_style(false);
+                    self.cycle_image_renderer(false);
                 }
                 KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 3 => {
-                    self.cycle_cover_style(true);
+                    self.cycle_image_renderer(true);
                 }
                 KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 4 => {
-                    self.cycle_icon_theme(false);
+                    self.cycle_cover_style(false);
                 }
                 KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 4 => {
+                    self.cycle_cover_style(true);
+                }
+                KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 5 => {
+                    self.cycle_icon_theme(false);
+                }
+                KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 5 => {
                     self.cycle_icon_theme(true);
                 }
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => {
@@ -3677,6 +4126,88 @@ impl App {
             return;
         };
         self.activate_card(card);
+    }
+
+    /// Starts the ordinary endless station for the selected song. This shares
+    /// the same watch request as a normal play; the separate action is an
+    /// explicit promise about what will follow the seed, not another fetch or
+    /// another queue held in memory.
+    fn start_home_radio(&mut self) {
+        let Some(track) = self.home_card().and_then(Card::track) else {
+            return;
+        };
+        self.play_track(track, false);
+    }
+
+    /// Inserts the selected song into the active queue. The queue owns the
+    /// bound and evicts only its farthest-ahead recommendation when full, so
+    /// repeated actions cannot turn a long session into a growing heap.
+    fn queue_home_track(&mut self, next: bool) {
+        let Some(track) = self.home_card().and_then(Card::track) else {
+            return;
+        };
+        let label = track.label();
+        let Some(now) = self.now.as_mut().filter(|now| now.playing.is_some()) else {
+            self.status = "wait for Up next to finish loading".to_string();
+            return;
+        };
+        if !now.insert_user_track(track.clone(), next) {
+            self.status = format!("{} is already in the queue", track.title);
+            return;
+        }
+
+        if next {
+            let _ = self.source.send(Request::Prefetch {
+                id: track.id.clone(),
+            });
+            self.status = format!("playing {label} next");
+        } else {
+            self.status = format!("added {label} to the queue");
+        }
+    }
+
+    /// Plays the playable cards in the current shelf as one finite queue. The
+    /// cards already hold all metadata needed here; no collection page is
+    /// fetched, and the queue is capped at the same fixed ahead window as a
+    /// radio page.
+    fn play_home_shelf(&mut self, shuffle: bool) {
+        let Some(shelf) = self.home.get(self.home_shelf) else {
+            return;
+        };
+        let title = shelf.title.clone();
+        let mut tracks: Vec<Track> = shelf
+            .cards
+            .iter()
+            .filter_map(Card::track)
+            .take(QUEUE_AHEAD + 1)
+            .collect();
+        if tracks.is_empty() {
+            self.status = "this shelf has nothing directly playable".to_string();
+            return;
+        }
+        if shuffle {
+            shuffle_tracks(&mut tracks);
+        }
+
+        let first = tracks[0].clone();
+        self.play_track(first, false);
+        self.queue_epoch = self.queue_epoch.wrapping_add(1);
+        if let Some(now) = self.now.as_mut() {
+            now.queue_title = title.clone();
+            now.queue = tracks;
+            now.queue_epoch = self.queue_epoch;
+            now.continuation = None;
+            now.topping_up = false;
+            now.topup_failures = 0;
+            now.dropped.clear();
+            now.playing = Some(0);
+            now.cursor[Tab::UpNext.index()] = 0;
+        }
+        self.status = if shuffle {
+            format!("shuffling {title}")
+        } else {
+            format!("playing {title}")
+        };
     }
 
     fn activate_card(&mut self, card: Card) {
@@ -3960,6 +4491,12 @@ impl App {
             // each of them is -- clamp it to the last one.
             KeyCode::Char('G') | KeyCode::End => self.jump_page(usize::MAX),
             KeyCode::Enter => self.open_page_row(),
+            KeyCode::Char('d') if tab == Some(Tab::UpNext) => self.remove_queue_selection(),
+            KeyCode::Char('K') if tab == Some(Tab::UpNext) => self.move_queue_selection(-1),
+            KeyCode::Char('J') if tab == Some(Tab::UpNext) => self.move_queue_selection(1),
+            KeyCode::Char('C') if tab == Some(Tab::UpNext) => self.clear_upcoming_queue(),
+            KeyCode::Char('z') if tab == Some(Tab::UpNext) => self.shuffle_upcoming_queue(),
+            KeyCode::Char('R') => self.cycle_repeat(),
             KeyCode::Char('n') => self.advance(1, false),
             KeyCode::Char('p') => self.advance(-1, false),
             KeyCode::Char(' ') => self.toggle_pause(),
@@ -4317,7 +4854,7 @@ impl App {
         format!("{state}{} -- {}", now.title, now.byline())
     }
 
-    fn begin_music_sign_in(&mut self, force: bool) {
+    fn begin_music_sign_in(&mut self, recover: bool) {
         if self.music_signing_in {
             self.status = "the YouTube Music session import is already pending".to_string();
             return;
@@ -4329,16 +4866,21 @@ impl App {
         }
         self.menu = None;
 
-        self.request_music_sign_in(force);
+        self.request_music_sign_in(recover);
     }
 
-    fn request_music_sign_in(&mut self, force: bool) {
+    fn request_music_sign_in(&mut self, recover: bool) {
         self.music_signing_in = true;
-        self.status = "finish signing in in the YouTube Music window ...".to_string();
+        self.status = if recover {
+            "renewing the saved YouTube Music session ...".to_string()
+        } else {
+            "finish signing in in the YouTube Music window ...".to_string()
+        };
         self.overlay = Overlay::SignIn(SignIn::Music {
             started: Instant::now(),
+            recovering: recover,
         });
-        if self.source.send(Request::MusicSignIn { force }).is_err() {
+        if self.source.send(Request::MusicSignIn { recover }).is_err() {
             self.music_signing_in = false;
             let reason = "source worker is not running".to_string();
             self.status = reason.clone();
@@ -4348,6 +4890,9 @@ impl App {
 
     fn log_out_music(&mut self) {
         self.menu = None;
+        // Clear the worker's in-memory copy even if removing credentials or
+        // the durable outbox reports an error below.
+        let _ = self.source.send(Request::ClearReports);
         match crate::session::sign_out() {
             Ok(warning) => {
                 // Any personalized response already in flight belongs to the
@@ -4355,10 +4900,6 @@ impl App {
                 self.home_generation = self.home_generation.wrapping_add(1);
                 self.home_attempts = 0;
                 self.home_pending = false;
-                self.cookie_refresh_attempted = false;
-                // Suppress the first-run auto-prompt. Logging out is an
-                // explicit request to remain signed out until M is pressed.
-                self.imported = true;
                 self.home.clear();
                 self.home_scroll.clear();
                 self.home_shelf = 0;
@@ -4366,10 +4907,11 @@ impl App {
                 self.home_top = 0;
                 self.selection_settled = None;
                 self.art = ArtCache::default();
-                self.status = match warning {
-                    Some(warning) => format!("logged out; {warning}"),
-                    None => "logged out of YouTube Music -- press M to sign in".to_string(),
-                };
+                self.status = warning.map_or_else(
+                    || "logged out of YouTube Music -- loading guest Home".to_string(),
+                    |warning| format!("logged out; {warning}"),
+                );
+                self.request_home();
             }
             Err(error) => {
                 self.status = format!("could not log out of YouTube Music: {error:#}");
@@ -4379,8 +4921,28 @@ impl App {
 
     fn nudge_volume(&mut self, delta: f32) {
         let volume = (self.snapshot().volume + delta).clamp(0.0, 2.0);
-        let _ = self.player.send(Command::SetVolume(volume));
-        self.status = format!("volume {:.0}%", volume * 100.0);
+        if let Err(error) = self.player.send(Command::SetVolume(volume)) {
+            self.status = format!("could not change volume: {error:#}");
+            return;
+        }
+        let settings = config::Settings {
+            start_in_tray: self.start_in_tray,
+            icon_theme: self.icon_theme,
+            cover_style: self.cover_style,
+            image_renderer: self.image_renderer,
+            volume,
+            output_device: self.output_device.clone(),
+        };
+        self.status = match settings.save() {
+            Ok(()) => format!("volume {:.0}%", volume * 100.0),
+            Err(error) => {
+                crate::diagnostics::error("config", &format!("could not save volume: {error:#}"));
+                format!(
+                    "volume {:.0}%; could not save it: {error:#}",
+                    volume * 100.0
+                )
+            }
+        };
     }
 
     /// Seeks relative to the current position, clamped at zero.
@@ -4400,6 +4962,25 @@ impl App {
         };
         let _ = self.player.send(Command::Seek(target));
     }
+}
+
+fn next_output_device(
+    current: Option<&str>,
+    outputs: &[OutputDevice],
+    forward: bool,
+) -> Option<String> {
+    let choices = outputs.len() + 1;
+    let current = current
+        .and_then(|id| outputs.iter().position(|output| output.id == id))
+        .map_or(0, |index| index + 1);
+    let next = if forward {
+        (current + 1) % choices
+    } else {
+        (current + choices - 1) % choices
+    };
+    next.checked_sub(1)
+        .and_then(|index| outputs.get(index))
+        .map(|output| output.id.clone())
 }
 
 fn account_menu_items(connected: bool, signing_in: bool) -> Vec<MenuItem> {
@@ -4812,6 +5393,179 @@ mod tests {
         assert_eq!(now.queue.len(), 5);
     }
 
+    #[test]
+    fn explicit_queue_actions_share_the_radio_memory_bound() {
+        let mut now = playing();
+        now.queue = queued(QUEUE_BEHIND + 1 + QUEUE_AHEAD);
+        now.playing = Some(QUEUE_BEHIND);
+        let old_tail = now.queue.last().unwrap().id.clone();
+
+        assert!(now.insert_user_track(numbered(999), true));
+
+        assert_eq!(now.queue.len(), QUEUE_BEHIND + 1 + QUEUE_AHEAD);
+        assert_eq!(now.queue[QUEUE_BEHIND + 1].id, "999");
+        assert!(
+            now.queue.iter().all(|track| track.id != old_tail),
+            "the farthest recommendation should yield to the user choice"
+        );
+    }
+
+    #[test]
+    fn adding_to_queue_uses_the_tail_and_rejects_duplicates() {
+        let mut now = playing();
+        now.queue = queued(4);
+        now.playing = Some(0);
+
+        assert!(now.insert_user_track(numbered(9), false));
+        assert_eq!(now.queue.last().unwrap().id, "9");
+        assert!(!now.insert_user_track(numbered(9), true));
+        assert_eq!(now.queue.iter().filter(|track| track.id == "9").count(), 1);
+    }
+
+    #[test]
+    fn queue_edits_apply_only_after_the_playing_track() {
+        let mut now = playing();
+        now.queue = queued(6);
+        now.playing = Some(2);
+
+        now.cursor[Tab::UpNext.index()] = 2;
+        assert!(now.remove_selected_upcoming().is_none());
+        assert!(!now.move_selected_upcoming(1));
+
+        now.cursor[Tab::UpNext.index()] = 4;
+        assert_eq!(now.remove_selected_upcoming().unwrap().id, "4");
+        assert_eq!(
+            now.queue
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0", "1", "2", "3", "5"]
+        );
+
+        assert!(now.move_selected_upcoming(-1));
+        assert_eq!(now.cursor(), 3);
+        assert_eq!(now.queue[3].id, "5");
+        assert!(
+            !now.move_selected_upcoming(-1),
+            "an upcoming row cannot cross the current track"
+        );
+    }
+
+    #[test]
+    fn clearing_upcoming_keeps_history_and_the_current_track() {
+        let mut now = playing();
+        now.queue = queued(8);
+        now.playing = Some(3);
+        now.cursor[Tab::UpNext.index()] = 7;
+
+        assert_eq!(now.clear_upcoming(), 4);
+        assert_eq!(
+            now.queue
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0", "1", "2", "3"]
+        );
+        assert_eq!(now.playing, Some(3));
+        assert_eq!(now.cursor(), 3);
+    }
+
+    #[test]
+    fn shuffling_upcoming_keeps_current_and_selected_tracks() {
+        let mut now = playing();
+        now.queue = queued(12);
+        now.playing = Some(3);
+        now.cursor[Tab::UpNext.index()] = 8;
+
+        let before = now
+            .queue
+            .iter()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(now.shuffle_upcoming(), 8);
+        assert_eq!(
+            now.queue[..=3]
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0", "1", "2", "3"]
+        );
+        assert_eq!(now.queue[now.cursor()].id, "8");
+
+        let mut after = now
+            .queue
+            .iter()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
+        let mut before = before;
+        before.sort();
+        after.sort();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn repeat_modes_cycle_in_the_order_shown_to_the_user() {
+        let mut repeat = RepeatMode::Off;
+        repeat = repeat.next();
+        assert_eq!((repeat, repeat.label()), (RepeatMode::All, "all"));
+        repeat = repeat.next();
+        assert_eq!((repeat, repeat.label()), (RepeatMode::One, "one"));
+        assert_eq!(repeat.next(), RepeatMode::Off);
+    }
+
+    #[test]
+    fn repeat_modes_change_only_automatic_queue_edges() {
+        let mut now = playing();
+        now.queue = queued(4);
+        now.playing = Some(3);
+
+        now.repeat = RepeatMode::One;
+        assert_eq!(now.advanced_index(1, true), Some(3));
+        assert_eq!(now.advanced_index(-1, false), Some(2));
+        assert_eq!(now.advanced_index(1, false), None);
+
+        now.repeat = RepeatMode::All;
+        assert_eq!(now.advanced_index(1, true), Some(0));
+        now.playing = Some(0);
+        assert_eq!(now.advanced_index(-1, false), Some(3));
+
+        now.topping_up = true;
+        now.playing = Some(3);
+        assert_eq!(
+            now.advanced_index(1, true),
+            None,
+            "a late page should land before repeat-all wraps"
+        );
+    }
+
+    #[test]
+    fn a_queue_still_loading_does_not_accept_an_orphaned_track() {
+        let mut now = playing();
+        now.queue = queued(2);
+
+        assert!(!now.insert_user_track(numbered(9), true));
+        assert_eq!(
+            now.queue
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0", "1"]
+        );
+    }
+
+    #[test]
+    fn shelf_shuffle_keeps_exactly_the_same_bounded_tracks() {
+        let mut tracks = queued(QUEUE_AHEAD + 1);
+        let mut ids: Vec<String> = tracks.iter().map(|track| track.id.clone()).collect();
+
+        shuffle_tracks(&mut tracks);
+
+        let mut shuffled: Vec<String> = tracks.into_iter().map(|track| track.id).collect();
+        ids.sort();
+        shuffled.sort();
+        assert_eq!(shuffled, ids);
+    }
+
     /// The window is what keeps an endless queue from being an endless `Vec`.
     /// Both indices have to move with it, or the queue silently jumps.
     #[test]
@@ -4913,6 +5667,39 @@ mod tests {
         now.playing = None;
 
         assert_eq!(now.remaining(), 0);
+    }
+
+    #[test]
+    fn audio_outputs_cycle_through_the_system_default() {
+        let outputs = vec![
+            OutputDevice {
+                id: "speakers".to_string(),
+                name: "Speakers".to_string(),
+            },
+            OutputDevice {
+                id: "headphones".to_string(),
+                name: "Headphones".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            next_output_device(None, &outputs, true).as_deref(),
+            Some("speakers")
+        );
+        assert_eq!(
+            next_output_device(Some("speakers"), &outputs, true).as_deref(),
+            Some("headphones")
+        );
+        assert_eq!(next_output_device(Some("headphones"), &outputs, true), None);
+        assert_eq!(
+            next_output_device(None, &outputs, false).as_deref(),
+            Some("headphones")
+        );
+        // A disconnected saved device starts cycling from the usable default.
+        assert_eq!(
+            next_output_device(Some("missing"), &outputs, true).as_deref(),
+            Some("speakers")
+        );
     }
 
     /// A continuation that carried the queue forward is trusted about where the

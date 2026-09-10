@@ -14,19 +14,18 @@
 //!
 //! Consequences worth stating plainly:
 //!
-//! - **Cookie only.** No saved web session or `cookies.txt`, no
-//!   reporting -- and the caller checks that before it gets here.
+//! - **Cookie only.** No saved web session or `cookies.txt`, no immediate
+//!   reporting. The caller keeps the play in a durable outbox until sign-in.
 //! - **Undocumented and unversioned.** The shape below is what the web client
-//!   sent when this was written. Nothing here is load-bearing: every failure is
-//!   swallowed by the caller, and a play that fails to report is still played,
-//!   still journalled, and still on MTUI's own shelves.
+//!   sent when this was written. A failure never costs the local play and stays
+//!   queued for a later authenticated attempt.
 //! - **Not verifiable from here.** A ping that is accepted and a ping that is
 //!   quietly discarded both come back `204`. The only real check is whether
 //!   YouTube Music's history actually fills up, which is what the ignored test
 //!   at the bottom is for.
 //!
-//! This writes to the user's real account, so it is opt-in twice over: they have
-//! to have saved a cookie, and they have to have left reporting on.
+//! This writes to the user's real account, so it requires an explicit Music
+//! sign-in and a YouTube account whose watch history is enabled.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -35,7 +34,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use super::http::Http;
-use super::innertube::{MUSIC_CLIENT_NAME, MUSIC_CLIENT_VERSION};
+use super::innertube::MUSIC_CLIENT_NAME;
 use super::sapisid;
 use crate::config::Cookies;
 
@@ -44,20 +43,19 @@ const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player";
 
 /// Below this, nothing is reported. The same threshold the journal calls a
 /// play, so the two histories cannot disagree about what happened.
-const MIN_REPORTABLE: Duration = Duration::from_secs(30);
+pub(super) const MIN_REPORTABLE: Duration = Duration::from_secs(30);
 
 /// The tracking protocol version the web client sends. Both pings carry it.
 const TRACKING_VERSION: &str = "2";
+const TRACKING_CLIENT_PARAM: &str = "web_remix";
+const TRACKING_FORMAT: &str = "251";
 
-/// Marks the one failure a caller can *fix* rather than merely report: YouTube
-/// did not recognise the session behind the cookie.
-///
-/// Matched on as a string, which is not elegant, but the alternative is an
-/// error enum threaded through a path where every other failure is equivalent
-/// and swallowed. This one is different in kind -- an imported cookie that has
-/// expired can be re-read from the browser without troubling the user, and this
-/// is what tells the caller to go and do that.
-pub const STALE: &str = "the cookie is no longer recognised";
+/// Identity and player-script timestamp currently published by YouTube Music's
+/// web client. Unlike browsing, a player request is rejected as `UNPLAYABLE`
+/// when this timestamp is zero, and that response contains no tracking URLs.
+/// Kept local to reporting so a protocol repair cannot perturb search or Home.
+const TRACKING_CLIENT_VERSION: &str = "1.20260830.16.00";
+const SIGNATURE_TIMESTAMP: u64 = 20_684;
 
 /// Length of a client playback nonce, and the alphabet it is drawn from. Both
 /// are what the web player uses; a nonce of the wrong shape is the kind of
@@ -73,18 +71,37 @@ const CPN_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 ///
 /// Two round trips on top of the play itself, which is why this is called from
 /// the worker after the fact rather than anywhere near the audio path.
+#[cfg(test)]
 pub fn report(http: &Http, cookies: &Cookies, video_id: &str, listened: Duration) -> Result<()> {
     if listened < MIN_REPORTABLE {
         return Ok(());
     }
 
     let cpn = nonce();
-    let tracking = tracking_urls(http, cookies, video_id, &cpn)?;
+    report_with_cpn(http, cookies, video_id, listened, &cpn)
+}
+
+/// Reports a queued play with the nonce assigned before its first attempt.
+/// Reusing it makes a retry describe the same playback instead of inventing a
+/// second one after a crash between YouTube accepting the ping and our local
+/// acknowledgement reaching disk.
+pub(super) fn report_with_cpn(
+    http: &Http,
+    cookies: &Cookies,
+    video_id: &str,
+    listened: Duration,
+    cpn: &str,
+) -> Result<()> {
+    if listened < MIN_REPORTABLE {
+        return Ok(());
+    }
+
+    let tracking = tracking_urls(http, cookies, video_id, cpn)?;
 
     // Start first, then duration. The order is the protocol: a watchtime ping
     // for a playback that was never announced has nothing to attach itself to.
-    ping(http, cookies, &tracking.playback, &cpn, None)?;
-    ping(http, cookies, &tracking.watchtime, &cpn, Some(listened))?;
+    ping(http, cookies, &tracking.playback, cpn, None)?;
+    ping(http, cookies, &tracking.watchtime, cpn, Some(listened))?;
     Ok(())
 }
 
@@ -103,26 +120,7 @@ struct Tracking {
 /// play reported against an anonymous session is attributed to nobody, which
 /// would be all of the cost of this file and none of the benefit.
 fn tracking_urls(http: &Http, cookies: &Cookies, video_id: &str, cpn: &str) -> Result<Tracking> {
-    let body = serde_json::json!({
-        "videoId": video_id,
-        "context": {
-            "client": {
-                "clientName": MUSIC_CLIENT_NAME,
-                "clientVersion": MUSIC_CLIENT_VERSION,
-                "hl": "en",
-            }
-        },
-        // Announces the nonce the pings will carry, and asks for a response
-        // that includes tracking at all -- a player response fetched without
-        // this comes back with no `playbackTracking` to read.
-        "playbackContext": {
-            "contentPlaybackContext": {
-                "signatureTimestamp": 0,
-                "referer": ORIGIN,
-            }
-        },
-        "cpn": cpn,
-    });
+    let body = tracking_body(video_id, cpn);
 
     let now = sapisid::unix_now();
     let request = http
@@ -141,22 +139,52 @@ fn tracking_urls(http: &Http, cookies: &Cookies, video_id: &str, cpn: &str) -> R
     if !(200..300).contains(&status) {
         bail!("YouTube refused the player request: HTTP {status}");
     }
-    let json: Value = serde_json::from_slice(&raw)?;
+    parse_tracking(&serde_json::from_slice(&raw)?)
+}
 
+fn tracking_body(video_id: &str, cpn: &str) -> Value {
+    serde_json::json!({
+        "videoId": video_id,
+        "context": {
+            "client": {
+                "clientName": MUSIC_CLIENT_NAME,
+                "clientVersion": TRACKING_CLIENT_VERSION,
+                "hl": "en",
+            }
+        },
+        // Announces the nonce the pings will carry, and asks for a response
+        // that includes tracking at all -- a player response fetched without
+        // this comes back with no `playbackTracking` to read.
+        "playbackContext": {
+            "contentPlaybackContext": {
+                "signatureTimestamp": SIGNATURE_TIMESTAMP,
+                "referer": ORIGIN,
+            }
+        },
+        "cpn": cpn,
+    })
+}
+
+fn parse_tracking(json: &Value) -> Result<Tracking> {
     let base = |field: &str| -> Option<String> {
         json.pointer(&format!("/playbackTracking/{field}/baseUrl"))
             .and_then(Value::as_str)
             .map(str::to_string)
     };
 
-    // Absent rather than malformed is the ordinary failure here: it is what a
-    // cookie YouTube no longer honours looks like, since an anonymous player
-    // response carries no tracking to report against.
     let (Some(playback), Some(watchtime)) = (
         base("videostatsPlaybackUrl"),
         base("videostatsWatchtimeUrl"),
     ) else {
-        bail!("{STALE} -- the player response carried no playback tracking");
+        let status = json
+            .pointer("/playabilityStatus/status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown status");
+        let reason = json
+            .pointer("/playabilityStatus/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("no reason given");
+        bail!("the player response carried no playback tracking ({status}: {reason})");
     };
 
     Ok(Tracking {
@@ -176,24 +204,12 @@ fn ping(
     cpn: &str,
     listened: Option<Duration>,
 ) -> Result<()> {
-    // The base URL already carries its own query string -- `docid`, `ei` and a
-    // signature among them -- so ours is appended to it rather than started.
-    let separator = if base.contains('?') { '&' } else { '?' };
-    let mut url =
-        format!("{base}{separator}ver={TRACKING_VERSION}&cpn={cpn}&cver={MUSIC_CLIENT_VERSION}");
-
-    if let Some(listened) = listened {
-        let secs = listened.as_secs();
-        // Start time and end time, in seconds. Reported as one continuous span
-        // from zero: MTUI plays a track through rather than seeking around it,
-        // so a single span is not a simplification of what happened.
-        url.push_str(&format!("&st=0&et={secs}&state=playing"));
-    }
+    let url = ping_url(base, cpn, listened)?;
 
     let now = sapisid::unix_now();
     let request = http
         .client()
-        .get(&url)
+        .get(url)
         .header(reqwest::header::ORIGIN, ORIGIN)
         .header(reqwest::header::REFERER, ORIGIN)
         .header(reqwest::header::COOKIE, cookies.header())
@@ -211,6 +227,48 @@ fn ping(
     Ok(())
 }
 
+/// Builds the same stats URL as the Music web client.
+///
+/// A successful response does not mean YouTube accepted the event: these
+/// endpoints also return 204 for incomplete telemetry and silently discard it.
+/// The client identity, playback format and timing fields are therefore part of
+/// the protocol rather than optional analytics decoration.
+fn ping_url(base: &str, cpn: &str, listened: Option<Duration>) -> Result<reqwest::Url> {
+    // YouTube returns `s.youtube.com`; its Music client deliberately sends the
+    // same signed path through the Music origin instead.
+    let base = base.replacen("https://s.", "https://music.", 1);
+    let mut url = reqwest::Url::parse(&base).context("YouTube returned an invalid tracking URL")?;
+
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("ver", TRACKING_VERSION)
+            .append_pair("c", TRACKING_CLIENT_PARAM)
+            .append_pair("cbrver", TRACKING_CLIENT_VERSION)
+            .append_pair("cver", TRACKING_CLIENT_VERSION)
+            .append_pair("cpn", cpn);
+
+        match listened {
+            None => {
+                query
+                    .append_pair("fmt", TRACKING_FORMAT)
+                    .append_pair("rtn", "0")
+                    .append_pair("rt", "0");
+            }
+            Some(listened) => {
+                let position = format!("{}.000", listened.as_secs());
+                query
+                    .append_pair("st", &position)
+                    .append_pair("et", &position)
+                    .append_pair("cmt", &position)
+                    .append_pair("final", "1");
+            }
+        }
+    }
+
+    Ok(url)
+}
+
 /// A client playback nonce: 16 characters identifying this one play.
 ///
 /// Hand-rolled rather than pulled in, on the same trade the SHA-1 in
@@ -225,7 +283,7 @@ fn ping(
 /// in the same tick would seed identically. The counter is what guarantees a
 /// distinct seed -- and the odd Weyl multiplier spreads its low bits across the
 /// whole word so even the first few nonces of a run differ in every position.
-fn nonce() -> String {
+pub(super) fn nonce() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     let mut state = std::time::SystemTime::now()
@@ -252,6 +310,116 @@ fn nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn query(url: &reqwest::Url) -> std::collections::HashMap<String, String> {
+        url.query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn tracking_request_carries_a_real_player_timestamp() {
+        let body = tracking_body("video", "abcdefghijklmnop");
+
+        assert_eq!(
+            body.pointer("/context/client/clientVersion")
+                .and_then(Value::as_str),
+            Some(TRACKING_CLIENT_VERSION)
+        );
+        assert_eq!(
+            body.pointer("/playbackContext/contentPlaybackContext/signatureTimestamp")
+                .and_then(Value::as_u64),
+            Some(SIGNATURE_TIMESTAMP)
+        );
+        assert_ne!(SIGNATURE_TIMESTAMP, 0);
+    }
+
+    #[test]
+    fn missing_tracking_reports_the_player_failure_without_blaming_the_session() {
+        let error = parse_tracking(&serde_json::json!({
+            "playabilityStatus": {
+                "status": "UNPLAYABLE",
+                "reason": "Video unavailable",
+            }
+        }))
+        .err()
+        .expect("tracking should be required")
+        .to_string();
+
+        assert!(error.contains("UNPLAYABLE: Video unavailable"));
+        assert!(!error.contains("cookie"));
+        assert!(!error.contains("session"));
+    }
+
+    #[test]
+    fn tracking_urls_are_read_from_a_playable_response() {
+        let tracking = parse_tracking(&serde_json::json!({
+            "playbackTracking": {
+                "videostatsPlaybackUrl": { "baseUrl": "https://example.test/start" },
+                "videostatsWatchtimeUrl": { "baseUrl": "https://example.test/time" },
+            }
+        }))
+        .expect("both tracking URLs should parse");
+
+        assert_eq!(tracking.playback, "https://example.test/start");
+        assert_eq!(tracking.watchtime, "https://example.test/time");
+    }
+
+    #[test]
+    fn playback_ping_matches_the_music_web_client() {
+        let url = ping_url(
+            "https://s.youtube.com/api/stats/playback?docid=video&ei=event",
+            "abcdefghijklmnop",
+            None,
+        )
+        .expect("tracking URL should parse");
+        let query = query(&url);
+
+        assert_eq!(url.host_str(), Some("music.youtube.com"));
+        assert_eq!(url.path(), "/api/stats/playback");
+        assert_eq!(query.get("docid").map(String::as_str), Some("video"));
+        assert_eq!(query.get("c").map(String::as_str), Some("web_remix"));
+        assert_eq!(query.get("fmt").map(String::as_str), Some("251"));
+        assert_eq!(query.get("rt").map(String::as_str), Some("0"));
+        assert_eq!(query.get("rtn").map(String::as_str), Some("0"));
+        assert_eq!(
+            query.get("cpn").map(String::as_str),
+            Some("abcdefghijklmnop")
+        );
+    }
+
+    #[test]
+    fn final_watchtime_ping_carries_the_playback_position() {
+        let url = ping_url(
+            "https://s.youtube.com/api/stats/watchtime?docid=video",
+            "abcdefghijklmnop",
+            Some(Duration::from_secs(187)),
+        )
+        .expect("tracking URL should parse");
+        let query = query(&url);
+
+        assert_eq!(url.host_str(), Some("music.youtube.com"));
+        assert_eq!(query.get("st").map(String::as_str), Some("187.000"));
+        assert_eq!(query.get("et").map(String::as_str), Some("187.000"));
+        assert_eq!(query.get("cmt").map(String::as_str), Some("187.000"));
+        assert_eq!(query.get("final").map(String::as_str), Some("1"));
+        assert!(!query.contains_key("fmt"));
+    }
+
+    #[test]
+    #[ignore = "hits the live YouTube Music player API without reporting a play"]
+    fn current_player_request_returns_tracking_urls() {
+        let http = Http::new().expect("client should build");
+        // Deliberately invalid credentials: this check is about the player
+        // request shape and never follows either returned tracking URL.
+        let cookies = Cookies::from_header("SAPISID=x; SID=y").expect("header should parse");
+
+        let tracking = tracking_urls(&http, &cookies, "dQw4w9WgXcQ", "abcdefghijklmnop")
+            .expect("the current player request should carry tracking URLs");
+
+        assert!(tracking.playback.starts_with("https://"));
+        assert!(tracking.watchtime.starts_with("https://"));
+    }
 
     #[test]
     fn a_nonce_is_the_shape_youtube_expects() {
