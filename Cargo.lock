@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "mtui"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1959,6 +1959,7 @@ dependencies = [
  "serde",
  "serde_json",
  "stream-download",
+ "symphonia",
  "tao",
  "tokio",
  "tracing-subscriber",

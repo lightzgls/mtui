@@ -20,12 +20,15 @@ use crate::source::artist::{ArtistPage, ArtistSong};
 use crate::source::cover::Cover;
 use crate::source::home::{Card, Shelf, Target};
 use crate::source::journal;
+use crate::source::listening::Listening;
 use crate::source::lrclib;
 use crate::source::watch::{Comments, Lyrics, QueuePage, Watch};
 use crate::source::worker::{PageRequestId, Request, Response, SourceWorker};
 use crate::source::youtube::{MAX_RESULTS, extract_video_id};
 use crate::source::{ArtistRef, BrowseEndpoint, StreamUrl, Track, UNKNOWN_ARTIST};
 use crate::tray::TrayCommand;
+
+pub mod preferences;
 
 /// How much of the window the cover is allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -130,11 +133,11 @@ const SEARCH_LIMIT: usize = 20;
 const PREFETCH_IDLE: Duration = Duration::from_millis(400);
 
 const VOLUME_STEP: f32 = 0.05;
+const DEFAULT_UNMUTED_VOLUME: f32 = 1.0;
 
 /// Exact pages retained for Back. A cap keeps nested artist browsing bounded
 /// even when someone walks through a long chain of related artists.
 const PAGE_HISTORY: usize = 12;
-const SETTINGS_ITEMS: usize = 6;
 
 /// Tracks the queue may skip past in a row before it gives up.
 ///
@@ -223,12 +226,44 @@ pub enum View {
 /// A semantic action produced by hit-testing the last rendered terminal frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseAction {
+    GoHome,
+    OpenPlayer,
+    OpenAppMenu,
     EditSearch,
     OpenHomeCard { shelf: usize, card: usize },
+    SelectHomeCard { shelf: usize, card: usize },
     PlayTrack(usize),
+    SelectTrack(usize),
     OpenTab(Tab),
     OpenPageRow(usize),
+    SelectPageRow(usize),
+    /// Toggle the current transport from the persistent player strip.
+    TogglePlayback,
+    /// Move through the active queue from the persistent player strip.
+    PreviousTrack,
+    NextTrack,
+    /// Seek to a point in the current track. The value is measured against
+    /// [`POINTER_SCALE`] so it stays `Eq` and deterministic in hit-map tests.
+    SeekTo(u16),
+    /// Set ordinary output volume from the persistent player's volume bar.
+    SetVolume(u16),
+    /// Toggle silence while retaining the user's last audible volume.
+    ToggleMute,
+    /// Open the actions for the current page or selection.
+    OpenPageActions,
+    /// Invoke an item in the currently open command menu.
+    ActivateMenuItem(usize),
+    CloseMenu,
+    BackMenu,
+    /// The modal owns this region, but the region performs no action.
+    IgnoreOverlay,
+    ActivateSetting(preferences::Setting),
+    ChooseSetting(usize),
+    CloseSettings,
 }
+
+/// Resolution used for mouse positions along a horizontal control.
+pub const POINTER_SCALE: u16 = 10_000;
 
 /// Which panel of the player page is showing.
 ///
@@ -910,9 +945,9 @@ pub enum MenuPage {
 impl MenuPage {
     pub fn title(self) -> &'static str {
         match self {
-            Self::Root => "App Menu",
-            Self::Account => "Account & Sessions",
-            Self::Help => "Keyboard Help",
+            Self::Root => "Menu",
+            Self::Account => "Account",
+            Self::Help => "Keyboard shortcuts",
             Self::PageActions => "Page Actions",
         }
     }
@@ -936,7 +971,22 @@ impl Menu {
     }
 
     fn move_by(&mut self, delta: isize, len: usize) {
-        self.selected = moved_cursor(self.selected, delta, len);
+        let mut next = moved_cursor(self.selected, delta, len);
+        while self.page != MenuPage::Help && self.items.get(next).is_some_and(|item| !item.enabled) {
+            let following = moved_cursor(next, delta.signum(), len);
+            if following == next { return; }
+            next = following;
+        }
+        self.selected = next;
+    }
+
+    fn shortcut_index(&self, key: KeyEvent) -> Option<usize> {
+        self.items.iter().position(|item| {
+            item.enabled && item.action.is_some() && (
+                item.shortcut.is_some_and(|shortcut| menu_shortcut_matches(shortcut, key))
+                || (item.action == Some(MenuAction::OpenSettings) && is_bare_character(key, 'S'))
+            )
+        })
     }
 
     fn first(&mut self) {
@@ -965,6 +1015,10 @@ pub struct MenuItem {
 }
 
 impl MenuItem {
+    pub fn opens_panel(&self) -> bool {
+        matches!(self.action, Some(MenuAction::OpenAccount | MenuAction::OpenSettings | MenuAction::OpenHelp))
+    }
+
     fn action(
         label: impl Into<String>,
         shortcut: Option<&'static str>,
@@ -1025,6 +1079,8 @@ enum MenuAction {
     CycleRepeat,
     FollowLyrics,
     TogglePause,
+    ToggleMute,
+    RetryTrack,
     Next,
     Previous,
     Stop,
@@ -1111,6 +1167,10 @@ pub struct App {
     output_devices: Vec<OutputDevice>,
     /// Stable id of the selected output, or `None` to follow the system default.
     output_device: Option<String>,
+    /// Mute is session state rather than a destructive volume change. The
+    /// remembered level makes a second `m` restore exactly what was audible.
+    muted: bool,
+    volume_before_mute: f32,
     /// Where the renderer wants the cover painted as real pixels, set on every
     /// frame the terminal-image path runs. `None` on the half-block path, which
     /// needs no help from the event loop.
@@ -1188,8 +1248,8 @@ pub struct App {
     /// such as sign-in so neither can accidentally replace the other; input
     /// maintains the one-modal-at-a-time invariant.
     menu: Option<Menu>,
-    /// Cursor for the persisted preferences in the Settings modal.
-    settings_selected: usize,
+    /// Settings selection, choice picker, and return navigation.
+    preferences: preferences::State,
     /// What is playing and the page around it. `None` before the first play and
     /// after a stop -- there is no player page for silence.
     pub now: Option<NowPlaying>,
@@ -1231,9 +1291,8 @@ pub struct App {
     /// already been replaced with whatever came next. This is what
     /// [`App::finish_listening`] reports from.
     ///
-    /// The *furthest*, not the latest: seeking backwards must not shorten what
-    /// the user is recorded as having heard.
-    listening: Option<(Track, Duration)>,
+    /// Measured audio progress, excluding paused time and seek jumps.
+    listening: Option<(Track, Listening)>,
     /// Prevents repeated `M` presses from opening duplicate session imports.
     music_signing_in: bool,
 
@@ -1245,6 +1304,10 @@ pub struct App {
     /// cover. This is a track already playing, and its answer must change none
     /// of that -- only where the audio is read from.
     resuming: Option<Resuming>,
+    /// Concise category for a terminal playback failure. Detailed resolver
+    /// output stays in diagnostics; this is the actionable text shown beside
+    /// Retry and Skip.
+    playback_error: Option<String>,
 
     /// The card on the user's Discord profile. Holds the last one published, so
     /// that recomputing it every tick costs a comparison rather than a socket
@@ -1310,6 +1373,20 @@ fn is_ctrl_key(key: KeyEvent, character: char) -> bool {
 
 fn is_bare_character(key: KeyEvent, character: char) -> bool {
     key.modifiers.difference(KeyModifiers::SHIFT).is_empty() && key.code == KeyCode::Char(character)
+}
+
+fn menu_shortcut_matches(shortcut: &str, key: KeyEvent) -> bool {
+    match shortcut {
+        "Space" => is_bare_character(key, ' '),
+        "Ctrl+S" => is_ctrl_key(key, 's'),
+        "Ctrl+C" => is_ctrl_key(key, 'c'),
+        _ => {
+            let mut characters = shortcut.chars();
+            characters.next().is_some_and(|character| {
+                characters.next().is_none() && is_bare_character(key, character)
+            })
+        }
+    }
 }
 
 fn page_behind_search(origin: View, player_back: View) -> View {
@@ -1401,6 +1478,12 @@ impl App {
             }
         };
         let output_device = settings.output_device.clone();
+        let muted = settings.volume == 0.0;
+        let volume_before_mute = if muted {
+            DEFAULT_UNMUTED_VOLUME
+        } else {
+            settings.volume
+        };
         let mut app = Self {
             // Browse, not Editing: the program now opens on a page there is
             // something to do with, and the keys that move around it are bare
@@ -1425,6 +1508,8 @@ impl App {
             image_renderer: settings.image_renderer,
             output_devices,
             output_device,
+            muted,
+            volume_before_mute,
             images: Vec::new(),
             painted: Vec::new(),
             painted_with_kitty: false,
@@ -1451,7 +1536,7 @@ impl App {
             pending_page_request: None,
             overlay: Overlay::None,
             menu: None,
-            settings_selected: 0,
+            preferences: preferences::State::default(),
             now: None,
             back_to: View::Home,
             player_back: None,
@@ -1464,6 +1549,7 @@ impl App {
             seed_rotation: 0,
             music_signing_in: false,
             resuming: None,
+            playback_error: None,
             // Started whether or not Discord is running and whether or not the
             // switch is on: what this costs while idle is one sleeping thread,
             // and deciding later would mean deciding on the render path.
@@ -1667,11 +1753,6 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Cursor used by the persisted-settings overlay.
-    pub fn settings_selected(&self) -> usize {
-        self.settings_selected
-    }
-
     pub fn presence_enabled(&self) -> bool {
         self.presence.enabled()
     }
@@ -1719,44 +1800,7 @@ impl App {
     }
 
     fn root_menu_items(&self) -> Vec<MenuItem> {
-        let mut items = vec![
-            MenuItem::action("Home", Some("H"), true, Some("Go to"), MenuAction::GoHome),
-            MenuItem::action("Search", Some("/"), true, None, MenuAction::BeginSearch),
-        ];
-        items.extend([
-            MenuItem::action(
-                "Now Playing",
-                Some("P"),
-                self.now.is_some(),
-                None,
-                MenuAction::OpenPlayer,
-            ),
-            MenuItem::action(
-                "Account & Sessions",
-                None,
-                true,
-                Some("MTUI"),
-                MenuAction::OpenAccount,
-            ),
-            MenuItem::action("Settings", Some("S"), true, None, MenuAction::OpenSettings),
-            MenuItem::action("Keyboard Help", Some("?"), true, None, MenuAction::OpenHelp),
-        ]);
-        #[cfg(windows)]
-        items.push(MenuItem::action(
-            "Continue in notification area",
-            Some("B"),
-            self.now.is_some(),
-            None,
-            MenuAction::Background,
-        ));
-        items.push(MenuItem::action(
-            "Quit",
-            Some("Ctrl+C"),
-            true,
-            None,
-            MenuAction::Quit,
-        ));
-        items
+        app_menu_items(self.now.is_some())
     }
 
     fn account_menu_items(&self) -> Vec<MenuItem> {
@@ -1765,29 +1809,7 @@ impl App {
     }
 
     fn help_menu_items(&self) -> Vec<MenuItem> {
-        vec![
-            MenuItem::help("Move selection", "j/k, Up/Down", Some("Navigation")),
-            MenuItem::help("First or last item", "g/G, Home/End", None),
-            MenuItem::help("Open or play", "Enter", None),
-            MenuItem::help("Go back", "Esc", None),
-            MenuItem::help("Search", "/ or i", Some("Pages")),
-            MenuItem::help("Home", "H", None),
-            MenuItem::help("Now Playing", "P", None),
-            MenuItem::help("Pause or resume", "Space", Some("Playback")),
-            MenuItem::help("Next or previous", "n / p", None),
-            MenuItem::help("Repeat off / all / one", "R", None),
-            MenuItem::help("Queue: remove / shuffle", "d / z", None),
-            MenuItem::help("Queue: move row", "K / J", None),
-            MenuItem::help("Queue: clear upcoming", "C", None),
-            MenuItem::help("Seek", "Left/Right", None),
-            MenuItem::help("Change volume", "+ / -", None),
-            MenuItem::help("Stop", "s", None),
-            MenuItem::help("App Menu", "Ctrl+K", Some("Global")),
-            MenuItem::help("Page Actions (outside search)", ".", None),
-            MenuItem::help("Keyboard Help", "?", None),
-            MenuItem::help("Settings", "Ctrl+S", None),
-            MenuItem::help("Quit immediately", "Ctrl+C", None),
-        ]
+        keyboard_help_items()
     }
 
     fn page_action_items(&self) -> Vec<MenuItem> {
@@ -2023,11 +2045,19 @@ impl App {
         }
 
         let snapshot = self.snapshot();
+        let failed = self.playback_failed(&snapshot);
         let current = now.playing;
         let can_previous =
             current.is_some_and(|index| index > 0 && now.queue.get(index - 1).is_some());
         let can_next = current.is_some_and(|index| now.queue.get(index + 1).is_some());
         items.extend([
+            MenuItem::action(
+                "Retry current track",
+                Some("r"),
+                failed,
+                Some("Playback failure"),
+                MenuAction::RetryTrack,
+            ),
             MenuItem::action(
                 "Open current artist",
                 None,
@@ -2047,7 +2077,22 @@ impl App {
                 MenuAction::TogglePause,
             ),
             MenuItem::action(
-                "Play next track",
+                if self.muted {
+                    "Restore volume"
+                } else {
+                    "Mute audio"
+                },
+                Some("m"),
+                snapshot.state != PlayState::Idle,
+                None,
+                MenuAction::ToggleMute,
+            ),
+            MenuItem::action(
+                if failed {
+                    "Skip failed track"
+                } else {
+                    "Play next track"
+                },
                 Some("n"),
                 can_next,
                 None,
@@ -2090,6 +2135,14 @@ impl App {
 
     pub fn snapshot(&self) -> Snapshot {
         self.player.snapshot()
+    }
+
+    fn playback_failed(&self, snapshot: &Snapshot) -> bool {
+        self.now.is_some()
+            && self.pending.is_none()
+            && self.resuming.is_none()
+            && snapshot.state == PlayState::Idle
+            && (self.playback_error.is_some() || snapshot.error.is_some())
     }
 
     /// True while the user is waiting on something: a request in flight, or a
@@ -2189,8 +2242,16 @@ impl App {
                             format!("audio output changed, but could not be saved: {error:#}")
                         }
                     };
+                    if matches!(self.overlay, Overlay::Settings) {
+                        self.preferences.notice = Some((self.status.clone(), self.status.contains("could not")));
+                    }
                 }
-                PlayerEvent::OutputChangeFailed { why } => self.status = why,
+                PlayerEvent::OutputChangeFailed { why } => {
+                    self.status = why;
+                    if matches!(self.overlay, Overlay::Settings) {
+                        self.preferences.notice = Some((self.status.clone(), true));
+                    }
+                }
             }
         }
     }
@@ -2356,8 +2417,12 @@ impl App {
                 crate::diagnostics::error("auth", "YouTube Music sign-in failed");
                 self.music_signing_in = false;
                 self.status = msg.clone();
-                self.menu = None;
-                self.overlay = Overlay::SignIn(SignIn::Failed { reason: msg });
+                if matches!(self.overlay, Overlay::Settings) {
+                    self.preferences.notice = Some((msg, true));
+                } else {
+                    self.menu = None;
+                    self.overlay = Overlay::SignIn(SignIn::Failed { reason: msg });
+                }
             }
             Response::Browsed {
                 title,
@@ -2507,9 +2572,10 @@ impl App {
                 // is parked in `Buffering` waiting for this, and silence here
                 // would leave it there naming a track it is never going to
                 // play another second of.
-                Err(why) => Command::ResumeFailed {
-                    why: why.lines().next().unwrap_or(&why).to_string(),
-                },
+                Err(why) => {
+                    let summary = self.record_playback_failure(&why);
+                    Command::ResumeFailed { why: summary }
+                }
             };
             let _ = self.player.send(cmd);
             return;
@@ -2570,7 +2636,7 @@ impl App {
         // alone it would sit there naming a track that is never going to play,
         // over an error the user cannot see past it.
         let _ = self.player.send(Command::Stop);
-        self.report(why);
+        self.record_playback_failure(&why);
     }
 
     /// The player page, but only if it still belongs to `video_id`.
@@ -2823,6 +2889,10 @@ impl App {
     /// `auto` marks a play the queue started rather than the user; only those
     /// are allowed to step over a track that will not resolve.
     fn play_track(&mut self, track: Track, auto: bool) {
+        self.start_track(track, auto, false);
+    }
+
+    fn start_track(&mut self, track: Track, auto: bool, bypass_cache: bool) {
         // A page whose response can still replace its contents must remain live,
         // not be cloned into Player's return slot. Queue advancement is allowed
         // to continue behind it without changing the visible route.
@@ -2836,7 +2906,8 @@ impl App {
         // readable. Every play in the program funnels through here, so this
         // covers a skip, a queue advance and a fresh choice alike.
         self.finish_listening();
-        self.listening = Some((track.clone(), Duration::ZERO));
+        self.listening = Some((track.clone(), Listening::new()));
+        self.playback_error = None;
         self.auto = auto;
         // Whatever the previous track was waiting on, it is not waiting any
         // more. Left set, a recovery URL arriving for the song just left would
@@ -2927,12 +2998,13 @@ impl App {
             // A track the user chose. The cache is exactly what should answer
             // it when it can -- that is the difference between pressing Enter
             // on a replay and waiting three seconds for yt-dlp again.
-            bypass_cache: false,
+            bypass_cache,
         };
         if self.source.send(request).is_err() {
             self.pending = None;
             let _ = self.player.send(Command::Stop);
-            self.status = "source worker is not running".to_string();
+            self.playback_error = Some("playback service is unavailable".to_string());
+            self.status = playback_failure_status("playback service is unavailable");
             return;
         }
         // Both behind the resolve, which is the order that matters: it is the
@@ -3026,6 +3098,14 @@ impl App {
     /// clears the page outright -- neither is a track that ended.
     pub fn tick_playback(&mut self) {
         let snap = self.snapshot();
+        if self.playback_error.is_none()
+            && self.now.is_some()
+            && self.pending.is_none()
+            && snap.state == PlayState::Idle
+            && let Some(error) = snap.error.as_deref()
+        {
+            self.record_playback_failure(error);
+        }
         let ended = self.last_state == PlayState::Playing
             && snap.state == PlayState::Idle
             && snap.error.is_none();
@@ -3033,10 +3113,15 @@ impl App {
 
         // Sampled every frame rather than read once at the end, because at the
         // end there is nothing to read: an ended track reports position zero.
-        if let Some((_, heard)) = self.listening.as_mut()
-            && snap.state != PlayState::Idle
-        {
-            *heard = (*heard).max(snap.position);
+        if let Some((track, listening)) = self.listening.as_mut() {
+            listening.observe(snap.position, snap.state == PlayState::Playing, Instant::now());
+            if !listening.reported && listening.heard >= Duration::from_secs(30)
+                && journal::record_pending(listening.report(&track.id))
+            {
+                listening.reported = true;
+                listening.checkpoint_sent();
+                let _ = self.source.send(Request::RetryReports);
+            }
         }
         if ended {
             self.finish_listening();
@@ -3130,6 +3215,7 @@ impl App {
         // keypress over -- and the status line has already said where it landed.
         if let Err(error) = config::Presence::save(enabled) {
             crate::diagnostics::error("config", &format!("could not save presence: {error:#}"));
+            self.status = "could not save Discord preference; changed for this session only".to_string();
         }
     }
 
@@ -3169,6 +3255,10 @@ impl App {
         } else {
             self.icon_theme.previous()
         };
+        self.set_icon_theme(theme);
+    }
+
+    fn set_icon_theme(&mut self, theme: IconTheme) {
         let settings = config::Settings {
             start_in_tray: self.start_in_tray,
             icon_theme: theme,
@@ -3195,6 +3285,10 @@ impl App {
         } else {
             self.cover_style.previous()
         };
+        self.set_cover_style(style);
+    }
+
+    fn set_cover_style(&mut self, style: CoverStyle) {
         let settings = config::Settings {
             start_in_tray: self.start_in_tray,
             icon_theme: self.icon_theme,
@@ -3222,6 +3316,10 @@ impl App {
         } else {
             self.image_renderer.previous()
         };
+        self.set_image_renderer(renderer);
+    }
+
+    fn set_image_renderer(&mut self, renderer: ImageRenderer) {
         let settings = config::Settings {
             start_in_tray: self.start_in_tray,
             icon_theme: self.icon_theme,
@@ -3256,8 +3354,12 @@ impl App {
     fn cycle_audio_output(&mut self, forward: bool) {
         self.refresh_output_devices();
         let next = next_output_device(self.output_device.as_deref(), &self.output_devices, forward);
+        self.set_audio_output(next);
+    }
+
+    fn set_audio_output(&mut self, next: Option<String>) {
         if next.as_deref() == self.output_device.as_deref() {
-            self.status = "no other audio outputs are available".to_string();
+            self.status = "this audio output is already selected".to_string();
             return;
         }
         let label = next
@@ -3274,6 +3376,17 @@ impl App {
 
     fn toggle_pause(&mut self) {
         let _ = self.player.send(Command::TogglePause);
+    }
+
+    fn retry_current_track(&mut self) {
+        let snapshot = self.snapshot();
+        if !self.playback_failed(&snapshot) {
+            return;
+        }
+        let Some(track) = self.listening.as_ref().map(|(track, _)| track.clone()) else {
+            return;
+        };
+        self.start_track(track, false, true);
     }
 
     fn toggle_cover_size(&mut self) {
@@ -3419,6 +3532,14 @@ impl App {
         }
     }
 
+    fn record_playback_failure(&mut self, why: &str) -> String {
+        crate::diagnostics::error("playback", why);
+        let summary = playback_failure_summary(why).to_string();
+        self.playback_error = Some(summary.clone());
+        self.status = playback_failure_status(&summary);
+        summary
+    }
+
     /// Hands the finished play to the worker, which journals it and -- with a
     /// cookie saved -- reports it to YouTube.
     ///
@@ -3429,33 +3550,26 @@ impl App {
     /// Nothing is reported for a track that never produced sound, which is what
     /// keeps a resolve that failed out of the history as a play that happened.
     fn finish_listening(&mut self) {
-        let Some((track, heard)) = self.listening.take() else {
+        let Some((track, listening)) = self.listening.take() else {
             return;
         };
-        if heard.is_zero() {
+        if listening.heard.is_zero() {
             return;
         }
-        // Not `busy`, and no response expected: the user is not waiting on this
-        // and there is nothing to tell them about it either way.
-        let _ = self.source.send(Request::ReportPlay {
-            track,
-            listened: heard,
-        });
+        journal::record_final(&track, listening.report(&track.id));
+        let _ = self.source.send(Request::RetryReports);
     }
 
     /// Writes the play in progress straight to the journal, for the way out.
     ///
-    /// [`Self::finish_listening`] hands the play to the metadata worker, which is
-    /// the right thread for it -- except at exit, where that thread is not
-    /// joined and the process may be gone before it runs. Quitting mid-song is
-    /// an ordinary way to end a session, so the track it happens on is worth
-    /// keeping rather than losing to a race.
+    /// The durable append uses the same nonce as the in-song checkpoint.
+    /// Network delivery resumes on the next launch without delaying shutdown.
     pub fn flush_listening(&mut self) {
-        let Some((track, heard)) = self.listening.take() else {
+        let Some((track, listening)) = self.listening.take() else {
             return;
         };
-        if !heard.is_zero() {
-            journal::record_final(&track, heard);
+        if !listening.heard.is_zero() {
+            journal::record_final(&track, listening.report(&track.id));
         }
     }
 
@@ -3791,7 +3905,13 @@ impl App {
                     self.menu = None;
                 }
             }
-            _ => {}
+            _ => {
+                let selected = self.menu.as_ref().and_then(|menu| menu.shortcut_index(key));
+                if let Some(selected) = selected {
+                    if let Some(menu) = self.menu.as_mut() { menu.selected = selected; }
+                    self.invoke_menu_item();
+                }
+            }
         }
         Ok(())
     }
@@ -3820,7 +3940,10 @@ impl App {
             MenuAction::BeginSearch => self.begin_search(),
             MenuAction::OpenPlayer => self.open_player(),
             MenuAction::OpenAccount => self.open_menu(MenuPage::Account),
-            MenuAction::OpenSettings => self.open_settings(),
+            MenuAction::OpenSettings => {
+                self.open_settings();
+                self.preferences.return_to_menu = true;
+            }
             MenuAction::OpenHelp => self.open_menu(MenuPage::Help),
             #[cfg(windows)]
             MenuAction::Background => self.background(),
@@ -3851,6 +3974,8 @@ impl App {
                 }
             }
             MenuAction::TogglePause => self.toggle_pause(),
+            MenuAction::ToggleMute => self.toggle_mute(),
+            MenuAction::RetryTrack => self.retry_current_track(),
             MenuAction::Next => self.advance(1, false),
             MenuAction::Previous => self.advance(-1, false),
             MenuAction::Stop => self.stop(),
@@ -3859,14 +3984,10 @@ impl App {
     }
 
     fn open_settings(&mut self) {
-        if self.music_signing_in {
-            self.status = "finish the pending sign-in before opening settings".to_string();
-            self.menu = None;
-            return;
-        }
+        let return_to_menu = self.menu.is_some();
         self.menu = None;
         self.refresh_output_devices();
-        self.settings_selected = 0;
+        self.preferences.open(return_to_menu);
         self.overlay = Overlay::Settings;
     }
 
@@ -3925,10 +4046,55 @@ impl App {
     /// Applies a click without manufacturing a key whose meaning depends on the
     /// current view. Modal layers retain the same ownership they have for keys.
     pub fn handle_mouse_action(&mut self, action: MouseAction) -> Result<()> {
-        if self.overlay.is_open() || self.menu.is_some() {
+        if matches!(self.overlay, Overlay::Settings) {
+            let intent = match action {
+                MouseAction::ActivateSetting(setting) if self.preferences.picker.is_none() => Some(preferences::Intent::Activate(setting)),
+                MouseAction::ChooseSetting(index) => self.preferences.choose(index),
+                MouseAction::CloseSettings if self.preferences.picker.is_some() => {
+                    self.preferences.picker = None;
+                    None
+                }
+                MouseAction::CloseSettings => Some(preferences::Intent::Close),
+                _ => None,
+            };
+            if let Some(intent) = intent {
+                self.handle_preferences_intent(intent);
+            }
+            return Ok(());
+        }
+        if self.overlay.is_open() {
+            return Ok(());
+        }
+        if self.menu.is_some() {
+            match action {
+                MouseAction::ActivateMenuItem(index) => {
+                    let len = self.menu_items().len();
+                    if index < len {
+                        if let Some(menu) = self.menu.as_mut() {
+                            menu.selected = index;
+                        }
+                        self.invoke_menu_item();
+                    }
+                }
+                MouseAction::CloseMenu | MouseAction::OpenPageActions => self.menu = None,
+                MouseAction::BackMenu => {
+                    if self.menu.as_ref().is_some_and(|menu| matches!(menu.page, MenuPage::Account | MenuPage::Help)) {
+                        self.open_menu(MenuPage::Root);
+                    } else {
+                        self.menu = None;
+                    }
+                }
+                _ => {}
+            }
             return Ok(());
         }
         match action {
+            MouseAction::GoHome => self.go_home(),
+            MouseAction::OpenPlayer => self.open_player(),
+            MouseAction::OpenAppMenu => self.toggle_root_menu(),
+            MouseAction::OpenPageActions if self.mode == Mode::Browse => {
+                self.open_menu(MenuPage::PageActions)
+            }
             MouseAction::EditSearch => self.begin_search(),
             MouseAction::OpenHomeCard { shelf, card } if self.view == View::Home => {
                 let selected = self
@@ -3943,11 +4109,28 @@ impl App {
                     self.activate_card(selected);
                 }
             }
+            MouseAction::SelectHomeCard { shelf, card } if self.view == View::Home => {
+                if self
+                    .home
+                    .get(shelf)
+                    .is_some_and(|row| card < row.cards.len())
+                {
+                    self.home_shelf = shelf;
+                    self.home_card = card;
+                    self.selection_settled = Some(Instant::now());
+                }
+            }
             MouseAction::PlayTrack(index) if self.view == View::Tracks => {
                 if index < self.results.len() {
                     self.selected = index;
                     self.selection_settled = Some(Instant::now());
                     self.play_selected();
+                }
+            }
+            MouseAction::SelectTrack(index) if self.view == View::Tracks => {
+                if index < self.results.len() {
+                    self.selected = index;
+                    self.selection_settled = Some(Instant::now());
                 }
             }
             MouseAction::OpenTab(tab) if self.view == View::Playing => {
@@ -3961,6 +4144,19 @@ impl App {
                 }
                 self.open_page_row();
             }
+            MouseAction::SelectPageRow(index) if self.view == View::Playing => {
+                if let Some(now) = self.now.as_mut() {
+                    *now.cursor_mut() = index;
+                }
+            }
+            MouseAction::TogglePlayback => self.toggle_pause(),
+            MouseAction::PreviousTrack => self.advance(-1, false),
+            MouseAction::NextTrack => self.advance(1, false),
+            MouseAction::SeekTo(position) => self.seek_to_fraction(position),
+            MouseAction::SetVolume(position) => {
+                self.set_volume(pointer_fraction(position) as f32)
+            }
+            MouseAction::ToggleMute => self.toggle_mute(),
             _ => {}
         }
         Ok(())
@@ -3968,7 +4164,7 @@ impl App {
 
     /// Mouse wheels follow the active view's existing up/down behavior.
     pub fn handle_mouse_scroll(&mut self, down: bool) -> Result<()> {
-        if self.mode == Mode::Editing {
+        if self.mode == Mode::Editing && !self.overlay.is_open() && self.menu.is_none() {
             return Ok(());
         }
         let code = if down { KeyCode::Down } else { KeyCode::Up };
@@ -4002,53 +4198,11 @@ impl App {
                     self.status = String::new();
                 }
             }
-            Overlay::Settings => match key.code {
-                KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
-                    self.settings_selected =
-                        moved_cursor(self.settings_selected, 1, SETTINGS_ITEMS);
+            Overlay::Settings => {
+                if let Some(intent) = self.preferences.key(key) {
+                    self.handle_preferences_intent(intent);
                 }
-                KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
-                    self.settings_selected =
-                        moved_cursor(self.settings_selected, -1, SETTINGS_ITEMS);
-                }
-                KeyCode::Char(' ') | KeyCode::Enter => match self.settings_selected() {
-                    0 => self.toggle_start_in_tray(),
-                    1 => self.toggle_presence(),
-                    2 => self.cycle_audio_output(true),
-                    3 => self.cycle_image_renderer(true),
-                    4 => self.cycle_cover_style(true),
-                    5 => self.cycle_icon_theme(true),
-                    _ => {}
-                },
-                KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 2 => {
-                    self.cycle_audio_output(false);
-                }
-                KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 2 => {
-                    self.cycle_audio_output(true);
-                }
-                KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 3 => {
-                    self.cycle_image_renderer(false);
-                }
-                KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 3 => {
-                    self.cycle_image_renderer(true);
-                }
-                KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 4 => {
-                    self.cycle_cover_style(false);
-                }
-                KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 4 => {
-                    self.cycle_cover_style(true);
-                }
-                KeyCode::Left | KeyCode::Char('h') if self.settings_selected() == 5 => {
-                    self.cycle_icon_theme(false);
-                }
-                KeyCode::Right | KeyCode::Char('l') if self.settings_selected() == 5 => {
-                    self.cycle_icon_theme(true);
-                }
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => {
-                    self.overlay = Overlay::None;
-                }
-                _ => {}
-            },
+            }
         }
 
         Ok(())
@@ -4096,6 +4250,7 @@ impl App {
             KeyCode::Esc if !self.results.is_empty() => self.view = View::Tracks,
             KeyCode::Char('c') => self.toggle_cover_size(),
             KeyCode::Char(' ') => self.toggle_pause(),
+            KeyCode::Char('m') => self.toggle_mute(),
             KeyCode::Char('s') => self.stop(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_volume(VOLUME_STEP),
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_volume(-VOLUME_STEP),
@@ -4354,6 +4509,7 @@ impl App {
             KeyCode::Char('S') => self.open_settings(),
             KeyCode::Char('M') => self.begin_music_sign_in(false),
             KeyCode::Char(' ') => self.toggle_pause(),
+            KeyCode::Char('m') => self.toggle_mute(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_volume(VOLUME_STEP),
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_volume(-VOLUME_STEP),
             KeyCode::Esc => self.go_back(),
@@ -4497,9 +4653,13 @@ impl App {
             KeyCode::Char('C') if tab == Some(Tab::UpNext) => self.clear_upcoming_queue(),
             KeyCode::Char('z') if tab == Some(Tab::UpNext) => self.shuffle_upcoming_queue(),
             KeyCode::Char('R') => self.cycle_repeat(),
+            KeyCode::Char('r') if self.playback_failed(&self.snapshot()) => {
+                self.retry_current_track()
+            }
             KeyCode::Char('n') => self.advance(1, false),
             KeyCode::Char('p') => self.advance(-1, false),
             KeyCode::Char(' ') => self.toggle_pause(),
+            KeyCode::Char('m') => self.toggle_mute(),
             KeyCode::Char('s') => self.stop(),
             KeyCode::Char('c') => self.toggle_cover_size(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_volume(VOLUME_STEP),
@@ -4586,6 +4746,7 @@ impl App {
         // same hazard by the other route.
         self.pending = None;
         self.resuming = None;
+        self.playback_error = None;
         // Nothing is playing, so nothing owns the cover pane.
         self.cover = None;
         self.cover_id = None;
@@ -4648,6 +4809,7 @@ impl App {
             KeyCode::PageUp => self.move_selection(-10),
             KeyCode::Enter => self.play_selected(),
             KeyCode::Char(' ') => self.toggle_pause(),
+            KeyCode::Char('m') => self.toggle_mute(),
             KeyCode::Char('c') => self.toggle_cover_size(),
             KeyCode::Char('s') => self.stop(),
             // Both cases, for the same reason as `l` below: this is the way back
@@ -4920,10 +5082,18 @@ impl App {
     }
 
     fn nudge_volume(&mut self, delta: f32) {
-        let volume = (self.snapshot().volume + delta).clamp(0.0, 2.0);
+        self.set_volume(self.snapshot().volume + delta);
+    }
+
+    fn set_volume(&mut self, volume: f32) {
+        let volume = volume.clamp(0.0, 2.0);
         if let Err(error) = self.player.send(Command::SetVolume(volume)) {
             self.status = format!("could not change volume: {error:#}");
             return;
+        }
+        self.muted = volume == 0.0;
+        if !self.muted {
+            self.volume_before_mute = volume;
         }
         let settings = config::Settings {
             start_in_tray: self.start_in_tray,
@@ -4934,6 +5104,7 @@ impl App {
             output_device: self.output_device.clone(),
         };
         self.status = match settings.save() {
+            Ok(()) if self.muted => "muted".to_string(),
             Ok(()) => format!("volume {:.0}%", volume * 100.0),
             Err(error) => {
                 crate::diagnostics::error("config", &format!("could not save volume: {error:#}"));
@@ -4942,6 +5113,25 @@ impl App {
                     volume * 100.0
                 )
             }
+        };
+    }
+
+    fn toggle_mute(&mut self) {
+        let (target, remembered) = mute_transition(
+            self.muted,
+            self.snapshot().volume,
+            self.volume_before_mute,
+        );
+        if let Err(error) = self.player.send(Command::SetVolume(target)) {
+            self.status = format!("could not change mute state: {error:#}");
+            return;
+        }
+        self.volume_before_mute = remembered;
+        self.muted = !self.muted;
+        self.status = if self.muted {
+            "muted -- press m or click mut to restore volume".to_string()
+        } else {
+            format!("volume {:.0}%", target * 100.0)
         };
     }
 
@@ -4961,7 +5151,82 @@ impl App {
                 .saturating_sub(Duration::from_secs(secs.unsigned_abs()))
         };
         let _ = self.player.send(Command::Seek(target));
+        if let Some((_, listening)) = self.listening.as_mut() { listening.seeked(); }
     }
+
+    /// Seeks to an absolute point selected on the progress bar.
+    fn seek_to_fraction(&mut self, position: u16) {
+        let snap = self.snapshot();
+        if snap.state == PlayState::Idle {
+            return;
+        }
+        let Some(total) = self.now.as_ref().and_then(|now| now.duration) else {
+            return;
+        };
+        let target = duration_at_pointer(total, position);
+        let _ = self.player.send(Command::Seek(target));
+        if let Some((_, listening)) = self.listening.as_mut() { listening.seeked(); }
+    }
+}
+
+fn duration_at_pointer(total: Duration, position: u16) -> Duration {
+    total.mul_f64(pointer_fraction(position))
+}
+
+fn pointer_fraction(position: u16) -> f64 {
+    f64::from(position.min(POINTER_SCALE)) / f64::from(POINTER_SCALE)
+}
+
+fn mute_transition(muted: bool, current: f32, remembered: f32) -> (f32, f32) {
+    if muted {
+        (
+            remembered.clamp(VOLUME_STEP, DEFAULT_UNMUTED_VOLUME * 2.0),
+            remembered,
+        )
+    } else {
+        (0.0, if current > 0.0 { current } else { remembered })
+    }
+}
+
+fn playback_failure_summary(why: &str) -> &'static str {
+    let why = why.to_ascii_lowercase();
+    if ["sign in", "login", "cookie", "authentication", "http 401", "http 403"]
+        .iter()
+        .any(|needle| why.contains(needle))
+    {
+        "YouTube session needs attention"
+    } else if why.contains("source worker") || why.contains("resolver") {
+        "playback service is unavailable"
+    } else if ["unavailable", "not available", "private", "restricted", "removed"]
+        .iter()
+        .any(|needle| why.contains(needle))
+    {
+        "track is unavailable"
+    } else if [
+        "timeout",
+        "timed out",
+        "network",
+        "connect",
+        "dns",
+        "http 5",
+        "request failed",
+    ]
+    .iter()
+    .any(|needle| why.contains(needle))
+    {
+        "network interrupted playback"
+    } else if ["decode", "decoder", "codec", "format", "audio stream"]
+        .iter()
+        .any(|needle| why.contains(needle))
+    {
+        "audio format could not be played"
+    } else {
+        "track could not be played"
+    }
+}
+
+fn playback_failure_status(summary: &str) -> String {
+    format!("{summary} — r retry · n skip")
 }
 
 fn next_output_device(
@@ -4983,7 +5248,75 @@ fn next_output_device(
         .map(|output| output.id.clone())
 }
 
-fn account_menu_items(connected: bool, signing_in: bool) -> Vec<MenuItem> {
+pub(crate) fn app_menu_items(has_player: bool) -> Vec<MenuItem> {
+    let mut items = vec![
+        MenuItem::action("Home", Some("H"), true, Some("Go to"), MenuAction::GoHome),
+        MenuItem::action("Search", Some("/"), true, None, MenuAction::BeginSearch),
+    ];
+    items.extend([
+        MenuItem::action(
+            "Now Playing",
+            Some("P"),
+            has_player,
+            None,
+            MenuAction::OpenPlayer,
+        ),
+        MenuItem::action(
+            "Account",
+            None,
+            true,
+            Some("App"),
+            MenuAction::OpenAccount,
+        ),
+        MenuItem::action("Settings", Some("Ctrl+S"), true, None, MenuAction::OpenSettings),
+        MenuItem::action("Keyboard shortcuts", Some("?"), true, None, MenuAction::OpenHelp),
+    ]);
+    #[cfg(windows)]
+    items.push(MenuItem::action(
+        "Minimize to tray",
+        Some("B"),
+        has_player,
+        Some("Window"),
+        MenuAction::Background,
+    ));
+    items.push(MenuItem::action(
+        "Quit",
+        Some("Ctrl+C"),
+        true,
+        None,
+        MenuAction::Quit,
+    ));
+    items
+}
+
+pub(crate) fn keyboard_help_items() -> Vec<MenuItem> {
+    vec![
+        MenuItem::help("Move selection", "j/k, Up/Down", Some("Navigation")),
+        MenuItem::help("First or last item", "g/G, Home/End", None),
+        MenuItem::help("Open or play", "Enter", None),
+        MenuItem::help("Go back", "Esc", None),
+        MenuItem::help("Search", "/ or i", Some("Pages")),
+        MenuItem::help("Home", "H", None),
+        MenuItem::help("Now Playing", "P", None),
+        MenuItem::help("Pause or resume", "Space", Some("Playback")),
+        MenuItem::help("Next or previous", "n / p", None),
+        MenuItem::help("Repeat off / all / one", "R", None),
+            MenuItem::help("Queue: remove / shuffle", "d / z", None),
+            MenuItem::help("Queue: move row", "K / J", None),
+            MenuItem::help("Queue: clear upcoming", "C", None),
+            MenuItem::help("Seek", "Left/Right", None),
+        MenuItem::help("Change volume", "+ / -", None),
+        MenuItem::help("Mute or restore volume", "m", None),
+        MenuItem::help("Stop", "s", None),
+        MenuItem::help("App Menu", "Ctrl+K", Some("Global")),
+        MenuItem::help("Page Actions (outside search)", ".", None),
+        MenuItem::help("Keyboard Help", "?", None),
+        MenuItem::help("Settings", "Ctrl+S", None),
+        MenuItem::help("Quit immediately", "Ctrl+C", None),
+    ]
+}
+
+pub(crate) fn account_menu_items(connected: bool, signing_in: bool) -> Vec<MenuItem> {
     let mut items = vec![MenuItem::action(
         if connected {
             "Refresh YouTube Music session"
@@ -5012,6 +5345,36 @@ fn account_menu_items(connected: bool, signing_in: bool) -> Vec<MenuItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn displayed_menu_shortcuts_select_the_matching_enabled_command() {
+        let menu = Menu::new(MenuPage::Root, app_menu_items(false));
+        for (code, modifiers, expected) in [
+            (KeyCode::Char('H'), KeyModifiers::SHIFT, MenuAction::GoHome),
+            (KeyCode::Char('/'), KeyModifiers::NONE, MenuAction::BeginSearch),
+            (KeyCode::Char('?'), KeyModifiers::SHIFT, MenuAction::OpenHelp),
+            (KeyCode::Char('s'), KeyModifiers::CONTROL, MenuAction::OpenSettings),
+        ] {
+            let index = menu.shortcut_index(KeyEvent::new(code, modifiers)).unwrap();
+            assert_eq!(menu.items[index].action, Some(expected));
+        }
+        assert_eq!(menu.shortcut_index(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT)), None);
+        assert_eq!(menu.shortcut_index(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::ALT)), None);
+        let account = Menu::new(MenuPage::Account, account_menu_items(false, false));
+        assert_eq!(account.shortcut_index(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT)), Some(0));
+        let pending = Menu::new(MenuPage::Account, account_menu_items(false, true));
+        assert_eq!(pending.shortcut_index(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT)), None);
+    }
+
+    #[test]
+    fn menu_navigation_skips_unavailable_player_commands() {
+        let mut menu = Menu::new(MenuPage::Root, app_menu_items(false));
+        menu.selected = 1;
+        menu.move_by(1, menu.items.len());
+        assert_eq!(menu.items[menu.selected].action, Some(MenuAction::OpenAccount));
+        menu.move_by(-1, menu.items.len());
+        assert_eq!(menu.items[menu.selected].action, Some(MenuAction::BeginSearch));
+    }
 
     #[test]
     fn logout_is_offered_only_for_a_connected_session() {
@@ -5186,6 +5549,75 @@ mod tests {
         );
         assert_eq!(Tab::UpNext.shifted(-1), Tab::Comments);
         assert_eq!(Tab::Comments.shifted(1), Tab::UpNext);
+    }
+
+    #[test]
+    fn pointer_positions_cover_the_whole_track() {
+        let total = Duration::from_secs(240);
+
+        assert_eq!(pointer_fraction(0), 0.0);
+        assert_eq!(pointer_fraction(POINTER_SCALE / 2), 0.5);
+        assert_eq!(pointer_fraction(POINTER_SCALE), 1.0);
+        assert_eq!(duration_at_pointer(total, 0), Duration::ZERO);
+        assert_eq!(
+            duration_at_pointer(total, POINTER_SCALE / 2),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            duration_at_pointer(total, POINTER_SCALE),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            duration_at_pointer(total, u16::MAX),
+            Duration::from_secs(240),
+            "out-of-range input is clamped"
+        );
+    }
+
+    #[test]
+    fn mute_restores_the_last_audible_volume() {
+        let (muted, remembered) = mute_transition(false, 0.65, 1.0);
+        assert_eq!(muted, 0.0);
+        assert_eq!(remembered, 0.65);
+
+        let (restored, remembered) = mute_transition(true, 0.0, remembered);
+        assert_eq!(restored, 0.65);
+        assert_eq!(remembered, 0.65);
+
+        let (restored_default, _) = mute_transition(true, 0.0, 0.0);
+        assert_eq!(restored_default, VOLUME_STEP);
+    }
+
+    #[test]
+    fn playback_failures_are_reduced_to_actionable_categories() {
+        assert_eq!(
+            playback_failure_summary("HTTP 403 while reading the signed URL"),
+            "YouTube session needs attention"
+        );
+        assert_eq!(
+            playback_failure_summary("Video unavailable: private video"),
+            "track is unavailable"
+        );
+        assert_eq!(
+            playback_failure_summary("chunk request timed out"),
+            "network interrupted playback"
+        );
+        assert_eq!(
+            playback_failure_summary("decoder rejected the audio codec"),
+            "audio format could not be played"
+        );
+        assert_eq!(
+            playback_failure_summary("resolver unavailable"),
+            "playback service is unavailable"
+        );
+        assert_eq!(
+            playback_failure_summary("unexpected response"),
+            "track could not be played"
+        );
+        assert_eq!(
+            playback_failure_status("track is unavailable"),
+            "track is unavailable — r retry · n skip"
+        );
     }
 
     #[test]

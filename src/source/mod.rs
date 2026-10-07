@@ -14,6 +14,8 @@ pub mod journal;
 pub mod lrclib;
 pub mod sapisid;
 pub mod stats;
+pub(crate) mod listening;
+mod history;
 pub mod watch;
 pub mod worker;
 pub mod youtube;
@@ -53,8 +55,10 @@ pub fn resolve_stream(
     let mut resolver = mtui_resolver::Resolver::new(yt.bin())?;
     resolver.set_js_runtime(yt.js_runtime().map(str::to_string));
     resolver.set_pot_provider(
-        yt.pot_plugin_dir().map(str::to_string),
-        yt.pot_server_home().map(str::to_string),
+        yt.pot_plugin_dir().map(str::to_string)
+            .or_else(|| std::env::var("MTUI_POT_PLUGIN_DIR").ok()),
+        yt.pot_server_home().map(str::to_string)
+            .or_else(|| std::env::var("MTUI_POT_SERVER_HOME").ok()),
     );
     if let Some(cookies) = crate::config::Cookies::available()? {
         resolver.set_session(Some(mtui_resolver::PlaybackSession::new(

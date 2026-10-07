@@ -1,9 +1,8 @@
 //! What this program has actually played, and what that says about the user.
 //!
-//! The landing page used to be built from liked songs alone, for the reason
-//! [`crate::source::home::personal`] gives: YouTube builds its own shelves from
-//! watch history, and no API this program can reach exposes one. But there is a
-//! history it can reach -- the plays that happened *here*. Nothing was recording
+//! The landing page used to be built from liked songs alone. Local plays add
+//! a separate signal to YouTube's account-backed shelves: the plays that
+//! happened *here*. Nothing was recording
 //! them, so the shelves had nothing to rank with and reduced to "your likes, in
 //! the order you liked them", which is the same page every launch.
 //!
@@ -37,6 +36,7 @@ const JOURNAL_FILE: &str = "plays.jsonl";
 /// the listening journal is a history, while this is a queue: successful
 /// delivery removes work from the latter without erasing what was heard.
 const REPORT_FILE: &str = "pending-plays.jsonl";
+static REPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// How much of a track has to be heard before it is a play rather than a
 /// glance. Thirty seconds is the scrobbling convention and it is a good one: it
@@ -166,15 +166,27 @@ pub struct PendingReport {
     pub listened: u64,
     pub at: u64,
     pub cpn: String,
+    /// Old entries have no ranges; recover their history without inventing
+    /// watchtime from what may have been a seek position.
+    #[serde(default)]
+    pub intervals: Vec<super::listening::Interval>,
+    #[serde(default)]
+    pub position_ms: Option<u64>,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl PendingReport {
+    #[cfg(test)]
     fn new(play: &Play) -> Self {
         Self {
             video_id: play.id.clone(),
             listened: play.listened,
             at: play.at,
             cpn: super::stats::nonce(),
+            intervals: Vec::new(),
+            position_ms: None,
+            revision: 0,
         }
     }
 }
@@ -184,12 +196,19 @@ impl PendingReport {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "event", rename_all = "kebab-case")]
 enum ReportEvent {
+    Deferred {
+        cpn: String,
+    },
     Pending {
         #[serde(flatten)]
         report: PendingReport,
     },
     Sent {
         cpn: String,
+        #[serde(default)]
+        revision: Option<u64>,
+        #[serde(default)]
+        intervals: Vec<super::listening::Interval>,
     },
 }
 
@@ -216,7 +235,11 @@ impl ReportQueue {
     }
 
     fn load_path(path: PathBuf) -> Self {
+        let _guard = REPORT_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut pending: VecDeque<PendingReport> = VecDeque::new();
+        let legacy_since = unix_now().saturating_sub(24 * 60 * 60);
         let mut events = 0;
         if let Ok(file) = fs::File::open(&path) {
             for line in BufReader::new(file).lines().map_while(Result::ok) {
@@ -225,12 +248,42 @@ impl ReportQueue {
                 };
                 events += 1;
                 match event {
-                    ReportEvent::Pending { report } => {
-                        if !pending.iter().any(|held| held.cpn == report.cpn) {
+                    ReportEvent::Deferred { cpn } => {
+                        if let Some(index) = pending.iter().position(|held| held.cpn == cpn)
+                            && let Some(report) = pending.remove(index)
+                        {
                             pending.push_back(report);
                         }
                     }
-                    ReportEvent::Sent { cpn } => pending.retain(|held| held.cpn != cpn),
+                    ReportEvent::Pending { report } => {
+                        if let Some(held) = pending.iter_mut().find(|held| held.cpn == report.cpn) {
+                            merge_report(held, report);
+                        } else {
+                            pending.push_back(report);
+                        }
+                    }
+                    ReportEvent::Sent {
+                        cpn,
+                        revision,
+                        intervals,
+                    } => pending.retain_mut(|held| {
+                        if held.cpn != cpn {
+                            return true;
+                        }
+                        // Older builds treated any HTTP 204 as delivery. Check
+                        // recent real plays again; a revisioned acknowledgement
+                        // from the new reporter confirms account-history readback.
+                        if revision.is_none() && held.at >= legacy_since {
+                            return true;
+                        }
+                        if revision.is_some_and(|sent| held.revision > sent) {
+                            held.intervals
+                                .retain(|interval| !intervals.contains(interval));
+                            true
+                        } else {
+                            false
+                        }
+                    }),
                 }
             }
         }
@@ -247,12 +300,26 @@ impl ReportQueue {
 
     /// Durably queues a meaningful play before any network request is made.
     /// Returns false for a glance which YouTube would not report anyway.
+    #[cfg(test)]
     pub fn enqueue(&mut self, play: &Play) -> bool {
-        if play.listened < super::stats::MIN_REPORTABLE.as_secs() {
+        self.enqueue_report(PendingReport::new(play))
+    }
+
+    #[cfg(test)]
+    pub fn enqueue_report(&mut self, mut report: PendingReport) -> bool {
+        if report.listened < super::stats::MIN_REPORTABLE.as_secs() {
             return false;
         }
+        if let Some(held) = self.pending.iter().find(|held| held.cpn == report.cpn) {
+            let mut intervals = held.intervals.clone();
+            for interval in &report.intervals {
+                if !intervals.contains(interval) {
+                    intervals.push(interval.clone());
+                }
+            }
+            report.intervals = intervals;
+        }
 
-        let report = PendingReport::new(play);
         if let Some(path) = &self.path
             && let Err(error) = append_report(
                 path,
@@ -266,12 +333,37 @@ impl ReportQueue {
                 &format!("could not persist a playback report for retry: {error}"),
             );
         }
-        self.pending.push_back(report);
+        if let Some(held) = self.pending.iter_mut().find(|held| held.cpn == report.cpn) {
+            *held = report;
+        } else {
+            self.pending.push_back(report);
+        }
         true
     }
 
     pub fn front(&self) -> Option<&PendingReport> {
         self.pending.front()
+    }
+
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Retain a failed item, but let other songs reach the server. Persist its
+    /// position so an unavailable track cannot block every subsequent play.
+    pub fn defer_front(&mut self) {
+        let Some(report) = self.pending.pop_front() else {
+            return;
+        };
+        if let Some(path) = &self.path {
+            let _ = append_report(
+                path,
+                &ReportEvent::Deferred {
+                    cpn: report.cpn.clone(),
+                },
+            );
+        }
+        self.pending.push_back(report);
     }
 
     /// Records successful delivery before removing it from memory. A failed
@@ -285,6 +377,8 @@ impl ReportQueue {
                 path,
                 &ReportEvent::Sent {
                     cpn: report.cpn.clone(),
+                    revision: Some(report.revision),
+                    intervals: report.intervals.clone(),
                 },
             )
         {
@@ -299,7 +393,11 @@ impl ReportQueue {
     }
 
     /// Drops both durable and in-memory work on explicit account logout.
+    #[cfg(test)]
     pub fn clear(&mut self) {
+        let _guard = REPORT_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.pending.clear();
         let Some(path) = &self.path else {
             return;
@@ -574,6 +672,7 @@ impl Journal {
     /// the user skipped past in four seconds is dropped entirely rather than
     /// recorded as a skip: at that length it is far more likely to be someone
     /// arrowing through a list than a judgement about the song.
+    #[cfg(test)]
     pub fn record(&mut self, play: Play) -> bool {
         if play.listened < NOISE {
             return false;
@@ -713,6 +812,9 @@ fn append(path: &std::path::Path, play: &Play) {
 }
 
 fn append_report(path: &std::path::Path, event: &ReportEvent) -> std::io::Result<()> {
+    let _guard = REPORT_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let mut line = serde_json::to_string(event).map_err(std::io::Error::other)?;
     line.push('\n');
 
@@ -729,6 +831,9 @@ fn append_report(path: &std::path::Path, event: &ReportEvent) -> std::io::Result
 /// the outbox because it signs the same user back in; logout may be followed by
 /// a different account, which must never inherit the first account's listens.
 pub fn forget_pending_reports() -> std::io::Result<()> {
+    let _guard = REPORT_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let path = crate::config::dir()
         .map_err(std::io::Error::other)?
         .join(REPORT_FILE);
@@ -741,21 +846,12 @@ pub fn forget_pending_reports() -> std::io::Result<()> {
 
 /// Records one play with no [`Journal`] in hand.
 ///
-/// For the single caller that has none: the UI thread on the way out. The
-/// journal lives on the metadata worker, and that thread is deliberately not
-/// joined at exit -- so a play handed to it as the process tears down may never
-/// be written, and the last track of a session is exactly the one worth
-/// keeping. This writes it directly instead.
-///
-/// Safe alongside the worker's own copy because it does what the ordinary path
-/// does: append one line. It deliberately does *not* compact, which is the only
-/// operation that rewrites the file and the only one two writers could tear.
-///
-/// The upstream report is queued beside it. Delivery remains asynchronous on
-/// the next launch, so quitting never waits on two network round trips and the
-/// last track of a session is no longer silently local-only.
-pub fn record_final(track: &Track, listened: Duration) {
-    let play = Play::new(track, listened);
+/// The UI appends locally before asking the history worker to deliver. This
+/// also covers shutdown, when network workers are deliberately not joined.
+/// Journal compaction remains on load; outbox appends and compaction share a
+/// lock so a checkpoint cannot disappear underneath a rewrite.
+pub fn record_final(track: &Track, report: PendingReport) {
+    let play = Play::new(track, Duration::from_secs(report.listened));
     if play.listened < NOISE {
         return;
     }
@@ -764,16 +860,41 @@ pub fn record_final(track: &Track, listened: Duration) {
     };
     append(&path, &play);
 
-    if play.listened >= super::stats::MIN_REPORTABLE.as_secs() {
-        let report = PendingReport::new(&play);
-        let report_path = path.with_file_name(REPORT_FILE);
-        if let Err(error) = append_report(&report_path, &ReportEvent::Pending { report }) {
+    record_pending(report);
+}
+
+/// Append before dispatching network work so exit cannot lose a queued play.
+pub fn record_pending(report: PendingReport) -> bool {
+    if report.listened < super::stats::MIN_REPORTABLE.as_secs() {
+        return false;
+    }
+    let Ok(path) = crate::config::dir().map(|dir| dir.join(REPORT_FILE)) else {
+        return false;
+    };
+    match append_report(&path, &ReportEvent::Pending { report }) {
+        Ok(()) => true,
+        Err(error) => {
             crate::diagnostics::error(
                 "history",
-                &format!("could not queue the final playback report: {error}"),
+                &format!("could not persist listening report: {error}"),
             );
+            false
         }
     }
+}
+
+fn merge_report(held: &mut PendingReport, mut newer: PendingReport) {
+    if newer.revision < held.revision {
+        return;
+    }
+    let mut intervals = held.intervals.clone();
+    for interval in &newer.intervals {
+        if !intervals.contains(interval) {
+            intervals.push(interval.clone());
+        }
+    }
+    newer.intervals = intervals;
+    *held = newer;
 }
 
 /// What a track is worth on the landing page.
@@ -1186,6 +1307,125 @@ mod tests {
 
         let delivered = ReportQueue::load_path(path.clone());
         assert!(delivered.front().is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn checkpoint_acknowledgement_cannot_erase_later_progress() {
+        use super::super::listening::Interval;
+        let path = std::env::temp_dir().join(format!(
+            "mtui-progress-{}.jsonl",
+            super::super::stats::nonce()
+        ));
+        let mut reports = ReportQueue {
+            path: Some(path.clone()),
+            pending: VecDeque::new(),
+        };
+        let mut checkpoint = PendingReport::new(&play("heard", "A", 30, 1));
+        checkpoint.revision = 30_000;
+        checkpoint.intervals.push(Interval {
+            start_ms: 0,
+            end_ms: 30_000,
+        });
+        reports.enqueue_report(checkpoint.clone());
+        // Finish arrives while checkpoint's network request is still running.
+        let mut finished = checkpoint.clone();
+        finished.revision = 60_500;
+        finished.listened = 60;
+        finished.intervals = vec![Interval {
+            start_ms: 30_000,
+            end_ms: 60_500,
+        }];
+        append_report(&path, &ReportEvent::Pending { report: finished }).unwrap();
+        reports.acknowledge_front();
+        let reloaded = ReportQueue::load_path(path.clone());
+        let pending = reloaded.front().unwrap();
+        assert_eq!(pending.cpn, checkpoint.cpn);
+        assert_eq!(pending.revision, 60_500);
+        assert_eq!(
+            pending.intervals,
+            vec![Interval {
+                start_ms: 30_000,
+                end_ms: 60_500
+            }]
+        );
+        assert_eq!(pending.listened, 60);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn old_outbox_entries_remain_readable_without_fabricated_watchtime() {
+        let old = r#"{"video_id":"heard","listened":120,"at":1,"cpn":"abcdefghijklmnop"}"#;
+        let report: PendingReport = serde_json::from_str(old).unwrap();
+        assert!(report.intervals.is_empty());
+        assert_eq!(report.position_ms, None);
+        assert_eq!(report.revision, 0);
+    }
+
+    #[test]
+    fn upgrade_recovers_recent_unverified_acknowledgements_once() {
+        let path = std::env::temp_dir().join(format!(
+            "mtui-legacy-{}.jsonl",
+            super::super::stats::nonce()
+        ));
+        let mut report = PendingReport::new(&play("heard", "A", 60, unix_now()));
+        append_report(
+            &path,
+            &ReportEvent::Pending {
+                report: report.clone(),
+            },
+        )
+        .unwrap();
+        append_report(
+            &path,
+            &ReportEvent::Sent {
+                cpn: report.cpn.clone(),
+                revision: None,
+                intervals: Vec::new(),
+            },
+        )
+        .unwrap();
+        report.cpn = "older-history".into();
+        report.at = unix_now().saturating_sub(48 * 60 * 60);
+        append_report(
+            &path,
+            &ReportEvent::Pending {
+                report: report.clone(),
+            },
+        )
+        .unwrap();
+        append_report(
+            &path,
+            &ReportEvent::Sent {
+                cpn: report.cpn,
+                revision: None,
+                intervals: Vec::new(),
+            },
+        )
+        .unwrap();
+        let mut reports = ReportQueue::load_path(path.clone());
+        assert_eq!(reports.len(), 1);
+        assert!(reports.acknowledge_front());
+        assert_eq!(ReportQueue::load_path(path.clone()).len(), 0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_song_does_not_block_later_history_after_restart() {
+        let path =
+            std::env::temp_dir().join(format!("mtui-defer-{}.jsonl", super::super::stats::nonce()));
+        let mut reports = ReportQueue {
+            path: Some(path.clone()),
+            pending: VecDeque::new(),
+        };
+        reports.enqueue(&play("unavailable", "A", 60, 1));
+        reports.enqueue(&play("playable", "A", 60, 2));
+        reports.defer_front();
+        let mut reloaded = ReportQueue::load_path(path.clone());
+        assert_eq!(reloaded.front().unwrap().video_id, "playable");
+        reloaded.acknowledge_front();
+        assert_eq!(reloaded.front().unwrap().video_id, "unavailable");
+        assert_eq!(ReportQueue::load_path(path.clone()).len(), 1);
         let _ = fs::remove_file(path);
     }
 

@@ -81,7 +81,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          $notes = "docs/releases/${{ github.ref_name }}.md"
+          $notesArgs = if (Test-Path -LiteralPath $notes) {
+            @("--notes-file", $notes)
+          } else {
+            @("--generate-notes")
+          }
           gh release create "${{ github.ref_name }}" `
             "dist/MTUI-$env:MTUI_VERSION-Setup-x64.exe#MTUI installer for Windows (x64)" `
             "dist/MTUI-$env:MTUI_VERSION-windows-x64-portable.exe#Portable MTUI for Windows (x64)" `
-            --generate-notes --verify-tag
+            @notesArgs --verify-tag

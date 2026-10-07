@@ -26,6 +26,7 @@ mod imp {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn AllocConsole() -> i32;
+        fn GetConsoleWindow() -> isize;
         fn DuplicateHandle(
             source_process: isize,
             source: isize,
@@ -40,6 +41,9 @@ mod imp {
         fn SetConsoleMode(handle: isize, mode: u32) -> i32;
         fn GetConsoleMode(handle: isize, mode: *mut u32) -> i32;
         fn GetConsoleScreenBufferInfo(handle: isize, info: *mut ConsoleScreenBufferInfo) -> i32;
+        fn SetConsoleScreenBufferSize(handle: isize, size: Coord) -> i32;
+        fn SetConsoleWindowInfo(handle: isize, absolute: i32, window: *const [i16; 4]) -> i32;
+        fn SetConsoleCursorPosition(handle: isize, position: Coord) -> i32;
         fn CreateFileW(
             name: *const u16,
             access: u32,
@@ -68,6 +72,11 @@ mod imp {
         fn MessageBoxW(window: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
     }
 
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn ShowScrollBar(window: isize, bar: i32, show: i32) -> i32;
+    }
+
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub(super) struct InputRecord {
@@ -76,6 +85,14 @@ mod imp {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Coord {
+        x: i16,
+        y: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
     struct ConsoleScreenBufferInfo {
         size: [i16; 2],
         cursor: [i16; 2],
@@ -131,6 +148,7 @@ mod imp {
     const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
     const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    const DISABLE_NEWLINE_AUTO_RETURN: u32 = 0x0008;
     const MB_ICONERROR: u32 = 0x0000_0010;
     const HOST_ARGUMENT: &str = "--mtui-console-host";
     const HANDSHAKE_LEN: usize = 512;
@@ -200,6 +218,9 @@ mod imp {
             mut output,
             size,
         } = console;
+        let main_screen = output
+            .try_clone()
+            .context("could not retain the console screen handle")?;
         let forwarder = std::thread::Builder::new()
             .name("mtui-console-output".to_string())
             .spawn(move || {
@@ -216,7 +237,7 @@ mod imp {
         }
         write_handshake(&mut parent_output, Ok(size))?;
 
-        forward_input(input, parent_output)
+        forward_input(input, parent_output, main_screen, size)
     }
 
     /// Starts a fresh console helper and waits for it to prove setup succeeded.
@@ -460,7 +481,7 @@ mod imp {
             ));
         }
         let input = File::from(open_console("CONIN$", GENERIC_READ | GENERIC_WRITE)?);
-        let output = File::from(open_console("CONOUT$", GENERIC_READ | GENERIC_WRITE)?);
+        let mut output = File::from(open_console("CONOUT$", GENERIC_READ | GENERIC_WRITE)?);
         let input_raw = input.as_raw_handle() as isize;
         let output_raw = output.as_raw_handle() as isize;
 
@@ -488,37 +509,87 @@ mod imp {
                     output_mode
                         | ENABLE_PROCESSED_OUTPUT
                         | ENABLE_WRAP_AT_EOL_OUTPUT
-                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                        | DISABLE_NEWLINE_AUTO_RETURN,
                 )
             } == 0
         {
             return Err(anyhow!("could not enable terminal output"));
         }
 
-        let mut info = ConsoleScreenBufferInfo {
-            size: [0; 2],
-            cursor: [0; 2],
-            attributes: 0,
-            window: [0; 4],
-            maximum_window_size: [0; 2],
-        };
-        if unsafe { GetConsoleScreenBufferInfo(output_raw, &mut info) } == 0 {
-            return Err(anyhow!("could not read the terminal size"));
-        }
-        let width = i32::from(info.window[2]) - i32::from(info.window[0]) + 1;
-        let height = i32::from(info.window[3]) - i32::from(info.window[1]) + 1;
-        if width <= 0 || height <= 0 || width > i32::from(u16::MAX) || height > i32::from(u16::MAX)
-        {
-            return Err(anyhow!("the new terminal reported an invalid size"));
-        }
+        // Resized/maximized windows can leave a partial cell below the text
+        // grid. Match the console's native background to the player surface,
+        // so that pixel remainder does not show as a separate black strip.
+        output.write_all(b"\x1b]4;0;rgb:1a/1a/1a\x1b\\")?;
+        let size = fit_console_to_window(output_raw)?;
+        hide_host_scrollbars();
         Ok(HostConsole {
             input,
             output,
-            size: (width as u16, height as u16),
+            size,
         })
     }
 
-    fn forward_input(input: File, mut output: File) -> Result<()> {
+    fn hide_host_scrollbars() {
+        // Conhost can retain a disabled scrollbar after a resize even when
+        // buffer and viewport sizes match. Hide its native chrome explicitly;
+        // list scrolling remains owned by the application and its mouse wheel.
+        let window = unsafe { GetConsoleWindow() };
+        if window != 0 {
+            unsafe {
+                ShowScrollBar(window, 3 /* SB_BOTH */, 0)
+            };
+        }
+    }
+
+    fn visible_size(window: [i16; 4]) -> Result<Coord> {
+        let width = i32::from(window[2]) - i32::from(window[0]) + 1;
+        let height = i32::from(window[3]) - i32::from(window[1]) + 1;
+        if width <= 0 || height <= 0 || width > i32::from(i16::MAX) || height > i32::from(i16::MAX)
+        {
+            return Err(anyhow!("the new terminal reported an invalid size"));
+        }
+        Ok(Coord {
+            x: width as i16,
+            y: height as i16,
+        })
+    }
+
+    /// A full-screen player needs one buffer cell for each visible cell, with
+    /// no scrollback. Keep the origin at zero so mouse and drawing agree.
+    fn fit_console_to_window(output_raw: isize) -> Result<(u16, u16)> {
+        let mut info = ConsoleScreenBufferInfo::default();
+        if unsafe { GetConsoleScreenBufferInfo(output_raw, &mut info) } == 0 {
+            return Err(anyhow!("could not read the terminal size"));
+        }
+        let size = visible_size(info.window)?;
+        if info.window[0] != 0 || info.window[1] != 0 {
+            let window = [0, 0, size.x - 1, size.y - 1];
+            if unsafe { SetConsoleWindowInfo(output_raw, 1, &window) } == 0 {
+                return Err(anyhow!("could not reset the terminal viewport"));
+            }
+        }
+        if info.size != [size.x, size.y] {
+            if info.cursor[0] >= size.x || info.cursor[1] >= size.y {
+                let cursor = Coord {
+                    x: info.cursor[0].clamp(0, size.x - 1),
+                    y: info.cursor[1].clamp(0, size.y - 1),
+                };
+                unsafe { SetConsoleCursorPosition(output_raw, cursor) };
+            }
+            if unsafe { SetConsoleScreenBufferSize(output_raw, size) } == 0 {
+                return Err(anyhow!("could not fit the terminal buffer to its window"));
+            }
+        }
+        Ok((size.x as u16, size.y as u16))
+    }
+
+    fn forward_input(
+        input: File,
+        mut output: File,
+        main_screen: File,
+        mut size: (u16, u16),
+    ) -> Result<()> {
         let handle = input.as_raw_handle() as isize;
         loop {
             let mut record = InputRecord {
@@ -528,6 +599,20 @@ mod imp {
             let mut read = 0;
             if unsafe { ReadConsoleInputW(handle, &mut record, 1, &mut read) } == 0 {
                 return Ok(());
+            }
+            if read != 0 && record.event_type == WINDOW_BUFFER_SIZE_EVENT {
+                // Classic conhost bases its scrollbar on the original buffer,
+                // even while VT draws on the alternate screen. Fit both: the
+                // active buffer alone cannot prevent scrollbars after a resize.
+                fit_console_to_window(main_screen.as_raw_handle() as isize)?;
+                hide_host_scrollbars();
+                let active = File::from(open_console("CONOUT$", GENERIC_READ | GENERIC_WRITE)?);
+                let new_size = fit_console_to_window(active.as_raw_handle() as isize)?;
+                if new_size == size {
+                    continue;
+                }
+                size = new_size;
+                record.event[0] = u32::from(size.0) | (u32::from(size.1) << 16);
             }
             if read != 0 && output.write_all(&encode_record(record)).is_err() {
                 return Ok(());
@@ -886,6 +971,26 @@ mod imp {
             .chain(std::iter::once(0))
             .collect();
         unsafe { MessageBoxW(0, text.as_ptr(), caption.as_ptr(), MB_ICONERROR) };
+    }
+
+    #[cfg(test)]
+    mod viewport_tests {
+        use super::*;
+
+        #[test]
+        fn viewport_size_excludes_scrollback_and_includes_last_cell() {
+            let size = visible_size([0, 8975, 119, 8999]).unwrap();
+            assert_eq!((size.x, size.y), (120, 25));
+            let size = visible_size([11, 4, 90, 43]).unwrap();
+            assert_eq!((size.x, size.y), (80, 40));
+        }
+
+        #[test]
+        fn invalid_viewports_cannot_be_sent_as_unsigned_resize_events() {
+            for window in [[0, 5, 79, 4], [4, 0, 2, 29], [0, 0, i16::MAX, 24]] {
+                assert!(visible_size(window).is_err());
+            }
+        }
     }
 }
 

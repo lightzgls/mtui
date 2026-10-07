@@ -112,11 +112,11 @@ pub async fn open(url: &str) -> Result<(AudioStream, StreamLink)> {
 
 /// Hands an open stream to symphonia.
 ///
-/// `Decoder::new_mp4` rather than the probing `Decoder::new`: every selected
-/// quality is AAC in an MP4/M4A container, so probing would only waste a seek
-/// and a read.
+/// The AAC adapter selects audio packets and their own duration explicitly,
+/// including in mixed video/audio MP4 fallbacks. Its packet backtracking cache
+/// is fixed at 2 MiB; the downloader separately retains its 1 MiB bound.
 ///
-/// It also leaves rodio's `is_seekable` at `false`, and that has to stay false
+/// It leaves the source's `is_seekable` at `false`, and that has to stay false
 /// however much the decoder would like to seek, because the two costs of
 /// telling symphonia otherwise are both ruinous here. Its mp4 reader parses
 /// every atom in a seekable stream rather than stopping at the `mdat`, which
@@ -129,8 +129,8 @@ pub async fn open(url: &str) -> Result<(AudioStream, StreamLink)> {
 /// emulates a forward seek by reading ahead and discarding, which is exact. It
 /// has no answer for a backward one -- see [`super::Command::Seek`], which winds
 /// a fresh stream forward instead.
-pub fn decoder(stream: AudioStream) -> Result<rodio::Decoder<AudioStream>> {
-    rodio::Decoder::new_mp4(stream).context("could not decode audio stream")
+pub fn decoder(stream: AudioStream) -> Result<super::decoder::AacDecoder> {
+    super::decoder::AacDecoder::open(stream).context("could not decode audio stream")
 }
 
 #[cfg(test)]
@@ -160,12 +160,107 @@ mod tests {
 
     /// One trip through the app's resolve cascade, for the track under test.
     fn resolve(id: &str) -> String {
+        resolve_track(id).url
+    }
+
+    fn resolve_track(id: &str) -> crate::source::StreamUrl {
         let tube = crate::source::innertube::InnerTube::new().ok();
-        let yt = crate::source::youtube::YouTube::default();
+        let yt = crate::source::youtube::YouTube::new(
+            std::env::var("MTUI_YT_DLP").unwrap_or_else(|_| "yt-dlp".into()),
+        )
+        .with_js_runtime(std::env::var("MTUI_JS_RUNTIME").ok());
         crate::source::resolve_stream(&yt, tube.as_ref(), id)
             .expect("resolve failed")
             .0
-            .url
+    }
+
+    #[test]
+    #[ignore = "hits YouTube and uses the audio device silently for one minute"]
+    fn native_handoff_keeps_the_player_clock_and_audio_running() {
+        use crate::player::{Command, PlayState, Player, PlayerEvent};
+        use mtui_resolver::{PlaybackSession, ResolveRequest, Resolver};
+
+        let id = std::env::var("MTUI_VIDEO_ID").unwrap_or_else(|_| "14OBXAjgj7U".into());
+        let mut resolver = Resolver::new(std::env::var("MTUI_YT_DLP").unwrap_or_else(|_| "yt-dlp".into())).unwrap();
+        if let Some(cookies) = crate::config::Cookies::available().unwrap() {
+            resolver.set_session(Some(PlaybackSession::new(cookies.header(), cookies.sapisid())));
+        }
+        let native = resolver.resolve_fast(ResolveRequest::new(&id)).unwrap();
+        let player = Player::spawn(0.0, None).unwrap();
+        player.send(Command::Play {
+            url: native.url, format: native.format, title: "Playback regression test".into(), id: id.clone(),
+        }).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let background = std::thread::spawn({
+            let id = id.clone();
+            move || tx.send(resolve_track(&id)).unwrap()
+        });
+        let started = Instant::now();
+        let mut last = Duration::ZERO;
+        let mut replacement = None;
+        let mut pending_resume = None;
+        loop {
+            assert!(started.elapsed() < Duration::from_secs(100), "player never reached one minute");
+            if let Ok(fresh) = rx.try_recv() {
+                println!("complete handoff stream: itag {:?}", fresh.format.itag);
+                player.send(Command::ArmReplacement { id: id.clone(), url: fresh.url.clone(), format: fresh.format }).unwrap();
+                replacement = Some(fresh);
+            }
+            while let Some(event) = player.poll_event() {
+                if let PlayerEvent::NeedsUrl { from, .. } = event {
+                    pending_resume = Some(from);
+                }
+            }
+            if let Some(fresh) = replacement.as_ref()
+                && let Some(from) = pending_resume.take()
+            {
+                player.send(Command::Resume { url: fresh.url.clone(), format: fresh.format, from }).unwrap();
+            }
+            let snapshot = player.snapshot();
+            assert!(snapshot.error.is_none(), "playback failed: {:?}", snapshot.error);
+            assert!(snapshot.position + Duration::from_millis(100) >= last,
+                "player jumped backwards from {last:?} to {:?}", snapshot.position);
+            last = snapshot.position;
+            if last >= Duration::from_secs(60) {
+                assert_eq!(snapshot.state, PlayState::Playing);
+                assert!(replacement.is_some(), "background stream was never applied");
+                println!("player reached {:.2}s in {:.2}s without resetting", last.as_secs_f64(), started.elapsed().as_secs_f64());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        player.send(Command::Stop).unwrap();
+        background.join().unwrap();
+    }
+
+    /// Exercises the real resolver, bounded downloader and decoder without an
+    /// audio device. A successful end-byte probe alone does not prove that a
+    /// mixed video/audio MP4 can be decoded through a non-seekable ring buffer.
+    #[test]
+    #[ignore = "hits YouTube and decodes complete tracks"]
+    fn decodes_complete_regression_tracks() {
+        let ids = std::env::var("MTUI_TEST_VIDEO_IDS")
+            .unwrap_or_else(|_| "14OBXAjgj7U,ZFUANtR97L0".into());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        for id in ids.split(',') {
+            let url = std::env::var("MTUI_STREAM_URL").unwrap_or_else(|_| resolve(id));
+            let itag = reqwest::Url::parse(&url).unwrap().query_pairs()
+                .find(|(key, _)| key == "itag").map(|(_, value)| value.into_owned());
+            let (stream, link) = runtime.block_on(super::open(&url)).unwrap();
+            let decoder = super::decoder(stream).unwrap();
+            let total = decoder.total_duration().expect("track must state its length");
+            let per_second = decoder.sample_rate().get() as f64 * decoder.channels().get() as f64;
+            let samples = decoder.count();
+            let decoded = Duration::from_secs_f64(samples as f64 / per_second);
+            println!("{id}, itag {itag:?}: decoded {:.2}s of {:.2}s, fault {:?}",
+                decoded.as_secs_f64(), total.as_secs_f64(), link.fault());
+            assert!(decoded + Duration::from_secs(3) >= total,
+                "{id} stopped short after {:.2}s", decoded.as_secs_f64());
+        }
     }
 
     /// A fresh stream can be wound to any point in the track.
@@ -476,6 +571,12 @@ mod tests {
 
         finished.store(true, std::sync::atomic::Ordering::Relaxed);
         answerer.join().expect("the URL answerer panicked");
+        let decoded = Duration::from_secs_f64(samples as f64 / per_second as f64);
+        if let Some(total) = total {
+            assert!(decoded + Duration::from_secs(3) >= total,
+                "track stopped after {:.1}s of {:.1}s", decoded.as_secs_f64(), total.as_secs_f64());
+        }
+        assert!(worst_lag < Duration::from_secs(1), "playback stalled for {worst_lag:?}");
     }
 
     /// Times the pipeline stage by stage against a live stream, so that

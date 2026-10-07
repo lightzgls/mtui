@@ -7,6 +7,7 @@
 
 pub mod backend;
 pub mod chunked;
+mod decoder;
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -310,8 +311,18 @@ enum Ending {
 }
 
 impl Track {
+    fn commit_stream(&mut self, total: Option<Duration>, link: StreamLink, from: Duration) {
+        self.link = link;
+        if total.is_some() {
+            self.total = total;
+        }
+        self.offset = from;
+        self.position = from;
+        self.seeking_to = None;
+    }
+
     fn arm_replacement(&mut self, url: String, format: AudioFormat) {
-        if same_representation(self.format, format) {
+        if same_representation(self.format, format) && same_file(&self.url, &url) {
             if self.link.supply_url(&url) {
                 self.url = url;
             }
@@ -574,6 +585,13 @@ fn run(
                     if resume_is_stale(state, cur.link.wants_url().is_some()) {
                         continue;
                     }
+                    // Buffered audio may have continued for seconds while the
+                    // resolver worked. Resume from where it is now, rather than
+                    // replaying the earlier position carried by the request.
+                    let from = resume_position(state, from, cur.position);
+                    let paused = state == PlayState::Paused;
+                    let can_splice = same_representation(cur.format, format)
+                        && same_file(&cur.url, &url);
                     cur.url = url;
 
                     // The stream is still running and only wants a signature
@@ -585,7 +603,7 @@ fn run(
                     // forward from byte zero to get back to where it already
                     // was -- audible, and pointless when the bytes are simply
                     // waiting behind a URL that has been replaced.
-                    if same_representation(cur.format, format)
+                    if can_splice
                         && cur.link.wants_url().is_some()
                         && cur.link.supply_url(&cur.url)
                     {
@@ -607,12 +625,16 @@ fn run(
                             // different itag, and the old figure would then be
                             // the wrong thing to measure the end against.
                             if let Some(cur) = track.as_mut() {
-                                cur.link = link;
-                                if total.is_some() {
-                                    cur.total = total;
-                                }
+                                cur.commit_stream(total, link, from);
                             }
-                            state = set_state(&snapshot, PlayState::Playing);
+                            if paused {
+                                player.pause();
+                            }
+                            state = set_state(&snapshot, if paused {
+                                PlayState::Paused
+                            } else {
+                                PlayState::Playing
+                            });
                         }
                         Err(e) => {
                             player.stop();
@@ -741,7 +763,9 @@ fn run(
             if !drained {
                 cur.played_to(cur.offset + player.get_pos());
             }
-            cur.note_progress();
+            if !drained {
+                cur.note_progress();
+            }
             let position = cur.position;
             update(&snapshot, |s| s.position = position);
         }
@@ -802,7 +826,9 @@ fn run(
         // whose next read failed exactly as it ends a finished one, with no
         // error anywhere. `empty()` is also true while idle, so only a state
         // that was actually running can mean anything by it.
-        if !drained || state != PlayState::Playing {
+        // An armed replacement may have started a new source since the first
+        // empty() check. The old queue's drain says nothing about that source.
+        if !player.empty() || state != PlayState::Playing {
             continue;
         }
         match track.as_ref().map_or(Ending::Finished, Track::ending) {
@@ -936,8 +962,34 @@ fn same_representation(current: AudioFormat, fresh: AudioFormat) -> bool {
     current.itag.is_some() && current == fresh
 }
 
+/// An itag identifies a quality, not necessarily the same encoded file. Only
+/// splice byte ranges when both signed URLs identify the same size and revision.
+fn same_file(current: &str, fresh: &str) -> bool {
+    fn identity(url: &str) -> Option<(u64, u64)> {
+        let url = reqwest::Url::parse(url).ok()?;
+        let mut length = None;
+        let mut modified = None;
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "clen" => length = value.parse::<u64>().ok(),
+                "lmt" => modified = value.parse::<u64>().ok(),
+                _ => {}
+            }
+        }
+        Some((length.filter(|length| *length > 0)?, modified?))
+    }
+    identity(current).is_some_and(|current| Some(current) == identity(fresh))
+}
+
 fn resume_is_stale(state: PlayState, downloader_waiting: bool) -> bool {
     state == PlayState::Playing && !downloader_waiting
+}
+
+fn resume_position(state: PlayState, requested: Duration, current: Duration) -> Duration {
+    match state {
+        PlayState::Playing | PlayState::Paused => current,
+        _ => requested,
+    }
 }
 
 /// Opens a different representation while the old buffered source keeps
@@ -962,13 +1014,7 @@ fn replace_running_stream(
     }
     cur.url = url;
     cur.format = format;
-    cur.link = link;
-    if total.is_some() {
-        cur.total = total;
-    }
-    cur.offset = from;
-    cur.position = from;
-    cur.seeking_to = None;
+    cur.commit_stream(total, link, from);
     Ok(())
 }
 
@@ -1065,12 +1111,12 @@ fn rebuild(
     });
 
     match start_stream(runtime, player, &url, from) {
-        Ok((_, link)) => {
+        Ok((total, link)) => {
             // The old stream's log described a stream that no longer exists.
             // Leaving it in place would let a fault from before the seek decide
             // how the *next* drain is read.
             if let Some(cur) = track.as_mut() {
-                cur.link = link;
+                cur.commit_stream(total, link, from);
             }
             set_state(snapshot, PlayState::Playing)
         }
@@ -1121,7 +1167,7 @@ fn open_stream(
     runtime: &tokio::runtime::Runtime,
     url: &str,
 ) -> Result<(
-    rodio::Decoder<backend::AudioStream>,
+    decoder::AacDecoder,
     Option<Duration>,
     StreamLink,
 )> {
@@ -1163,7 +1209,7 @@ fn open_stream(
 /// Hands an opened stream to rodio, starting `skip` into the track.
 fn play_source(
     player: &rodio::Player,
-    decoder: rodio::Decoder<backend::AudioStream>,
+    decoder: decoder::AacDecoder,
     skip: Duration,
 ) {
     // Replace whatever was playing; rodio queues appended sources otherwise.
@@ -1249,11 +1295,12 @@ mod tests {
     #[test]
     fn replacements_are_spliced_only_when_the_representation_matches() {
         let mut same = track(5, Some(213));
+        same.url = "https://example.com/a.m4a?clen=1234&lmt=5678".into();
         same.arm_replacement(
-            "https://example.com/refreshed.m4a".into(),
+            "https://example.com/refreshed.m4a?clen=1234&lmt=5678".into(),
             AudioFormat { itag: Some(140) },
         );
-        assert_eq!(same.url, "https://example.com/refreshed.m4a");
+        assert_eq!(same.url, "https://example.com/refreshed.m4a?clen=1234&lmt=5678");
         assert!(same.replacement.is_none());
 
         let mut different = track(5, Some(213));
@@ -1269,10 +1316,43 @@ mod tests {
     }
 
     #[test]
+    fn the_same_quality_does_not_prove_byte_offsets_are_interchangeable() {
+        let original = "https://example.com/a?clen=1234&lmt=5678";
+        assert!(same_file(original, "https://other.example/b?lmt=5678&clen=1234&expire=999"));
+        assert!(!same_file(original, "https://example.com/b?clen=1234&lmt=5679"));
+        assert!(!same_file(original, "https://example.com/b?clen=1235&lmt=5678"));
+        assert!(!same_file("https://example.com/a", "https://example.com/a"));
+    }
+
+    #[test]
     fn a_late_resume_is_ignored_after_the_downloader_recovered() {
         assert!(resume_is_stale(PlayState::Playing, false));
         assert!(!resume_is_stale(PlayState::Playing, true));
         assert!(!resume_is_stale(PlayState::Buffering, false));
+    }
+
+    #[test]
+    fn a_representation_change_uses_the_position_reached_while_resolving() {
+        let requested = Duration::from_secs(10);
+        let current = Duration::from_secs(18);
+        assert_eq!(resume_position(PlayState::Playing, requested, current), current);
+        assert_eq!(resume_position(PlayState::Paused, requested, current), current);
+        assert_eq!(resume_position(PlayState::Buffering, requested, current), requested);
+    }
+
+    #[test]
+    fn resuming_resets_the_clock_origin_without_resetting_the_retry_budget() {
+        let mut resumed = track(18, Some(213));
+        resumed.rebuilds = 2;
+        resumed.commit_stream(Some(Duration::from_secs(210)), StreamLink::default(), Duration::from_secs(18));
+        resumed.played_to(resumed.offset + Duration::from_secs(1));
+        resumed.note_progress();
+        assert_eq!(resumed.position, Duration::from_secs(19));
+        assert_eq!(resumed.rebuilds, 2, "a repeated failure spent no retry budget");
+        resumed.played_to(resumed.offset + PROGRESS);
+        resumed.note_progress();
+        assert_eq!(resumed.rebuilds, 0);
+        assert_eq!(resumed.total, Some(Duration::from_secs(210)));
     }
 
     /// The same track, whose downloader recorded a refusal at `offset`.

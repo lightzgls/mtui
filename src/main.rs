@@ -260,6 +260,19 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
                                 app.handle_mouse_action(action)?;
                             }
                         }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            if let Some(action) = mouse.drag_action_at(event.column, event.row) {
+                                app.handle_mouse_action(action)?;
+                            }
+                        }
+                        MouseEventKind::Down(MouseButton::Right) => {
+                            if let Some(action) =
+                                mouse.context_action_at(event.column, event.row)
+                            {
+                                app.handle_mouse_action(action)?;
+                            }
+                            app.handle_mouse_action(app::MouseAction::OpenPageActions)?;
+                        }
                         _ => {}
                     },
                     Event::Resize(width, height) => {

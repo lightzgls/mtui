@@ -187,10 +187,27 @@ installs require network access but not administrator access.
 <!-- USAGE -->
 ## Usage
 
+The top bar provides Home, Playing, search, and Menu. Home uses artwork shelves;
+Now Playing shows artwork beside Queue, Lyrics, Related, and Comments. In a
+narrow window the track header moves above the tabs. Progress and playback
+controls stay at the bottom on every page, with colors taken from the cover.
+
+`Ctrl-K` shows a compact menu grouped into navigation, app preferences, and
+window actions. Its displayed shortcuts work while the menu is open. Settings
+groups audio output under Playback, cover and icon choices under Appearance,
+and Discord/tray switches under Integrations. Click a value or press Enter to
+choose it; a choice list changes nothing until you confirm. Esc cancels the
+choice list, then returns to Settings and the menu it was opened from.
+
 `Ctrl-K` opens the global App Menu. Outside search entry, `.` opens actions for
 the current page or selection. The terminal UI also accepts the mouse: use the
 wheel to navigate, click the search box to edit, and click visible cards, rows,
-player tabs, or queue entries to open them.
+player tabs, or queue entries to open them. Click or drag the progress bar to
+seek; the persistent player also exposes previous, play/pause, next, and volume
+controls wherever the terminal is wide enough to show them clearly. Press `m`
+or click the `vol`/`mut` label to mute or restore the previous volume. Right-click
+an item to select it and open its actions; every menu row is clickable. If a
+track cannot play, press `r` to retry it or `n` to skip to the next queue item.
 
 ### First Run
 
@@ -237,8 +254,10 @@ sign-in profile without stopping current playback.
 | `P` | Open the player |
 | `Space` | Pause or resume |
 | `+` / `-` | Change volume |
+| `m` | Mute or restore the previous volume |
 | Left / Right | Seek five seconds while browsing tracks or the player |
 | `n` / `p` | Next or previous track on the player |
+| `r` | Retry the current track on the player, or refresh the current browse page |
 | `R` | Cycle repeat off, all, or one |
 | `d` | Remove the selected upcoming queue track |
 | `K` / `J` | Move the selected upcoming queue track |
@@ -247,7 +266,7 @@ sign-in profile without stopping current playback.
 | `c` | Change cover-art size |
 | `M` | Import or refresh the personalized Home session |
 | `D` | Toggle Discord Rich Presence directly |
-| `S` or `Ctrl-S` | Open settings for audio output, tray, song cover, app icon, and Discord presence |
+| `S` or `Ctrl-S` | Open grouped settings; Enter chooses a value, Left/Right cycles choices |
 | `B` | Continue in the Windows notification area |
 | `q` or `Ctrl-C` | Quit |
 
@@ -258,7 +277,7 @@ notification area. Closing the terminal with its `X` button also moves MTUI to t
 tray without interrupting playback. The tray menu can show MTUI, pause or resume,
 move between tracks, and quit.
 
-Enable **Keep notification-area icon** under Settings to retain the icon while the
+Enable **Keep tray icon visible** under Settings → Integrations to retain the icon while the
 terminal UI is open. Windows may place new icons under the hidden-icons `^` menu.
 
 ### Configuration
@@ -271,17 +290,24 @@ terminal UI is open. Windows may place new icons under the hidden-icons `^` menu
 Downloaded tools are kept separately under `%LOCALAPPDATA%\mtui` on Windows or
 `$XDG_CACHE_HOME/mtui` on Linux.
 
-**Resource use.** Playback uses a fixed 1 MiB audio ring buffer rather than
-downloading a whole song into memory. MTUI holds one current cover, and its
+**Resource use.** Playback uses a fixed 1 MiB audio ring buffer and a fixed
+2 MiB packet cache for MP4 interleaving rather than downloading a whole song
+into memory. MTUI holds one current cover, and its
 Home/artist artwork LRU is capped at 32 images with a raw RGB budget of about
 6 MiB. Late image replies for evicted cards are discarded. Process monitors may
 report additional shared audio, TLS, and system-library pages as resident memory,
 but caches do not grow with the number of songs played.
 
+**Playback recovery.** Complete audio-only AAC streams are preferred before the
+combined video/audio fallback. Only AAC packets reach the audio decoder, and
+duration comes from the audio track. A replacement keeps the current listening
+position; byte ranges are spliced only when format, file size, and revision
+match. Automatic recovery and manual Retry both bypass failed cached URLs.
+
 **Graphics.** MTUI detects Kitty graphics and Sixel support automatically. The
-Settings panel's **Image renderer** choice can keep automatic detection, force
+Settings panel's **Artwork display** choice can keep automatic detection, force
 Kitty (useful when a multiplexer hides terminal capabilities), or use universal
-terminal-cell pixel art. **Song cover** separately switches the large current-song
+terminal-cell pixel art. **Cover style** separately switches the large current-song
 cover between bitmap/pixel rendering and colored ASCII. Artwork is center-cropped
 to a square sleeve. `MTUI_GRAPHICS=blocks`, `MTUI_GRAPHICS=kitty`, and
 `MTUI_GRAPHICS=sixel` remain available as startup overrides for automatic
@@ -291,6 +317,16 @@ detection.
 in `mtui.log` inside the configuration directory. The log rotates at 1 MiB and
 keeps one backup as `mtui.log.1`. URLs and credential-bearing messages are
 redacted; cookies, tokens, and song titles are not intentionally logged.
+
+**Listening history.** With YouTube Music signed in, MTUI reports a song after
+30 seconds of actual playback. The local journal records the full listening
+duration when you skip, finish, or quit. Pauses, buffering, and seek jumps do not
+count as listening. Reports are persisted before network delivery, retried every 30
+seconds while open and on the next launch, and acknowledged only after the song
+appears in recent YouTube Music history. A successful telemetry HTTP response
+alone does not discard the pending report. YouTube account history must be
+enabled for writes to appear; logging out clears that account's pending reports.
+On upgrade, unverified reports from the previous 24 hours are checked and recovered.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 

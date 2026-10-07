@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "mtui"
-version = "0.7.0"
+version = "0.8.0"
 default-run = "mtui"
 edition = "2024"
 description = "A terminal music player for YouTube Music, built to stay small in memory"
@@ -22,12 +22,16 @@ serde_json = "1.0.151"
 
 # Audio output. Only `playback` + the two symphonia features we actually need.
 # Deliberately excludes `recording`, `dither`/`noise` (pulls rand), and every
-# codec except AAC-LC in an MP4/M4A container -- YouTube itags 141 and 140.
+# codec except AAC-LC in an MP4/M4A container, including mixed MP4 fallbacks.
 rodio = { version = "0.22.2", default-features = false, features = [
     "playback",
     "symphonia-aac",
     "symphonia-isomp4",
 ] }
+
+# The same AAC/MP4 decoder rodio already uses. Direct access lets the player
+# select audio packets in mixed MP4 fallbacks and configure bounded backtracking.
+symphonia = { version = "0.5.5", default-features = false, features = ["aac", "isomp4"] }
 
 # HTTP streaming as a Read+Seek source, backed by a fixed-size circular buffer.
 # native-tls resolves to Windows SChannel / system OpenSSL, so no C compiler and

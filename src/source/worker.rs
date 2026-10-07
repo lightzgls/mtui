@@ -12,17 +12,17 @@
 //! the same queue would let a slow thumbnail sit in front of the resolve that
 //! actually produces audio.
 //!
-//! Metadata and listening-history calls get a third thread by the same
-//! argument: queueing one behind a four-second resolve would make opening an
-//! album or artist feel broken.
+//! Metadata has its own thread so a resolve cannot delay opening an album or
+//! artist. History has another, with durable checkpoints and timed retries;
+//! verification of a write must never hold up browsing or audio.
 //!
-//! The player page gets a fifth. Its panels are fetched while music is already
+//! The player page has its own worker. Its panels are fetched while music is already
 //! playing and nobody is waiting on them, so they must not be able to delay
 //! anything that somebody is: a comment section costs two round trips, and
 //! sharing the library's queue would put it in front of the playlist the user
 //! just asked to open.
 //!
-//! The landing page's card artwork gets a sixth, which is the same argument at
+//! The landing page's card artwork also has its own worker, for the same reason at
 //! a different scale. One cover is one request per track; a screenful of cards
 //! is a dozen at once, and a dozen pictures of things the user has not chosen
 //! must not be able to queue in front of the picture of the thing they are
@@ -42,14 +42,12 @@ use super::cover::{self, Cover};
 use super::home::{self, Shelf};
 use super::http::Http;
 use super::innertube::InnerTube;
-use super::journal::{Journal, Play, ReportQueue};
+use super::journal::Journal;
 use super::{ArtistRef, BrowseEndpoint, StreamUrl, Track};
-use super::{lrclib, stats, watch};
+use super::{lrclib, watch};
 use crate::config::Cookies;
 use crate::source::youtube::YouTube;
 use mtui_resolver::{PlaybackSession, ResolveRequest, Resolver};
-
-const RECENT_REPLACEMENT: Duration = Duration::from_secs(30);
 
 pub type PageRequestId = u64;
 
@@ -109,16 +107,6 @@ pub enum Request {
     /// Establishes a Music session in MTUI's cross-platform sign-in window.
     MusicSignIn {
         recover: bool,
-    },
-    /// A finished play: how far the user actually got through a track.
-    ///
-    /// Journalled locally, which is what the shelves above are ranked from, and
-    /// -- when a cookie allows it -- reported to YouTube so the same play shows
-    /// up in their history everywhere else. Answers with nothing on success;
-    /// the user did not ask for this and there is nothing to tell them.
-    ReportPlay {
-        track: Track,
-        listened: Duration,
     },
     /// Retries the durable playback outbox after a Music session is imported.
     RetryReports,
@@ -306,6 +294,7 @@ pub struct SourceWorker {
     tx: Sender<Request>,
     cover_tx: Sender<Request>,
     metadata_tx: Sender<Request>,
+    history_tx: Sender<Request>,
     page_tx: Sender<Request>,
     art_tx: Sender<Request>,
     /// Kept so a sign-in thread can be handed somewhere to answer. Sign-in is
@@ -327,6 +316,7 @@ impl SourceWorker {
         let (req_tx, req_rx) = channel::<Request>();
         let (cover_req_tx, cover_req_rx) = channel::<Request>();
         let (metadata_req_tx, metadata_req_rx) = channel::<Request>();
+        let (history_req_tx, history_req_rx) = channel::<Request>();
         let (page_req_tx, page_req_rx) = channel::<Request>();
         let (art_req_tx, art_req_rx) = channel::<Request>();
         let (complete_tx, complete_rx) = channel::<CompletionRequest>();
@@ -363,6 +353,11 @@ impl SourceWorker {
             .context("failed to spawn metadata worker")?;
 
         thread::Builder::new()
+            .name("mtui-history".to_string())
+            .spawn(move || super::history::run(history_req_rx))
+            .context("failed to spawn history worker")?;
+
+        thread::Builder::new()
             .name("mtui-page".to_string())
             .spawn(move || run_pages(page_req_rx, page_res_tx))
             .context("failed to spawn player page worker")?;
@@ -376,6 +371,7 @@ impl SourceWorker {
             tx: req_tx,
             cover_tx: cover_req_tx,
             metadata_tx: metadata_req_tx,
+            history_tx: history_req_tx,
             page_tx: page_req_tx,
             art_tx: art_req_tx,
             res_tx: spawn_res_tx,
@@ -430,10 +426,9 @@ impl SourceWorker {
             | Request::Comments { .. } => {
                 self.page_tx.send(req).context("player page worker is gone")
             }
-            Request::ReportPlay { .. }
-            | Request::RetryReports
-            | Request::ClearReports
-            | Request::OpenBrowse { .. }
+            Request::RetryReports
+            | Request::ClearReports => self.history_tx.send(req).context("history worker is gone"),
+            Request::OpenBrowse { .. }
             | Request::OpenArtist { .. } => self
                 .metadata_tx
                 .send(req)
@@ -472,7 +467,6 @@ fn name(req: &Request) -> &'static str {
         Request::Art { .. } => "Art",
         Request::PersonalHome { .. } => "PersonalHome",
         Request::MusicSignIn { .. } => "MusicSignIn",
-        Request::ReportPlay { .. } => "ReportPlay",
         Request::RetryReports => "RetryReports",
         Request::ClearReports => "ClearReports",
         Request::OpenBrowse { .. } => "OpenBrowse",
@@ -492,6 +486,7 @@ impl Drop for SourceWorker {
         let _ = self.tx.send(Request::Shutdown);
         let _ = self.cover_tx.send(Request::Shutdown);
         let _ = self.metadata_tx.send(Request::Shutdown);
+        let _ = self.history_tx.send(Request::Shutdown);
         let _ = self.page_tx.send(Request::Shutdown);
         // Only the source thread is joined. The cover thread may be most of a
         // ten-second timeout into a fetch, and making the user wait that out to
@@ -540,8 +535,6 @@ fn run_completions(yt: YouTube, rx: Receiver<CompletionRequest>, tx: Sender<Resp
         yt.pot_plugin_dir().map(str::to_string),
         yt.pot_server_home().map(str::to_string),
     );
-    let mut recent_background: Option<(String, Instant)> = None;
-
     while let Ok(mut request) = rx.recv() {
         // Only the newest queued track can still benefit from expensive work.
         while let Ok(newer) = rx.try_recv() {
@@ -549,15 +542,12 @@ fn run_completions(yt: YouTube, rx: Receiver<CompletionRequest>, tx: Sender<Resp
         }
         resolver.set_session(playback_session());
         let started = Instant::now();
-        // A cap request is commonly queued while this worker is still finding
-        // the background replacement for that same cap. Once it reaches the
-        // queue, the verified URL is already cached; invalidating it would run
-        // the same four-second extraction twice and deliver a stale resume.
-        let reuse_background = can_reuse_background(&request, recent_background.as_ref());
+        // A recovery must invalidate even a recently cached replacement: that
+        // replacement can itself be the URL which just stopped decoding.
         let stream = resolver
             .resolve(ResolveRequest {
                 video_id: &request.id,
-                bypass_cache: request.bypass_cache && !reuse_background,
+                bypass_cache: request.bypass_cache,
             })
             .map_err(|error| error.to_string());
         let elapsed = started.elapsed().as_millis();
@@ -574,9 +564,6 @@ fn run_completions(yt: YouTube, rx: Receiver<CompletionRequest>, tx: Sender<Resp
                 &format!("complete replacement failed after {elapsed} ms"),
             ),
         }
-        if request.title.is_none() && stream.is_ok() {
-            recent_background = Some((request.id.clone(), Instant::now()));
-        }
         let response = match request.title {
             Some(title) => Response::Resolved {
                 id: request.id,
@@ -592,14 +579,6 @@ fn run_completions(yt: YouTube, rx: Receiver<CompletionRequest>, tx: Sender<Resp
             break;
         }
     }
-}
-
-fn can_reuse_background(request: &CompletionRequest, recent: Option<&(String, Instant)>) -> bool {
-    request.bypass_cache
-        && request.title.is_some()
-        && recent.is_some_and(|(id, resolved)| {
-            *id == request.id && resolved.elapsed() < RECENT_REPLACEMENT
-        })
 }
 
 fn run_source_loop(
@@ -861,35 +840,9 @@ fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
     let Ok(http) = Http::new() else {
         return;
     };
-    let mut journal = Journal::load();
-    let mut reports = ReportQueue::load();
-    retry_reports(&http, &mut reports);
 
     while let Ok(req) = rx.recv() {
         let response = match req {
-            Request::ReportPlay { track, listened } => {
-                // Local first, and unconditionally: this is the half that needs no
-                // account, no cookie and no network, and it is what MTUI's own
-                // shelves are ranked from. A play too short to mean anything is
-                // dropped here rather than tested for twice.
-                let play = Play::new(&track, listened);
-                if journal.record(play.clone()) {
-                    // Queue first, then try the network. A missing cookie, a
-                    // stale session, an offline machine or a process killed
-                    // mid-request all leave the same recoverable state on disk.
-                    reports.enqueue(&play);
-                    retry_reports(&http, &mut reports);
-                }
-                None
-            }
-            Request::RetryReports => {
-                retry_reports(&http, &mut reports);
-                None
-            }
-            Request::ClearReports => {
-                reports.clear();
-                None
-            }
             Request::OpenBrowse {
                 request_id,
                 endpoint,
@@ -914,35 +867,6 @@ fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
         };
         if response.is_some_and(|response| tx.send(response).is_err()) {
             break;
-        }
-    }
-}
-
-fn retry_reports(http: &Http, reports: &mut ReportQueue) {
-    let Some(cookies) = Cookies::available().ok().flatten() else {
-        return;
-    };
-
-    while let Some(report) = reports.front().cloned() {
-        match stats::report_with_cpn(
-            http,
-            &cookies,
-            &report.video_id,
-            Duration::from_secs(report.listened),
-            &report.cpn,
-        ) {
-            Ok(()) => {
-                if !reports.acknowledge_front() {
-                    return;
-                }
-            }
-            Err(_) => {
-                crate::diagnostics::error(
-                    "history",
-                    "playback report retained: YouTube tracking is unavailable",
-                );
-                return;
-            }
         }
     }
 }
@@ -1217,23 +1141,4 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn recovery_reuses_a_just_completed_background_url() {
-        let recovery = CompletionRequest {
-            id: "video".into(),
-            title: Some("Track".into()),
-            bypass_cache: true,
-        };
-        let recent = ("video".to_string(), Instant::now());
-        assert!(can_reuse_background(&recovery, Some(&recent)));
-
-        let other = ("other".to_string(), Instant::now());
-        assert!(!can_reuse_background(&recovery, Some(&other)));
-
-        let background = CompletionRequest {
-            title: None,
-            ..recovery
-        };
-        assert!(!can_reuse_background(&background, Some(&recent)));
-    }
 }

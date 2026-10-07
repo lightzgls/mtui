@@ -31,6 +31,7 @@ fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 
 const PLAYER_TIMEOUT: Duration = Duration::from_secs(5);
 const FALLBACK_BUDGET: Duration = Duration::from_secs(30);
+const MUSIC_RESERVE: Duration = Duration::from_secs(8);
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const POT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
 const POT_ACTIVATION_DELAY: Duration = Duration::from_secs(5);
@@ -344,9 +345,9 @@ impl Resolver {
         &self,
         video_id: &str,
     ) -> std::result::Result<ResolvedStream, ResolveError> {
-        if let Ok(fast) =
-            resolve_player(&self.runtime, &self.client, self.session.as_ref(), video_id)
-            && serves_whole_file(&self.runtime, &self.client, &fast.url)
+        if let Ok(fast) = resolve_complete_player(
+            &self.runtime, &self.client, self.session.as_ref(), video_id,
+        )
         {
             return Ok(fast);
         }
@@ -371,6 +372,26 @@ impl Resolver {
             ResolveSource::YtDlpEmbedded,
             false,
         ));
+        // Give standard audio-only extraction a turn before spending the
+        // budget on proof-of-origin work or a lower-quality muxed fallback.
+        if let Some(session) = self.session.as_ref() {
+            attempts.push((
+                Some(session),
+                "https://www.youtube.com/watch?v=",
+                AUDIO_FORMAT,
+                &[] as &[&str],
+                ResolveSource::YtDlp,
+                false,
+            ));
+        }
+        attempts.push((
+            None,
+            "https://www.youtube.com/watch?v=",
+            AUDIO_FORMAT,
+            &[] as &[&str],
+            ResolveSource::YtDlp,
+            false,
+        ));
         if self.pot_plugin_dir.is_some() && self.pot_server_home.is_some() {
             attempts.push((
                 None,
@@ -390,14 +411,6 @@ impl Resolver {
                 ResolveSource::YtDlpMusic,
                 false,
             ));
-            attempts.push((
-                Some(session),
-                "https://www.youtube.com/watch?v=",
-                AUDIO_FORMAT,
-                &[] as &[&str],
-                ResolveSource::YtDlp,
-                false,
-            ));
         }
         attempts.push((
             None,
@@ -407,21 +420,21 @@ impl Resolver {
             ResolveSource::YtDlpMusic,
             false,
         ));
-        attempts.push((
-            None,
-            "https://www.youtube.com/watch?v=",
-            AUDIO_FORMAT,
-            &[] as &[&str],
-            ResolveSource::YtDlp,
-            false,
-        ));
         let fallback_started = Instant::now();
         for (session, watch_url, format, flags, source, uses_pot) in attempts {
             let remaining = FALLBACK_BUDGET.saturating_sub(fallback_started.elapsed());
             if remaining.is_zero() {
                 break;
             }
-            let timeout = remaining.min(if uses_pot {
+            let attempt_budget = if format == AUDIO_FORMAT {
+                remaining.saturating_sub(MUSIC_RESERVE)
+            } else {
+                remaining
+            };
+            if attempt_budget.is_zero() {
+                continue;
+            }
+            let timeout = attempt_budget.min(if uses_pot {
                 POT_ATTEMPT_TIMEOUT
             } else {
                 ATTEMPT_TIMEOUT
@@ -584,6 +597,26 @@ pub fn resolve_player(
         }
     }
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no player clients are configured")))
+}
+
+/// Try every native client before invoking a subprocess. A capped answer from
+/// the first client must not hide a complete audio stream from another one.
+fn resolve_complete_player(
+    runtime: &tokio::runtime::Runtime,
+    client: &reqwest::Client,
+    session: Option<&PlaybackSession>,
+    video_id: &str,
+) -> Result<ResolvedStream> {
+    let candidates = session.map(|session| (&AUTHENTICATED_CLIENT, Some(session)))
+        .into_iter().chain(CLIENTS.iter().map(|identity| (identity, None)));
+    for (identity, session) in candidates {
+        if let Ok(stream) = resolve_player_as(runtime, client, identity, session, video_id)
+            && serves_whole_file(runtime, client, &stream.url)
+        {
+            return Ok(stream);
+        }
+    }
+    bail!("no native client serves complete audio for {video_id}")
 }
 
 fn resolve_player_as(
@@ -1240,6 +1273,23 @@ mod tests {
             &resolver.client,
             &stream.url
         ));
+    }
+
+    #[test]
+    #[ignore = "hits YouTube to diagnose native client streams"]
+    fn probes_native_regression_clients() {
+        let ids = std::env::var("MTUI_TEST_VIDEO_IDS")
+            .unwrap_or_else(|_| "14OBXAjgj7U,ZFUANtR97L0".into());
+        let resolver = Resolver::new("yt-dlp").unwrap();
+        for id in ids.split(',') {
+            for identity in CLIENTS {
+                match resolve_player_as(&resolver.runtime, &resolver.client, identity, None, id) {
+                    Ok(stream) => println!("{id} {}: itag {:?}, complete {}", identity.name,
+                        stream.format.itag, serves_whole_file(&resolver.runtime, &resolver.client, &stream.url)),
+                    Err(error) => println!("{id} {}: {error}", identity.name),
+                }
+            }
+        }
     }
 
     #[test]
