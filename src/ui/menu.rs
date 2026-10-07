@@ -266,11 +266,12 @@ fn menu_offset(lines: &[MenuRenderLine], selected: usize, viewport: usize) -> us
         .position(|line| line.item == Some(selected))
         .unwrap_or(0);
     let mut offset = centred_offset(selected_line, viewport, lines.len());
-    // Do not strand a section's first item at the top without its heading.
+    // Keep the heading only when the selected item still fits in the viewport.
     if viewport > 1
         && offset > 0
         && lines[offset].item.is_some()
         && lines[offset - 1].item.is_none()
+        && selected_line < offset + viewport - 1
     {
         offset -= 1;
     }
@@ -335,6 +336,23 @@ mod tests {
                     assert!(mouse.targets.iter().any(|target| matches!(target, MouseTarget::Area(_, MouseAction::ActivateMenuItem(index)) if *index == selected)), "selected row clipped at {width}x{height}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn menus_without_tray_actions_keep_the_last_selected_row_visible() {
+        let items: Vec<_> = app_menu_items(true)
+            .into_iter()
+            .filter(|item| item.shortcut != Some("B"))
+            .collect();
+        let selected = items.len() - 1;
+        for (width, height) in [(30, 10), (30, 9), (48, 12)] {
+            let (buffer, mouse) = drawn(MenuPage::Root, selected, &items, width, height);
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("Quit"), "Quit clipped at {width}x{height}");
+            assert!(mouse.targets.iter().any(|target| matches!(target,
+                MouseTarget::Area(_, MouseAction::ActivateMenuItem(index)) if *index == selected
+            )));
         }
     }
 
