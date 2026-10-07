@@ -4,9 +4,10 @@
 //! Covers are already resampled to their exact on-screen pixel size, so the
 //! terminal only has to place them at the current cursor position.
 
-use crate::app::ImageBound;
+use crate::app::{ImageBound, PlannedImage};
 
 /// A private, contiguous ID range for the placements in one MTUI frame.
+#[cfg(test)]
 const FIRST_IMAGE_ID: u32 = 1_296_326_409;
 /// Kitty permits at most 4096 base64 bytes in one protocol chunk.
 const CHUNK: usize = 4096;
@@ -45,8 +46,16 @@ pub fn encode(rgb: &[u8], width: u32, height: u32, bound: ImageBound, image_id: 
 }
 
 /// Deletes MTUI's image and all of its placements.
+#[cfg(test)]
 pub const fn image_id(index: usize) -> u32 {
     FIRST_IMAGE_ID + index as u32
+}
+
+/// A placement keeps its ID when other covers arrive earlier in the same row.
+pub fn placement_id(image: &PlannedImage) -> u32 {
+    // The full cell coordinate is unique within a frame. Reserve the high bit
+    // for MTUI and retain 15 bits of each coordinate (well beyond a viewport).
+    0x8000_0000 | (u32::from(image.plan.row) << 15) | u32::from(image.plan.col)
 }
 
 /// Deletes one MTUI image and its placement without touching another app's

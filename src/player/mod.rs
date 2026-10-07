@@ -488,6 +488,10 @@ fn run(
     // branch on the state without taking the lock the UI is reading through.
     let mut state = PlayState::Idle;
     let mut track: Option<Track> = None;
+    // Retain an initial refusal until the already-running full resolver answers.
+    // A new user choice or Stop cancels it before that answer can start audio.
+    let mut failed_start: Option<(String, String)> = None;
+    let mut start_retries = 0u8;
     // Commands pulled off the channel ahead of time, which is how opening a
     // stream can notice that it has been superseded. Drained before the channel
     // is read again, so nothing here waits longer than it would have.
@@ -510,6 +514,8 @@ fn run(
         if let Some(cmd) = cmd {
             match cmd {
                 Command::Load { title } => {
+                    failed_start = None;
+                    start_retries = 0;
                     player.stop();
                     track = None;
                     state = PlayState::Buffering;
@@ -526,6 +532,7 @@ fn run(
                     title,
                     id,
                 } => {
+                    failed_start = None;
                     update(&snapshot, |s| {
                         s.state = PlayState::Buffering;
                         s.title = title.clone();
@@ -561,14 +568,28 @@ fn run(
                             state = set_state(&snapshot, PlayState::Playing);
                         }
                         Err(e) => {
+                            if drain(&rx, &mut queued) {
+                                continue;
+                            }
                             player.stop();
                             track = None;
-                            state = PlayState::Idle;
-                            set_error(&snapshot, format!("{e:#}"));
+                            if start_retries == 0 {
+                                start_retries += 1;
+                                failed_start = Some((id.clone(), title));
+                                state = set_state(&snapshot, PlayState::Buffering);
+                                let _ = events.send(PlayerEvent::NeedsUrl { id, from: Duration::ZERO });
+                            } else {
+                                state = PlayState::Idle;
+                                set_error(&snapshot, format!("{e:#}"));
+                            }
                         }
                     }
                 }
                 Command::Resume { url, format, from } => {
+                    if let Some((id, title)) = failed_start.take() {
+                        queued.push_front(Command::Play { id, title, url, format });
+                        continue;
+                    }
                     // Nothing to carry on: the track was stopped or replaced
                     // while the app was resolving. The URL just fetched is
                     // simply dropped -- starting it would play a song the user
@@ -648,12 +669,17 @@ fn run(
                     }
                 }
                 Command::ArmReplacement { id, url, format } => {
+                    if let Some((id, title)) = failed_start.take_if(|(failed, _)| *failed == id) {
+                        queued.push_front(Command::Play { id, title, url, format });
+                        continue;
+                    }
                     let Some(cur) = track.as_mut().filter(|cur| cur.id == id) else {
                         continue;
                     };
                     cur.arm_replacement(url, format);
                 }
                 Command::ResumeFailed { why } => {
+                    failed_start = None;
                     // Let a downloader still waiting stop waiting. Without
                     // this it sits out its whole timeout for an answer that
                     // has already come back empty.
@@ -675,6 +701,7 @@ fn run(
                     }
                 }
                 Command::Stop => {
+                    failed_start = None;
                     player.stop();
                     track = None;
                     state = PlayState::Idle;
@@ -1265,6 +1292,75 @@ fn set_error(snapshot: &Arc<Mutex<Snapshot>>, msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "uses a local AAC fixture (MTUI_AUDIO_FIXTURE), zero-volume audio, and loopback HTTP"]
+    fn initial_403_recovers_once_and_stop_cancels_a_late_replacement() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let done = Arc::new(AtomicBool::new(false));
+        let server_done = done.clone();
+        let audio = std::fs::read(std::env::var_os("MTUI_AUDIO_FIXTURE").expect("set MTUI_AUDIO_FIXTURE to an AAC/MP4 test file")).unwrap();
+        let server = thread::spawn(move || {
+            while !server_done.load(Ordering::Relaxed) {
+                let Ok((mut socket, _)) = listener.accept() else { thread::sleep(Duration::from_millis(5)); continue; };
+                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut request = [0; 4096];
+                let read = socket.read(&mut request).unwrap_or(0);
+                let text = String::from_utf8_lossy(&request[..read]);
+                if text.contains("/deny") {
+                    let _ = socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                } else {
+                    let lower = text.to_ascii_lowercase();
+                    let (start, end) = lower.lines().find_map(|line| line.strip_prefix("range: bytes="))
+                        .and_then(|range| range.split_once('-')).map(|(start, end)| (start.parse::<usize>().unwrap_or(0), end.parse::<usize>().unwrap_or(audio.len() - 1)))
+                        .unwrap_or((0, audio.len() - 1));
+                    let end = end.min(audio.len() - 1);
+                    if start <= end {
+                        let _ = write!(socket, "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mp4\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n", end - start + 1, audio.len());
+                        let _ = socket.write_all(&audio[start..=end]);
+                    }
+                }
+            }
+        });
+        let player = Player::spawn(0.0, None).unwrap();
+        let choose = || {
+            player.send(Command::Load { title: "Fixture".into() }).unwrap();
+            player.send(Command::Play { url: format!("{base}/deny"), format: AudioFormat { itag: None }, title: "Fixture".into(), id: "fixture".into() }).unwrap();
+        };
+        let wait_for_recovery = || {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while Instant::now() < deadline {
+                if let Some(PlayerEvent::NeedsUrl { id, from }) = player.poll_event() {
+                    assert_eq!(id, "fixture"); assert!(from.is_zero()); return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            panic!("initial refusal did not request recovery: {:?}", player.snapshot());
+        };
+        choose(); wait_for_recovery();
+        player.send(Command::Resume { url: format!("{base}/valid"), format: AudioFormat { itag: None }, from: Duration::ZERO }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while player.snapshot().position < Duration::from_millis(300) && Instant::now() < deadline { thread::sleep(Duration::from_millis(20)); }
+        assert_eq!(player.snapshot().state, PlayState::Playing);
+        assert!(player.snapshot().position >= Duration::from_millis(300));
+        choose(); wait_for_recovery();
+        player.send(Command::Stop).unwrap();
+        player.send(Command::ArmReplacement { id: "fixture".into(), url: format!("{base}/valid"), format: AudioFormat { itag: None } }).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(player.snapshot().state, PlayState::Idle);
+        choose(); wait_for_recovery();
+        player.send(Command::Resume { url: format!("{base}/deny"), format: AudioFormat { itag: None }, from: Duration::ZERO }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while player.snapshot().error.is_none() && Instant::now() < deadline { thread::sleep(Duration::from_millis(20)); }
+        assert_eq!(player.snapshot().state, PlayState::Idle);
+        assert!(player.snapshot().error.is_some());
+        assert!(player.poll_event().is_none(), "a second refusal must not create an endless retry");
+        drop(player); done.store(true, Ordering::Relaxed); server.join().unwrap();
+    }
 
     fn track(position: u64, total: Option<u64>) -> Track {
         Track {

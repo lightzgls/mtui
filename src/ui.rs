@@ -30,6 +30,10 @@ use crate::source::cover::Cover;
 use crate::source::home::{Card, Shelf};
 
 mod dialog;
+mod browse;
+mod search;
+mod palette;
+mod home;
 mod menu;
 mod preferences;
 mod shell;
@@ -107,7 +111,7 @@ const MINI_PLAYER_FLOOR: u16 = 12;
 const STATUS_VOLUME_WIDTH: u16 = 22;
 const MIN_WIDTH_WITH_STATUS_VOLUME: u16 = 80;
 /// Three three-cell transport buttons: previous, play/pause, and next.
-const TRANSPORT_WIDTH: u16 = 9;
+const TRANSPORT_WIDTH: u16 = 12;
 
 /// Named rather than inlined into [`hint_line`] so the test that checks they
 /// fit [`HINTS_WIDTH`] measures the strings that are actually drawn.
@@ -175,10 +179,6 @@ const HERO_HEIGHT: u16 = 4;
 /// Below this a card holds nothing but borders and an ellipsis, so the page
 /// stands down and says so rather than drawing a column of empty boxes.
 const MIN_HOME_WIDTH: u16 = 24;
-
-/// Shelves kept together on the landing page before later sections are allowed
-/// to spend the remaining height on larger cards.
-const MIN_VISIBLE_HOME_SECTIONS: usize = 3;
 
 /// Colour of a card with no artwork -- either because none arrived, or because
 /// it has not arrived yet. Grey rather than a guessed hue: a made-up colour on
@@ -294,6 +294,7 @@ impl MouseMap {
             MouseTarget::TrackRows { area, first } if contains(area, column, row) => Some(
                 MouseAction::SelectTrack(first + usize::from(row.saturating_sub(area.y))),
             ),
+            MouseTarget::Area(area, MouseAction::PlayTrack(index)) if contains(area, column, row) => Some(MouseAction::SelectTrack(index)),
             MouseTarget::PageRows { area, first } if contains(area, column, row) => Some(
                 MouseAction::SelectPageRow(first + usize::from(row.saturating_sub(area.y))),
             ),
@@ -404,6 +405,17 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
     // Menus are the final layer. Input keeps them mutually exclusive with the
     // ordinary overlays, but drawing last preserves that invariant visually.
     menu::render(frame, app, mouse);
+    palette::apply(frame, app.cover.as_ref(), if app.cover_style == CoverStyle::ColoredAscii { cover_area } else { None });
+}
+
+#[cfg(windows)]
+pub fn canvas_color(cover: Option<&Cover>) -> (u8, u8, u8) {
+    palette::background(cover)
+}
+
+#[cfg(test)]
+pub(crate) fn preview_buffer(name: &str, buffer: &ratatui::buffer::Buffer) {
+    tests::print_preview(name, buffer);
 }
 
 /// Draws whichever modal is up, centred over the whole window.
@@ -796,7 +808,8 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMa
         layouts = shelf_layouts(&app.home, shelves, app.home_top, plan.max_shape);
     }
     if let Some(focused) = layouts.iter().find(|layout| layout.index == app.home_shelf) {
-        app.clamp_home_cards(focused.across as usize);
+        app.home_grid_rows = usize::from(focused.rows);
+        app.clamp_home_grid(usize::from(focused.across), usize::from(focused.rows));
     }
 
     for layout in &layouts {
@@ -804,22 +817,13 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMa
             continue;
         };
         let offset = app.home_scroll.get(layout.index).copied().unwrap_or(0);
-        let cards = Rect {
-            y: layout.area.y.saturating_add(1),
-            height: layout.area.height.saturating_sub(1),
-            ..layout.area
-        };
-        for column in 0..layout.across {
-            let card = offset + column as usize;
+        for slot in 0..layout.across * layout.rows {
+            let card = offset + slot as usize;
             if card >= shelf.cards.len() {
                 break;
             }
             mouse.targets.push(MouseTarget::Area(
-                Rect {
-                    x: cards.x + column * layout.slot,
-                    width: layout.slot.saturating_sub(1),
-                    ..cards
-                },
+                layout.card_rect(slot),
                 MouseAction::OpenHomeCard {
                     shelf: layout.index,
                     card,
@@ -1412,25 +1416,21 @@ struct ShelfLayout {
     area: Rect,
     across: u16,
     slot: u16,
+    rows: u16,
+}
+
+impl ShelfLayout {
+    fn card_rect(self, slot: u16) -> Rect {
+        let height = self.area.height.saturating_sub(1) / self.rows.max(1);
+        Rect::new(self.area.x + (slot / self.rows.max(1)) * self.slot,
+            self.area.y + 1 + (slot % self.rows.max(1)) * height,
+            self.slot.saturating_sub(1), height)
+    }
 }
 
 fn section_shape(shelf: &Shelf, index: usize, max_shape: CardShape) -> CardShape {
-    let playable = shelf.cards.iter().filter(|card| card.is_playable()).count();
-    let browsable = shelf.cards.len().saturating_sub(playable);
-    let desired = if index == 0 {
-        CardShape::Gallery
-    } else if matches!(shelf.title.as_str(), "From your listening" | "Quick picks") {
-        CardShape::Tile
-    } else if browsable > playable {
-        CardShape::Poster
-    } else {
-        match index % 3 {
-            0 => CardShape::Gallery,
-            1 => CardShape::Tile,
-            _ => CardShape::Poster,
-        }
-    };
-    desired.min(max_shape)
+    let _ = index;
+    home::shape(shelf, max_shape)
 }
 
 fn shelf_layouts(
@@ -1439,52 +1439,7 @@ fn shelf_layouts(
     top: usize,
     max_shape: CardShape,
 ) -> Vec<ShelfLayout> {
-    let mut layouts = Vec::new();
-    let mut y = area.y;
-    let bottom = area.y + area.height;
-    let visible_goal = shelves
-        .len()
-        .saturating_sub(top)
-        .min(MIN_VISIBLE_HOME_SECTIONS);
-    for (index, shelf) in shelves.iter().enumerate().skip(top) {
-        let desired = section_shape(shelf, index, max_shape);
-        let position = index - top;
-        let remaining = visible_goal.saturating_sub(position + 1) as u16;
-        let available = bottom.saturating_sub(y);
-        // Keep the first three section headings and card rows on screen
-        // together. Earlier shelves retain their preferred shape; a later one
-        // steps down only when doing so is what makes room for the sections
-        // still owed below it.
-        let shape = if position < visible_goal {
-            CardShape::ALL
-                .into_iter()
-                .find(|shape| {
-                    *shape <= desired
-                        && available
-                            >= shelf_height(*shape)
-                                .saturating_add(shelf_height(CardShape::Text) * remaining)
-                                .saturating_sub(1)
-                })
-                .unwrap_or(CardShape::Text)
-        } else {
-            desired
-        };
-        let (width, height) = card_size(shape);
-        let row_height = height + 1;
-        if y + row_height > bottom {
-            break;
-        }
-        let across = (area.width / width).max(1);
-        layouts.push(ShelfLayout {
-            index,
-            shape,
-            area: Rect::new(area.x, y, area.width, row_height),
-            across,
-            slot: area.width / across,
-        });
-        y += shelf_height(shape);
-    }
-    layouts
+    home::layouts(shelves, area, top, max_shape)
 }
 
 /// The artwork side of drawing a shelf: what shape to draw, what pictures are
@@ -1523,7 +1478,7 @@ fn render_feed(
             continue;
         };
         tiles.shape = layout.shape;
-        render_shelf(
+        home::render_shelf(
             frame,
             shelf,
             layout.area,
@@ -1532,7 +1487,7 @@ fn render_feed(
                 selected: cursor.card,
                 offset: scroll.get(index).copied().unwrap_or(0),
             },
-            (layout.across, layout.slot),
+            *layout,
             &mut tiles,
         );
     }
@@ -1653,7 +1608,7 @@ fn render_card(frame: &mut Frame, card: &Card, area: Rect, selected: bool, tiles
         tiles
             .images
             .as_ref()
-            .map_or(rows.saturating_mul(2), |(_, graphics)| {
+            .map_or_else(|| square_columns(rows, cell_pixels()), |(_, graphics)| {
                 let (cell_w, cell_h) = (u32::from(graphics.cell.0), u32::from(graphics.cell.1));
                 ((u32::from(rows) * cell_h + cell_w / 2) / cell_w)
                     .max(1)
@@ -1965,7 +1920,9 @@ fn render_tile_blocks(frame: &mut Frame, art: Option<&Cover>, area: Rect) {
     };
 
     let (px_w, px_h) = (u32::from(area.width), u32::from(area.height) * 2);
-    let crop = Crop::fill(cover, px_w, px_h);
+    let cell = cell_pixels();
+    let crop = Crop::fill(cover, u32::from(area.width) * u32::from(cell.0),
+        u32::from(area.height) * u32::from(cell.1));
 
     let lines: Vec<Line> = (0..area.height)
         .map(|row| {
@@ -2205,6 +2162,13 @@ fn render_player(
         None
     };
     render_player_identity(frame, identity, &layout, images);
+    if let Some(info) = layout.info {
+        register_identity_targets(mouse, app.now.as_ref().expect("player identity"), Rect::new(info.x, info.y + 2, info.width, 1));
+    } else if let Some(hero) = layout.hero {
+        let cols = (hero.height.min(3) * 2).min(hero.width);
+        let x = hero.x + cols + 1;
+        register_identity_targets(mouse, app.now.as_ref().expect("player identity"), Rect::new(x, hero.y + 2, hero.width.saturating_sub(cols + 2), 1));
+    }
     render_panel(frame, app, layout.panel, mouse);
     layout.art
 }
@@ -2290,12 +2254,35 @@ fn render_track_info(
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(
-            truncate(&now.byline(), width),
-            Style::default().fg(Color::Gray),
-        )),
+        identity_byline(now, width),
     ];
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn identity_byline(now: &NowPlaying, width: usize) -> Line<'static> {
+    let artist = truncate(&now.artist, width);
+    let used = display_width(&artist);
+    let mut spans = vec![Span::styled(artist, Style::default().fg(Color::Gray)
+        .add_modifier(if now.artist_ref.is_some() { Modifier::UNDERLINED } else { Modifier::empty() }))];
+    if let Some(album) = &now.album {
+        spans.push(Span::styled(truncate(&format!(" • {album}"), width.saturating_sub(used)),
+            Style::default().fg(Color::Gray).add_modifier(if now.album_route.is_some() { Modifier::UNDERLINED } else { Modifier::empty() })));
+    }
+    Line::from(spans)
+}
+
+fn register_identity_targets(mouse: &mut MouseMap, now: &NowPlaying, area: Rect) {
+    let artist_width = (display_width(&now.artist) as u16).min(area.width);
+    if now.artist_ref.is_some() && artist_width > 0 {
+        mouse.targets.push(MouseTarget::Area(Rect::new(area.x, area.y, artist_width, 1), MouseAction::OpenPlayingArtist));
+    }
+    if let Some(album) = &now.album {
+        let start = artist_width.saturating_add(3);
+        let width = (display_width(album) as u16).min(area.width.saturating_sub(start));
+        if now.album_route.is_some() && width > 0 {
+            mouse.targets.push(MouseTarget::Area(Rect::new(area.x + start, area.y, width, 1), MouseAction::OpenPlayingAlbum));
+        }
+    }
 }
 
 /// The scrubber: a bar, and the clock beside it.
@@ -2435,6 +2422,11 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseM
                 },
                 first,
             });
+            for (slot, track) in now.queue.iter().skip(first).take(count).enumerate() {
+                if let Some((x, width)) = queue_artist_region(track, content.width as usize) {
+                    mouse.targets.push(MouseTarget::Area(Rect::new(content.x + x as u16, content.y + UP_NEXT_HEADER as u16 + slot as u16, width as u16, 1), MouseAction::OpenQueueArtist(first + slot)));
+                }
+            }
         }
         Tab::Related => {
             let total = now.related_rows().len();
@@ -2664,12 +2656,20 @@ fn queue_line<'a>(
     if artist_width > 0 {
         spans.push(Span::styled(
             cell(&track.uploader, artist_width),
-            dim(Color::Gray),
+            dim(Color::Gray).add_modifier(if track.artist_ref.is_some() { Modifier::UNDERLINED } else { Modifier::empty() }),
         ));
     }
     spans.push(Span::styled(format!("{duration} "), dim(Color::DarkGray)));
 
     Line::from(spans)
+}
+
+fn queue_artist_region(track: &Track, width: usize) -> Option<(usize, usize)> {
+    track.artist_ref.as_ref()?;
+    let text_width = width.saturating_sub(QUEUE_MARKER_WIDTH + display_width(&track.duration_str()) + 1);
+    if text_width < MIN_QUEUE_TITLE + QUEUE_ARTIST_WIDTH { return None; }
+    let artist_width = display_width(&truncate(&track.uploader, QUEUE_ARTIST_WIDTH)).min(QUEUE_ARTIST_WIDTH);
+    (artist_width > 0).then_some((QUEUE_MARKER_WIDTH + text_width - QUEUE_ARTIST_WIDTH, artist_width))
 }
 
 /// The lyrics, wrapped to the panel and scrolled by line.
@@ -2685,6 +2685,7 @@ fn render_lyrics(
     snap: &Snapshot,
     area: Rect,
 ) -> (usize, Option<usize>) {
+    let area = Rect::new(area.x + u16::from(area.width > 8), area.y, area.width.saturating_sub(if area.width > 8 { 2 } else { 0 }), area.height);
     let width = (area.width as usize).saturating_sub(LYRIC_GUTTER + 1);
     let Panel::Ready(lyrics) = &now.lyrics else {
         message(frame, waiting_on(&now.lyrics), area);
@@ -2732,6 +2733,7 @@ fn render_lyrics(
                         .enumerate()
                         .map(|(row, line)| (line, Some(at), row == 0)),
                 );
+                if area.height >= 12 { lines.push((String::new(), None, false)); }
             }
         }
     }
@@ -3005,6 +3007,26 @@ fn clock(d: Duration) -> String {
 }
 
 fn render_results(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMap) {
+    if app.browsing.is_none() && (!app.search_items.is_empty() || (!app.query.is_empty() && app.results.is_empty())) {
+        search::render(frame, app, area, mouse);
+        return;
+    }
+    browse::render(frame, app, area, mouse);
+}
+
+fn cell_pixels() -> (u16, u16) {
+    #[cfg(windows)]
+    { crate::console::cell_size() }
+    #[cfg(not(windows))]
+    { (8, 16) }
+}
+
+fn square_columns(rows: u16, cell: (u16, u16)) -> u16 {
+    ((u32::from(rows) * u32::from(cell.1) + u32::from(cell.0.max(1)) / 2) / u32::from(cell.0.max(1)))
+        .max(1).min(u32::from(u16::MAX)) as u16
+}
+
+fn render_compact_results(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMap) {
     let [heading, inner] = Layout::vertical([
         Constraint::Length(1), Constraint::Min(0),
     ]).areas(shell::inset(area));
@@ -3149,7 +3171,8 @@ fn header_line(title_width: usize, artist_width: usize, album_width: usize) -> L
 /// spans, which is less work than the results list already does.
 fn render_cover(frame: &mut Frame, cover: &Cover, area: Rect, size: CoverSize) {
     let (max_cols, max_rows) = usable(area, size);
-    let (px_w, px_h) = fit(cover, max_cols, max_rows);
+    let (cols, rows) = fit_cells(cover, (max_cols, max_rows), cell_pixels());
+    let (px_w, px_h) = (u32::from(cols), u32::from(rows) * 2);
     if px_w == 0 || px_h == 0 {
         return;
     }
@@ -3188,7 +3211,8 @@ const ASCII_RAMP: &[u8] = b" .:-=+*#%@";
 /// styles never moves the surrounding layout.
 fn render_ascii_cover(frame: &mut Frame, cover: &Cover, area: Rect, size: CoverSize) {
     let (max_cols, max_rows) = usable(area, size);
-    let (px_w, px_h) = fit_ascii(cover, max_cols, max_rows);
+    let (cols, rows) = fit_cells(cover, (max_cols, max_rows), cell_pixels());
+    let (px_w, px_h) = (u32::from(cols), u32::from(rows) * 2);
     if px_w == 0 || px_h == 0 {
         return;
     }
@@ -3235,6 +3259,7 @@ fn ascii_style(colour: Color) -> Style {
 
 /// Largest image size, in pixels, that fits a `cols` x `rows` box of cells
 /// without distorting the aspect ratio.
+#[cfg(test)]
 fn fit(cover: &Cover, cols: u16, rows: u16) -> (u32, u32) {
     let (max_w, max_h) = (u32::from(cols), u32::from(rows) * 2);
     if max_w == 0 || max_h == 0 || cover.width == 0 || cover.height == 0 {
@@ -3249,6 +3274,7 @@ fn fit(cover: &Cover, cols: u16, rows: u16) -> (u32, u32) {
     }
 }
 
+#[cfg(test)]
 fn fit_ascii(cover: &Cover, cols: u16, rows: u16) -> (u32, u32) {
     let (width, height) = fit(cover, cols, rows);
     let height = height - height % 2;
@@ -3272,10 +3298,9 @@ fn sample_rgb(cover: &Cover, x: u32, y: u32, px_w: u32, px_h: u32) -> (u8, u8, u
 }
 
 fn render_status(frame: &mut Frame, app: &App, area: Rect, mouse: &mut MouseMap) {
-    let byline = app.now.as_ref().map(NowPlaying::byline);
     let track = app.now.as_ref().map(|now| MiniTrack {
         title: &now.title,
-        byline: byline.as_deref().unwrap_or(""),
+        byline: &now.artist,
         duration: now.duration,
     });
     render_player_strip(
@@ -3290,6 +3315,23 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, mouse: &mut MouseMap)
         area,
         mouse,
     );
+    if let Some(now) = &app.now {
+        register_footer_artist(frame, now, &app.snapshot(), area, mouse);
+    }
+    if let Some(now) = &app.now && area.height >= 3 && area.width >= 82 {
+        let mut x = area.x;
+        for (label, action) in [
+            (" Shuffle ".to_owned(), MouseAction::ShufflePlayback),
+            (format!(" Repeat: {} ", now.repeat.label()), MouseAction::RepeatPlayback),
+            (" Output ".to_owned(), MouseAction::ChooseOutput),
+        ] {
+            let width = display_width(&label) as u16;
+            let rect = Rect::new(x, area.bottom() - 1, width, 1);
+            frame.render_widget(Paragraph::new(label).style(Style::default().fg(Color::Gray)), rect);
+            mouse.targets.push(MouseTarget::Area(rect, action));
+            x += width + 1;
+        }
+    }
 }
 
 struct PlayerStrip<'a> {
@@ -3298,6 +3340,19 @@ struct PlayerStrip<'a> {
     status: &'a str,
     hint: &'a str,
     accent: Color,
+}
+
+fn register_footer_artist(frame: &mut Frame, now: &NowPlaying, snap: &Snapshot, area: Rect, mouse: &mut MouseMap) {
+    if area.height < 2 || now.artist_ref.is_none() || snap.error.is_some() || snap.state == PlayState::Idle { return; }
+    let controls = Rect::new(area.x, area.y + 1, area.width, 1);
+    let hint_width = if area.height > 2 { 0 } else { display_width(HINTS_PLAYING) as u16 };
+    let [identity, _, _] = status_control_areas(controls, true, hint_width);
+    let start = usize::from(TRANSPORT_WIDTH) + display_width(&now.title) + 3;
+    let width = display_width(&now.artist);
+    if start + width > usize::from(identity.width.saturating_sub(1)) || width == 0 { return; }
+    let rect = Rect::new(identity.x + start as u16, identity.y, width as u16, 1);
+    frame.render_widget(Paragraph::new(now.artist.clone()).style(Style::default().fg(Color::Gray).add_modifier(Modifier::UNDERLINED)), rect);
+    mouse.targets.push(MouseTarget::Area(rect, MouseAction::OpenPlayingArtist));
 }
 
 fn render_player_strip(
@@ -3433,15 +3488,15 @@ fn register_transport_targets(mouse: &mut MouseMap, area: Rect) {
     if area.width >= TRANSPORT_WIDTH {
         mouse.targets.extend([
             MouseTarget::Area(
-                Rect::new(area.x, area.y, 3, 1),
+                Rect::new(area.x, area.y, 4, 1),
                 MouseAction::PreviousTrack,
             ),
             MouseTarget::Area(
-                Rect::new(area.x + 3, area.y, 3, 1),
+                Rect::new(area.x + 4, area.y, 4, 1),
                 MouseAction::TogglePlayback,
             ),
             MouseTarget::Area(
-                Rect::new(area.x + 6, area.y, 3, 1),
+                Rect::new(area.x + 8, area.y, 4, 1),
                 MouseAction::NextTrack,
             ),
         ]);
@@ -3527,8 +3582,8 @@ fn mini_player_line(
     let (symbol, colour) = match snap.state {
         PlayState::Idle => ("-", Color::DarkGray),
         PlayState::Buffering => ("~", Color::Yellow),
-        PlayState::Playing => ("||", Color::Green),
-        PlayState::Paused => (">", Color::Yellow),
+        PlayState::Playing => ("II", Color::Green),
+        PlayState::Paused => ("▶", Color::Yellow),
     };
 
     if snap.state == PlayState::Idle {
@@ -3538,25 +3593,15 @@ fn mini_player_line(
         ));
     }
 
-    // Basic characters work in classic Windows consoles as well as modern
-    // terminals; several console fonts lack the Unicode transport glyphs.
-    let toggle = if symbol.len() == 2 {
-        format!(" {symbol}")
-    } else {
-        format!(" {symbol} ")
-    };
+    let toggle = padded(symbol, 4);
     let mut spans = if width >= TRANSPORT_WIDTH as usize {
         vec![
-            Span::styled(" |<", Style::default().fg(Color::Gray)),
+            Span::styled("‹‹  ", Style::default().fg(Color::Gray)),
             Span::styled(toggle.clone(), Style::default().fg(colour)),
-            Span::styled(" >|", Style::default().fg(Color::Gray)),
+            Span::styled("››  ", Style::default().fg(Color::Gray)),
         ]
     } else {
-        let lead = if width >= 3 {
-            toggle
-        } else {
-            padded(symbol, width)
-        };
+        let lead = padded(symbol, width.min(3));
         vec![Span::styled(lead, Style::default().fg(colour))]
     };
     let mut remaining = width.saturating_sub(
@@ -3800,6 +3845,46 @@ mod tests {
     use crate::app::RepeatMode;
     use crate::source::watch::{Comment, Comments, Lyrics, TimedLine};
     use crate::source::{ArtistRef, BrowseEndpoint};
+    #[test]
+    fn artist_and_album_links_match_their_clipped_byline_regions() {
+        let mut now = playing();
+        now.artist = "Artist".into();
+        now.artist_ref = Some(ArtistRef { name: "Artist".into(), endpoint: BrowseEndpoint::new("UCartist") });
+        now.album = Some("Album".into());
+        now.album_route = Some(("Album".into(), BrowseEndpoint::new("MPREalbum")));
+        let mut mouse = MouseMap::default();
+        register_identity_targets(&mut mouse, &now, Rect::new(4, 8, 30, 1));
+        assert_eq!(mouse.action_at(5, 8), Some(MouseAction::OpenPlayingArtist));
+        assert_eq!(mouse.action_at(14, 8), Some(MouseAction::OpenPlayingAlbum));
+        assert_eq!(mouse.action_at(12, 8), None);
+        mouse.targets.clear();
+        register_identity_targets(&mut mouse, &now, Rect::new(4, 8, 5, 1));
+        assert_eq!(mouse.action_at(8, 8), Some(MouseAction::OpenPlayingArtist));
+        assert_eq!(mouse.action_at(9, 8), None);
+        assert!(identity_byline(&now, 30).spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 8)).unwrap();
+        let snap = Snapshot { state: PlayState::Playing, ..Default::default() };
+        mouse.targets.clear();
+        terminal.draw(|frame| register_footer_artist(frame, &now, &snap, Rect::new(0, 4, 100, 3), &mut mouse)).unwrap();
+        let x = TRANSPORT_WIDTH + display_width(&now.title) as u16 + 3;
+        assert_eq!(mouse.action_at(x, 5), Some(MouseAction::OpenPlayingArtist));
+        mouse.targets.clear();
+        terminal.draw(|frame| register_footer_artist(frame, &now, &snap, Rect::new(0, 4, 20, 3), &mut mouse)).unwrap();
+        assert_eq!(mouse.action_at(x, 5), None);
+    }
+
+    #[test]
+    fn queue_artist_targets_require_a_visible_linked_column() {
+        let mut track = Track { id: "song".into(), title: "Song".into(), uploader: "Artist".into(), duration: Some(Duration::from_secs(180)),
+            album: None, artist_ref: Some(ArtistRef { name: "Artist".into(), endpoint: BrowseEndpoint::new("UCartist") }) };
+        let (x, width) = queue_artist_region(&track, 50).unwrap();
+        let row = queue_line(&track, false, false, 50, Color::Cyan);
+        let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text.chars().skip(x).take(width).collect::<String>(), "Artist");
+        assert!(queue_artist_region(&track, 20).is_none());
+        track.artist_ref = None;
+        assert!(queue_artist_region(&track, 50).is_none());
+    }
 
     /// A 16:9 cover, as every YouTube thumbnail is once shrunk.
     fn wide() -> Cover {
@@ -5124,16 +5209,17 @@ mod tests {
             }),
             "idle",
             true,
-            40,
+            44,
             Color::Magenta,
         );
         let text = line_text(&line);
 
-        assert!(text.starts_with(" |< || >|"), "{text:?}");
+        assert!(text.starts_with("‹‹  II  ››  "), "{text:?}");
+        assert_eq!(display_width("‹‹  II  ››  "), usize::from(TRANSPORT_WIDTH));
         assert!(text.contains("1:05/3:00"), "{text:?}");
         assert!(text.contains('━') && text.contains('─'), "{text:?}");
         assert!(text.contains("Let It Happen"), "{text:?}");
-        assert!(display_width(&text) <= 40, "{text:?}");
+        assert!(display_width(&text) <= 44, "{text:?}");
     }
 
     #[test]
@@ -5143,8 +5229,8 @@ mod tests {
 
         assert_eq!(mouse.action_at(11, 3), Some(MouseAction::PreviousTrack));
         assert_eq!(mouse.action_at(14, 3), Some(MouseAction::TogglePlayback));
-        assert_eq!(mouse.action_at(17, 3), Some(MouseAction::NextTrack));
-        assert_eq!(mouse.action_at(19, 3), None);
+        assert_eq!(mouse.action_at(18, 3), Some(MouseAction::NextTrack));
+        assert_eq!(mouse.action_at(22, 3), None);
     }
 
     #[test]
@@ -5269,7 +5355,7 @@ mod tests {
             20,
             Color::Cyan,
         ));
-        assert!(paused_text.starts_with(" |< >  >|"), "{paused_text:?}");
+        assert!(paused_text.starts_with("‹‹  ▶   ››  "), "{paused_text:?}");
         assert!(paused_text.contains("Feather"), "{paused_text:?}");
 
         let failed = Snapshot {
@@ -5283,6 +5369,15 @@ mod tests {
         assert!(display_width(&error_text) <= 14, "{error_text:?}");
         assert!(!error_text.contains("Feather"), "{error_text:?}");
         assert_eq!(line.spans[0].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn playback_uses_the_requested_controls_and_track_label() {
+        let snap = Snapshot { state: PlayState::Playing, title: "ill miss you".into(), ..Default::default() };
+        let text = line_text(&mini_player_line(&snap, Some(MiniTrack {
+            title: "ill miss you", byline: "AZALI", duration: None,
+        }), "idle", false, 60, Color::Cyan));
+        assert_eq!(text, "‹‹  II  ››  ill miss you · AZALI");
     }
 
     #[test]
@@ -5522,9 +5617,10 @@ mod tests {
             }
             render_player_strip(frame, PlayerStrip {
                 snap: &snap,
-                track: Some(MiniTrack { title: &now.title, byline: &now.byline(), duration: now.duration }),
+                track: Some(MiniTrack { title: &now.title, byline: &now.artist, duration: now.duration }),
                 status: "", hint: if view == View::Home { HINTS_AWAY } else { HINTS_PLAYING }, accent,
             }, footer, &mut mouse);
+            palette::apply(frame, Some(cover), None);
         }).unwrap();
         (terminal.backend().buffer().clone(), mouse)
     }
@@ -5564,7 +5660,7 @@ mod tests {
                 assert_eq!(mouse.action_at(0, footer_y), Some(MouseAction::SeekTo(0)));
                 assert_eq!(mouse.action_at(1, footer_y + 1), Some(MouseAction::PreviousTrack));
                 assert_eq!(mouse.action_at(4, footer_y + 1), Some(MouseAction::TogglePlayback));
-                assert_eq!(mouse.action_at(7, footer_y + 1), Some(MouseAction::NextTrack));
+                assert_eq!(mouse.action_at(9, footer_y + 1), Some(MouseAction::NextTrack));
                 assert_eq!(mouse.action_at(width - 1, footer_y), None, "the clock must not seek");
                 assert!(!text.contains('╭') && !text.contains('┌'), "page frames returned: {text}");
             }
@@ -5965,7 +6061,7 @@ mod tests {
 
         assert_eq!(
             section_shape(&shelves[0], 0, CardShape::Gallery),
-            CardShape::Gallery
+            CardShape::Tile
         );
         assert_eq!(
             section_shape(&shelves[1], 1, CardShape::Gallery),
@@ -6001,9 +6097,9 @@ mod tests {
         let layouts = shelf_layouts(&shelves, Rect::new(0, 0, 100, 34), 0, CardShape::Gallery);
 
         assert_eq!(layouts.len(), 3);
-        assert_eq!(layouts[0].shape, CardShape::Gallery);
+        assert_eq!(layouts[0].shape, CardShape::Tile);
         assert_eq!(layouts[1].shape, CardShape::Tile);
-        assert_eq!(layouts[2].shape, CardShape::Tile);
+        assert_eq!(layouts[2].shape, CardShape::Poster);
     }
 
     /// Short windows keep a complete browsing shelf.

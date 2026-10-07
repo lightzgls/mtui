@@ -328,6 +328,16 @@ Use Ratatui `TestBackend` to render real page state and verify:
 
 ## 12. Delivery phases
 
+### Player refinement decisions — 2026-10-08
+
+Derive a muted background and raised surfaces from the playing cover, with a brighter accent for controls and readable neutral text. Apply the palette across the app without recoloring artwork pixels or introducing gradients. The playback strip belongs to this same palette rather than a separate black slab.
+
+Keep artist and album text as navigation targets. Each target must preserve YouTube Music's canonical browse ID and optional parameters; a display name is insufficient to invent an album or artist route.
+
+Provide Like, Share, Save to playlist, Shuffle, Repeat, and Output device in the persistent playback bar. Wider windows show individual actions; narrow windows keep these available through a clearly labeled player-actions menu. Like and Save require authenticated server writes and visible success/failure states. Output opens the existing device chooser. Repeat indicates Off, All, or One; shuffle preserves the currently playing track.
+
+Lyrics use quieter preceding lines, bright current text, comfortable paragraph spacing, and automatic following that yields to manual scrolling. Transparency is an optional host capability rather than a substitute for contrast.
+
 1. **Clean baseline:** remove GUI residue, keep the root TUI as the only product,
    and run its complete tests.
 2. **Shell and Now Playing:** align regions, implement the full-width seek bar,

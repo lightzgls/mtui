@@ -150,6 +150,16 @@ the first four groups.
 
 ## 9. Conclusion
 
+### Network and playback findings — 2026-10-08
+
+Recent playback logs show a native Music audio URL returning HTTP 403 immediately, followed several seconds later by a working full-resolution fallback. A larger connection pool does not address this refusal. Validate the opening byte range before accepting a native URL; if opening still fails, recover once with a fresh URL and preserve cancellation. A replacement arriving after Stop or a new track selection must never start the old track.
+
+There is no fixed count of InnerTube connections. Workers own reusable HTTP clients whose pools open connections as needed. Search, artist pages, albums, and playlists now share one metadata client. Native playback and full-resolution fallback retain separate clients so metadata and slow extraction cannot hold up audio. Player panels, history reporting, and artwork have their own clients; Home and cover requests use temporary clients. A process snapshot before these changes showed 10 established TCP connections across metadata, artwork, and audio combined.
+
+Metadata, resolver, and audio clients now retain at most two idle connections per host; artwork retains four, with a configured 30-second idle timeout. These are idle-pool limits, not active-request limits. Artwork still caps concurrent fetches at 16 and only fetches visible covers. Reducing idle residency supports the memory goal without serializing artwork behind playback.
+
+YouTube Music can return only a top artist and songs in an unfiltered search response. Mixed search fills absent categories from the service's actual filtered endpoints and retains canonical browse routes. Home loads the first provider page promptly, then bounded continuation pages and real library, release, discovery, and chart sections. Both views keep their data and artwork bounded.
+
 Continue from the existing TUI. Remove the GUI experiment, retain its product
 requirements where they describe useful music behavior, and implement those
 behaviors as testable TUI surfaces. The first engineering milestone is a clean,

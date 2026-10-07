@@ -13,7 +13,7 @@ mod imp {
     use std::io::{self, Read, Write};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
@@ -41,6 +41,10 @@ mod imp {
         fn SetConsoleMode(handle: isize, mode: u32) -> i32;
         fn GetConsoleMode(handle: isize, mode: *mut u32) -> i32;
         fn GetConsoleScreenBufferInfo(handle: isize, info: *mut ConsoleScreenBufferInfo) -> i32;
+        fn GetCurrentConsoleFontEx(handle: isize, maximum: i32, info: *mut ConsoleFontInfo) -> i32;
+        fn GetConsoleFontSize(handle: isize, number: u32) -> Coord;
+        fn SetCurrentConsoleFontEx(handle: isize, maximum: i32, info: *const ConsoleFontInfo) -> i32;
+        fn WaitForSingleObject(handle: isize, timeout: u32) -> u32;
         fn SetConsoleScreenBufferSize(handle: isize, size: Coord) -> i32;
         fn SetConsoleWindowInfo(handle: isize, absolute: i32, window: *const [i16; 4]) -> i32;
         fn SetConsoleCursorPosition(handle: isize, position: Coord) -> i32;
@@ -75,6 +79,15 @@ mod imp {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn ShowScrollBar(window: isize, bar: i32, show: i32) -> i32;
+        fn ShowWindow(window: isize, command: i32) -> i32;
+        fn SetForegroundWindow(window: isize) -> i32;
+        fn IsWindow(window: isize) -> i32;
+        fn IsIconic(window: isize) -> i32;
+        fn GetClientRect(window: isize, rect: *mut [i32; 4]) -> i32;
+        fn GetClassNameW(window: isize, name: *mut u16, count: i32) -> i32;
+        fn GetWindowLongPtrW(window: isize, index: i32) -> isize;
+        fn GetDpiForWindow(window: isize) -> u32;
+        fn SetThreadDpiAwarenessContext(context: isize) -> isize;
     }
 
     #[repr(C)]
@@ -99,6 +112,16 @@ mod imp {
         attributes: u16,
         window: [i16; 4],
         maximum_window_size: [i16; 2],
+    }
+
+    #[repr(C)]
+    struct ConsoleFontInfo {
+        bytes: u32,
+        number: u32,
+        size: Coord,
+        family: u32,
+        weight: u32,
+        face: [u16; 32],
     }
 
     #[repr(C)]
@@ -134,6 +157,8 @@ mod imp {
     const KEY_EVENT: u16 = 0x0001;
     const MOUSE_EVENT: u16 = 0x0002;
     const WINDOW_BUFFER_SIZE_EVENT: u16 = 0x0004;
+    // Private pipe record: viewport dimensions followed by current cell pixels.
+    const GEOMETRY_EVENT: u16 = 0x8000;
     const SHIFT_PRESSED: u32 = 0x0010;
     const ALT_PRESSED: u32 = 0x0001 | 0x0002;
     const CONTROL_PRESSED: u32 = 0x0004 | 0x0008;
@@ -162,6 +187,22 @@ mod imp {
     static SESSION: OnceLock<Mutex<Option<ConsoleSession>>> = OnceLock::new();
     static CLOSED: AtomicBool = AtomicBool::new(true);
     static SIZE: AtomicU32 = AtomicU32::new((24 << 16) | 80);
+    static WINDOW: AtomicIsize = AtomicIsize::new(0);
+    static CELL: AtomicU32 = AtomicU32::new((16 << 16) | 8);
+
+    pub fn cell_size() -> (u16, u16) {
+        let packed = CELL.load(Ordering::Acquire);
+        (packed as u16, (packed >> 16) as u16)
+    }
+
+    pub fn focus() -> bool {
+        let window = WINDOW.load(Ordering::Acquire);
+        if window == 0 || closed() || unsafe { IsWindow(window) } == 0 {
+            return false;
+        }
+        unsafe { ShowWindow(window, 9); SetForegroundWindow(window); }
+        true
+    }
 
     struct ConsoleSession {
         child: Child,
@@ -403,6 +444,11 @@ mod imp {
             ));
         }
         let width = u16::from_le_bytes([message[9], message[10]]);
+        if message[8] == HANDSHAKE_READY {
+            WINDOW.store(i64::from_le_bytes(message[15..23].try_into().unwrap()) as isize, Ordering::Release);
+            let cell = u32::from_le_bytes(message[23..27].try_into().unwrap());
+            if cell as u16 != 0 && (cell >> 16) != 0 { CELL.store(cell, Ordering::Release); }
+        }
         let height = u16::from_le_bytes([message[11], message[12]]);
         let length =
             usize::from(u16::from_le_bytes([message[13], message[14]])).min(HANDSHAKE_LEN - 15);
@@ -428,6 +474,11 @@ mod imp {
                 message[8] = HANDSHAKE_READY;
                 message[9..11].copy_from_slice(&width.to_le_bytes());
                 message[11..13].copy_from_slice(&height.to_le_bytes());
+                message[15..23].copy_from_slice(&(unsafe { GetConsoleWindow() } as i64).to_le_bytes());
+                if let Ok(handle) = open_console("CONOUT$", GENERIC_READ) {
+                    let cell = font_size(handle.as_raw_handle() as isize);
+                    message[23..27].copy_from_slice(&pack(cell).to_le_bytes());
+                }
             }
             Err(err) => {
                 message[8] = HANDSHAKE_ERROR;
@@ -474,6 +525,9 @@ mod imp {
     }
 
     fn open_host_console() -> Result<HostConsole> {
+        // Query the native host in its actual monitor coordinate space rather
+        // than DPI-virtualized pixels inherited from the launcher.
+        unsafe { SetThreadDpiAwarenessContext(-4); }
         if unsafe { AllocConsole() } == 0 {
             return Err(anyhow!(
                 "could not allocate a console: {}",
@@ -535,7 +589,7 @@ mod imp {
         // buffer and viewport sizes match. Hide its native chrome explicitly;
         // list scrolling remains owned by the application and its mouse wheel.
         let window = unsafe { GetConsoleWindow() };
-        if window != 0 {
+        if window != 0 && unsafe { GetWindowLongPtrW(window, -16) } & 0x0030_0000 != 0 {
             unsafe {
                 ShowScrollBar(window, 3 /* SB_BOTH */, 0)
             };
@@ -563,10 +617,14 @@ mod imp {
             return Err(anyhow!("could not read the terminal size"));
         }
         let size = visible_size(info.window)?;
-        if info.window[0] != 0 || info.window[1] != 0 {
+        if info.window != [0, 0, size.x - 1, size.y - 1] {
             let window = [0, 0, size.x - 1, size.y - 1];
             if unsafe { SetConsoleWindowInfo(output_raw, 1, &window) } == 0 {
-                return Err(anyhow!("could not reset the terminal viewport"));
+                // Conhost can change the viewport between any two API calls
+                // during a resize. Keep the helper alive and retry next poll.
+                unsafe { GetConsoleScreenBufferInfo(output_raw, &mut info); }
+                let actual = visible_size(info.window)?;
+                return Ok((actual.x as u16, actual.y as u16));
             }
         }
         if info.size != [size.x, size.y] {
@@ -578,8 +636,14 @@ mod imp {
                 unsafe { SetConsoleCursorPosition(output_raw, cursor) };
             }
             if unsafe { SetConsoleScreenBufferSize(output_raw, size) } == 0 {
-                return Err(anyhow!("could not fit the terminal buffer to its window"));
+                unsafe { GetConsoleScreenBufferInfo(output_raw, &mut info); }
+                let actual = visible_size(info.window)?;
+                return Ok((actual.x as u16, actual.y as u16));
             }
+        }
+        if unsafe { GetConsoleScreenBufferInfo(output_raw, &mut info) } != 0 {
+            let actual = visible_size(info.window)?;
+            return Ok((actual.x as u16, actual.y as u16));
         }
         Ok((size.x as u16, size.y as u16))
     }
@@ -591,7 +655,46 @@ mod imp {
         mut size: (u16, u16),
     ) -> Result<()> {
         let handle = input.as_raw_handle() as isize;
+        unsafe { SetThreadDpiAwarenessContext(-4); }
+        let mut cell = font_size(main_screen.as_raw_handle() as isize);
+        let mut pixels = native_geometry();
+        let mut locked_font = read_font(main_screen.as_raw_handle() as isize);
         loop {
+            // Font zoom and a monitor DPI transition can keep the same number
+            // of columns. Poll pixels as well as cells rather than relying only
+            // on WINDOW_BUFFER_SIZE_EVENT. Waiting on input keeps this idle.
+            let active = open_console("CONOUT$", GENERIC_READ | GENERIC_WRITE)?;
+            let active_raw = active.as_raw_handle() as isize;
+            let mut new_cell = font_size(active_raw);
+            let mut new_pixels = native_geometry();
+            let mut zoom_reset = false;
+            if pixels.map(|(_, _, dpi)| dpi) != new_pixels.map(|(_, _, dpi)| dpi) {
+                // Moving to another DPI follows the host's new font metrics.
+                locked_font = read_font(active_raw);
+            } else if new_pixels.is_some() && new_cell != cell
+                && let Some(font) = &locked_font
+            {
+                // This app owns its console: keep Ctrl+wheel zoom from changing
+                // the grid underneath the artwork and leaving unused space.
+                zoom_reset = unsafe { SetCurrentConsoleFontEx(active_raw, 0, font) } != 0;
+                new_cell = font_size(active_raw);
+                new_pixels = native_geometry();
+            }
+            let new_size = fit_console_to_window(active_raw)?;
+            hide_host_scrollbars();
+            if new_size != size || new_cell != cell || new_pixels != pixels || zoom_reset {
+                size = new_size;
+                cell = new_cell;
+                pixels = new_pixels;
+                let record = InputRecord { event_type: GEOMETRY_EVENT, event: [pack(size), pack(cell), 0, 0] };
+                if output.write_all(&encode_record(record)).is_err() { return Ok(()); }
+            }
+            drop(active);
+            match unsafe { WaitForSingleObject(handle, 100) } {
+                0 => {},
+                258 => continue,
+                _ => return Ok(()),
+            }
             let mut record = InputRecord {
                 event_type: 0,
                 event: [0; 4],
@@ -601,23 +704,50 @@ mod imp {
                 return Ok(());
             }
             if read != 0 && record.event_type == WINDOW_BUFFER_SIZE_EVENT {
-                // Classic conhost bases its scrollbar on the original buffer,
-                // even while VT draws on the alternate screen. Fit both: the
-                // active buffer alone cannot prevent scrollbars after a resize.
-                fit_console_to_window(main_screen.as_raw_handle() as isize)?;
-                hide_host_scrollbars();
-                let active = File::from(open_console("CONOUT$", GENERIC_READ | GENERIC_WRITE)?);
-                let new_size = fit_console_to_window(active.as_raw_handle() as isize)?;
-                if new_size == size {
-                    continue;
-                }
-                size = new_size;
-                record.event[0] = u32::from(size.0) | (u32::from(size.1) << 16);
+                continue; // Geometry is reconciled at the start of the loop.
             }
             if read != 0 && output.write_all(&encode_record(record)).is_err() {
                 return Ok(());
             }
         }
+    }
+
+    fn pack(value: (u16, u16)) -> u32 { u32::from(value.0) | (u32::from(value.1) << 16) }
+
+    fn native_geometry() -> Option<(i32, i32, u32)> {
+        let window = unsafe { GetConsoleWindow() };
+        let mut name = [0u16; 32];
+        let count = unsafe { GetClassNameW(window, name.as_mut_ptr(), name.len() as i32) };
+        // A Windows Terminal pseudoconsole HWND is message-only; its client
+        // rectangle does not describe the visible terminal tab.
+        if count <= 0 || String::from_utf16_lossy(&name[..count as usize]) != "ConsoleWindowClass"
+            || unsafe { IsIconic(window) } != 0 { return None; }
+        let mut rect = [0; 4];
+        if unsafe { GetClientRect(window, &mut rect) } == 0 { return None; }
+        let (width, height) = (rect[2] - rect[0], rect[3] - rect[1]);
+        (width > 0 && height > 0).then(|| (width, height, unsafe { GetDpiForWindow(window) }))
+    }
+
+    fn read_font(handle: isize) -> Option<ConsoleFontInfo> {
+        let mut info = ConsoleFontInfo { bytes: std::mem::size_of::<ConsoleFontInfo>() as u32,
+            number: 0, size: Coord { x: 0, y: 0 }, family: 0, weight: 0, face: [0; 32] };
+        (unsafe { GetCurrentConsoleFontEx(handle, 0, &mut info) } != 0).then_some(info)
+    }
+
+    fn font_size(handle: isize) -> (u16, u16) {
+        if let Some(info) = read_font(handle) {
+            let size = unsafe { GetConsoleFontSize(handle, info.number) };
+            // Both font APIs return logical units. The renderer needs physical
+            // pixels, including per-monitor scaling and whole-pixel rounding.
+            let dpi = native_geometry().map_or(96, |(_, _, dpi)| dpi.max(96));
+            let physical = |size: Coord| (
+                ((size.x as u32 * dpi + 48) / 96).max(1) as u16,
+                ((size.y as u32 * dpi + 48) / 96).max(1) as u16,
+            );
+            if size.x > 0 && size.y > 0 { return physical(size); }
+            if info.size.x > 0 && info.size.y > 0 { return physical(info.size); }
+            (8, 16)
+        } else { (8, 16) }
     }
 
     pub(super) fn encode_record(record: InputRecord) -> [u8; RECORD_LEN] {
@@ -732,6 +862,16 @@ mod imp {
                     return Ok(None);
                 }
                 let record = decode_record(&self.wire);
+                if record.event_type == GEOMETRY_EVENT {
+                    let dimensions = (record.event[0] as u16, (record.event[0] >> 16) as u16);
+                    let pixels = record.event[1];
+                    if dimensions.0 != 0 && dimensions.1 != 0 && pixels as u16 != 0 && (pixels >> 16) != 0 {
+                        set_size(dimensions.0, dimensions.1);
+                        CELL.store(pixels, Ordering::Release);
+                        return Ok(Some(Event::Resize(dimensions.0, dimensions.1)));
+                    }
+                    continue;
+                }
                 if let Some(event) = event(record, &mut self.high_surrogate) {
                     if let Event::Resize(width, height) = &event {
                         set_size(*width, *height);
@@ -1002,6 +1142,8 @@ mod imp {
     use anyhow::{Result, anyhow};
     use crossterm::event::{self, Event};
 
+    pub fn focus() -> bool { true }
+
     /// Detaching a running process from its controlling terminal is a different
     /// problem on Unix and there is no notification area to put the result in.
     pub fn detach() -> Result<()> {
@@ -1047,10 +1189,10 @@ mod imp {
     }
 }
 
-pub use imp::{Input, Output, attach, closed, detach, output, report_error};
+pub use imp::{Input, Output, attach, closed, detach, focus, output, report_error};
 
 #[cfg(windows)]
-pub use imp::{is_host, prepare_parent, run_host, size};
+pub use imp::{cell_size, is_host, prepare_parent, run_host, size};
 
 #[cfg(all(test, windows))]
 mod tests {

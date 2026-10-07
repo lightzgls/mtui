@@ -273,6 +273,17 @@ The next public-quality release is acceptable when:
 
 ## 11. Open decisions
 
+### Player and browse refinements — 2026-10-08
+
+- Search must include songs, artists, albums, playlists, and music videos, with category filters and the correct play or browse action.
+- Home must load further sections from YouTube Music, preserving the service's headings and order.
+- Artist and album names in Now Playing must open their canonical Music pages when available.
+- The current cover must color the whole application: background, surfaces, navigation, playback bar, and lyric emphasis. Use solid colors, no gradients, and retain readable contrast.
+- Lyrics should have comfortable spacing and a clear current line, with manual scrolling and automatic following.
+- Investigate optional window transparency with readable text and sharp artwork. Terminal support must determine availability.
+- The persistent playback bar must expose Like, Share, Save to playlist, Shuffle, Repeat, and Output device alongside transport, progress, and volume. Mouse and keyboard access are required. Likes and playlist saves must reflect confirmed server state; decorative or nonfunctional buttons do not satisfy this requirement.
+- Intermittent HTTP 403 responses must trigger bounded automatic recovery without requiring a page refresh or restarting a track that is already playing.
+
 1. The exact minimum terminal dimensions for the full player layout.
 2. Whether downloads belong in the product.
 3. Whether multi-account switching is needed for the first public release.

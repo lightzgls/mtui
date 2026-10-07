@@ -110,6 +110,7 @@ pub struct Watch {
     pub queue_title: String,
     /// The queue itself, starting with the track that seeded it.
     pub queue: Vec<Track>,
+    pub album_route: Option<(String, super::BrowseEndpoint)>,
     /// Browse id of the "Lyrics" tab, when this track has one. Instrumentals
     /// and most videos do not.
     pub lyrics_id: Option<String>,
@@ -250,6 +251,7 @@ pub fn fetch(http: &Http, video_id: &str) -> Result<Watch> {
     let watch = Watch {
         queue_title: queue_title(&json).unwrap_or_default(),
         queue: queue(&json),
+        album_route: playing_album(&json, video_id),
         lyrics_id: tab_id(&json, "Lyrics"),
         related_id: tab_id(&json, "Related"),
         continuation: queue_token(&json),
@@ -261,6 +263,13 @@ pub fn fetch(http: &Http, video_id: &str) -> Result<Watch> {
         bail!("YouTube Music returned no queue for this track");
     }
     Ok(watch)
+}
+
+fn playing_album(json: &Value, video_id: &str) -> Option<(String, super::BrowseEndpoint)> {
+    let mut rows = Vec::new();
+    home::collect(json, "playlistPanelVideoRenderer", &mut rows);
+    rows.into_iter().find(|row| row["videoId"].as_str() == Some(video_id))?
+        .pointer("/longBylineText/runs").and_then(home::album_ref)
 }
 
 /// The next page of a queue, and the token for the page after it.
@@ -637,9 +646,10 @@ fn parse_queue_row(row: &Value) -> Option<Track> {
             .and_then(parse_duration),
         // Only shown when the byline named one between the artist and whatever
         // trails it -- counted from the front, since the tail varies.
-        album: (fields.len() >= 3)
-            .then(|| fields[1].to_string())
-            .filter(|album| !album.is_empty()),
+        album: row.pointer("/longBylineText/runs").and_then(home::album_ref).map(|(title, _)| title)
+            .or_else(|| fields.last().and_then(|year| year.parse::<u16>().ok())
+                .filter(|year| (1900..=2100).contains(year))
+                .and_then(|_| (fields.len() >= 3).then(|| fields[1].to_string()))),
         artist_ref: row
             .pointer("/longBylineText/runs")
             .and_then(home::artist_ref),
@@ -891,6 +901,18 @@ mod tests {
 
         let track = queue(&json).remove(0);
         assert_eq!(track.artist_ref.unwrap().endpoint.browse_id, "UCGz-artist");
+    }
+
+    #[test]
+    fn the_playing_album_keeps_its_route_and_play_counts_are_not_albums() {
+        let mut json = row("x", "Song", "Artist • Collaborator • 358K plays", "3:00");
+        assert!(queue(&json)[0].album.is_none());
+        json["playlistPanelVideoRenderer"]["longBylineText"]["runs"] = serde_json::json!([
+            {"text":"Artist"}, {"text":" • "}, {"text":"Album", "navigationEndpoint":{"browseEndpoint":{"browseId":"MPREalbum","params":"album-params"}}}
+        ]);
+        assert_eq!(queue(&json)[0].album.as_deref(), Some("Album"));
+        assert_eq!(playing_album(&json, "x").unwrap().1.params.as_deref(), Some("album-params"));
+        assert!(playing_album(&json, "other-song").is_none());
     }
 
     #[test]

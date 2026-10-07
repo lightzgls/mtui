@@ -11,8 +11,8 @@
 //! So this is a cache, and being a cache it has to be bounded -- in entries,
 //! and more importantly in how big an entry can get. Both bounds are set for
 //! the same reason the rest of this program is the size it is: see [`EDGE`] and
-//! [`CAPACITY`] for the arithmetic. Full together they stay around six
-//! megabytes, while retaining enough detail for terminal bitmap protocols.
+//! [`CAPACITY`] for the entry bound. The decoded pixels stay within eight
+//! megabytes, with smaller thumbnails on pages that show many covers.
 //!
 //! Nothing here fetches. The cache records what is wanted, the worker's art
 //! thread answers, and [`ArtCache::store`] puts the answer away -- so a slow or
@@ -32,14 +32,14 @@ pub const EDGE: u32 = 256;
 
 /// Entries kept before the least recently wanted is dropped.
 ///
-/// Roughly two screenfuls of a wide terminal: enough that scrolling down a page
-/// and back finds the tiles still there, and far short of the whole feed. At
-/// [`EDGE`] the raw RGB pixel budget is 6 MiB.
-pub(crate) const CAPACITY: usize = 32;
+/// Enough for a large visible grid and some recently visited cards. Resolution
+/// adapts to the working set so retaining more entries does not exceed 8 MiB.
+pub(crate) const CAPACITY: usize = 128;
+const PIXEL_BUDGET: usize = 8 * 1024 * 1024;
 
 const _: () = {
     assert!(EDGE >= 192);
-    assert!(EDGE as usize * EDGE as usize * 3 * CAPACITY <= 8 * 1024 * 1024);
+    assert!(144 * 144 * 3 * CAPACITY <= PIXEL_BUDGET);
 };
 
 #[derive(Default)]
@@ -57,9 +57,26 @@ pub struct ArtCache {
     /// rather than a timestamp per entry: the list is sixty-odd long, so
     /// finding and moving a key is cheaper than it looks and needs no clock.
     recent: VecDeque<String>,
+    visible: HashSet<String>,
 }
 
 impl ArtCache {
+    /// Reserve the whole visible set before touching individual entries. Doing
+    /// this one card at a time makes a page larger than the old cache capacity
+    /// evict itself on every frame, including pictures still on screen.
+    pub fn want_visible<'a>(&mut self, keys: impl Iterator<Item = &'a str>) -> Vec<String> {
+        let keys: Vec<String> = keys.map(str::to_owned).collect();
+        self.visible = keys.iter().take(CAPACITY).cloned().collect();
+        let mut requests = Vec::new();
+        for key in keys {
+            if !self.visible.contains(&key) { continue; }
+            self.touch(&key);
+            if self.asked.insert(key.clone()) { requests.push(key); }
+        }
+        self.evict();
+        requests
+    }
+
     /// The picture for a card, if one has arrived.
     pub fn get(&self, key: &str) -> Option<&Cover> {
         self.art.get(key)
@@ -71,6 +88,7 @@ impl ArtCache {
     /// Marks it wanted when it answers `true`, so a card drawn on every frame
     /// for the second it takes the CDN to answer produces one request rather
     /// than a hundred.
+    #[cfg(test)]
     pub fn want(&mut self, key: &str) -> bool {
         self.touch(key);
         let newly_asked = self.asked.insert(key.to_string());
@@ -118,12 +136,18 @@ impl ArtCache {
     /// is an unbounded set held open by whatever is slowest to answer.
     fn evict(&mut self) {
         while self.recent.len() > CAPACITY {
-            let Some(oldest) = self.recent.pop_front() else {
+            let Some(index) = self.recent.iter().position(|key| !self.visible.contains(key)) else {
                 return;
             };
+            let oldest = self.recent.remove(index).expect("entry found");
             self.art.remove(&oldest);
             self.asked.remove(&oldest);
         }
+        // Large windows keep every visible cover, at a smaller thumbnail size,
+        // rather than cycling them in and out of memory. The pixel budget stays
+        // fixed regardless of the number of requests or decoded pictures.
+        let edge = ((PIXEL_BUDGET / (3 * self.recent.len().max(1))) as f64).sqrt() as u32;
+        for cover in self.art.values_mut() { cover.shrink(edge.min(EDGE)); }
     }
 }
 
@@ -133,6 +157,33 @@ mod tests {
 
     fn cover() -> Cover {
         Cover::solid(8, 8)
+    }
+
+    #[test]
+    fn a_large_visible_page_keeps_its_covers_and_does_not_refetch() {
+        let mut cache = ArtCache::default();
+        let keys: Vec<String> = (0..80).map(|i| i.to_string()).collect();
+        assert_eq!(cache.want_visible(keys.iter().map(String::as_str)).len(), 80);
+        for key in &keys { cache.store(key.clone(), Some(Cover::solid(EDGE, EDGE))); }
+        for _ in 0..20 {
+            assert!(cache.want_visible(keys.iter().map(String::as_str)).is_empty());
+            assert!(keys.iter().all(|key| cache.get(key).is_some()));
+        }
+        let bytes: usize = cache.art.values().map(|cover| (cover.width * cover.height * 3) as usize).sum();
+        assert!(bytes <= PIXEL_BUDGET);
+        let next: Vec<String> = (80..160).map(|i| i.to_string()).collect();
+        assert_eq!(cache.want_visible(next.iter().map(String::as_str)).len(), 80);
+        assert!(next.iter().all(|key| cache.asked.contains(key)));
+        assert!(cache.art.len() <= CAPACITY);
+    }
+
+    #[test]
+    fn an_oversized_visible_set_stays_stable_and_bounded() {
+        let mut cache = ArtCache::default();
+        let keys: Vec<String> = (0..CAPACITY + 20).map(|i| i.to_string()).collect();
+        assert_eq!(cache.want_visible(keys.iter().map(String::as_str)).len(), CAPACITY);
+        assert!(cache.want_visible(keys.iter().map(String::as_str)).is_empty());
+        assert_eq!(cache.asked.len(), CAPACITY);
     }
 
     #[test]

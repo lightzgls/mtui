@@ -339,6 +339,8 @@ impl ChunkedClient {
 /// anything slower than this has already failed, it just has not said so.
 fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .pool_max_idle_per_host(2)
+        .pool_idle_timeout(Duration::from_secs(30))
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .build()

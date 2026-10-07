@@ -19,6 +19,7 @@ mod console;
 mod diagnostics;
 mod discord;
 mod graphics;
+mod instance;
 mod kitty;
 mod player;
 mod session;
@@ -30,7 +31,7 @@ mod ui;
 #[cfg(windows)]
 use std::io;
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
@@ -92,6 +93,7 @@ fn main() -> Result<()> {
         }
         return result;
     }
+    let Some(instance) = instance::Instance::acquire()? else { return Ok(()); };
     #[cfg(windows)]
     console::prepare_parent();
 
@@ -101,7 +103,7 @@ fn main() -> Result<()> {
         &format!("MTUI {} started", env!("CARGO_PKG_VERSION")),
     );
 
-    if let Err(err) = start() {
+    if let Err(err) = start(&instance) {
         diagnostics::error("app", &format!("fatal error: {err:#}"));
         console::report_error(&format!("{err:#}"));
         return Err(err);
@@ -110,7 +112,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn start() -> Result<()> {
+fn start(instance: &instance::Instance) -> Result<()> {
     let settings = config::Settings::load();
     let keep_tray = settings.start_in_tray;
     // The Windows-subsystem binary starts without a console. Opening one here
@@ -129,10 +131,10 @@ fn start() -> Result<()> {
         None
     };
 
-    run(settings, startup_tray)
+    run(settings, startup_tray, instance)
 }
 
-fn run(settings: config::Settings, mut tray: Option<Tray>) -> Result<()> {
+fn run(settings: config::Settings, mut tray: Option<Tray>, instance: &instance::Instance) -> Result<()> {
     // Fail before touching the terminal, so a missing dependency prints a plain
     // message instead of appearing as a blank alternate screen. On a first run
     // this is also where yt-dlp gets fetched, which prints progress -- another
@@ -153,11 +155,11 @@ fn run(settings: config::Settings, mut tray: Option<Tray>) -> Result<()> {
     // runs first because that is how the program is started; after that, each
     // returns when the user has asked for the other.
     loop {
-        run_foreground(&mut app, &mut tray)?;
+        run_foreground(&mut app, &mut tray, instance)?;
         if app.should_quit {
             break;
         }
-        run_background(&mut app, &mut tray)?;
+        run_background(&mut app, &mut tray, instance)?;
         if app.should_quit {
             break;
         }
@@ -171,7 +173,7 @@ fn run(settings: config::Settings, mut tray: Option<Tray>) -> Result<()> {
 }
 
 /// The terminal interface. Returns when the user quits or asks to background.
-fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
+fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::Instance) -> Result<()> {
     app.wants_foreground = false;
 
     if console::closed() {
@@ -198,9 +200,22 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
         Err(err) => return Err(err),
     };
     let mut mouse = ui::MouseMap::default();
+    let mut activation_until = None;
 
     (|| -> Result<()> {
         while !app.should_quit && !app.wants_background {
+            if instance.take_activation() {
+                // Closing the helper and relaunching can happen before its pipe
+                // reports EOF. Carry that activation through the tray transition.
+                activation_until = Some(Instant::now() + Duration::from_millis(300));
+                if !console::focus() {
+                    app.wants_background = true;
+                    app.wants_foreground = true;
+                    break;
+                }
+            }
+            #[cfg(windows)]
+            { app.graphics.cell = console::cell_size(); }
             app.poll_source();
             // Before the prefetch: a track that just ended starts the next one
             // here, and the prefetch warms the one after it.
@@ -209,6 +224,8 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
             app.tick_prefetch();
             app.tick_presence();
             sync_foreground_tray(app, tray);
+            #[cfg(windows)]
+            foreground.terminal.backend_mut().set_canvas_color(ui::canvas_color(app.cover.as_ref()))?;
             foreground
                 .terminal
                 .draw(|frame| ui::render(frame, app, &mut mouse))
@@ -218,11 +235,11 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
             // draws can erase them. Clear and rebuild in the same breath.
             if app.image_needs_clearing() {
                 if app.painted_with_kitty() {
-                    for index in 0..app.painted_image_count() {
+                    for image in app.painted_images() {
                         foreground
                             .terminal
                             .backend_mut()
-                            .write_all(&kitty::delete(kitty::image_id(index)))
+                            .write_all(&kitty::delete(kitty::placement_id(image)))
                             .context("could not remove a Kitty image")?;
                     }
                 }
@@ -241,6 +258,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
             if console::closed() {
                 // Unlike explicit B, X always backgrounds, including idle.
                 app.wants_background = true;
+                app.wants_foreground |= activation_until.is_some_and(|until| Instant::now() <= until);
                 break;
             }
 
@@ -290,12 +308,16 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
                                 .context("could not resize the foreground")?;
                         }
                         app.invalidate_image();
+                        // A font/DPI change invalidates the entire physical
+                        // grid even if its row and column count is unchanged.
+                        foreground.terminal.clear().context("could not repaint the resized foreground")?;
                     }
                     _ => {}
                 }
             }
             if console::closed() {
                 app.wants_background = true;
+                app.wants_foreground |= activation_until.is_some_and(|until| Instant::now() <= until);
             }
         }
         Ok(())
@@ -360,6 +382,7 @@ struct WindowsBackend {
     inner: CrosstermBackend<console::Output>,
     size: Size,
     cursor: Position,
+    canvas: Option<(u8, u8, u8)>,
 }
 
 #[cfg(windows)]
@@ -369,6 +392,7 @@ impl WindowsBackend {
             inner: CrosstermBackend::new(output),
             size,
             cursor: Position::ORIGIN,
+            canvas: None,
         }
     }
 
@@ -376,6 +400,15 @@ impl WindowsBackend {
         self.size = size;
         self.cursor.x = self.cursor.x.min(size.width.saturating_sub(1));
         self.cursor.y = self.cursor.y.min(size.height.saturating_sub(1));
+    }
+
+    fn set_canvas_color(&mut self, color: (u8, u8, u8)) -> io::Result<()> {
+        if self.canvas != Some(color) {
+            let (r, g, b) = color;
+            write!(self.inner, "\x1b]4;0;rgb:{r:02x}/{g:02x}/{b:02x}\x1b\\")?;
+            self.canvas = Some(color);
+        }
+        Ok(())
     }
 }
 
@@ -579,7 +612,7 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
 /// in the foreground, with the reason in the status bar. Backgrounding is a
 /// convenience, and half of one, with the icon missing or the console gone, is
 /// a player the user cannot reach at all.
-fn run_background(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
+fn run_background(app: &mut App, tray: &mut Option<Tray>, instance: &instance::Instance) -> Result<()> {
     app.wants_background = false;
 
     if tray.is_none() {
@@ -630,6 +663,10 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>) -> Result<()> {
     }
 
     while !app.should_quit && !app.wants_foreground {
+        if instance.take_activation() {
+            app.wants_foreground = true;
+            break;
+        }
         app.poll_source();
         app.tick_playback();
         app.tick_prefetch();
@@ -679,12 +716,12 @@ fn paint_cover(app: &mut App, out: &mut impl Write) -> Result<()> {
         return Ok(());
     }
     let kitty_enabled = app.kitty_images();
-    for (index, (cover, image)) in images.iter().enumerate() {
+    for (cover, image) in &images {
         let plan = image.plan;
         let (width, height) = (u32::from(plan.width), u32::from(plan.height));
         let rgb = cover.resample(width, height);
         let payload = if kitty_enabled {
-            let id = kitty::image_id(index);
+            let id = kitty::placement_id(image);
             out.write_all(&kitty::delete(id))?;
             kitty::encode(&rgb, width, height, plan.bound, id)
         } else {

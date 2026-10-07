@@ -76,10 +76,6 @@ const TRENDING_DEPTH: usize = 12;
 /// complete release carousel.
 const NEW_MUSIC_DEPTH: usize = 12;
 
-/// Ceiling on the rows taken from an opened playlist or album, matching the
-/// library's own limit on the same thing.
-const MAX_TRACKS: usize = 200;
-
 /// Cards put on a shelf built here. A screenful is three or four; this is deep
 /// enough to scroll through and shallow enough that a shelf is not a list.
 #[cfg(test)]
@@ -260,6 +256,7 @@ pub fn fetch(http: &Http, cookies: Option<&Cookies>) -> Result<(Vec<Shelf>, bool
     Ok((fetch_public(http)?, false))
 }
 
+#[cfg(test)]
 pub fn fetch_public(http: &Http) -> Result<Vec<Shelf>> {
     let mut shelves = parse_shelves(&browse(http, None, HOME_ID)?);
     if shelves.is_empty() {
@@ -346,11 +343,88 @@ fn is_trending_songs(title: &str) -> bool {
     title.starts_with("trending") && !title.contains("playlist")
 }
 
+#[cfg(test)]
 pub fn fetch_personalised(http: &Http, cookies: &Cookies) -> Result<Option<Vec<Shelf>>> {
     let shelves = parse_shelves(&browse(http, Some(cookies), HOME_ID)?);
-    Ok(is_personalised(&shelves).then_some(shelves))
+    // Shelf names vary by language and change on the service. A valid signed-in
+    // response should not be discarded because it lacks four English labels.
+    Ok((!shelves.is_empty()).then_some(shelves))
 }
 
+/// Deliver the first screen promptly, then append bounded provider continuations.
+pub fn stream_feed(http: &Http, cookies: Option<&Cookies>, mut emit: impl FnMut(Vec<Shelf>, bool)) -> Result<()> {
+    let signed = cookies.and_then(|cookies| browse(http, Some(cookies), HOME_ID).ok())
+        .filter(|json| !parse_shelves(json).is_empty());
+    let (mut json, session) = match signed {
+        Some(json) => (json, cookies),
+        None => (browse(http, None, HOME_ID)?, None),
+    };
+    let first: Vec<_> = parse_shelves(&json).into_iter().take(24).collect();
+    if first.is_empty() { bail!("YouTube Music returned no Home sections"); }
+    let mut count = first.len();
+    let mut titles: std::collections::HashSet<String> = first.iter().map(|shelf| shelf.title.clone()).collect();
+    emit(first, true);
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..3 {
+        let Some(token) = home_continuation(&json).filter(|token| seen.insert(token.clone())) else { break; };
+        drop(json);
+        let request = post_request_as(http, BROWSE_URL, session, MUSIC_CLIENT_VERSION, serde_json::json!({"continuation": token}))?
+            .timeout(HOME_TIMEOUT);
+        let Ok((status, raw)) = http.send(request) else { break; };
+        if !(200..300).contains(&status) { break; }
+        let Ok(next) = serde_json::from_slice::<Value>(&raw) else { break; };
+        json = next;
+        let more: Vec<_> = parse_shelves(&json).into_iter().filter(|shelf| titles.insert(shelf.title.clone()))
+            .take(24usize.saturating_sub(count)).collect();
+        count += more.len();
+        if !more.is_empty() { emit(more, false); }
+        if count >= 24 { break; }
+    }
+    // Signed-in library collections are real account data, never synthetic mixes.
+    if let Some(cookies) = session
+        && count < 24
+        && let Ok(library) = browse(http, Some(cookies), "FEmusic_liked_playlists")
+    {
+        let mut rows = Vec::new();
+        collect(&library, "musicTwoRowItemRenderer", &mut rows);
+        let cards: Vec<_> = rows.into_iter().filter_map(|row| parse_card(&serde_json::json!({"musicTwoRowItemRenderer": row})))
+            .filter(|card| matches!(&card.target, Target::Open { endpoint } if endpoint.browse_id.starts_with("VL")))
+            .take(MAX_CARDS).collect();
+        if !cards.is_empty() && titles.insert("Your playlists".into()) {
+            emit(vec![Shelf { title: "Your playlists".into(), cards }], false);
+            count += 1;
+        }
+    }
+    for browse_id in [NEW_RELEASES_ID, "FEmusic_explore"] {
+        if count >= 24 { break; }
+        if let Ok(page) = browse(http, session, browse_id) {
+            let shelves: Vec<_> = parse_shelves(&page).into_iter().filter(|shelf| titles.insert(shelf.title.clone()))
+                .take(24usize.saturating_sub(count)).collect();
+            count += shelves.len();
+            if !shelves.is_empty() { emit(shelves, false); }
+        }
+    }
+    if count < 24 && !titles.iter().any(|title| is_new_music(title))
+        && let Some(shelf) = fetch_new_music(http) { emit(vec![shelf], false); count += 1; }
+    if count < 24 && !titles.iter().any(|title| is_trending_songs(title))
+        && let Some(shelf) = fetch_trending(http) { emit(vec![shelf], false); }
+    Ok(())
+}
+
+fn home_continuation(json: &Value) -> Option<String> {
+    let mut lists = Vec::new();
+    collect(json, "sectionListRenderer", &mut lists);
+    collect(json, "sectionListContinuation", &mut lists);
+    // Continuations inside a carousel page its cards, rather than Home sections.
+    lists.into_iter().find_map(|list| {
+        list.pointer("/continuations/0/nextContinuationData/continuation")
+            .or_else(|| list.pointer("/continuations/0/reloadContinuationData/continuation"))
+            .and_then(Value::as_str).map(str::to_owned)
+            .or_else(|| list["contents"].as_array()?.iter().find_map(|item| item.pointer("/continuationItemRenderer/continuationEndpoint/continuationCommand/token")?.as_str().map(str::to_owned)))
+    })
+}
+
+#[cfg(test)]
 pub fn is_personalised(shelves: &[Shelf]) -> bool {
     const PERSONAL: [&str; 4] = [
         "Quick picks",
@@ -368,21 +442,9 @@ pub fn is_personalised(shelves: &[Shelf]) -> bool {
 /// Albums and playlists answer with different trees, and either may arrive in
 /// a one- or two-column layout, so rows are found by walking. Artist pages use
 /// their dedicated mixed-content parser instead.
+#[cfg(test)]
 pub fn tracks_endpoint(http: &Http, endpoint: &BrowseEndpoint) -> Result<Vec<Track>> {
-    let json = browse_endpoint(http, None, endpoint)?;
-
-    let mut rows = Vec::new();
-    collect(&json, "musicResponsiveListItemRenderer", &mut rows);
-
-    let tracks: Vec<Track> = rows
-        .into_iter()
-        .filter_map(parse_row)
-        .take(MAX_TRACKS)
-        .collect();
-    if tracks.is_empty() {
-        bail!("nothing playable came back for this one");
-    }
-    Ok(tracks)
+    Ok(super::collection::fetch(http, endpoint, "Collection")?.tracks)
 }
 
 /// One `browse` call against YouTube Music's internal API.
@@ -475,7 +537,7 @@ fn post_as(
     Ok(serde_json::from_slice(&raw)?)
 }
 
-fn post_request_as(
+pub(super) fn post_request_as(
     http: &Http,
     url: &str,
     cookies: Option<&Cookies>,
@@ -869,8 +931,18 @@ fn queue(json: &Value) -> Vec<Card> {
 /// untyped: the path to a shelf differs between the one- and two-column layouts
 /// YouTube serves, and both carry the same renderer at the end of it.
 pub(super) fn parse_shelves(json: &Value) -> Vec<Shelf> {
+    fn gather<'a>(value: &'a Value, shelves: &mut Vec<&'a Value>) {
+        for name in ["musicCarouselShelfRenderer", "musicShelfRenderer", "gridRenderer", "musicImmersiveCarouselShelfRenderer"] {
+            if let Some(shelf) = value.get(name) { shelves.push(shelf); return; }
+        }
+        match value {
+            Value::Array(items) => for item in items { gather(item, shelves); },
+            Value::Object(map) => for child in map.values() { gather(child, shelves); },
+            _ => {},
+        }
+    }
     let mut carousels = Vec::new();
-    collect(json, "musicCarouselShelfRenderer", &mut carousels);
+    gather(json, &mut carousels);
 
     carousels
         .into_iter()
@@ -879,10 +951,11 @@ pub(super) fn parse_shelves(json: &Value) -> Vec<Shelf> {
             // cards on the landing page says nothing about what it is.
             let title = shelf
                 .pointer("/header/musicCarouselShelfBasicHeaderRenderer/title/runs")
+                .or_else(|| shelf.pointer("/title/runs"))
                 .and_then(runs_text)?;
 
             let cards: Vec<Card> = shelf
-                .pointer("/contents")?
+                .get("contents").or_else(|| shelf.get("items"))?
                 .as_array()?
                 .iter()
                 .filter_map(parse_card)
@@ -945,7 +1018,7 @@ fn parse_community_playlists(json: &Value) -> Option<Shelf> {
     })
 }
 
-fn parse_card(item: &Value) -> Option<Card> {
+pub(super) fn parse_card(item: &Value) -> Option<Card> {
     let two_row = &item["musicTwoRowItemRenderer"];
     if two_row.is_object() {
         let title = two_row.pointer("/title/runs").and_then(runs_text)?;
@@ -1042,7 +1115,7 @@ fn target(endpoint: &Value, label: &str, artist_hint: bool) -> Option<Target> {
         });
     }
     let route = browse_route(endpoint)?;
-    if is_artist_endpoint(endpoint) || artist_hint {
+    if is_artist_endpoint(endpoint) || artist_hint || route.browse_id.starts_with("UC") || route.browse_id.starts_with("MPLA") {
         return Some(Target::Artist {
             artist: ArtistRef {
                 name: label.to_string(),
@@ -1094,6 +1167,14 @@ pub(super) fn artist_ref(runs: &Value) -> Option<ArtistRef> {
     })
 }
 
+pub(super) fn album_ref(runs: &Value) -> Option<(String, BrowseEndpoint)> {
+    runs.as_array()?.iter().find_map(|run| {
+        let endpoint = browse_route(&run["navigationEndpoint"])?;
+        if !endpoint.browse_id.starts_with("MPRE") { return None; }
+        Some((run["text"].as_str()?.to_owned(), endpoint))
+    })
+}
+
 /// The video id of a list row, from wherever this particular shelf put it.
 ///
 /// Three places, and which one is used varies by shelf rather than by anything
@@ -1118,7 +1199,7 @@ pub(super) fn video_id(row: &Value) -> Option<String> {
 /// not mean the same things: a playlist row puts the artist in its own column
 /// and the duration in a fixed column at the end, where a search row joins
 /// artist, album and duration into one string.
-fn parse_row(row: &Value) -> Option<Track> {
+pub(super) fn parse_row(row: &Value) -> Option<Track> {
     let id = video_id(row)?;
     let title = flex_column(row, 0)?;
 
@@ -1216,6 +1297,38 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn home_paging_uses_section_tokens_and_preserves_grid_cards() {
+        let json = serde_json::json!({"contents":{"sectionListRenderer": {
+            "continuations":[{"nextContinuationData":{"continuation":"home-next"}}],
+            "contents":[{"gridRenderer":{"title":{"runs":[{"text":"Recommended albums"}]},
+                "items":[{"musicTwoRowItemRenderer":{"title":{"runs":[{"text":"Album"}]},
+                    "navigationEndpoint":{"browseEndpoint":{"browseId":"MPREalbum"}}}}]}}
+            ]}}});
+        assert_eq!(home_continuation(&json).as_deref(), Some("home-next"));
+        let shelves = parse_shelves(&json);
+        assert_eq!(shelves[0].title, "Recommended albums");
+        assert_eq!(shelves[0].cards.len(), 1);
+        assert!(home_continuation(&serde_json::json!({"musicCarouselShelfRenderer":{
+            "continuations":[{"nextContinuationData":{"continuation":"cards-only"}}]
+        }})).is_none());
+    }
+
+    #[test]
+    #[ignore = "reads the saved account Home feed without playback or history writes"]
+    fn live_home_streams_more_sections() {
+        let http = Http::new().unwrap();
+        let cookies = Cookies::available().unwrap();
+        let mut counts = Vec::new();
+        stream_feed(&http, cookies.as_ref(), |shelves, first| {
+            println!("Home {}: {} sections, {} cards", if first { "initial" } else { "additional" }, shelves.len(), shelves.iter().map(|shelf| shelf.cards.len()).sum::<usize>());
+            counts.push(shelves.len());
+        }).unwrap();
+        assert!(!counts.is_empty());
+        assert!(counts.iter().sum::<usize>() <= 24);
+        assert!(counts.len() > 1, "Home should expose continuations or supplemental Music sections");
+    }
 
     /// A picture card, as the home feed sends them.
     fn card(title: &str, subtitle: &str, endpoint: Value) -> Value {

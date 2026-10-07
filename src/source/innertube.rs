@@ -20,15 +20,17 @@
 
 use std::time::Duration;
 
+#[cfg(test)]
 use anyhow::{Context, Result, bail};
 
 #[cfg(test)]
 use super::StreamUrl;
-use super::Track;
-use super::home;
+#[cfg(test)]
+use super::{Track, home};
 
 /// Kept short on purpose. This is a speculative fast path; if it is not clearly
 /// winning, the fallback is right there and will do the job properly.
+#[cfg(test)]
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// YouTube *Music*'s search, which is a different corpus to YouTube's.
@@ -37,11 +39,13 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// mix compilations, full concert uploads, duplicate reuploads from channels
 /// that do not own the track. This endpoint returns songs, with the artist and
 /// album as structured fields rather than guesswork on a title string.
+#[cfg(test)]
 const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search";
 
 /// The "Songs" search filter, base64 protobuf as YouTube Music's own client
 /// sends it. Without it the response also carries albums, artists, playlists
 /// and podcast episodes -- none of which we can hand to a decoder.
+#[cfg(test)]
 const SONGS_FILTER: &str = "EgWKAQIIAWoKEAoQCRADEAQQBQ%3D%3D";
 
 /// Shared with [`crate::source::home`], which talks to the same corpus through
@@ -50,6 +54,7 @@ const SONGS_FILTER: &str = "EgWKAQIIAWoKEAoQCRADEAQQBQ%3D%3D";
 pub(super) const MUSIC_CLIENT_NAME: &str = "WEB_REMIX";
 pub(super) const MUSIC_CLIENT_VERSION: &str = "1.20241127.01.00";
 
+#[cfg(test)]
 pub struct InnerTube {
     client: reqwest::Client,
     /// Held rather than built per call, so the connection pool and TLS session
@@ -58,6 +63,7 @@ pub struct InnerTube {
     runtime: tokio::runtime::Runtime,
 }
 
+#[cfg(test)]
 impl InnerTube {
     pub fn new() -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -133,6 +139,7 @@ impl InnerTube {
 /// change, and every one of those lines would be a way for a rename to become a
 /// hard failure. Here, anything unrecognised simply yields no tracks, which the
 /// caller reads as "fall back to yt-dlp".
+#[cfg(test)]
 fn parse_search(json: &serde_json::Value, limit: usize) -> Vec<Track> {
     let sections = json
         .pointer("/contents/tabbedSearchResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents")
@@ -154,6 +161,7 @@ fn parse_search(json: &serde_json::Value, limit: usize) -> Vec<Track> {
         .collect()
 }
 
+#[cfg(test)]
 fn parse_track(item: &serde_json::Value) -> Option<Track> {
     // Absent on rows that are not playable individually, such as an album
     // header that shares the shelf.

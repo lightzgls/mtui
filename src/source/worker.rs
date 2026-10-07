@@ -41,9 +41,8 @@ use super::artist::{self, ArtistPage};
 use super::cover::{self, Cover};
 use super::home::{self, Shelf};
 use super::http::Http;
-use super::innertube::InnerTube;
 use super::journal::Journal;
-use super::{ArtistRef, BrowseEndpoint, StreamUrl, Track};
+use super::{ArtistRef, BrowseEndpoint, StreamUrl};
 use super::{lrclib, watch};
 use crate::config::Cookies;
 use crate::source::youtube::YouTube;
@@ -64,6 +63,7 @@ pub enum Request {
         request_id: PageRequestId,
         query: String,
         limit: usize,
+        filter: super::search::Filter,
     },
     /// `title` is carried through so the UI can label playback without
     /// re-looking-up the track when the response arrives.
@@ -183,7 +183,7 @@ pub enum Request {
 pub enum Response {
     Results {
         request_id: PageRequestId,
-        tracks: Result<Vec<Track>, String>,
+        tracks: Result<Vec<super::search::Item>, String>,
     },
     /// The landing page.
     Home {
@@ -194,6 +194,7 @@ pub enum Response {
     HomeFailed {
         generation: u64,
     },
+    HomeMore { generation: u64, shelves: Vec<Shelf> },
     /// A YouTube Music web session was established successfully.
     ///
     /// The UI answers this by asking for the landing page again -- the page on
@@ -201,15 +202,12 @@ pub enum Response {
     /// had.
     CookiesImported(String),
     MusicSignInFailed(String),
-    /// Contents of something opened from the landing page. Distinct from
-    /// [`Self::PlaylistTracks`] because these rows are not the user's: they
-    /// belong to a YouTube Music album or a stranger's playlist, so there is
-    /// nothing here that removing a row could apply to.
+    /// Authenticated album or playlist contents, with their own page metadata.
     Browsed {
         request_id: PageRequestId,
         endpoint: BrowseEndpoint,
         title: String,
-        tracks: Result<Vec<Track>, String>,
+        page: Box<Result<super::collection::Page, String>>,
     },
     Artist {
         request_id: PageRequestId,
@@ -429,6 +427,7 @@ impl SourceWorker {
             Request::RetryReports
             | Request::ClearReports => self.history_tx.send(req).context("history worker is gone"),
             Request::OpenBrowse { .. }
+            | Request::Search { .. }
             | Request::OpenArtist { .. } => self
                 .metadata_tx
                 .send(req)
@@ -599,22 +598,9 @@ fn run_source_loop(
     // Resolves taken off the queue. Behind `asked` exactly when the queue holds
     // one the user asked for more recently than the one in hand.
     let mut taken = 0u64;
-    // Built once so its connection pool and TLS session outlive a single track.
-    // `None` means the fast path is simply unavailable and every resolve goes
-    // to yt-dlp -- slower, but no less correct.
-    let tube = InnerTube::new().ok();
 
     while let Ok(req) = rx.recv() {
         let response = match req {
-            Request::Search {
-                request_id,
-                query,
-                limit,
-            } => Response::Results {
-                request_id,
-                tracks: search(&yt, tube.as_ref(), &query, limit)
-                    .map_err(|error| format!("{error:#}")),
-            },
             Request::Resolve {
                 id,
                 title,
@@ -759,21 +745,6 @@ fn run_source_loop(
     }
 }
 
-/// Searches for songs, preferring YouTube Music to YouTube at large.
-///
-/// The difference is what comes back, not just how fast. Plain `ytsearch`
-/// returns reaction videos, hour-long mix compilations, full concert uploads
-/// and duplicate reuploads alongside the actual songs; the music corpus returns
-/// songs with a real artist and album. yt-dlp still answers when the fast path
-/// cannot, so an unrecognised response shape degrades to the old results rather
-/// than to no results.
-fn search(yt: &YouTube, tube: Option<&InnerTube>, query: &str, limit: usize) -> Result<Vec<Track>> {
-    match tube.and_then(|t| t.search(query, limit).ok()) {
-        Some(tracks) => Ok(tracks),
-        None => yt.search(query, limit),
-    }
-}
-
 /// The account session available to playback right now. Read immediately before
 /// resolving so Music sign-in, manual cookie change, or stale-session removal
 /// takes effect without copying the session into worker requests.
@@ -788,28 +759,22 @@ fn spawn_personal_home(tx: Sender<Response>, generation: u64) {
     if thread::Builder::new()
         .name("mtui-personal-home".to_string())
         .spawn(move || {
-            let response = (|| -> Result<Response> {
+            let response = (|| -> Result<()> {
                 let http = Http::new()?;
                 // One feed at a time. A signed-in request gets first choice;
                 // the public page is fetched only when there is no session or
                 // the personalized endpoint cannot produce a usable page.
                 // This avoids keeping two JSON trees and two card collections
                 // alive during startup just to race them.
-                let shelves = Cookies::available()
-                    .ok()
-                    .flatten()
-                    .and_then(|cookies| home::fetch_personalised(&http, &cookies).ok().flatten())
-                    .or_else(|| home::fetch_public(&http).ok());
-                Ok(match shelves {
-                    Some(shelves) => Response::Home {
-                        generation,
-                        shelves,
-                    },
-                    None => Response::HomeFailed { generation },
-                })
-            })()
-            .unwrap_or(Response::HomeFailed { generation });
-            let _ = tx.send(response);
+                let cookies = Cookies::available().ok().flatten();
+                home::stream_feed(&http, cookies.as_ref(), |shelves, first| {
+                    let response = if first { Response::Home { generation, shelves } }
+                        else { Response::HomeMore { generation, shelves } };
+                    let _ = tx.send(response);
+                })?;
+                Ok(())
+            })();
+            if response.is_err() { let _ = tx.send(Response::HomeFailed { generation }); }
         })
         .is_err()
     {
@@ -843,14 +808,18 @@ fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
 
     while let Ok(req) = rx.recv() {
         let response = match req {
+            Request::Search { request_id, query, limit, filter } => Some(Response::Results {
+                request_id, tracks: super::search::fetch(&http, &query, filter, limit)
+                    .map_err(|error| format!("{error:#}")),
+            }),
             Request::OpenBrowse {
                 request_id,
                 endpoint,
                 title,
             } => Some(Response::Browsed {
                 request_id,
-                tracks: home::tracks_endpoint(&http, &endpoint)
-                    .map_err(|error| format!("{error:#}")),
+                page: Box::new(super::collection::fetch(&http, &endpoint, &title)
+                    .map_err(|error| format!("{error:#}"))),
                 endpoint,
                 title,
             }),

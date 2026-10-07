@@ -86,6 +86,17 @@ pub struct Cover {
 }
 
 impl Cover {
+    /// Keep a thumbnail within the cache's per-picture pixel allowance.
+    pub fn shrink(&mut self, edge: u32) {
+        let longest = self.width.max(self.height);
+        if longest <= edge { return; }
+        let width = (self.width * edge / longest).max(1);
+        let height = (self.height * edge / longest).max(1);
+        self.rgb = self.resample(width, height);
+        self.width = width;
+        self.height = height;
+    }
+
     /// The only way a `Cover` is made, so that no picture can exist without the
     /// accent colour drawn beside it having been worked out from its pixels.
     fn build(width: u32, height: u32, rgb: Vec<u8>) -> Self {
@@ -312,7 +323,10 @@ impl ArtFetcher {
                 .enable_all()
                 .build()
                 .context("could not start a runtime for artwork")?,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .pool_max_idle_per_host(4)
+                .pool_idle_timeout(Duration::from_secs(30))
+                .build().context("could not build the artwork HTTP client")?,
         })
     }
 

@@ -7,17 +7,21 @@
 //! subsequent streaming and decoding happens in-process.
 
 use std::process::Stdio;
+#[cfg(test)]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::{Track, UNKNOWN_ARTIST, command};
+use super::command;
+#[cfg(test)]
+use super::{Track, UNKNOWN_ARTIST};
 
 /// Hard ceiling on search results. Bounded by construction so a long session
 /// cannot grow the heap.
 pub const MAX_RESULTS: usize = 200;
 
 /// Flags for a search: list the results without visiting each video page.
+#[cfg(test)]
 const SEARCH_FLAGS: &[&str] = &[
     "--flat-playlist",
     "--dump-json",
@@ -28,6 +32,8 @@ const SEARCH_FLAGS: &[&str] = &[
 /// Shape of the `--dump-json` fields we consume. yt-dlp emits far more; serde
 /// drops the rest rather than allocating it.
 #[derive(serde::Deserialize)]
+#[cfg(test)]
+#[allow(dead_code)]
 struct YtDlpEntry {
     id: String,
     #[serde(default)]
@@ -127,6 +133,8 @@ impl YouTube {
     ///
     /// Uses `--flat-playlist` so yt-dlp only reads the search listing and never
     /// visits each video page -- one process, not N, and no JS challenge solve.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Track>> {
         let limit = limit.min(MAX_RESULTS);
         if query.trim().is_empty() {
@@ -212,6 +220,7 @@ fn is_video_id(s: &str) -> bool {
 
 /// yt-dlp writes multi-line diagnostics; the first ERROR line is the useful
 /// one. Falls back to the last non-empty line so we never report nothing.
+#[cfg(test)]
 fn first_error_line(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
     let line = text
@@ -229,6 +238,7 @@ fn first_error_line(stderr: &[u8]) -> String {
 /// about, and the extractor is always the same one. What it costs is the front
 /// half of a line that has to fit a status bar beside the key hints -- so the
 /// preamble survives and the half that says what happened is what gets cut.
+#[cfg(test)]
 fn strip_preamble(line: &str) -> &str {
     let line = line.strip_prefix("ERROR: ").unwrap_or(line);
     // `[youtube]`, or whichever extractor answered.

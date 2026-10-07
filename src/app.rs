@@ -118,13 +118,6 @@ pub struct PlannedImage {
     pub plan: ImagePlan,
 }
 
-/// How many results to request. Bounded by [`MAX_RESULTS`] at the source.
-///
-/// YouTube pages search results twenty at a time, so this is deliberately one
-/// page: asking for fifty costs two further round trips (measured at ~1 s) to
-/// fill in rows below the fold that are rarely scrolled to.
-const SEARCH_LIMIT: usize = 20;
-
 /// How long the selection must sit still before it is speculatively resolved.
 ///
 /// Long enough that scrolling through the list does not spawn a process per
@@ -234,6 +227,16 @@ pub enum MouseAction {
     SelectHomeCard { shelf: usize, card: usize },
     PlayTrack(usize),
     SelectTrack(usize),
+    PlayCollection,
+    ShuffleCollection,
+    RetryCollection,
+    SearchFilter(crate::source::search::Filter),
+    OpenPlayingArtist,
+    OpenQueueArtist(usize),
+    OpenPlayingAlbum,
+    ShufflePlayback,
+    RepeatPlayback,
+    ChooseOutput,
     OpenTab(Tab),
     OpenPageRow(usize),
     SelectPageRow(usize),
@@ -431,10 +434,15 @@ impl ArtistView {
 #[derive(Debug, Clone)]
 struct TrackPage {
     results: Vec<Track>,
+    query: String,
+    search_items: Vec<crate::source::search::Item>,
+    search_filter: crate::source::search::Filter,
     selected: usize,
     offset: usize,
     browsing: Option<String>,
     browsing_endpoint: Option<BrowseEndpoint>,
+    collection: Option<crate::source::collection::Details>,
+    collection_error: Option<String>,
     status: String,
 }
 
@@ -443,7 +451,7 @@ enum HistoryEntry {
     Home {
         status: String,
     },
-    Tracks(TrackPage),
+    Tracks(Box<TrackPage>),
     Artist {
         artist: Box<ArtistView>,
         status: String,
@@ -492,6 +500,7 @@ pub struct NowPlaying {
     pub artist: String,
     pub artist_ref: Option<ArtistRef>,
     pub album: Option<String>,
+    pub album_route: Option<(String, BrowseEndpoint)>,
     /// The track's length, which the player itself does not report -- rodio
     /// knows only how far it has got. Without this there is no progress bar,
     /// only a clock.
@@ -575,6 +584,7 @@ impl NowPlaying {
             artist: track.uploader.clone(),
             artist_ref: track.artist_ref.clone(),
             album: track.album.clone(),
+            album_route: None,
             duration: track.duration,
             queue_title: String::new(),
             queue: Vec::new(),
@@ -1127,6 +1137,8 @@ pub struct App {
     pub mode: Mode,
     pub query: String,
     pub results: Vec<Track>,
+    pub search_items: Vec<crate::source::search::Item>,
+    pub search_filter: crate::source::search::Filter,
     /// Index into `results`. Meaningless when `results` is empty.
     pub selected: usize,
     /// First visible row, maintained so rendering can slice rather than
@@ -1209,6 +1221,7 @@ pub struct App {
     /// number of cards.
     pub home_shelf: usize,
     pub home_card: usize,
+    pub home_grid_rows: usize,
     /// First visible shelf, maintained like [`Self::offset`] so the renderer
     /// slices rather than laying out shelves it will not draw.
     pub home_top: usize,
@@ -1236,6 +1249,8 @@ pub struct App {
     /// is showing one.
     pub browsing: Option<String>,
     browsing_endpoint: Option<BrowseEndpoint>,
+    pub collection: Option<crate::source::collection::Details>,
+    pub collection_error: Option<String>,
     /// Dedicated mixed-content artist page. Kept while another view is open so
     /// Player and search can return without refetching it.
     pub artist: Option<ArtistView>,
@@ -1491,6 +1506,8 @@ impl App {
             mode: Mode::Browse,
             query: String::new(),
             results: Vec::new(),
+            search_items: Vec::new(),
+            search_filter: crate::source::search::Filter::All,
             selected: 0,
             offset: 0,
             status: "loading the home feed ...".to_string(),
@@ -1521,6 +1538,7 @@ impl App {
             home: Vec::new(),
             home_shelf: 0,
             home_card: 0,
+            home_grid_rows: 1,
             home_top: 0,
             home_scroll: Vec::new(),
             art: ArtCache::default(),
@@ -1529,6 +1547,8 @@ impl App {
             home_generation: 0,
             browsing: None,
             browsing_endpoint: None,
+            collection: None,
+            collection_error: None,
             artist: None,
             history: Vec::new(),
             search_page: None,
@@ -1580,6 +1600,10 @@ impl App {
         }
     }
 
+    pub fn collection_art_key(&self) -> Option<&str> {
+        self.browsing_endpoint.as_ref().map(|endpoint| endpoint.browse_id.as_str())
+    }
+
     fn snapshot_blocked(&self) -> bool {
         page_snapshot_blocked(
             self.pending_page_request,
@@ -1616,14 +1640,19 @@ impl App {
             View::Home => Some(HistoryEntry::Home {
                 status: self.status.clone(),
             }),
-            View::Tracks => Some(HistoryEntry::Tracks(TrackPage {
+            View::Tracks => Some(HistoryEntry::Tracks(Box::new(TrackPage {
                 results: self.results.clone(),
+                query: self.query.clone(),
+                search_items: self.search_items.clone(),
+                search_filter: self.search_filter,
                 selected: self.selected,
                 offset: self.offset,
                 browsing: self.browsing.clone(),
                 browsing_endpoint: self.browsing_endpoint.clone(),
+                collection: self.collection.clone(),
+                collection_error: self.collection_error.clone(),
                 status: self.status.clone(),
-            })),
+            }))),
             View::Artist => self.artist.clone().map(|artist| HistoryEntry::Artist {
                 artist: Box::new(artist),
                 status: self.status.clone(),
@@ -1660,10 +1689,15 @@ impl App {
             }
             HistoryEntry::Tracks(page) => {
                 self.results = page.results;
+                self.query = page.query;
+                self.search_items = page.search_items;
+                self.search_filter = page.search_filter;
                 self.selected = page.selected;
                 self.offset = page.offset;
                 self.browsing = page.browsing;
                 self.browsing_endpoint = page.browsing_endpoint;
+                self.collection = page.collection;
+                self.collection_error = page.collection_error;
                 self.status = page.status;
                 self.view = View::Tracks;
             }
@@ -1890,11 +1924,11 @@ impl App {
                 ]
             }
             View::Tracks => {
-                let selected = self.results.get(self.selected);
+                let selected = self.selected_result_track();
                 let mut items = vec![MenuItem::action(
-                    "Play selected track",
+                    if selected.is_some() { "Play selected track" } else { "Open selected result" },
                     Some("Enter"),
-                    selected.is_some(),
+                    self.result_count() > 0,
                     Some("Selected track"),
                     MenuAction::PlaySelected,
                 )];
@@ -2162,6 +2196,7 @@ impl App {
         }
         self.images
             .iter()
+            .filter(|image| !self.painted.contains(image))
             .filter_map(|image| {
                 let art = match &image.source {
                     ImageSource::Playing => self.cover.as_ref(),
@@ -2181,11 +2216,13 @@ impl App {
     /// went away, or moved out from under them. Erasing protocol pixels means
     /// painting cells over it, so only a redraw can undo it.
     pub fn image_needs_clearing(&self) -> bool {
-        !self.painted.is_empty() && self.painted != self.images
+        // A new cover arriving does not invalidate pictures already on screen.
+        // Only removals or changed placements need their old pixels erased.
+        self.painted.iter().any(|image| !self.images.contains(image))
     }
 
-    pub fn painted_image_count(&self) -> usize {
-        self.painted.len()
+    pub fn painted_images(&self) -> &[PlannedImage] {
+        &self.painted
     }
 
     pub fn painted_with_kitty(&self) -> bool {
@@ -2271,6 +2308,7 @@ impl App {
             });
             return;
         };
+        if track.id != id { return; }
         let title = track.label();
 
         self.status = format!("reconnecting {title} ...");
@@ -2369,8 +2407,11 @@ impl App {
                 };
                 self.browsing = None;
                 self.browsing_endpoint = None;
+                self.collection = None;
+                self.collection_error = None;
                 self.view = View::Tracks;
-                self.results = tracks;
+                self.results = tracks.iter().filter_map(|item| item.track.clone()).collect();
+                self.search_items = tracks;
                 self.selected = 0;
                 self.offset = 0;
                 // Start the debounce on the top hit: it is what Enter plays
@@ -2397,6 +2438,15 @@ impl App {
                 }
                 self.home_attempts = self.home_attempts.saturating_sub(1);
                 self.finish_home_attempts();
+            }
+            Response::HomeMore { generation, shelves } => {
+                if generation != self.home_generation { return; }
+                for shelf in shelves {
+                    if self.home.len() >= 24 { break; }
+                    if self.home.iter().any(|existing| existing.title == shelf.title) { continue; }
+                    self.home.push(shelf);
+                    self.home_scroll.push(0);
+                }
             }
             Response::CookiesImported(browser) => {
                 // The page on screen was built without a session. There is a
@@ -2427,19 +2477,23 @@ impl App {
             Response::Browsed {
                 title,
                 endpoint,
-                tracks,
+                page,
                 ..
             } => {
                 if self.browsing_endpoint.as_ref() != Some(&endpoint) {
                     return;
                 }
-                let tracks = match tracks {
-                    Ok(tracks) => tracks,
+                let page = match *page {
+                    Ok(page) => page,
                     Err(reason) => {
+                        self.collection_error = Some(reason.clone());
                         self.report(reason);
                         return;
                     }
                 };
+                let tracks = page.tracks;
+                self.collection = Some(page.details);
+                self.collection_error = None;
                 if self.view == View::Tracks {
                     self.status = format!("{} tracks in {title}", tracks.len());
                 }
@@ -2680,7 +2734,7 @@ impl App {
                 // browse id came from this response, so it is never coming --
                 // settled here rather than left to say "loading" for the rest
                 // of the track.
-                now.playing = None;
+                now.playing = now.queue.iter().position(|track| track.id == video_id);
                 now.related = Panel::Empty(why.clone());
                 // Lyrics are not settled with it: LRCLIB needs only the artist
                 // and title, and both arrived with the track rather than in
@@ -2694,6 +2748,10 @@ impl App {
 
         now.lyrics_id = watch.lyrics_id;
         now.related_id = watch.related_id;
+        if let Some((title, endpoint)) = watch.album_route {
+            now.album = Some(title.clone());
+            now.album_route = Some((title, endpoint));
+        }
 
         match now.queue.iter().position(|track| track.id == video_id) {
             // The queue carried over, so this response describes a queue we are
@@ -3662,10 +3720,12 @@ impl App {
     /// out everything already held or already asked for, so this is a no-op on
     /// all but the first frame after the view moves.
     pub fn want_art(&mut self, cards: Vec<(String, Option<String>)>) {
-        for (key, url) in cards {
-            if self.art.want(&key)
-                && let Some(url) = url
-            {
+        let mut urls: std::collections::HashMap<_, _> = cards.iter()
+            .filter_map(|(key, url)| Some((key.clone(), url.clone()?))).collect();
+        let requests = self.art.want_visible(cards.iter()
+            .filter(|(_, url)| url.is_some()).map(|(key, _)| key.as_str()));
+        for key in requests {
+            if let Some(url) = urls.remove(&key) {
                 let _ = self.source.send(Request::Art { key, url });
             }
         }
@@ -3719,7 +3779,7 @@ impl App {
     /// row in the results.
     fn selected_id(&self) -> Option<String> {
         match self.view {
-            View::Tracks => Some(self.results.get(self.selected)?.id.clone()),
+            View::Tracks => Some(self.selected_result_track()?.id.clone()),
             View::Home => match &self.home_card()?.target {
                 Target::Play { video_id } => Some(video_id.clone()),
                 // Opening one is a round trip of its own, and nothing about
@@ -3754,7 +3814,7 @@ impl App {
     /// Keeps `offset` such that `selected` is visible in a viewport `height`
     /// rows tall. Called by the renderer, which is what knows the height.
     pub fn clamp_scroll(&mut self, height: usize) {
-        if height == 0 || self.results.is_empty() {
+        if height == 0 || self.result_count() == 0 {
             self.offset = 0;
             return;
         }
@@ -3764,7 +3824,7 @@ impl App {
             self.offset = self.selected + 1 - height;
         }
         // Avoid a trailing gap when the list shrinks.
-        let max_offset = self.results.len().saturating_sub(height);
+        let max_offset = self.result_count().saturating_sub(height);
         self.offset = self.offset.min(max_offset);
     }
 
@@ -3836,6 +3896,19 @@ impl App {
             *offset = self.home_card + 1 - cards;
         }
         *offset = (*offset).min(len.saturating_sub(cards));
+    }
+
+    pub fn clamp_home_grid(&mut self, columns: usize, rows: usize) {
+        if rows <= 1 { self.clamp_home_cards(columns); return; }
+        if self.home.is_empty() || columns == 0 { return; }
+        let len = self.home[self.home_shelf].cards.len();
+        let offset = &mut self.home_scroll[self.home_shelf];
+        let selected_column = self.home_card / rows;
+        let mut first = *offset / rows;
+        if selected_column < first { first = selected_column; }
+        if selected_column >= first + columns { first = selected_column + 1 - columns; }
+        first = first.min(len.div_ceil(rows).saturating_sub(columns));
+        *offset = first * rows;
     }
 
     fn open_menu(&mut self, page: MenuPage) {
@@ -4121,14 +4194,39 @@ impl App {
                 }
             }
             MouseAction::PlayTrack(index) if self.view == View::Tracks => {
-                if index < self.results.len() {
+                if index < self.result_count() {
                     self.selected = index;
                     self.selection_settled = Some(Instant::now());
                     self.play_selected();
                 }
             }
+            MouseAction::PlayCollection if self.view == View::Tracks => self.play_collection(0, false),
+            MouseAction::ShuffleCollection if self.view == View::Tracks => self.play_collection(0, true),
+            MouseAction::RetryCollection if self.view == View::Tracks => self.reload_collection(),
+            MouseAction::SearchFilter(filter) if self.view == View::Tracks && self.browsing.is_none() => self.filter_search(filter),
+            MouseAction::OpenPlayingArtist => {
+                if let Some(artist) = self.now.as_ref().and_then(|now| now.artist_ref.clone()) {
+                    self.open_artist(artist);
+                }
+            }
+            MouseAction::OpenQueueArtist(index) => {
+                if let Some(artist) = self.now.as_ref().and_then(|now| now.queue.get(index)).and_then(|track| track.artist_ref.clone()) {
+                    self.open_artist(artist);
+                }
+            }
+            MouseAction::OpenPlayingAlbum => {
+                if let Some((title, endpoint)) = self.now.as_ref().and_then(|now| now.album_route.clone()) {
+                    self.open_browse(endpoint, title);
+                }
+            }
+            MouseAction::ShufflePlayback => self.shuffle_upcoming_queue(),
+            MouseAction::RepeatPlayback => self.cycle_repeat(),
+            MouseAction::ChooseOutput => {
+                self.open_settings();
+                self.handle_preferences_intent(preferences::Intent::Activate(preferences::Setting::Output));
+            }
             MouseAction::SelectTrack(index) if self.view == View::Tracks => {
-                if index < self.results.len() {
+                if index < self.result_count() {
                     self.selected = index;
                     self.selection_settled = Some(Instant::now());
                 }
@@ -4218,6 +4316,7 @@ impl App {
     fn handle_home_key(&mut self, key: KeyEvent) -> Result<()> {
         let (was_shelf, was_card) = (self.home_shelf, self.home_card);
         let last_shelf = self.home.len().saturating_sub(1);
+        let rows = self.home_grid_rows.max(1);
         let last_card = self
             .home
             .get(self.home_shelf)
@@ -4226,13 +4325,17 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('l') | KeyCode::Right => {
-                self.home_card = (self.home_card + 1).min(last_card)
+                self.home_card = (self.home_card + rows).min(last_card)
             }
-            KeyCode::Char('h') | KeyCode::Left => self.home_card = self.home_card.saturating_sub(1),
+            KeyCode::Char('h') | KeyCode::Left => self.home_card = self.home_card.saturating_sub(rows),
             KeyCode::Char('j') | KeyCode::Down => {
-                self.home_shelf = (self.home_shelf + 1).min(last_shelf)
+                if self.home_card % rows + 1 < rows && self.home_card < last_card { self.home_card += 1; }
+                else { self.home_shelf = (self.home_shelf + 1).min(last_shelf); }
             }
-            KeyCode::Char('k') | KeyCode::Up => self.home_shelf = self.home_shelf.saturating_sub(1),
+            KeyCode::Char('k') | KeyCode::Up => {
+                if !self.home_card.is_multiple_of(rows) { self.home_card -= 1; }
+                else { self.home_shelf = self.home_shelf.saturating_sub(1); }
+            }
             KeyCode::Char('g') | KeyCode::Home => (self.home_shelf, self.home_card) = (0, 0),
             KeyCode::Char('G') | KeyCode::End => self.home_shelf = last_shelf,
             KeyCode::PageDown => self.home_shelf = (self.home_shelf + 3).min(last_shelf),
@@ -4385,10 +4488,13 @@ impl App {
         }
         self.push_current_page();
         self.results.clear();
+        self.search_items.clear();
         self.selected = 0;
         self.offset = 0;
         self.browsing = Some(title.clone());
         self.browsing_endpoint = Some(endpoint.clone());
+        self.collection = Some(crate::source::collection::Details { title: title.clone(), ..Default::default() });
+        self.collection_error = None;
         self.view = View::Tracks;
         self.mode = Mode::Browse;
         self.status = format!("opening {title} ...");
@@ -4401,6 +4507,7 @@ impl App {
         if self.source.send(request).is_err() {
             self.cancel_page_request();
             self.status = "source worker is not running".to_string();
+            self.collection_error = Some(self.status.clone());
         }
     }
 
@@ -4454,7 +4561,9 @@ impl App {
     fn context_artist(&self) -> Option<ArtistRef> {
         match self.view {
             View::Home => card_artist(self.home_card()?),
-            View::Tracks => self.results.get(self.selected)?.artist_ref.clone(),
+            View::Tracks => self.search_items.get(self.selected)
+                .filter(|_| self.browsing.is_none()).and_then(|item| card_artist(&item.card))
+                .or_else(|| self.selected_result_track()?.artist_ref.clone()),
             View::Artist => {
                 let artist = self.artist.as_ref()?;
                 artist
@@ -4803,11 +4912,16 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('g') | KeyCode::Home => self.selected = 0,
             KeyCode::Char('G') | KeyCode::End => {
-                self.selected = self.results.len().saturating_sub(1);
+                self.selected = self.result_count().saturating_sub(1);
             }
             KeyCode::PageDown => self.move_selection(10),
             KeyCode::PageUp => self.move_selection(-10),
             KeyCode::Enter => self.play_selected(),
+            KeyCode::Char(c @ '1'..='6') if self.browsing.is_none() => {
+                self.filter_search(crate::source::search::Filter::ALL[(c as u8 - b'1') as usize]);
+            }
+            KeyCode::Char('z') if self.browsing.is_some() => self.play_collection(0, true),
+            KeyCode::Char('r') if self.browsing.is_some() => self.reload_collection(),
             KeyCode::Char(' ') => self.toggle_pause(),
             KeyCode::Char('m') => self.toggle_mute(),
             KeyCode::Char('c') => self.toggle_cover_size(),
@@ -4845,10 +4959,10 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.results.is_empty() {
+        if self.result_count() == 0 {
             return;
         }
-        let last = self.results.len() - 1;
+        let last = self.result_count() - 1;
         let next = self.selected as isize + delta;
         self.selected = next.clamp(0, last as isize) as usize;
     }
@@ -4899,21 +5013,92 @@ impl App {
         let request = Request::Search {
             request_id,
             query,
-            limit: SEARCH_LIMIT.min(MAX_RESULTS),
+            limit: 60.min(MAX_RESULTS),
+            filter: crate::source::search::Filter::All,
         };
+        self.search_filter = crate::source::search::Filter::All;
         if self.source.send(request).is_err() {
             self.cancel_page_request();
             self.status = "source worker is not running".to_string();
         }
     }
 
+    pub fn result_count(&self) -> usize {
+        if self.browsing.is_none() && !self.search_items.is_empty() {
+            self.search_items.len()
+        } else { self.results.len() }
+    }
+
+    fn selected_result_track(&self) -> Option<&Track> {
+        if self.browsing.is_none() && !self.search_items.is_empty() {
+            self.search_items.get(self.selected)?.track.as_ref()
+        } else { self.results.get(self.selected) }
+    }
+
+    fn filter_search(&mut self, filter: crate::source::search::Filter) {
+        if self.busy || self.query.trim().is_empty() { return; }
+        self.search_filter = filter;
+        self.status = format!("Searching {}…", filter.label());
+        let request_id = self.begin_page_request(PageRequestKind::Search);
+        if self.source.send(Request::Search {
+            request_id, query: self.query.clone(), limit: 60.min(MAX_RESULTS), filter,
+        }).is_err() { self.cancel_page_request(); }
+    }
+
     fn play_selected(&mut self) {
+        if self.browsing.is_some() {
+            self.play_collection(self.selected, false);
+            return;
+        }
+        if let Some(item) = self.search_items.get(self.selected).cloned() {
+            if let Some(track) = item.track {
+                self.play_track(track, false);
+            } else {
+                self.activate_card(item.card);
+            }
+            return;
+        }
         // Resolving takes seconds and spawns yt-dlp, so it goes to the worker
         // and playback starts when the response arrives -- unless a prefetch
         // already warmed the cache, in which case the round trip is all that is
         // left and saying "resolving" would be a lie the user can see through.
         if let Some(track) = self.results.get(self.selected).cloned() {
             self.play_track(track, false);
+        }
+    }
+
+    fn reload_collection(&mut self) {
+        if self.busy { return; }
+        let Some(endpoint) = self.browsing_endpoint.clone() else { return; };
+        let title = self.browsing.clone().unwrap_or_default();
+        self.collection_error = None;
+        self.status = format!("opening {title} ...");
+        let request_id = self.begin_page_request(PageRequestKind::Browse);
+        if self.source.send(Request::OpenBrowse { request_id, endpoint, title }).is_err() {
+            self.cancel_page_request();
+            self.collection_error = Some("source worker is not running".to_owned());
+        }
+    }
+
+    fn play_collection(&mut self, start: usize, shuffle: bool) {
+        if self.busy || self.collection_error.is_some() { return; }
+        let mut tracks = self.results.clone();
+        if shuffle { shuffle_tracks(&mut tracks); }
+        let position = if shuffle { 0 } else { start };
+        let Some(first) = tracks.get(position).cloned() else { return; };
+        let title = self.browsing.clone().unwrap_or_else(|| "Songs".to_owned());
+        self.play_track(first, false);
+        self.queue_epoch = self.queue_epoch.wrapping_add(1);
+        if let Some(now) = self.now.as_mut() {
+            now.queue_title = title;
+            now.queue = tracks;
+            now.queue_epoch = self.queue_epoch;
+            now.continuation = None;
+            now.topping_up = false;
+            now.topup_failures = 0;
+            now.dropped.clear();
+            now.playing = Some(position);
+            now.cursor[Tab::UpNext.index()] = position;
         }
     }
 
@@ -5347,6 +5532,112 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "renders fixture UI with a zero-volume audio worker; run with isolated APPDATA"]
+    fn preview_search_palette_and_player_links() {
+        use crate::source::search::{Filter, Item};
+        let player = Player::spawn(0.0, None).unwrap();
+        let source = SourceWorker::spawn(crate::source::youtube::YouTube::default()).unwrap();
+        let mut app = App::new(player, source, Graphics::blocks(), config::Settings::default());
+        let artist = ArtistRef { name: "Evening Artist".into(), endpoint: BrowseEndpoint::new("UCfixture") };
+        let track = Track { id: "fixtureSong".into(), title: "A quieter evening".into(), uploader: artist.name.clone(),
+            album: Some("Evening Album".into()), artist_ref: Some(artist.clone()), duration: Some(Duration::from_secs(180)) };
+        app.search_items = [
+            (Filter::Artists, "Evening Artist", Target::Artist { artist: artist.clone() }),
+            (Filter::Albums, "Evening Album", Target::Open { endpoint: BrowseEndpoint::new("MPREfixture") }),
+            (Filter::Playlists, "After hours", Target::Open { endpoint: BrowseEndpoint::new("VLfixture") }),
+            (Filter::Songs, "A quieter evening", Target::Play { video_id: track.id.clone() }),
+        ].into_iter().map(|(kind, title, target)| Item {
+            card: Card { title: title.into(), subtitle: format!("{} • Evening Artist", kind.label().trim_end_matches('s')),
+                art: None, duration: None, artist_ref: Some(artist.clone()), target },
+            kind, track: (kind == Filter::Songs).then(|| track.clone()),
+        }).collect();
+        let keys: Vec<_> = app.search_items.iter().map(|item| item.card.art_key().to_owned()).collect();
+        app.art.want_visible(keys.iter().map(String::as_str));
+        for (index, key) in keys.into_iter().enumerate() {
+            app.art.store(key, Some(Cover::from_rgb(4, 4, [70 + index as u8 * 35, 90, 110].repeat(16))));
+        }
+        app.results = vec![track.clone()]; app.query = "Evening".into(); app.view = View::Tracks;
+        app.cover = Some(Cover::from_rgb(4, 4, [72, 104, 156].repeat(16)));
+        app.now = Some(NowPlaying::new(&track));
+        app.now.as_mut().unwrap().album_route = Some(("Evening Album".into(), BrowseEndpoint::new("MPREfixture")));
+        let mut mouse = crate::ui::MouseMap::default();
+        for (width, height) in [(48, 18), (100, 36), (160, 42)] {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("Artists") && text.contains("Playlists"));
+            assert!((0..height).any(|y| (0..width).any(|x| mouse.action_at(x, y) == Some(MouseAction::PlayTrack(1)))));
+            crate::ui::preview_buffer(&format!("mixed-search-{width}x{height}"), buffer);
+        }
+        app.handle_mouse_action(MouseAction::PlayTrack(0)).unwrap();
+        assert_eq!(app.view, View::Artist);
+        assert!(app.listening.is_none());
+        app.go_back();
+        assert_eq!(app.search_items.len(), 4);
+        app.handle_mouse_action(MouseAction::PlayTrack(1)).unwrap();
+        assert_eq!(app.browsing_endpoint.as_ref().unwrap().browse_id, "MPREfixture");
+        assert!(app.listening.is_none());
+        app.go_back();
+        app.view = View::Playing;
+        app.now.as_mut().unwrap().tab = Tab::Lyrics;
+        app.now.as_mut().unwrap().lyrics = Panel::Ready(Lyrics {
+            text: "The evening settles quietly\nA little light across the room\nThe music stays with us".into(),
+            source: Some("Synced lyrics".into()), timed: (0..8).map(|index| crate::source::watch::TimedLine {
+                start: Duration::from_secs(index * 10), text: format!("A quiet lyric line {index}") }).collect(),
+        });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        assert!((0..36).any(|y| (0..120).any(|x| mouse.action_at(x, y) == Some(MouseAction::OpenPlayingAlbum))));
+        crate::ui::preview_buffer("palette-lyrics-120x36", terminal.backend().buffer());
+        app.handle_mouse_action(MouseAction::OpenPlayingArtist).unwrap();
+        assert_eq!(app.view, View::Artist);
+        assert!(app.listening.is_none());
+    }
+
+    #[test]
+    #[ignore = "reads saved playlists through clicks and workers; no playback or history writes"]
+    fn saved_playlist_clicks_load_tracks_in_the_real_app() {
+        let cookies = config::Cookies::available().unwrap().expect("sign in before this check");
+        let http = crate::source::http::Http::new().unwrap();
+        let cards: Vec<Card> = crate::source::collection::saved_cards(&http, &cookies).unwrap()
+            .into_iter().take(4).collect();
+        assert!(!cards.is_empty());
+        let player = Player::spawn(0.0, None).unwrap();
+        let source = SourceWorker::spawn(crate::source::youtube::YouTube::default()).unwrap();
+        let mut app = App::new(player, source, Graphics::blocks(), config::Settings::default());
+        // Startup Home is independent; invalidate it before providing this
+        // fixture shelf so its later response cannot replace the click target.
+        app.home_generation += 1;
+        app.home_pending = false;
+        app.home = vec![Shelf { title: "Saved playlists".into(), cards }];
+        for card in 0..app.home[0].cards.len() {
+            app.view = View::Home;
+            app.handle_mouse_action(MouseAction::OpenHomeCard { shelf: 0, card }).unwrap();
+            assert_eq!(app.view, View::Tracks);
+            assert!(app.collection.is_some());
+            let deadline = Instant::now() + Duration::from_secs(25);
+            while app.pending_page_request.is_some() && Instant::now() < deadline {
+                app.poll_source();
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            assert!(app.pending_page_request.is_none(), "playlist request timed out");
+            assert!(app.collection_error.is_none(), "playlist click failed: {:?}", app.collection_error);
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 36)).unwrap();
+            let mut mouse = crate::ui::MouseMap::default();
+            terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+            let rendered: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+            assert!(rendered.contains("Play") || app.results.is_empty());
+            if let Some(track) = app.results.first() {
+                assert!(rendered.contains(&track.title.chars().take(12).collect::<String>()));
+            }
+            println!("Saved playlist click: {} tracks rendered, error=false", app.results.len());
+        }
+        assert!(app.now.is_none());
+        assert!(app.listening.is_none());
+    }
+
+    #[test]
     fn displayed_menu_shortcuts_select_the_matching_enabled_command() {
         let menu = Menu::new(MenuPage::Root, app_menu_items(false));
         for (code, modifiers, expected) in [
@@ -5467,14 +5758,19 @@ mod tests {
         for selected in 0..PAGE_HISTORY + 3 {
             push_history(
                 &mut history,
-                HistoryEntry::Tracks(TrackPage {
+                HistoryEntry::Tracks(Box::new(TrackPage {
                     results: Vec::new(),
+                    query: String::new(),
+                    search_items: Vec::new(),
+                    search_filter: crate::source::search::Filter::All,
                     selected,
                     offset: selected,
                     browsing: None,
                     browsing_endpoint: None,
+                    collection: None,
+                    collection_error: None,
                     status: format!("page {selected}"),
-                }),
+                })),
             );
         }
 

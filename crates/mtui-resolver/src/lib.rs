@@ -234,6 +234,8 @@ impl Resolver {
             .build()
             .map_err(|e| ResolveError::from_message(format!("could not start resolver: {e}")))?;
         let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(2)
+            .pool_idle_timeout(Duration::from_secs(30))
             .timeout(PLAYER_TIMEOUT)
             .build()
             .map_err(|e| ResolveError::from_message(format!("could not build resolver: {e}")))?;
@@ -586,13 +588,15 @@ pub fn resolve_player(
             Some(session),
             video_id,
         ) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) if starts_serving(runtime, client, &stream.url) => return Ok(stream),
+            Ok(_) => last = Some(anyhow::anyhow!("native audio URL refused its opening bytes")),
             Err(e) => last = Some(e),
         }
     }
     for identity in CLIENTS {
         match resolve_player_as(runtime, client, identity, None, video_id) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) if starts_serving(runtime, client, &stream.url) => return Ok(stream),
+            Ok(_) => last = Some(anyhow::anyhow!("native audio URL refused its opening bytes")),
             Err(e) => last = Some(e),
         }
     }
@@ -874,6 +878,10 @@ pub fn serves_whole_file(
     runtime.block_on(serves_byte(client, url, last, length.is_none()))
 }
 
+fn starts_serving(runtime: &tokio::runtime::Runtime, client: &reqwest::Client, url: &str) -> bool {
+    runtime.block_on(serves_byte(client, url, 0, false))
+}
+
 async fn serves_byte(client: &reqwest::Client, url: &str, at: u64, unknown_length: bool) -> bool {
     for _ in 0..2 {
         let sent = client
@@ -1127,6 +1135,28 @@ mod tests {
         assert!(!served_probe(StatusCode::BAD_GATEWAY, false));
         assert!(served_probe(StatusCode::RANGE_NOT_SATISFIABLE, true));
         assert!(!served_probe(StatusCode::RANGE_NOT_SATISFIABLE, false));
+    }
+
+    #[test]
+    fn opening_probe_rejects_a_403_then_accepts_a_fresh_url() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/audio", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for status in ["403 Forbidden", "206 Partial Content"] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut request = [0; 2048];
+                let read = socket.read(&mut request).unwrap();
+                assert!(String::from_utf8_lossy(&request[..read]).to_ascii_lowercase().contains("range: bytes=0-0"));
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx").unwrap();
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(3)).build().unwrap();
+        assert!(!starts_serving(&runtime, &client, &url));
+        assert!(starts_serving(&runtime, &client, &url));
+        server.join().unwrap();
     }
 
     #[test]

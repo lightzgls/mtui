@@ -7,9 +7,11 @@
 pub mod artist;
 pub mod bootstrap;
 pub mod cover;
+pub mod collection;
 pub mod home;
 pub mod http;
 pub mod innertube;
+pub mod search;
 pub mod journal;
 pub mod lrclib;
 pub mod sapisid;
