@@ -6,9 +6,8 @@ A lightweight YouTube Music player with a mouse-friendly terminal interface and 
 
 ## Preview
 
-[![MTUI Now Playing with artwork, queue, and playback controls](assets/previews/now-playing.png)](https://github.com/lightzgls/mtui/raw/refs/heads/main/assets/previews/overview.mp4)
+https://github.com/user-attachments/assets/27cdd7f8-daf9-4ccc-b736-d903014b5be1
 
-**[Watch the overview video](https://github.com/lightzgls/mtui/raw/refs/heads/main/assets/previews/overview.mp4)** — a real screen recording of the app.
 
 <details>
 <summary>More screenshots</summary>
