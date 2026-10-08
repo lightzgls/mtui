@@ -21,13 +21,16 @@
     browser window used only while signing in.
     <br />
     <br />
-    <a href="https://github.com/lightzgls/mtui/releases/latest">View Demo</a>
+    <a href="https://github.com/lightzgls/mtui/releases/latest">Download</a>
     &middot;
     <a href="https://github.com/lightzgls/mtui/issues/new?labels=bug">Report Bug</a>
     &middot;
     <a href="https://github.com/lightzgls/mtui/issues/new?labels=enhancement">Request Feature</a>
   </p>
 </div>
+
+## Preview
+
 <img width="1901" height="1025" alt="image" src="https://github.com/user-attachments/assets/fdbfd164-ec9a-4e50-a0da-1b33ae060bd8" />
 <img width="1906" height="1023" alt="image" src="https://github.com/user-attachments/assets/97d485f4-91df-4344-b6cf-2028758b75f6" />
 <img width="1893" height="1020" alt="image" src="https://github.com/user-attachments/assets/c1f943fb-cae9-460c-afb8-241e93f9425f" />
@@ -41,6 +44,7 @@
 <details>
   <summary>Table of Contents</summary>
   <ol>
+    <li><a href="#preview">Preview</a></li>
     <li>
       <a href="#about-the-project">About The Project</a>
       <ul>
@@ -82,18 +86,22 @@ image covers, and an optional native browser window that is used only while you
 sign in.
 
 Search and playback work without an account. Signing in adds your personalized
-YouTube Music Home.
+YouTube Music Home, saved playlists, Like state, playlist saves, and listening
+history synchronization. Search includes songs, artists, albums, playlists, and
+videos, with filters for each result type.
 
 Discord Rich Presence is off by default. MTUI publishes playback details only
 after you enable it with `D` or in Settings.
 
 ### Highlights
 
+These features describe the current development build.
+
 | Browse | Play | Personalize |
 |---|---|---|
-| Home, search, artists, albums, and playlists | Native AAC playback with bounded buffering | Kitty images, pixel art, or colored ASCII |
-| Personalized shelves with optional sign-in | Continuous queues, prefetching, and seeking | Discord Rich Presence and four icon themes |
-| Synced lyrics, comments, and related music | One current cover and bounded artwork cache | Windows notification-area controls |
+| Mixed search with song, artist, album, playlist, and video filters | Native AAC playback with bounded buffering and URL recovery | Solid app colors derived from the current cover |
+| Personalized Home shelves and saved playlist pages | Continuous queues, prefetching, seeking, shuffle, and repeat | Kitty images, pixel art, or colored ASCII |
+| Clickable artist and album links, synced lyrics, comments, and related music | Like, Share, Save to playlist, and output-device controls | Discord Rich Presence, four icon themes, and Windows tray controls |
 
 ```text
 Home / Search
@@ -190,7 +198,21 @@ installs require network access but not administrator access.
 The top bar provides Home, Playing, search, and Menu. Home uses artwork shelves;
 Now Playing shows artwork beside Queue, Lyrics, Related, and Comments. In a
 narrow window the track header moves above the tabs. Progress and playback
-controls stay at the bottom on every page, with colors taken from the cover.
+controls stay at the bottom on every page. The cover supplies a muted solid
+background, matching surfaces, and an accent throughout the app.
+
+Queue entries have space between songs and clear title, artist, and duration
+columns. Short windows use compact rows. Click the current artist or album to
+open its page when YouTube Music provides that link; queue artists are clickable
+when the artist column is visible.
+
+The playback bar offers **Like, Share, Save to playlist, Shuffle, Repeat, and
+Output**. Smaller windows keep the full set in **Actions**, also available with
+`Ctrl-P` outside search entry. Share shows the song's YouTube Music link; the
+Windows build also provides a Copy link button.
+Like and playlist saves use the signed-in account and show pending, confirmed,
+or failed states. The playlist picker marks songs already saved and keeps the
+song it was opened for even if playback moves to another track.
 
 `Ctrl-K` shows a compact menu grouped into navigation, app preferences, and
 window actions. Its displayed shortcuts work while the menu is open. Settings
@@ -214,7 +236,9 @@ track cannot play, press `r` to retry it or `n` to skip to the next queue item.
 | Experience | Account needed | How to connect |
 |---|---:|---|
 | Search and playback | No | Start typing with `/` or `i` |
-| Personalized Home | Optional | Press `M` and sign in |
+| Personalized Home and saved playlists | Yes | Press `M` or use App Menu → Account & Sessions |
+| Likes, saving songs to playlists, and listening-history sync | Yes | Use the same YouTube Music session |
+| Share links, shuffle, repeat, and output-device selection | No | Use the playback bar or `Ctrl-P` |
 
 ### Sign In
 
@@ -244,6 +268,7 @@ sign-in profile without stopping current playback.
 |---|---|
 | `Ctrl-K` | Open the App Menu for navigation, accounts, settings, help, tray, and quit |
 | `.` | Open page and selection actions, including available artist links |
+| `Ctrl-P` | Open all six playback actions outside search entry |
 | `?` | Open keyboard help |
 | Arrows or `hjkl` | Move through rows, cards, shelves, and tabs |
 | `g` / `G` | Jump to the beginning or end |
@@ -277,6 +302,10 @@ notification area. Closing the terminal with its `X` button also moves MTUI to t
 tray without interrupting playback. The tray menu can show MTUI, pause or resume,
 move between tracks, and quit.
 
+Opening the executable or its shortcut again restores the running session.
+Use **App Menu → Quit**, the tray's Quit command, or `Ctrl-C` to exit fully
+before opening an updated build.
+
 Enable **Keep tray icon visible** under Settings → Integrations to retain the icon while the
 terminal UI is open. Windows may place new icons under the hidden-icons `^` menu.
 
@@ -296,13 +325,16 @@ into memory. MTUI holds one current cover, and its
 Home/artist artwork LRU is capped at 32 images with a raw RGB budget of about
 6 MiB. Late image replies for evicted cards are discarded. Process monitors may
 report additional shared audio, TLS, and system-library pages as resident memory,
-but caches do not grow with the number of songs played.
+but caches do not grow with the number of songs played. Around 50 MiB during
+steady playback remains the design target and needs verification across playback
+and sign-in scenarios.
 
 **Playback recovery.** Complete audio-only AAC streams are preferred before the
 combined video/audio fallback. Only AAC packets reach the audio decoder, and
 duration comes from the audio track. A replacement keeps the current listening
 position; byte ranges are spliced only when format, file size, and revision
 match. Automatic recovery and manual Retry both bypass failed cached URLs.
+An opening HTTP 403 triggers one fresh-URL recovery before an error is shown.
 
 **Graphics.** MTUI detects Kitty graphics and Sixel support automatically. The
 Settings panel's **Artwork display** choice can keep automatic detection, force
@@ -311,7 +343,8 @@ terminal-cell pixel art. **Cover style** separately switches the large current-s
 cover between bitmap/pixel rendering and colored ASCII. Artwork is center-cropped
 to a square sleeve. `MTUI_GRAPHICS=blocks`, `MTUI_GRAPHICS=kitty`, and
 `MTUI_GRAPHICS=sixel` remain available as startup overrides for automatic
-detection.
+detection. MTUI's native Windows window locks font zoom and recalculates artwork
+geometry when resized or moved between monitors with different scaling.
 
 **Diagnostics.** MTUI records startup, shutdown, crashes, and subsystem failures
 in `mtui.log` inside the configuration directory. The log rotates at 1 MiB and
@@ -335,10 +368,15 @@ On upgrade, unverified reports from the previous 24 hours are checked and recove
 
 - [x] Native AAC playback with bounded buffering
 - [x] Personalized YouTube Music Home with optional sign-in
+- [x] Mixed search filters and album, artist, and saved playlist pages
+- [x] Like, Share, Save to playlist, Shuffle, Repeat, and Output in the player
+- [x] Cover-derived app colors, spaced queue rows, and mouse navigation
 - [x] Synced lyrics, comments, and related music
 - [x] Discord Rich Presence and four icon themes
 - [x] Windows notification-area controls
 - [x] Unified YouTube Music sign-in on every desktop
+- [x] Reopening the Windows shortcut restores the same running session
+- [ ] Verify the steady-playback memory target across long sessions
 - [ ] Demo video
 
 See the [open issues](https://github.com/lightzgls/mtui/issues) for a full list of
@@ -350,8 +388,8 @@ first and describe the user problem.
 <!-- CONTRIBUTING -->
 ## Contributing
 
-MTUI is a personal project, not a company-backed product, and contributions are
-genuinely useful.
+MTUI is a personal project. Contributions, bug reports, and documentation
+improvements are welcome.
 
 - Found a bug or rough edge? [Open an issue](https://github.com/lightzgls/mtui/issues/new).
 - Have an improvement? [Start a pull request](https://github.com/lightzgls/mtui/compare).
@@ -360,9 +398,9 @@ genuinely useful.
 The standard flow:
 
 1. Fork the project
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
+2. Create your feature branch (`git checkout -b feature/my-change`)
+3. Commit your changes (`git commit -m 'Describe the change'`)
+4. Push to the branch (`git push origin feature/my-change`)
 5. Open a pull request
 
 Please keep changes focused, explain behavior changes, and add tests when the
@@ -370,7 +408,25 @@ affected code has a practical test seam.
 
 ### Development
 
-MTUI uses Rust 2024 and requires Rust 1.85 or newer.
+MTUI uses Rust 2024. Use the current stable toolchain; the locked ratatui version
+requires Rust 1.88 or newer.
+
+The main feature boundaries are:
+
+- `src/app/`: navigation state, settings, and player-action behavior.
+- `src/ui/`: page layouts, dialogs, artwork palette, queue spacing, and mouse targets.
+- `src/source/`: YouTube Music reads, account writes, and background workers.
+- `src/player/`: native audio playback, bounded buffering, and stream recovery.
+- `crates/mtui-resolver/`: source resolution and fallback selection.
+
+Build the unified Windows executable with:
+
+```sh
+cargo build --locked --release --bin mtui
+```
+
+The output is `target/release/mtui.exe`. The Windows sign-in helper is embedded in
+that executable. Run the normal checks before committing:
 
 ```sh
 cargo test --workspace --all-targets

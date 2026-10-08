@@ -36,6 +36,12 @@ pub(super) fn inset(area: Rect) -> Rect {
     )
 }
 
+/// Extra side padding on normal panels, retaining compact tabs at the floor.
+pub(super) fn panel_inset(area: Rect) -> Rect {
+    let margin = if area.width >= 40 { 2 } else { area.width.min(2) / 2 };
+    Rect::new(area.x + margin, area.y, area.width.saturating_sub(margin * 2), area.height)
+}
+
 pub(super) struct PlayerAreas {
     pub hero: Option<Rect>,
     pub art: Option<Rect>,
@@ -64,7 +70,9 @@ pub(super) fn player_areas(area: Rect) -> PlayerAreas {
         };
     }
 
-    let panel_width = (area.width * 2 / 5).clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH);
+    // At normal widths keep title, artist, duration, and their gaps visible.
+    let minimum = if area.width >= 96 { 46 } else { PANEL_MIN_WIDTH };
+    let panel_width = (area.width * 2 / 5).clamp(minimum, PANEL_MAX_WIDTH);
     let [left, divider, panel] = Layout::horizontal([
         Constraint::Min(1),
         Constraint::Length(2),
@@ -72,9 +80,10 @@ pub(super) fn player_areas(area: Rect) -> PlayerAreas {
     ])
     .areas(area);
     let left = inset(left);
-    let (art, info) = if left.height > INFO_HEIGHT {
+    let info_height = if left.height >= 18 { INFO_HEIGHT } else { 3 };
+    let (art, info) = if left.height > info_height {
         let [art, info] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(INFO_HEIGHT)]).areas(left);
+            Layout::vertical([Constraint::Min(1), Constraint::Length(info_height)]).areas(left);
         (Some(art), info)
     } else {
         (None, left)

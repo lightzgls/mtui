@@ -336,6 +336,12 @@ Keep artist and album text as navigation targets. Each target must preserve YouT
 
 Provide Like, Share, Save to playlist, Shuffle, Repeat, and Output device in the persistent playback bar. Wider windows show individual actions; narrow windows keep these available through a clearly labeled player-actions menu. Like and Save require authenticated server writes and visible success/failure states. Output opens the existing device chooser. Repeat indicates Off, All, or One; shuffle preserves the currently playing track.
 
+The TUI now uses a persistent action row with Like, Share, Save to playlist, Shuffle, Repeat, and Output. Actions / Ctrl+P opens the complete menu at every normal window width. Share presents the canonical Music link and copies it through the Windows clipboard. The save picker pins the song it was opened for, lists editable playlists (bounded to 100), marks existing membership, and has loading, saving, empty, error, and refresh states.
+
+Account actions share the metadata worker and cannot queue ahead of audio resolution. Likes are confirmed by a fresh signed-in rating read; saves require an added-item result for the exact song or a fresh membership read. Neither operation retries a write automatically after a timeout. Request IDs prevent late account responses from changing another song or picker, and logout clears account state.
+
+Queue rows keep two cells between metadata columns and one blank row between songs when the panel can show at least four songs. Short panels retain compact rows. Drawing, scrolling, and mouse targets share the same item geometry; blank spacer rows have no playback action. Wide windows grant the side panel up to 68 cells with two cells of inner padding. Track identity keeps extra space around its status and title when height allows, and playback actions keep clear gaps between labels.
+
 Lyrics use quieter preceding lines, bright current text, comfortable paragraph spacing, and automatic following that yields to manual scrolling. Transparency is an optional host capability rather than a substitute for contrast.
 
 1. **Clean baseline:** remove GUI residue, keep the root TUI as the only product,

@@ -30,12 +30,14 @@ use crate::source::cover::Cover;
 use crate::source::home::{Card, Shelf};
 
 mod dialog;
+mod actions;
 mod browse;
 mod search;
 mod palette;
 mod home;
 mod menu;
 mod preferences;
+mod queue;
 mod shell;
 
 /// Width reserved for the right-aligned duration column, including padding.
@@ -60,17 +62,13 @@ static MARQUEE_START: OnceLock<Instant> = OnceLock::new();
 /// thin to read titles in, so it is dropped instead.
 const MIN_WIDTH_WITH_COVER: u16 = 64;
 
-/// Bounds on the player page's panel, borders included.
-///
-/// The floor leaves thirty-two inner columns, enough for all four compact tab
-/// labels. The ceiling exists so a wide terminal spends its columns on the
-/// cover, which is the thing that gets better with more of them.
+/// Side panels keep metadata readable without overwhelming the artwork.
+/// The minimum still leaves room for all four compact tab labels.
 const PANEL_MIN_WIDTH: u16 = 34;
-const PANEL_MAX_WIDTH: u16 = 52;
+const PANEL_MAX_WIDTH: u16 = 68;
 
-/// Track identity under the cover. Transport, progress and volume live in the
-/// persistent strip so those controls stay in one place on every page.
-const INFO_HEIGHT: u16 = 3;
+/// Room around track identity; short windows retain its compact three rows.
+const INFO_HEIGHT: u16 = 5;
 
 /// Progress at the content edge, transport/details, then quiet navigation hints.
 const STATUS_HEIGHT: u16 = 3;
@@ -81,19 +79,6 @@ const HEADER_HEIGHT: u16 = 2;
 /// progress bar above it -- two bars of the same length read as two of the
 /// same thing.
 const VOLUME_BAR_WIDTH: usize = 12;
-
-/// Columns a queue row spends on the `▶` marker and the space either side.
-const QUEUE_MARKER_WIDTH: usize = 3;
-
-/// Rows the Up next panel spends on naming the queue before listing it. These
-/// do not scroll, so they come off the viewport rather than out of the list.
-const UP_NEXT_HEADER: usize = 3;
-
-/// Width of the artist column in a queue row, and the title width defended
-/// before one is granted. Same principle as [`MIN_TITLE_WIDTH`] in the results
-/// list, at the narrower scale a side panel can afford.
-const QUEUE_ARTIST_WIDTH: usize = 14;
-const MIN_QUEUE_TITLE: usize = 16;
 
 /// Columns the lyrics panel keeps to the left of every line, for the mark
 /// against the one being sung. Held even when nothing is marked, so that a line
@@ -298,6 +283,7 @@ impl MouseMap {
             MouseTarget::PageRows { area, first } if contains(area, column, row) => Some(
                 MouseAction::SelectPageRow(first + usize::from(row.saturating_sub(area.y))),
             ),
+            MouseTarget::Area(area, MouseAction::OpenPageRow(index)) if contains(area, column, row) => Some(MouseAction::SelectPageRow(index)),
             _ => None,
         })
     }
@@ -425,6 +411,7 @@ fn render_overlay(frame: &mut Frame, app: &App, mouse: &mut MouseMap) {
         Overlay::SignIn(phase) => render_sign_in(frame, phase),
         Overlay::Message { body } => render_message(frame, body),
         Overlay::Settings => preferences::render(frame, app, mouse),
+        Overlay::Share { .. } | Overlay::SavePlaylist(_) => actions::overlay(frame, app, mouse),
     }
 }
 
@@ -2163,7 +2150,7 @@ fn render_player(
     };
     render_player_identity(frame, identity, &layout, images);
     if let Some(info) = layout.info {
-        register_identity_targets(mouse, app.now.as_ref().expect("player identity"), Rect::new(info.x, info.y + 2, info.width, 1));
+        register_identity_targets(mouse, app.now.as_ref().expect("player identity"), track_info_rows(info)[2]);
     } else if let Some(hero) = layout.hero {
         let cols = (hero.height.min(3) * 2).min(hero.width);
         let x = hero.x + cols + 1;
@@ -2239,7 +2226,7 @@ fn render_track_info(
     accent: Color,
 ) {
     let width = area.width as usize;
-    let lines = vec![
+    let lines = [
         Line::from(Span::styled(
             if snap.state == PlayState::Paused {
                 "PAUSED"
@@ -2256,7 +2243,15 @@ fn render_track_info(
         )),
         identity_byline(now, width),
     ];
-    frame.render_widget(Paragraph::new(lines), area);
+    for (line, row) in lines.into_iter().zip(track_info_rows(area)) {
+        frame.render_widget(Paragraph::new(line), row);
+    }
+}
+
+/// Pair the title and byline, with space above them and after the status label.
+fn track_info_rows(area: Rect) -> [Rect; 3] {
+    let offsets = if area.height >= INFO_HEIGHT { [1, 3, 4] } else { [0, 1, 2] };
+    offsets.map(|offset| Rect::new(area.x, area.y + offset.min(area.height), area.width, u16::from(offset < area.height)))
 }
 
 fn identity_byline(now: &NowPlaying, width: usize) -> Line<'static> {
@@ -2395,7 +2390,7 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseM
     // the borrow below is what stops either being asked for down there.
     let snap = app.snapshot();
     let accent = ambient(app);
-    let inner = shell::inset(area);
+    let inner = shell::panel_inset(area);
     if inner.height < 2 {
         return;
     }
@@ -2409,25 +2404,7 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseM
     render_tabs(frame, tab, tabs, accent, mouse);
 
     match tab {
-        Tab::UpNext if !now.queue.is_empty() => {
-            let viewport = (content.height as usize).saturating_sub(UP_NEXT_HEADER);
-            let cursor = now.cursor().min(now.queue.len().saturating_sub(1));
-            let first = centred_offset(cursor, viewport, now.queue.len());
-            let count = viewport.min(now.queue.len().saturating_sub(first));
-            mouse.targets.push(MouseTarget::PageRows {
-                area: Rect {
-                    y: content.y.saturating_add(UP_NEXT_HEADER as u16),
-                    height: count as u16,
-                    ..content
-                },
-                first,
-            });
-            for (slot, track) in now.queue.iter().skip(first).take(count).enumerate() {
-                if let Some((x, width)) = queue_artist_region(track, content.width as usize) {
-                    mouse.targets.push(MouseTarget::Area(Rect::new(content.x + x as u16, content.y + UP_NEXT_HEADER as u16 + slot as u16, width as u16, 1), MouseAction::OpenQueueArtist(first + slot)));
-                }
-            }
-        }
+        Tab::UpNext => queue::register_targets(mouse, now, content),
         Tab::Related => {
             let total = now.related_rows().len();
             let viewport = content.height as usize;
@@ -2452,14 +2429,13 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseM
         app.follow_page(offset);
     }
     // A list stops at its last row; a wall of text stops one screenful short of
-    // its end. `render_up_next` keeps its header out of the scroll, so what it
-    // reports is rows rather than lines and the viewport must match.
+    // its end. Queue item geometry excludes both the heading and spacer rows.
     let selects = matches!(tab, Tab::UpNext | Tab::Related);
-    let viewport = (content.height as usize).saturating_sub(if tab == Tab::UpNext {
-        UP_NEXT_HEADER
+    let viewport = if tab == Tab::UpNext {
+        queue::Geometry::new(app.now.as_ref().expect("player panel"), content).viewport
     } else {
-        0
-    });
+        content.height as usize
+    };
     app.clamp_page(viewport, total, selects);
 }
 
@@ -2471,7 +2447,7 @@ fn render_panel_body(
     accent: Color,
 ) -> (usize, Option<usize>) {
     match now.tab {
-        Tab::UpNext => (render_up_next(frame, now, area, accent), None),
+        Tab::UpNext => (queue::render(frame, now, area, accent), None),
         Tab::Lyrics => render_lyrics(frame, now, snap, area),
         Tab::Comments => (render_comments(frame, now, area), None),
         Tab::Related => (render_related(frame, now, area, accent), None),
@@ -2549,127 +2525,6 @@ fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Color, mouse: 
         Paragraph::new(vec![Line::from(labels), Line::from(rule)]),
         area,
     );
-}
-
-/// The queue, headed by what it is a queue of. Returns its length in rows.
-///
-/// The heading does not scroll with the rows: what a queue is a queue of is the
-/// one thing on this panel that stays true however far down it the user is.
-fn render_up_next(frame: &mut Frame, now: &NowPlaying, area: Rect, ambient: Color) -> usize {
-    if now.queue.is_empty() {
-        message(frame, "loading the queue ...", area);
-        return 0;
-    }
-
-    let width = area.width as usize;
-    let mut lines = vec![
-        Line::from(Span::styled(
-            " Playing from",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            format!(" {}", truncate(&now.queue_title, width.saturating_sub(1))),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        if now.repeat.label() == "off" {
-            Line::from("")
-        } else {
-            Line::from(Span::styled(
-                format!(" Repeat {}", now.repeat.label()),
-                Style::default().fg(ambient),
-            ))
-        },
-    ];
-    debug_assert_eq!(lines.len(), UP_NEXT_HEADER);
-
-    let viewport = (area.height as usize).saturating_sub(UP_NEXT_HEADER);
-    let cursor = now.cursor().min(now.queue.len().saturating_sub(1));
-    let offset = centred_offset(cursor, viewport, now.queue.len());
-
-    lines.extend(
-        now.queue
-            .iter()
-            .enumerate()
-            .skip(offset)
-            .take(viewport)
-            .map(|(index, track)| {
-                queue_line(
-                    track,
-                    index == cursor,
-                    Some(index) == now.playing,
-                    width,
-                    ambient,
-                )
-            }),
-    );
-
-    frame.render_widget(Paragraph::new(lines), area);
-    now.queue.len()
-}
-
-/// One queue row: a marker for the track playing, the title, and its length.
-fn queue_line<'a>(
-    track: &Track,
-    selected: bool,
-    playing: bool,
-    width: usize,
-    ambient: Color,
-) -> Line<'a> {
-    let style = if selected {
-        highlight(ambient)
-    } else if playing {
-        // The row this colour was taken from in the first place, so it wears it
-        // as ink rather than as a fill -- marked without being the loudest
-        // thing on a panel the cursor is also moving through.
-        Style::default().fg(ambient).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
-    let dim = |colour: Color| {
-        if selected {
-            style
-        } else {
-            Style::default().fg(colour)
-        }
-    };
-
-    let duration = track.duration_str();
-    // The marker, and the length with a space after it.
-    let text_width = width.saturating_sub(QUEUE_MARKER_WIDTH + duration.chars().count() + 1);
-    // The artist gets a column when the panel is wide enough to carry one
-    // without the titles becoming unreadable, and is dropped rather than
-    // stacked below when it is not: two rows per track would halve a queue that
-    // only shows a handful of them as it is.
-    let (title_width, artist_width) = if text_width >= MIN_QUEUE_TITLE + QUEUE_ARTIST_WIDTH {
-        (text_width - QUEUE_ARTIST_WIDTH, QUEUE_ARTIST_WIDTH)
-    } else {
-        (text_width, 0)
-    };
-
-    let mut spans = vec![
-        Span::styled(
-            format!(" {} ", if playing { "▶" } else { " " }),
-            if playing { style } else { dim(Color::DarkGray) },
-        ),
-        Span::styled(focused_cell(&track.title, title_width, selected), style),
-    ];
-    if artist_width > 0 {
-        spans.push(Span::styled(
-            cell(&track.uploader, artist_width),
-            dim(Color::Gray).add_modifier(if track.artist_ref.is_some() { Modifier::UNDERLINED } else { Modifier::empty() }),
-        ));
-    }
-    spans.push(Span::styled(format!("{duration} "), dim(Color::DarkGray)));
-
-    Line::from(spans)
-}
-
-fn queue_artist_region(track: &Track, width: usize) -> Option<(usize, usize)> {
-    track.artist_ref.as_ref()?;
-    let text_width = width.saturating_sub(QUEUE_MARKER_WIDTH + display_width(&track.duration_str()) + 1);
-    if text_width < MIN_QUEUE_TITLE + QUEUE_ARTIST_WIDTH { return None; }
-    let artist_width = display_width(&truncate(&track.uploader, QUEUE_ARTIST_WIDTH)).min(QUEUE_ARTIST_WIDTH);
-    (artist_width > 0).then_some((QUEUE_MARKER_WIDTH + text_width - QUEUE_ARTIST_WIDTH, artist_width))
 }
 
 /// The lyrics, wrapped to the panel and scrolled by line.
@@ -3318,20 +3173,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, mouse: &mut MouseMap)
     if let Some(now) = &app.now {
         register_footer_artist(frame, now, &app.snapshot(), area, mouse);
     }
-    if let Some(now) = &app.now && area.height >= 3 && area.width >= 82 {
-        let mut x = area.x;
-        for (label, action) in [
-            (" Shuffle ".to_owned(), MouseAction::ShufflePlayback),
-            (format!(" Repeat: {} ", now.repeat.label()), MouseAction::RepeatPlayback),
-            (" Output ".to_owned(), MouseAction::ChooseOutput),
-        ] {
-            let width = display_width(&label) as u16;
-            let rect = Rect::new(x, area.bottom() - 1, width, 1);
-            frame.render_widget(Paragraph::new(label).style(Style::default().fg(Color::Gray)), rect);
-            mouse.targets.push(MouseTarget::Area(rect, action));
-            x += width + 1;
-        }
-    }
+    if let Some(now) = &app.now { actions::bar(frame, now, area, mouse); }
 }
 
 struct PlayerStrip<'a> {
@@ -3877,13 +3719,13 @@ mod tests {
     fn queue_artist_targets_require_a_visible_linked_column() {
         let mut track = Track { id: "song".into(), title: "Song".into(), uploader: "Artist".into(), duration: Some(Duration::from_secs(180)),
             album: None, artist_ref: Some(ArtistRef { name: "Artist".into(), endpoint: BrowseEndpoint::new("UCartist") }) };
-        let (x, width) = queue_artist_region(&track, 50).unwrap();
-        let row = queue_line(&track, false, false, 50, Color::Cyan);
+        let (x, width) = queue::artist_region(&track, 50).unwrap();
+        let row = queue::line(&track, false, false, 50, Color::Cyan);
         let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
         assert_eq!(text.chars().skip(x).take(width).collect::<String>(), "Artist");
-        assert!(queue_artist_region(&track, 20).is_none());
+        assert!(queue::artist_region(&track, 20).is_none());
         track.artist_ref = None;
-        assert!(queue_artist_region(&track, 50).is_none());
+        assert!(queue::artist_region(&track, 50).is_none());
     }
 
     /// A 16:9 cover, as every YouTube thumbnail is once shrunk.
@@ -4673,7 +4515,7 @@ mod tests {
                     Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(area);
                 render_tabs(frame, now.tab, tabs, Color::Cyan, &mut mouse);
                 match now.tab {
-                    Tab::UpNext => render_up_next(frame, now, content, Color::Cyan),
+                    Tab::UpNext => queue::render(frame, now, content, Color::Cyan),
                     Tab::Lyrics => render_lyrics(frame, now, &snap, content).0,
                     Tab::Comments => render_comments(frame, now, content),
                     Tab::Related => render_related(frame, now, content, Color::Cyan),
@@ -5450,9 +5292,11 @@ mod tests {
                 .trim_end()
                 .to_string()
         };
-        assert_eq!(row(0), "NOW PLAYING");
-        assert_eq!(row(1), "Let It Happen");
-        assert_eq!(row(2), "Tame Impala • Currents");
+        assert_eq!(row(0), "");
+        assert_eq!(row(1), "NOW PLAYING");
+        assert_eq!(row(2), "");
+        assert_eq!(row(3), "Let It Happen");
+        assert_eq!(row(4), "Tame Impala • Currents");
     }
 
     #[test]
@@ -5608,7 +5452,7 @@ mod tests {
                 }, &layout, None);
                 let [tabs, content] = Layout::vertical([
                     Constraint::Length(2), Constraint::Min(0),
-                ]).areas(shell::inset(layout.panel));
+                ]).areas(shell::panel_inset(layout.panel));
                 render_tabs(frame, now.tab, tabs, accent, &mut mouse);
                 render_panel_body(frame, now, &snap, content, accent);
                 if let Some(art) = layout.art {
@@ -5620,6 +5464,7 @@ mod tests {
                 track: Some(MiniTrack { title: &now.title, byline: &now.artist, duration: now.duration }),
                 status: "", hint: if view == View::Home { HINTS_AWAY } else { HINTS_PLAYING }, accent,
             }, footer, &mut mouse);
+            actions::bar(frame, now, footer, &mut mouse);
             palette::apply(frame, Some(cover), None);
         }).unwrap();
         (terminal.backend().buffer().clone(), mouse)

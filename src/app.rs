@@ -29,6 +29,7 @@ use crate::source::{ArtistRef, BrowseEndpoint, StreamUrl, Track, UNKNOWN_ARTIST}
 use crate::tray::TrayCommand;
 
 pub mod preferences;
+pub mod actions;
 
 /// How much of the window the cover is allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -237,6 +238,14 @@ pub enum MouseAction {
     ShufflePlayback,
     RepeatPlayback,
     ChooseOutput,
+    LikePlaying,
+    SharePlaying,
+    SavePlaying,
+    OpenPlayerActions,
+    ChoosePlaylist(usize),
+    ClosePlayerDialog,
+    RetryPlaylists,
+    CopyShareLink,
     OpenTab(Tab),
     OpenPageRow(usize),
     SelectPageRow(usize),
@@ -543,6 +552,9 @@ pub struct NowPlaying {
     /// Where in `queue` the playing track is. `None` until the queue lands, or
     /// when what is playing is not in it.
     pub playing: Option<usize>,
+    pub liked: Option<bool>,
+    pub like_pending: bool,
+    rating_request: u64,
     pub repeat: RepeatMode,
     pub tab: Tab,
     /// One cursor per tab, so switching away and back returns to where the user
@@ -597,6 +609,9 @@ impl NowPlaying {
             topup_failures: 0,
             dropped: VecDeque::new(),
             playing: None,
+            liked: None,
+            like_pending: false,
+            rating_request: 0,
             repeat: RepeatMode::Off,
             tab: Tab::UpNext,
             cursor: [0; Tab::ALL.len()],
@@ -950,6 +965,7 @@ pub enum MenuPage {
     Account,
     Help,
     PageActions,
+    PlayerActions,
 }
 
 impl MenuPage {
@@ -959,6 +975,7 @@ impl MenuPage {
             Self::Account => "Account",
             Self::Help => "Keyboard shortcuts",
             Self::PageActions => "Page Actions",
+            Self::PlayerActions => "Player actions",
         }
     }
 }
@@ -1095,6 +1112,10 @@ enum MenuAction {
     Previous,
     Stop,
     ToggleCoverSize,
+    LikePlaying,
+    SharePlaying,
+    SavePlaying,
+    ChooseOutput,
 }
 
 /// A non-menu modal that owns keyboard input for as long as it is up.
@@ -1113,6 +1134,8 @@ pub enum Overlay {
     },
     /// Small persisted preferences changed without leaving the current page.
     Settings,
+    Share { url: String, notice: Option<String> },
+    SavePlaylist(Box<actions::PlaylistPicker>),
 }
 
 impl Overlay {
@@ -1310,6 +1333,8 @@ pub struct App {
     listening: Option<(Track, Listening)>,
     /// Prevents repeated `M` presses from opening duplicate session imports.
     music_signing_in: bool,
+    account_request: u64,
+    pending_save: Option<(u64, String)>,
 
     /// A track whose stream died, waiting on a fresh URL to carry on with.
     ///
@@ -1568,6 +1593,8 @@ impl App {
             queue_epoch: 0,
             seed_rotation: 0,
             music_signing_in: false,
+            account_request: 0,
+            pending_save: None,
             resuming: None,
             playback_error: None,
             // Started whether or not Discord is running and whether or not the
@@ -2368,7 +2395,10 @@ impl App {
         // is still going on.
         if !matches!(
             response,
-            Response::Cover { .. }
+            Response::Rating { .. }
+                | Response::Playlists { .. }
+                | Response::PlaylistSaved { .. }
+                | Response::Cover { .. }
                 | Response::Art { .. }
                 | Response::Results { .. }
                 | Response::Browsed { .. }
@@ -2389,6 +2419,9 @@ impl App {
         }
 
         match response {
+            Response::Rating { request_id, video_id, changed, result } => self.apply_rating(request_id, &video_id, changed, result),
+            Response::Playlists { request_id, choices } => self.apply_playlists(request_id, choices),
+            Response::PlaylistSaved { request_id, result } => self.apply_playlist_saved(request_id, result),
             Response::Results { tracks, .. } => {
                 let tracks = match tracks {
                     Ok(tracks) => tracks,
@@ -2461,6 +2494,7 @@ impl App {
                 // A valid session is the missing half of any reports queued
                 // while signed out or while the previous cookie was stale.
                 let _ = self.source.send(Request::RetryReports);
+                self.request_rating();
                 self.request_home();
             }
             Response::MusicSignInFailed(msg) => {
@@ -3067,6 +3101,7 @@ impl App {
         }
         // Both behind the resolve, which is the order that matters: it is the
         // one producing audio, and these are decoration around it.
+        self.request_rating();
         self.request_cover(track.id.clone());
         let _ = self.source.send(Request::Watch { video_id: track.id });
         // A tab the user is already on has to be fetched now; the switch that
@@ -3924,6 +3959,7 @@ impl App {
             MenuPage::Account => self.account_menu_items(),
             MenuPage::Help => self.help_menu_items(),
             MenuPage::PageActions => self.page_action_items(),
+            MenuPage::PlayerActions => self.player_action_items(),
         }
     }
 
@@ -4053,6 +4089,10 @@ impl App {
             MenuAction::Previous => self.advance(-1, false),
             MenuAction::Stop => self.stop(),
             MenuAction::ToggleCoverSize => self.toggle_cover_size(),
+            MenuAction::LikePlaying => self.like_playing(),
+            MenuAction::SharePlaying => self.share_playing(),
+            MenuAction::SavePlaying => self.save_playing(),
+            MenuAction::ChooseOutput => self.choose_output(),
         }
     }
 
@@ -4096,6 +4136,10 @@ impl App {
             return self.handle_menu_key(key);
         }
 
+        if self.mode == Mode::Browse && is_ctrl_key(key, 'p') {
+            self.open_menu(MenuPage::PlayerActions);
+            return Ok(());
+        }
         if self.mode == Mode::Browse && is_bare_character(key, '?') {
             self.open_menu(MenuPage::Help);
             return Ok(());
@@ -4119,6 +4163,7 @@ impl App {
     /// Applies a click without manufacturing a key whose meaning depends on the
     /// current view. Modal layers retain the same ownership they have for keys.
     pub fn handle_mouse_action(&mut self, action: MouseAction) -> Result<()> {
+        if self.handle_player_dialog_mouse(action) { return Ok(()); }
         if matches!(self.overlay, Overlay::Settings) {
             let intent = match action {
                 MouseAction::ActivateSetting(setting) if self.preferences.picker.is_none() => Some(preferences::Intent::Activate(setting)),
@@ -4219,12 +4264,13 @@ impl App {
                     self.open_browse(endpoint, title);
                 }
             }
+            MouseAction::LikePlaying => self.like_playing(),
+            MouseAction::SharePlaying => self.share_playing(),
+            MouseAction::SavePlaying => self.save_playing(),
+            MouseAction::OpenPlayerActions => self.open_menu(MenuPage::PlayerActions),
             MouseAction::ShufflePlayback => self.shuffle_upcoming_queue(),
             MouseAction::RepeatPlayback => self.cycle_repeat(),
-            MouseAction::ChooseOutput => {
-                self.open_settings();
-                self.handle_preferences_intent(preferences::Intent::Activate(preferences::Setting::Output));
-            }
+            MouseAction::ChooseOutput => self.choose_output(),
             MouseAction::SelectTrack(index) if self.view == View::Tracks => {
                 if index < self.result_count() {
                     self.selected = index;
@@ -4270,7 +4316,9 @@ impl App {
     }
 
     fn handle_overlay_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.handle_player_dialog_key(key) { return Ok(()); }
         match &mut self.overlay {
+            Overlay::Share { .. } | Overlay::SavePlaylist(_) => {}
             Overlay::None => {}
             // A failed session import is the one phase with somewhere to go:
             // the thread behind it is gone, so `M` starts a fresh attempt.
@@ -5236,6 +5284,7 @@ impl App {
     }
 
     fn log_out_music(&mut self) {
+        self.clear_account_actions();
         self.menu = None;
         // Clear the worker's in-memory copy even if removing credentials or
         // the durable outbox reports an error below.
@@ -5486,6 +5535,7 @@ pub(crate) fn keyboard_help_items() -> Vec<MenuItem> {
         MenuItem::help("Pause or resume", "Space", Some("Playback")),
         MenuItem::help("Next or previous", "n / p", None),
         MenuItem::help("Repeat off / all / one", "R", None),
+        MenuItem::help("Player actions", "Ctrl+P", None),
             MenuItem::help("Queue: remove / shuffle", "d / z", None),
             MenuItem::help("Queue: move row", "K / J", None),
             MenuItem::help("Queue: clear upcoming", "C", None),
@@ -5590,6 +5640,25 @@ mod tests {
         terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
         assert!((0..36).any(|y| (0..120).any(|x| mouse.action_at(x, y) == Some(MouseAction::OpenPlayingAlbum))));
         crate::ui::preview_buffer("palette-lyrics-120x36", terminal.backend().buffer());
+        app.now.as_mut().unwrap().tab = Tab::UpNext;
+        app.now.as_mut().unwrap().queue_title = "Evening Mix".into();
+        app.now.as_mut().unwrap().playing = Some(0);
+        app.now.as_mut().unwrap().queue = (0..40).map(|index| Track {
+            id: format!("fixture{index}"), title: format!("Evening song {index:02} — a longer title"), ..track.clone()
+        }).collect();
+        for (width, height) in [(48, 18), (64, 20), (100, 36), (160, 42), (216, 50)] {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            for selected in [0, 20, 39] {
+                app.now.as_mut().unwrap().cursor[Tab::UpNext.index()] = selected;
+                terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+                assert!((0..height).any(|y| (0..width).any(|x| mouse.action_at(x, y) == Some(MouseAction::OpenPageRow(selected)))), "selected song cannot be clicked at {width}x{height}");
+                assert!((0..height).any(|y| (0..width).any(|x| mouse.action_at(x, y) == Some(MouseAction::OpenPlayingAlbum))), "album target missing at {width}x{height}");
+                if width >= 100 {
+                    assert!((0..height).any(|y| (0..width).any(|x| mouse.action_at(x, y) == Some(MouseAction::OpenQueueArtist(selected)))), "queue artist hidden at {width}x{height}");
+                }
+                crate::ui::preview_buffer(&format!("spaced-queue-{width}x{height}-{selected}"), terminal.backend().buffer());
+            }
+        }
         app.handle_mouse_action(MouseAction::OpenPlayingArtist).unwrap();
         assert_eq!(app.view, View::Artist);
         assert!(app.listening.is_none());

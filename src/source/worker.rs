@@ -59,6 +59,10 @@ struct CompletionRequest {
 }
 
 pub enum Request {
+    Rating { request_id: u64, video_id: String },
+    SetRating { request_id: u64, video_id: String, liked: bool },
+    Playlists { request_id: u64, video_id: String },
+    SaveToPlaylist { request_id: u64, video_id: String, playlist_id: String },
     Search {
         request_id: PageRequestId,
         query: String,
@@ -181,6 +185,9 @@ pub enum Request {
 }
 
 pub enum Response {
+    Rating { request_id: u64, video_id: String, changed: bool, result: Result<bool, String> },
+    Playlists { request_id: u64, choices: Result<Vec<super::library::Playlist>, String> },
+    PlaylistSaved { request_id: u64, result: Result<(), String> },
     Results {
         request_id: PageRequestId,
         tracks: Result<Vec<super::search::Item>, String>,
@@ -426,7 +433,11 @@ impl SourceWorker {
             }
             Request::RetryReports
             | Request::ClearReports => self.history_tx.send(req).context("history worker is gone"),
-            Request::OpenBrowse { .. }
+            Request::Rating { .. }
+            | Request::SetRating { .. }
+            | Request::Playlists { .. }
+            | Request::SaveToPlaylist { .. }
+            | Request::OpenBrowse { .. }
             | Request::Search { .. }
             | Request::OpenArtist { .. } => self
                 .metadata_tx
@@ -459,6 +470,10 @@ impl SourceWorker {
 /// would leave whoever hit it re-reading [`SourceWorker::send`] to guess.
 fn name(req: &Request) -> &'static str {
     match req {
+        Request::Rating { .. } => "Rating",
+        Request::SetRating { .. } => "SetRating",
+        Request::Playlists { .. } => "Playlists",
+        Request::SaveToPlaylist { .. } => "SaveToPlaylist",
         Request::Search { .. } => "Search",
         Request::Resolve { .. } => "Resolve",
         Request::Prefetch { .. } => "Prefetch",
@@ -808,6 +823,18 @@ fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
 
     while let Ok(req) = rx.recv() {
         let response = match req {
+            Request::Rating { request_id, video_id } => Some(Response::Rating {
+                request_id, result: super::library::rating(&http, &video_id).map_err(|e| e.to_string()), video_id, changed: false,
+            }),
+            Request::SetRating { request_id, video_id, liked } => Some(Response::Rating {
+                request_id, result: super::library::set_rating(&http, &video_id, liked).map_err(|e| e.to_string()), video_id, changed: true,
+            }),
+            Request::Playlists { request_id, video_id } => Some(Response::Playlists {
+                request_id, choices: super::library::playlists(&http, &video_id).map_err(|e| e.to_string()),
+            }),
+            Request::SaveToPlaylist { request_id, video_id, playlist_id } => Some(Response::PlaylistSaved {
+                request_id, result: super::library::save(&http, &video_id, &playlist_id).map_err(|e| e.to_string()),
+            }),
             Request::Search { request_id, query, limit, filter } => Some(Response::Results {
                 request_id, tracks: super::search::fetch(&http, &query, filter, limit)
                     .map_err(|error| format!("{error:#}")),

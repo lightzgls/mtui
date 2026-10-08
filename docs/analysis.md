@@ -160,6 +160,10 @@ Metadata, resolver, and audio clients now retain at most two idle connections pe
 
 YouTube Music can return only a top artist and songs in an unfiltered search response. Mixed search fills absent categories from the service's actual filtered endpoints and retains canonical browse routes. Home loads the first provider page promptly, then bounded continuation pages and real library, release, discovery, and chart sections. Both views keep their data and artwork bounded.
 
+Player account actions use the existing signed Music session and native InnerTube requests, with no additional resident browser or worker. A read-only check on 2026-10-08 returned two editable playlist choices and the current song's Like state. Current Music exposes `likeButtonRenderer` under `playerOverlays`, outside queue rows; match its target video ID before adopting that state. Mutation confirmation and timeout behavior are tested with scripted responses, without changing the user's real likes or playlists.
+
+Reference implementations: [ytmusicapi rating and playlist mutations](https://github.com/sigma67/ytmusicapi/tree/main/ytmusicapi/mixins), [YouTube.js playlist-option parser](https://github.com/LuanRT/YouTube.js/blob/main/src/parser/classes/PlaylistAddToOption.ts), and [Microsoft clipboard ownership](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-emptyclipboard).
+
 Continue from the existing TUI. Remove the GUI experiment, retain its product
 requirements where they describe useful music behavior, and implement those
 behaviors as testable TUI surfaces. The first engineering milestone is a clean,

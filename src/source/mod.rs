@@ -13,6 +13,7 @@ pub mod http;
 pub mod innertube;
 pub mod search;
 pub mod journal;
+pub mod library;
 pub mod lrclib;
 pub mod sapisid;
 pub mod stats;

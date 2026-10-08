@@ -13,6 +13,7 @@
 //! going into the background stops drawing, not playing.
 
 mod app;
+mod clipboard;
 mod art;
 mod config;
 mod console;
