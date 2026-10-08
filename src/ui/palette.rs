@@ -9,6 +9,7 @@ fn tint(level: u8, accent: (u8, u8, u8)) -> Color {
     Color::Rgb(channel(accent.0), channel(accent.1), channel(accent.2))
 }
 
+#[cfg(windows)]
 pub(super) fn background(cover: Option<&Cover>) -> (u8, u8, u8) {
     let Some(cover) = cover else {
         return (26, 26, 26);
