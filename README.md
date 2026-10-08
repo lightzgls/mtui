@@ -95,6 +95,19 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 Windows output: `target/release/mtui.exe`. Live network/account tests are ignored by default. See [requirements](docs/requirements.md), [analysis](docs/analysis.md), and [design](docs/design.md) for scope and architecture. Focused pull requests and bug reports are welcome.
 
+## Acknowledgments and references
+
+[Pear Desktop](https://github.com/pear-devs/pear-desktop) was the main inspiration for MTUI's listening experience. Thank you to the Pear Desktop team, and to the maintainers and contributors whose work supports this project:
+
+- [YouTube Music](https://music.youtube.com/) and [Spotify](https://open.spotify.com/) — references for browsing, navigation, and player layout.
+- [ytmusicapi](https://github.com/sigma67/ytmusicapi) and [YouTube.js](https://github.com/LuanRT/YouTube.js) — implementation references for YouTube Music requests, account actions, and playlist parsing.
+- [Lavalink YouTube Source](https://github.com/lavalink-devs/youtube-source) — a reference for playback reliability research.
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) — stream extraction fallback and PO-token support.
+- [LRCLIB](https://lrclib.net/) — community lyrics and synchronized timing fallback.
+- [Ratatui](https://ratatui.rs/) and [Crossterm](https://github.com/crossterm-rs/crossterm) — the terminal interface; [Rodio](https://github.com/RustAudio/rodio) and [Symphonia](https://github.com/pdeljanov/Symphonia) — native audio playback and decoding.
+- [Tokio](https://tokio.rs/), [Reqwest](https://github.com/seanmonstar/reqwest), [wry](https://github.com/tauri-apps/wry), and [tao](https://github.com/tauri-apps/tao) — background work, networking, and native sign-in.
+- [Best-README-Template](https://github.com/othneildrew/Best-README-Template) — the initial documentation structure.
+
 ## License
 
 [MIT](LICENSE). External playback tools have their own licenses, including the GPL-3.0 bgutil provider. MTUI is an unofficial personal project, unaffiliated with YouTube, Google, or Discord.
