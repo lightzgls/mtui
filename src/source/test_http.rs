@@ -18,6 +18,9 @@ pub(crate) fn serve(replies: Vec<(Vec<u8>, Duration)>) -> (String, thread::JoinH
                     }
                     Err(_) => return requests,
                 };
+                // Accepted sockets inherit the listener's nonblocking mode
+                // on some platforms. Reads must wait for incoming headers.
+                socket.set_nonblocking(false).unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 socket.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
                 let mut request = Vec::new();
@@ -55,6 +58,7 @@ fn cancelled_tcp_connections_do_not_consume_http_replies() {
     drop(std::net::TcpStream::connect(&address).unwrap());
     let mut socket = std::net::TcpStream::connect(&address).unwrap();
     socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    thread::sleep(Duration::from_millis(50));
     socket.write_all(b"GET /fixture HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
     let mut response = Vec::new();
     socket.read_to_end(&mut response).unwrap();
