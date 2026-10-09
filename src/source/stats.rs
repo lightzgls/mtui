@@ -89,11 +89,13 @@ impl Reporter {
             serde_json::to_vec(&tracking_body(&report.video_id, identity))?,
         );
         let (status, raw) = send(&self.http, request)?;
+        if status == 401 { crate::session::authentication_failed(cookies); }
         if status != 200 {
             bail!("Music refused the reporting player request: HTTP {status}");
         }
         let json: Value = serde_json::from_slice(&raw)?;
         if !authenticated_player(&json) {
+            if super::account::logged_in(&json) == Some(false) { crate::session::authentication_failed(cookies); }
             bail!("Music reporting session has expired; sign in again");
         }
         let tracking = parse_tracking(&json)?;
@@ -123,6 +125,7 @@ impl Reporter {
             authenticated(self.http.client().get(url), cookies, identity),
         )?;
         if !(200..300).contains(&status) {
+            if status == 401 { crate::session::authentication_failed(cookies); }
             bail!("Music refused listening telemetry: HTTP {status}");
         }
         Ok(())
@@ -138,9 +141,13 @@ impl Reporter {
                 .body(serde_json::to_vec(&body)?),
         )?;
         if status != 200 {
+            if status == 401 { crate::session::authentication_failed(cookies); }
             bail!("Music history verification failed: HTTP {status}");
         }
         let json: Value = serde_json::from_slice(&raw)?;
+        if super::account::logged_in(&json) == Some(false) {
+            crate::session::authentication_failed(cookies);
+        }
         if json.get("contents").is_none() {
             bail!("Music did not return account history; sign in again");
         }

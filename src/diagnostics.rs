@@ -119,7 +119,7 @@ fn clean_label(label: &str) -> String {
         .collect()
 }
 
-fn safe_message(message: &str) -> String {
+pub(crate) fn safe_message(message: &str) -> String {
     let lower = message.to_ascii_lowercase();
     if [
         "authorization:",

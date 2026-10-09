@@ -1206,6 +1206,7 @@ pub struct App {
     /// remembered level makes a second `m` restore exactly what was audible.
     muted: bool,
     volume_before_mute: f32,
+    volume_save: Option<(Instant, f32)>,
     /// Where the renderer wants the cover painted as real pixels, set on every
     /// frame the terminal-image path runs. `None` on the half-block path, which
     /// needs no help from the event loop.
@@ -1333,6 +1334,9 @@ pub struct App {
     listening: Option<(Track, Listening)>,
     /// Prevents repeated `M` presses from opening duplicate session imports.
     music_signing_in: bool,
+    automatic_sign_in: bool,
+    sign_in_prompted: bool,
+    session_renewal: crate::session::renewal::Renewal,
     account_request: u64,
     pending_save: Option<(u64, String)>,
 
@@ -1356,6 +1360,10 @@ pub struct App {
 
     player: Player,
     source: SourceWorker,
+}
+
+impl Drop for App {
+    fn drop(&mut self) { self.flush_volume(); }
 }
 
 /// A track being recovered mid-play, and where playback has to pick up.
@@ -1552,6 +1560,7 @@ impl App {
             output_device,
             muted,
             volume_before_mute,
+            volume_save: None,
             images: Vec::new(),
             painted: Vec::new(),
             painted_with_kitty: false,
@@ -1593,6 +1602,9 @@ impl App {
             queue_epoch: 0,
             seed_rotation: 0,
             music_signing_in: false,
+            automatic_sign_in: false,
+            sign_in_prompted: false,
+            session_renewal: crate::session::renewal::Renewal::default(),
             account_request: 0,
             pending_save: None,
             resuming: None,
@@ -2269,10 +2281,33 @@ impl App {
     /// so a cover and a resolve can land in the same frame and handling only
     /// the first would leave the other a frame stale.
     pub fn poll_source(&mut self) {
+        if self.volume_save.is_some_and(|(at, _)| at.elapsed() >= Duration::from_millis(250)) {
+            self.flush_volume();
+        }
         while let Some(response) = self.source.poll() {
             self.apply(response);
         }
         self.poll_player();
+        self.tick_session();
+    }
+
+    /// The same loop runs in the tray. Only the slow policy check touches disk;
+    /// browser startup and renewal remain on a separate, bounded worker.
+    fn tick_session(&mut self) {
+        if crate::session::take_authentication_failure() {
+            self.session_renewal.authentication_failed();
+        }
+        if self.music_signing_in
+            || matches!(&self.overlay, Overlay::SavePlaylist(picker) if picker.loading || picker.saving)
+            || self.pending_save.is_some()
+            || self.now.as_ref().is_some_and(|now| now.like_pending)
+            || !self.session_renewal.take_due()
+        { return; }
+        self.music_signing_in = true;
+        if self.source.send(Request::RenewMusicSession).is_err() {
+            self.music_signing_in = false;
+            crate::diagnostics::warn("auth", "could not queue automatic session renewal");
+        }
     }
 
     /// Answers what the player thread cannot do for itself.
@@ -2354,6 +2389,15 @@ impl App {
     }
 
     fn apply(&mut self, response: Response) {
+        let session_generation = match &response {
+            Response::CookiesImported { generation, .. }
+            | Response::MusicSignInFailed { generation, .. }
+            | Response::SessionRenewed { generation, .. } => Some(*generation),
+            _ => None,
+        };
+        if session_generation.is_some_and(|generation| generation != self.source.session_generation()) {
+            return;
+        }
         let page_request = match &response {
             Response::Results { request_id, .. }
             | Response::Browsed { request_id, .. }
@@ -2413,7 +2457,9 @@ impl App {
                 | Response::Comments { .. }
                 | Response::Home { .. }
                 | Response::HomeFailed { .. }
-                | Response::CookiesImported(_)
+                | Response::CookiesImported { .. }
+                | Response::MusicSignInFailed { .. }
+                | Response::SessionRenewed { .. }
         ) {
             self.busy = false;
         }
@@ -2481,13 +2527,17 @@ impl App {
                     self.home_scroll.push(0);
                 }
             }
-            Response::CookiesImported(browser) => {
+            Response::CookiesImported { browser, .. } => {
+                self.clear_account_actions();
                 // The page on screen was built without a session. There is a
                 // better one available now, so it is asked for again -- this is
                 // the whole point of doing the import in the background rather
                 // than holding the first frame back behind it.
                 self.status = format!("read your YouTube session from {browser}");
                 self.music_signing_in = false;
+                self.automatic_sign_in = false;
+                self.sign_in_prompted = false;
+                self.session_renewal.succeeded();
                 if matches!(self.overlay, Overlay::SignIn(SignIn::Music { .. })) {
                     self.overlay = Overlay::None;
                 }
@@ -2497,9 +2547,41 @@ impl App {
                 self.request_rating();
                 self.request_home();
             }
-            Response::MusicSignInFailed(msg) => {
+            Response::SessionRenewed { result, .. } => {
+                self.music_signing_in = false;
+                match result {
+                    Ok(()) => {
+                        self.sign_in_prompted = false;
+                        self.session_renewal.succeeded();
+                        crate::diagnostics::info("auth", "saved Music session renewed automatically");
+                        let _ = self.source.send(Request::RetryReports);
+                        if self.now.as_ref().is_none_or(|now| !now.like_pending) { self.request_rating(); }
+                    }
+                    Err(crate::session::RenewalFailure::SignInRequired) => {
+                        if !self.sign_in_prompted {
+                            self.sign_in_prompted = true;
+                            self.automatic_sign_in = true;
+                            self.music_signing_in = true;
+                            self.status = "Google needs verification—finish in the sign-in window.".into();
+                            if self.source.send(Request::MusicSignIn { recover: true }).is_err() {
+                                self.music_signing_in = false;
+                                self.automatic_sign_in = false;
+                            }
+                        }
+                    }
+                    Err(crate::session::RenewalFailure::Temporary(message)) => {
+                        crate::diagnostics::warn("auth", &format!("automatic renewal deferred: {message}"));
+                    }
+                }
+            }
+            Response::MusicSignInFailed { message: msg, .. } => {
                 crate::diagnostics::error("auth", "YouTube Music sign-in failed");
                 self.music_signing_in = false;
+                if self.automatic_sign_in {
+                    self.automatic_sign_in = false;
+                    self.status = "Google sign-in was not completed; automatic recovery will keep checking.".into();
+                    return;
+                }
                 self.status = msg.clone();
                 if matches!(self.overlay, Overlay::Settings) {
                     self.preferences.notice = Some((msg, true));
@@ -3755,6 +3837,7 @@ impl App {
     /// out everything already held or already asked for, so this is a no-op on
     /// all but the first frame after the view moves.
     pub fn want_art(&mut self, cards: Vec<(String, Option<String>)>) {
+        self.source.visible_art(cards.iter().filter(|(_,url)|url.is_some()).map(|(key,_)|key.clone()));
         let mut urls: std::collections::HashMap<_, _> = cards.iter()
             .filter_map(|(key, url)| Some((key.clone(), url.clone()?))).collect();
         let requests = self.art.want_visible(cards.iter()
@@ -5265,6 +5348,7 @@ impl App {
     }
 
     fn request_music_sign_in(&mut self, recover: bool) {
+        self.automatic_sign_in = false;
         self.music_signing_in = true;
         self.status = if recover {
             "renewing the saved YouTube Music session ...".to_string()
@@ -5285,6 +5369,9 @@ impl App {
 
     fn log_out_music(&mut self) {
         self.clear_account_actions();
+        self.music_signing_in = false;
+        self.automatic_sign_in = false;
+        self.sign_in_prompted = false;
         self.menu = None;
         // Clear the worker's in-memory copy even if removing credentials or
         // the durable outbox reports an error below.
@@ -5329,25 +5416,19 @@ impl App {
         if !self.muted {
             self.volume_before_mute = volume;
         }
-        let settings = config::Settings {
-            start_in_tray: self.start_in_tray,
-            icon_theme: self.icon_theme,
-            cover_style: self.cover_style,
-            image_renderer: self.image_renderer,
-            volume,
-            output_device: self.output_device.clone(),
-        };
-        self.status = match settings.save() {
-            Ok(()) if self.muted => "muted".to_string(),
-            Ok(()) => format!("volume {:.0}%", volume * 100.0),
-            Err(error) => {
-                crate::diagnostics::error("config", &format!("could not save volume: {error:#}"));
-                format!(
-                    "volume {:.0}%; could not save it: {error:#}",
-                    volume * 100.0
-                )
-            }
-        };
+        self.volume_save = Some((Instant::now(), volume));
+        self.status = if self.muted { "muted".into() } else { format!("volume {:.0}%", volume * 100.0) };
+    }
+
+    fn flush_volume(&mut self) {
+        let Some((_, volume)) = self.volume_save.take() else { return; };
+        let settings = config::Settings { start_in_tray: self.start_in_tray,
+            icon_theme: self.icon_theme, cover_style: self.cover_style,
+            image_renderer: self.image_renderer, volume, output_device: self.output_device.clone() };
+        if let Err(error) = settings.save() {
+            crate::diagnostics::error("config", &format!("could not save volume: {error:#}"));
+            self.status = "Could not save the volume setting.".into();
+        }
     }
 
     fn toggle_mute(&mut self) {
@@ -5567,7 +5648,7 @@ pub(crate) fn account_menu_items(connected: bool, signing_in: bool) -> Vec<MenuI
         items.push(MenuItem::action(
             "Log out of YouTube Music",
             None,
-            !signing_in,
+            true,
             None,
             MenuAction::LogOutMusic,
         ));
@@ -5749,7 +5830,8 @@ mod tests {
         assert!(connected[1].enabled);
 
         let pending = account_menu_items(true, true);
-        assert!(pending.iter().all(|item| !item.enabled));
+        assert!(!pending[0].enabled);
+        assert!(pending[1].enabled, "logout must remain available during renewal");
     }
 
     #[test]

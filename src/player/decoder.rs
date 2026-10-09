@@ -153,6 +153,24 @@ impl AacDecoder {
             return Ok(true);
         }
     }
+
+    fn advance_packet(&mut self) -> bool {
+        match self.fill_packet() {
+            Ok(true) => true,
+            result => {
+                if let Err(error) = result {
+                    crate::diagnostics::warn(
+                        "decoder",
+                        &format!("AAC decoding stopped: {error:#}"),
+                    );
+                }
+                self.samples.clear();
+                self.next_sample = 0;
+                self.ended = true;
+                false
+            }
+        }
+    }
 }
 
 impl Iterator for AacDecoder {
@@ -162,23 +180,16 @@ impl Iterator for AacDecoder {
         if self.ended {
             return None;
         }
-        if self.next_sample >= self.samples.len() {
-            match self.fill_packet() {
-                Ok(true) => {}
-                result => {
-                    if let Err(error) = result {
-                        crate::diagnostics::warn(
-                            "decoder",
-                            &format!("AAC decoding stopped: {error:#}"),
-                        );
-                    }
-                    self.ended = true;
-                    return None;
-                }
-            }
+        if self.next_sample >= self.samples.len() && !self.advance_packet() {
+            return None;
         }
         let sample = self.samples[self.next_sample];
         self.next_sample += 1;
+        // Rodio treats a zero-length span as EOF when skipping to the resume
+        // position. Load the next packet before exposing an exhausted span.
+        if self.next_sample == self.samples.len() {
+            self.advance_packet();
+        }
         Some(sample)
     }
 }
@@ -214,6 +225,7 @@ impl Source for AacDecoder {
         self.samples.clear();
         self.next_sample = 0;
         self.ended = false;
+        self.advance_packet();
         if let Some(base) = self.codec.codec_params().time_base {
             let delta =
                 Duration::from(base.calc_time(seeked.required_ts.saturating_sub(seeked.actual_ts)));
@@ -227,6 +239,10 @@ impl Source for AacDecoder {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "decoder_packets.rs"]
+mod packet_tests;
 
 #[cfg(test)]
 mod tests {

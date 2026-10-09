@@ -5,11 +5,17 @@
 //! potentially blocking work may run.
 
 pub mod artist;
+pub(crate) mod account;
 pub mod bootstrap;
+pub(crate) mod body;
+mod errors;
+#[cfg(test)]
+pub(crate) mod test_http;
 pub mod cover;
 pub mod collection;
 pub mod home;
 pub mod http;
+mod inbox;
 pub mod innertube;
 pub mod search;
 pub mod journal;

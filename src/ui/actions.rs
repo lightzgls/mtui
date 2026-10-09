@@ -191,7 +191,7 @@ pub(super) fn playlists(
             .take(list.height as usize)
         {
             let row = Rect::new(list.x, list.y + (index - offset) as u16, list.width, 1);
-            let suffix = if choice.contains { "  Saved" } else { "" };
+            let suffix = if choice.contains == Some(true) { "  Saved" } else { "" };
             let label = format!(
                 " {}{}",
                 truncate(
@@ -206,7 +206,7 @@ pub(super) fn playlists(
                     .bg(Color::Rgb(32, 32, 32))
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(if choice.contains {
+                Style::default().fg(if choice.contains == Some(true) {
                     Color::DarkGray
                 } else {
                     Color::White
@@ -269,7 +269,7 @@ mod tests {
                 .map(|i| crate::source::library::Playlist {
                     id: format!("p{i}"),
                     title: format!("Playlist {i} — evening favourites"),
-                    contains: i == 3,
+                    contains: Some(i == 3),
                 })
                 .collect(),
             loading: false,

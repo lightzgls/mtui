@@ -24,6 +24,8 @@ mod instance;
 mod kitty;
 mod player;
 mod session;
+#[path = "session/protocol.rs"]
+mod session_protocol;
 mod sixel;
 mod source;
 mod tray;
@@ -80,8 +82,8 @@ const IDLE_TICK: Duration = Duration::from_millis(500);
 
 fn main() -> Result<()> {
     #[cfg(windows)]
-    if let Some(recover) = session::helper_request() {
-        return session::run_helper(recover);
+    if let Some((recover, silent)) = session::helper_request() {
+        return session::run_helper(recover, silent);
     }
     #[cfg(windows)]
     if console::is_host() {

@@ -59,6 +59,8 @@ On first launch, MTUI downloads missing playback tools: yt-dlp, a supported Java
 
 Search and playback work without an account. Press **M** or open **Menu → Account & Sessions** to sign in for personalized Home, playlists, likes, and listening-history sync. YouTube account history must be enabled for history writes.
 
+Sign in once; MTUI maintains the saved session automatically, including in the tray. It renews every 48 hours and recovers early after authentication failures. Temporary failures retry quietly; a sign-in window appears only when Google requires verification.
+
 Settings and sessions live in `%APPDATA%\mtui`; downloaded tools live in `%LOCALAPPDATA%\mtui`. Upgrades preserve your data. See the [usage guide](docs/usage.md) for setup, troubleshooting, and Linux/macOS instructions.
 
 ## Controls

@@ -82,6 +82,7 @@ impl App {
             return;
         };
         now.like_pending = false;
+        if let Err(error) = &result { self.session_renewal.observe_error(error); }
         match result {
             Ok(liked) => {
                 now.liked = Some(liked);
@@ -200,6 +201,7 @@ impl App {
             return;
         }
         picker.loading = false;
+        if let Err(error) = &choices { self.session_renewal.observe_error(error); }
         match choices {
             Ok(choices) => {
                 picker.choices = choices;
@@ -221,7 +223,7 @@ impl App {
             return;
         };
         picker.selected = index;
-        if choice.contains {
+        if choice.contains == Some(true) {
             picker.notice = Some("This song is already saved here.".into());
             return;
         }
@@ -251,15 +253,20 @@ impl App {
             Ok(()) => format!("Saved to {title} on YouTube Music."),
             Err(error) => error.clone(),
         };
+        if let Err(error) = &result { self.session_renewal.observe_error(error); }
         self.pending_save = None;
         self.status = message.clone();
+        let mut liked_video = None;
         if let Overlay::SavePlaylist(picker) = &mut self.overlay
             && picker.request_id == request_id
         {
             picker.saving = false;
             if result.is_ok() {
                 if let Some(choice) = picker.choices.get_mut(picker.selected) {
-                    choice.contains = true;
+                    choice.contains = Some(true);
+                    if choice.id.strip_prefix("VL").unwrap_or(&choice.id) == "LM" {
+                        liked_video = Some(picker.video_id.clone());
+                    }
                 }
                 picker.notice = Some(message);
             } else {
@@ -267,9 +274,17 @@ impl App {
                 picker.notice = None;
             }
         }
+        if let Some(video_id) = liked_video {
+            let request_id = self.next_account_request();
+            if let Some(now) = self.now.as_mut().filter(|now|now.video_id == video_id && !now.like_pending) {
+                now.rating_request = request_id;
+                now.liked = Some(true);
+            }
+        }
     }
 
     pub(super) fn clear_account_actions(&mut self) {
+        self.source.invalidate_account();
         let request_id = self.next_account_request();
         self.pending_save = None;
         if let Some(now) = self.now.as_mut() {
@@ -483,7 +498,7 @@ mod tests {
             choices: vec![Playlist {
                 id: "p".into(),
                 title: "Evenings".into(),
-                contains: false,
+                contains: Some(false),
             }],
             loading: false,
             saving: true,
@@ -516,7 +531,7 @@ mod tests {
             picker.video_id, "first",
             "save remains bound to the chosen song"
         );
-        assert!(picker.choices[0].contains && !picker.saving);
+        assert!(picker.choices[0].contains == Some(true) && !picker.saving);
         app.clear_account_actions();
         assert!(app.pending_save.is_none() && !app.overlay.is_open());
         assert!(app.now.as_ref().unwrap().liked.is_none());

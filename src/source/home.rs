@@ -488,10 +488,17 @@ fn browse_endpoint_as(
 ) -> Result<Value> {
     let request = browse_request(http, cookies, endpoint, client_version)?;
     let (status, raw) = http.send(request)?;
+    if status == 401 && let Some(cookies) = cookies { crate::session::authentication_failed(cookies); }
     if !(200..300).contains(&status) {
-        bail!("YouTube Music refused the request: HTTP {status}");
+        let error = serde_json::from_slice::<Value>(&raw).ok();
+        bail!("{}", super::errors::message(status, error.as_ref().and_then(|json|json.get("error"))));
     }
-    Ok(serde_json::from_slice(&raw)?)
+    let json: Value = serde_json::from_slice(&raw)?;
+    if (json.pointer("/error/code").and_then(Value::as_u64) == Some(401)
+        || super::account::logged_in(&json) == Some(false))
+        && let Some(cookies) = cookies
+    { crate::session::authentication_failed(cookies); }
+    Ok(json)
 }
 
 fn browse_request(
@@ -531,10 +538,21 @@ fn post_as(
 ) -> Result<Value> {
     let request = post_request_as(http, url, cookies, client_version, extra)?;
     let (status, raw) = http.send(request)?;
-    if !(200..300).contains(&status) {
-        bail!("YouTube Music refused the request: HTTP {status}");
+    if status == 401 && let Some(cookies) = cookies {
+        crate::session::authentication_failed(cookies);
     }
-    Ok(serde_json::from_slice(&raw)?)
+    if !(200..300).contains(&status) {
+        let error = serde_json::from_slice::<Value>(&raw).ok();
+        bail!("{}", super::errors::message(status, error.as_ref().and_then(|json|json.get("error"))));
+    }
+    let json: Value = serde_json::from_slice(&raw)?;
+    if (json.pointer("/error/code").and_then(Value::as_u64) == Some(401)
+        || super::account::logged_in(&json) == Some(false))
+        && let Some(cookies) = cookies
+    {
+        crate::session::authentication_failed(cookies);
+    }
+    Ok(json)
 }
 
 pub(super) fn post_request_as(

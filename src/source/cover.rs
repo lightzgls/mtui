@@ -2,7 +2,7 @@
 //! actually draw.
 //!
 //! Two callers want different things from that sentence, and both are served
-//! here. [`fetch`] is the cover of the track that is playing: one picture, as
+//! here. [`fetch_cancellable`] is the cover of the track that is playing: one picture, as
 //! large as YouTube has it, found by video id. [`ArtFetcher`] is the landing
 //! page's card artwork: many small pictures, found by URL because an album
 //! sleeve has no id to derive one from, and kept small enough that a screenful
@@ -15,7 +15,7 @@
 //! runs, because a dozen tiles arriving at once is the one case where handshakes
 //! cost more than the pictures. Its doc comment makes that argument in full.
 //!
-//! What [`fetch`] shows is the *video* thumbnail, which for auto-generated
+//! What [`fetch_cancellable`] shows is the *video* thumbnail, which for auto-generated
 //! "Topic" uploads is the album art and for a music video is a frame from it.
 //! Card artwork is the real sleeve, because the feed says where it is.
 
@@ -40,6 +40,8 @@ const MAX_EDGE: u32 = 1280;
 /// Ceiling on the response body. A 1280x720 thumbnail runs 60-90 KB; anything
 /// wildly past that is not one, and buffering it would undo the point.
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_SOURCE_PIXELS: u64 = 4 * 1024 * 1024;
+const MAX_DECODE_BYTES: usize = 12 * 1024 * 1024;
 
 /// Per-channel distance at which two pixels count as the same colour when
 /// looking for padding bars. Generous, because JPEG does not keep a flat black
@@ -59,7 +61,7 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// Card tiles are requested in a burst and are never worth holding the whole
 /// visible page behind one slow CDN edge.
 const ART_TIMEOUT: Duration = Duration::from_secs(5);
-const ART_CONCURRENCY: usize = 16;
+const ART_CONCURRENCY: usize = 4;
 
 /// Thumbnail names to try, largest first.
 ///
@@ -199,7 +201,7 @@ fn accent_of(rgb: &[u8]) -> (u8, u8, u8) {
     const FLOOR: u8 = 24;
     const CEILING: u8 = 232;
 
-    let mut cells = vec![[0u32; 4]; STEPS * STEPS * STEPS];
+    let mut cells = vec![[0u64; 4]; STEPS * STEPS * STEPS];
     for px in rgb.chunks_exact(3) {
         let (r, g, b) = (px[0], px[1], px[2]);
         let high = r.max(g).max(b);
@@ -209,11 +211,11 @@ fn accent_of(rgb: &[u8]) -> (u8, u8, u8) {
         }
         // Plus one so a genuinely grey picture still elects a cell rather than
         // returning the fallback below with a perfectly good grey to hand.
-        let weight = u32::from(high - low) + 1;
+        let weight = u64::from(high - low) + 1;
         let cell = &mut cells[index(r, g, b, STEPS)];
-        cell[0] += u32::from(r) * weight;
-        cell[1] += u32::from(g) * weight;
-        cell[2] += u32::from(b) * weight;
+        cell[0] += u64::from(r) * weight;
+        cell[1] += u64::from(g) * weight;
+        cell[2] += u64::from(b) * weight;
         cell[3] += weight;
     }
 
@@ -257,11 +259,12 @@ fn lift((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
 
 /// Fetches and decodes the thumbnail for a YouTube video id, taking the largest
 /// size that upload actually has.
-pub fn fetch(video_id: &str) -> Result<Cover> {
+pub fn fetch_cancellable(video_id: &str, cancel: Option<&super::http::Cancellation>) -> Result<Cover> {
     let deadline = Instant::now() + TIMEOUT;
     let mut last = None;
 
     for name in SIZES {
+        if cancel.is_some_and(|cancel| !cancel.active()) { bail!("thumbnail request was superseded"); }
         // A missing size answers 404 in milliseconds, so the ladder normally
         // costs nothing; this only bites when the CDN is unreachable, and then
         // it stops rather than spending the budget again on the next name.
@@ -272,7 +275,7 @@ pub fn fetch(video_id: &str) -> Result<Cover> {
         // Decode failures fall through with the fetch failures: a truncated or
         // otherwise unreadable JPEG at one size says nothing about the next,
         // and there is a smaller copy of the same picture right below it.
-        match get(&url(video_id, name), left).and_then(|body| decode(&body, MAX_EDGE)) {
+        match get(&url(video_id, name), left, cancel).and_then(|body| decode(&body, MAX_EDGE)) {
             Ok(cover) => return Ok(cover),
             Err(e) => last = Some(e),
         }
@@ -356,7 +359,7 @@ impl ArtFetcher {
     }
 }
 
-fn get(url: &str, timeout: Duration) -> Result<Vec<u8>> {
+fn get(url: &str, timeout: Duration, cancel: Option<&super::http::Cancellation>) -> Result<Vec<u8>> {
     // A current-thread runtime, built for this one request and dropped with it.
     // The worker thread blocks on the request anyway, so there is nothing for a
     // resident reactor to do between tracks.
@@ -365,7 +368,11 @@ fn get(url: &str, timeout: Duration) -> Result<Vec<u8>> {
         .build()
         .context("could not start a runtime for the thumbnail fetch")?;
 
-    runtime.block_on(read(&reqwest::Client::new(), url, timeout))
+    let client = reqwest::Client::new();
+    runtime.block_on(async {
+        let task = read(&client, url, timeout);
+        if let Some(cancel) = cancel { cancel.run(task).await } else { task.await }
+    })
 }
 
 /// One GET, bounded in both time and size. Shared by the per-track cover and
@@ -378,17 +385,8 @@ async fn read(client: &reqwest::Client, url: &str, timeout: Duration) -> Result<
         .await?
         .error_for_status()?;
 
-    // Checked before and after reading: a server may not send a length, and one
-    // that does may be lying about it.
-    if response.content_length().is_some_and(|n| n > MAX_BYTES) {
-        bail!("thumbnail is implausibly large");
-    }
-    let body = response.bytes().await?;
-    if body.len() as u64 > MAX_BYTES {
-        bail!("thumbnail is implausibly large");
-    }
-
-    Ok(body.to_vec())
+    super::body::read(response, MAX_BYTES as usize).await
+        .context("thumbnail is implausibly large or incomplete")
 }
 
 /// Decodes a JPEG, trims the padding YouTube fitted it into, centre-crops the
@@ -400,6 +398,17 @@ async fn read(client: &reqwest::Client, url: &str, timeout: Duration) -> Result<
 /// one -- see [`crate::art::EDGE`].
 fn decode(jpeg: &[u8], edge: u32) -> Result<Cover> {
     let mut decoder = jpeg_decoder::Decoder::new(jpeg);
+    decoder.read_info().context("thumbnail has no readable JPEG header")?;
+    let header = decoder.info().context("thumbnail carried no frame header")?;
+    if header.width == 0 || header.height == 0 || edge == 0 { bail!("thumbnail has zero extent"); }
+    if u64::from(header.width) * u64::from(header.height) > MAX_SOURCE_PIXELS {
+        bail!("thumbnail dimensions exceed the decoding budget");
+    }
+    let longest = u32::from(header.width.max(header.height)).max(1);
+    let target_width = (u32::from(header.width) * edge / longest).max(1).min(u32::from(header.width));
+    let target_height = (u32::from(header.height) * edge / longest).max(1).min(u32::from(header.height));
+    decoder.scale(target_width as u16, target_height as u16)?;
+    decoder.set_max_decoding_buffer_size(MAX_DECODE_BYTES);
     let pixels = decoder
         .decode()
         .context("thumbnail is not decodable JPEG")?;
@@ -427,9 +436,20 @@ fn decode(jpeg: &[u8], edge: u32) -> Result<Cover> {
     }
 
     let square = square_crop(trim_bars(width, height, &rgb));
-    let cropped = crop(width, &rgb, square.0, square.1, square.2, square.3);
+    let cropped = crop_owned(width, rgb, square.0, square.1, square.2, square.3);
     let side = square.2;
+    if side <= edge {
+        return Ok(Cover::build(side, side, cropped));
+    }
     Ok(shrink(side, side, &cropped, edge))
+}
+
+fn crop_owned(width: u32, mut rgb: Vec<u8>, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
+    if (x, y, w) == (0, 0, width) {
+        rgb.truncate((w * h * 3) as usize);
+        return rgb;
+    }
+    crop(width, &rgb, x, y, w, h)
 }
 
 fn square_crop((x, y, width, height): (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
@@ -687,6 +707,20 @@ mod tests {
     }
 
     #[test]
+    fn full_size_saturated_covers_do_not_overflow_the_palette() {
+        let pixels = [220, 100, 120].repeat(720 * 720);
+        assert_eq!(accent_of(&pixels), (220, 100, 120));
+    }
+
+    #[test]
+    fn oversized_dimensions_are_rejected_before_pixel_decoding() {
+        let header = [255,216,255,192,0,17,8,16,0,16,0,3,1,17,0,2,17,1,3,17,1,
+            255,218,0,12,3,1,0,2,17,3,17,0,63,0];
+        let error = decode(&header, MAX_EDGE).err().expect("4096 square must be rejected");
+        assert!(error.to_string().contains("dimensions"), "{error:#}");
+    }
+
+    #[test]
     fn artwork_is_centre_cropped_to_a_square() {
         assert_eq!(square_crop((0, 0, 16, 9)), (3, 0, 9, 9));
         assert_eq!(square_crop((2, 4, 8, 14)), (2, 7, 8, 8));
@@ -807,7 +841,7 @@ mod tests {
     #[test]
     #[ignore = "requires network access"]
     fn fetches_a_real_thumbnail() {
-        let cover = fetch("dQw4w9WgXcQ").expect("thumbnail should fetch and decode");
+        let cover = fetch_cancellable("dQw4w9WgXcQ", None).expect("thumbnail should fetch and decode");
         // Exact dimensions depend on how much padding this particular upload
         // arrives with, so assert the invariants instead. The lower bound is
         // the point of the ladder: anything under 720 on the long edge means a

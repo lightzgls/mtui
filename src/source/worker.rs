@@ -31,9 +31,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 
@@ -41,6 +41,8 @@ use super::artist::{self, ArtistPage};
 use super::cover::{self, Cover};
 use super::home::{self, Shelf};
 use super::http::Http;
+use super::account::Session;
+use super::inbox::{Inbox, Kind};
 use super::journal::Journal;
 use super::{ArtistRef, BrowseEndpoint, StreamUrl};
 use super::{lrclib, watch};
@@ -112,6 +114,8 @@ pub enum Request {
     MusicSignIn {
         recover: bool,
     },
+    /// Quiet, bounded renewal using the existing browser profile.
+    RenewMusicSession,
     /// Retries the durable playback outbox after a Music session is imported.
     RetryReports,
     /// Clears account-bound pending reports on explicit logout.
@@ -207,8 +211,9 @@ pub enum Response {
     /// The UI answers this by asking for the landing page again -- the page on
     /// screen was built without a cookie, and there is now a better one to be
     /// had.
-    CookiesImported(String),
-    MusicSignInFailed(String),
+    CookiesImported { generation: u64, browser: String },
+    MusicSignInFailed { generation: u64, message: String },
+    SessionRenewed { generation: u64, result: Result<(), crate::session::RenewalFailure> },
     /// Authenticated album or playlist contents, with their own page metadata.
     Browsed {
         request_id: PageRequestId,
@@ -295,16 +300,22 @@ pub enum Response {
 
 /// Handle to the worker threads. Both answer into one response channel, so the
 /// UI drains a single queue regardless of which thread did the work.
+struct AccountWork {
+    request: Request,
+    session: Session,
+}
+
 pub struct SourceWorker {
     tx: Sender<Request>,
-    cover_tx: Sender<Request>,
-    metadata_tx: Sender<Request>,
+    cover_tx: Arc<Inbox>,
+    metadata_tx: Arc<Inbox>,
+    account_tx: SyncSender<AccountWork>,
+    account_generation: Arc<AtomicU64>,
     history_tx: Sender<Request>,
-    page_tx: Sender<Request>,
-    art_tx: Sender<Request>,
+    page_tx: Arc<Inbox>,
+    art_tx: Arc<Inbox>,
     /// Kept so a sign-in thread can be handed somewhere to answer. Sign-in is
-    /// spawned on demand rather than kept resident: it runs at most once a
-    /// session and would otherwise be a thread asleep for the whole run.
+    /// spawned on demand rather than kept resident, including scheduled renewal.
     res_tx: Sender<Response>,
     rx: Receiver<Response>,
     /// How many resolves have been asked for. The source thread counts the ones
@@ -319,17 +330,24 @@ pub struct SourceWorker {
 impl SourceWorker {
     pub fn spawn(yt: YouTube) -> Result<Self> {
         let (req_tx, req_rx) = channel::<Request>();
-        let (cover_req_tx, cover_req_rx) = channel::<Request>();
-        let (metadata_req_tx, metadata_req_rx) = channel::<Request>();
+        let cover_req_tx = Inbox::new(Kind::Cover);
+        let cover_req_rx = cover_req_tx.clone();
+        let metadata_req_tx = Inbox::new(Kind::Browse);
+        let metadata_req_rx = metadata_req_tx.clone();
+        let (account_tx, account_rx) = sync_channel::<AccountWork>(32);
+        let account_generation = Arc::new(AtomicU64::new(0));
         let (history_req_tx, history_req_rx) = channel::<Request>();
-        let (page_req_tx, page_req_rx) = channel::<Request>();
-        let (art_req_tx, art_req_rx) = channel::<Request>();
+        let page_req_tx = Inbox::new(Kind::Panels);
+        let page_req_rx = page_req_tx.clone();
+        let art_req_tx = Inbox::new(Kind::Artwork);
+        let art_req_rx = art_req_tx.clone();
         let (complete_tx, complete_rx) = channel::<CompletionRequest>();
         let (res_tx, res_rx) = channel::<Response>();
         let resolves = Arc::new(AtomicU64::new(0));
         let thread_resolves = Arc::clone(&resolves);
         let cover_res_tx = res_tx.clone();
         let metadata_res_tx = res_tx.clone();
+        let account_res_tx = res_tx.clone();
         let page_res_tx = res_tx.clone();
         let art_res_tx = res_tx.clone();
         let spawn_res_tx = res_tx.clone();
@@ -358,6 +376,11 @@ impl SourceWorker {
             .context("failed to spawn metadata worker")?;
 
         thread::Builder::new()
+            .name("mtui-account".to_string())
+            .spawn(move || run_accounts(account_rx, account_res_tx))
+            .context("failed to spawn account worker")?;
+
+        thread::Builder::new()
             .name("mtui-history".to_string())
             .spawn(move || super::history::run(history_req_rx))
             .context("failed to spawn history worker")?;
@@ -376,6 +399,8 @@ impl SourceWorker {
             tx: req_tx,
             cover_tx: cover_req_tx,
             metadata_tx: metadata_req_tx,
+            account_tx,
+            account_generation,
             history_tx: history_req_tx,
             page_tx: page_req_tx,
             art_tx: art_req_tx,
@@ -420,7 +445,12 @@ impl SourceWorker {
                 Ok(())
             }
             Request::MusicSignIn { recover } => {
-                spawn_music_sign_in(self.res_tx.clone(), recover);
+                self.invalidate_account();
+                spawn_music_sign_in(self.res_tx.clone(), recover, self.account_generation.clone());
+                Ok(())
+            }
+            Request::RenewMusicSession => {
+                spawn_session_renewal(self.res_tx.clone(), self.account_generation.clone());
                 Ok(())
             }
             Request::Watch { .. }
@@ -436,8 +466,12 @@ impl SourceWorker {
             Request::Rating { .. }
             | Request::SetRating { .. }
             | Request::Playlists { .. }
-            | Request::SaveToPlaylist { .. }
-            | Request::OpenBrowse { .. }
+            | Request::SaveToPlaylist { .. } => {
+                let session = Session::capture(self.account_generation.clone())?;
+                self.account_tx.try_send(AccountWork { request: req, session })
+                    .map_err(|_| anyhow::anyhow!("account worker is busy or unavailable; try again shortly"))
+            }
+            Request::OpenBrowse { .. }
             | Request::Search { .. }
             | Request::OpenArtist { .. } => self
                 .metadata_tx
@@ -446,6 +480,15 @@ impl SourceWorker {
             _ => self.tx.send(req).context("source worker is gone"),
         }
     }
+
+    /// Invalidates account actions queued before a logout or session refresh.
+    pub fn invalidate_account(&self) {
+        self.account_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn session_generation(&self) -> u64 { self.account_generation.load(Ordering::SeqCst) }
+
+    pub fn visible_art(&self, keys: impl Iterator<Item=String>) { self.art_tx.visible_art(keys); }
 
     /// Non-blocking poll, called once per UI frame. `None` means nothing new.
     ///
@@ -481,6 +524,7 @@ fn name(req: &Request) -> &'static str {
         Request::Art { .. } => "Art",
         Request::PersonalHome { .. } => "PersonalHome",
         Request::MusicSignIn { .. } => "MusicSignIn",
+        Request::RenewMusicSession => "RenewMusicSession",
         Request::RetryReports => "RetryReports",
         Request::ClearReports => "ClearReports",
         Request::OpenBrowse { .. } => "OpenBrowse",
@@ -497,11 +541,13 @@ fn name(req: &Request) -> &'static str {
 
 impl Drop for SourceWorker {
     fn drop(&mut self) {
+        self.invalidate_account();
         let _ = self.tx.send(Request::Shutdown);
         let _ = self.cover_tx.send(Request::Shutdown);
         let _ = self.metadata_tx.send(Request::Shutdown);
         let _ = self.history_tx.send(Request::Shutdown);
         let _ = self.page_tx.send(Request::Shutdown);
+        let _ = self.art_tx.send(Request::Shutdown);
         // Only the source thread is joined. The cover thread may be most of a
         // ten-second timeout into a fetch, and making the user wait that out to
         // quit -- for a picture that is already off screen -- would be absurd.
@@ -797,44 +843,73 @@ fn spawn_personal_home(tx: Sender<Response>, generation: u64) {
     }
 }
 
-fn spawn_music_sign_in(tx: Sender<Response>, recover: bool) {
+fn spawn_music_sign_in(tx: Sender<Response>, recover: bool, generation: Arc<AtomicU64>) {
+    let expected = generation.load(Ordering::SeqCst);
     let report = tx.clone();
     if thread::Builder::new()
         .name("mtui-music-signin".to_string())
         .spawn(move || {
-            let response = match crate::session::sign_in(recover) {
-                Ok(browser) => Response::CookiesImported(browser),
-                Err(err) => Response::MusicSignInFailed(format!("{err:#}")),
+            let response = match crate::session::sign_in(recover, &generation, expected) {
+                Ok(browser) => Response::CookiesImported { generation: expected, browser },
+                Err(err) => Response::MusicSignInFailed { generation: expected, message: format!("{err:#}") },
             };
             let _ = tx.send(response);
         })
         .is_err()
     {
-        let _ = report.send(Response::MusicSignInFailed(
-            "could not start the YouTube Music sign-in window".to_string(),
-        ));
+        let _ = report.send(Response::MusicSignInFailed {
+            generation: expected, message: "could not start the YouTube Music sign-in window".to_string(),
+        });
     }
 }
 
-fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
+fn spawn_session_renewal(tx: Sender<Response>, generation: Arc<AtomicU64>) {
+    let expected = generation.load(Ordering::SeqCst);
+    let report = tx.clone();
+    if thread::Builder::new().name("mtui-session-renewal".into()).spawn(move || {
+        let result = crate::session::renew(&generation, expected)
+            .map_err(|error| crate::session::classify_renewal_failure(format!("{error:#}")));
+        let _ = tx.send(Response::SessionRenewed { generation: expected, result });
+    }).is_err() {
+        let _ = report.send(Response::SessionRenewed {
+            generation: expected, result: Err(crate::session::RenewalFailure::Temporary("could not start automatic session renewal".into())),
+        });
+    }
+}
+
+fn run_accounts(rx: Receiver<AccountWork>, tx: Sender<Response>) {
     let Ok(http) = Http::new() else {
         return;
     };
 
-    while let Ok(req) = rx.recv() {
-        let response = match req {
+    while let Ok(work) = rx.recv() {
+        let response = match work.request {
             Request::Rating { request_id, video_id } => Some(Response::Rating {
-                request_id, result: super::library::rating(&http, &video_id).map_err(|e| e.to_string()), video_id, changed: false,
+                request_id, result: super::library::read_rating(&http, &work.session, &video_id).map_err(|e| e.to_string()), video_id, changed: false,
             }),
             Request::SetRating { request_id, video_id, liked } => Some(Response::Rating {
-                request_id, result: super::library::set_rating(&http, &video_id, liked).map_err(|e| e.to_string()), video_id, changed: true,
+                request_id, result: super::library::set_rating_for(&http, &work.session, &video_id, liked).map_err(|e| e.to_string()), video_id, changed: true,
             }),
             Request::Playlists { request_id, video_id } => Some(Response::Playlists {
-                request_id, choices: super::library::playlists(&http, &video_id).map_err(|e| e.to_string()),
+                request_id, choices: super::library::read_playlists(&http, &work.session, &video_id).map_err(|e| e.to_string()),
             }),
             Request::SaveToPlaylist { request_id, video_id, playlist_id } => Some(Response::PlaylistSaved {
-                request_id, result: super::library::save(&http, &video_id, &playlist_id).map_err(|e| e.to_string()),
+                request_id, result: super::library::save_for(&http, &work.session, &video_id, &playlist_id).map_err(|e| e.to_string()),
             }),
+            other => {
+                debug_assert!(false, "{} was routed to the account thread", name(&other));
+                None
+            }
+        };
+        if response.is_some_and(|response| tx.send(response).is_err()) { break; }
+    }
+}
+
+fn run_metadata(rx: Arc<Inbox>, tx: Sender<Response>) {
+    let Ok(mut http) = Http::new() else { return; };
+    while let Some(work) = rx.recv() {
+        http.set_cancellation(work.cancel.clone());
+        let response = match work.request {
             Request::Search { request_id, query, limit, filter } => Some(Response::Results {
                 request_id, tracks: super::search::fetch(&http, &query, filter, limit)
                     .map_err(|error| format!("{error:#}")),
@@ -861,10 +936,12 @@ fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
                 None
             }
         };
+        if work.cancel.is_some_and(|cancel| !cancel.active()) { continue; }
         if response.is_some_and(|response| tx.send(response).is_err()) {
             break;
         }
     }
+
 }
 
 /// Fetches the panels of the player page.
@@ -873,17 +950,18 @@ fn run_metadata(rx: Receiver<Request>, tx: Sender<Response>) {
 /// [`Response::Failed`]: these arrive beside music that is already playing, and
 /// a lyrics fetch that came back empty is a fact about the track, not an error
 /// worth taking the status line away from what is playing.
-fn run_pages(rx: Receiver<Request>, tx: Sender<Response>) {
+fn run_pages(rx: Arc<Inbox>, tx: Sender<Response>) {
     // Built once, so the connection pool and TLS session survive between
     // tracks -- the same argument `InnerTube` makes for its client.
     // Without it there is nothing this thread can do, so it stops rather than
     // answering every request with the same failure.
-    let Ok(http) = Http::new() else {
+    let Ok(mut http) = Http::new() else {
         return;
     };
 
-    while let Ok(req) = rx.recv() {
-        let response = match req {
+    while let Some(work) = rx.recv() {
+        http.set_cancellation(work.cancel.clone());
+        let response = match work.request {
             Request::Watch { video_id } => Response::Watch {
                 watch: Box::new(watch::fetch(&http, &video_id).map_err(|e| format!("{e:#}"))),
                 video_id,
@@ -935,6 +1013,7 @@ fn run_pages(rx: Receiver<Request>, tx: Sender<Response>) {
             }
         };
 
+        if work.cancel.is_some_and(|cancel| !cancel.active()) { continue; }
         if tx.send(response).is_err() {
             break;
         }
@@ -998,9 +1077,9 @@ fn lyrics(
     }
 }
 
-fn run_covers(rx: Receiver<Request>, tx: Sender<Response>) {
-    while let Ok(req) = rx.recv() {
-        let id = match req {
+fn run_covers(rx: Arc<Inbox>, tx: Sender<Response>) {
+    while let Some(work) = rx.recv() {
+        let id = match work.request {
             Request::Cover { id } => id,
             Request::Shutdown => break,
             // Routed elsewhere by `send`; reaching here would mean that routing
@@ -1019,9 +1098,10 @@ fn run_covers(rx: Receiver<Request>, tx: Sender<Response>) {
         // with an error the user can do nothing about. The UI renders no cover
         // pane and says nothing.
         let response = Response::Cover {
-            art: cover::fetch(&id).ok(),
+            art: cover::fetch_cancellable(&id, work.cancel.as_ref()).ok(),
             id,
         };
+        if work.cancel.is_some_and(|cancel| !cancel.active()) { continue; }
         if tx.send(response).is_err() {
             break;
         }
@@ -1041,15 +1121,15 @@ fn run_covers(rx: Receiver<Request>, tx: Sender<Response>) {
 /// cards without pictures, which is what the renderer does anyway until they
 /// arrive -- so the thread answers every request with `None` rather than
 /// exiting, which would silently strand the requests in the channel.
-fn run_art(rx: &Receiver<Request>, tx: &Sender<Response>) {
+fn run_art(rx: &Arc<Inbox>, tx: &Sender<Response>) {
     let fetcher = cover::ArtFetcher::new();
     if let Err(e) = &fetcher {
         debug_assert!(false, "could not start the artwork fetcher: {e:#}");
     }
 
-    while let Ok(req) = rx.recv() {
+    while let Some(work) = rx.recv() {
         let mut batch = Vec::new();
-        match req {
+        match work.request {
             Request::Art { key, url } => batch.push((key, url)),
             Request::Shutdown => break,
             other => {
@@ -1061,15 +1141,15 @@ fn run_art(rx: &Receiver<Request>, tx: &Sender<Response>) {
         // The renderer sends one bounded visible screen at a time. Drain that
         // burst so one slow image cannot sit in front of every card after it.
         let mut shutting_down = false;
-        while batch.len() < crate::art::CAPACITY {
-            match rx.recv_timeout(Duration::from_millis(2)) {
-                Ok(Request::Art { key, url }) => batch.push((key, url)),
-                Ok(Request::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
+        while batch.len() < 4 {
+            match rx.try_recv().map(|work|work.request) {
+                Some(Request::Art { key, url }) => batch.push((key, url)),
+                Some(Request::Shutdown) => {
                     shutting_down = true;
                     break;
                 }
-                Err(RecvTimeoutError::Timeout) => break,
-                Ok(other) => debug_assert!(false, "{} was routed to the art thread", name(&other)),
+                None => break,
+                Some(other) => debug_assert!(false, "{} was routed to the art thread", name(&other)),
             }
         }
 

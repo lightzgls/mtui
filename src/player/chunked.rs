@@ -282,8 +282,23 @@ fn is_transient(status: Option<StatusCode>, error: &reqwest::Error) -> bool {
         Some(status) => transient_status(status),
         // No response at all: a connect failure, a timeout, or a body that
         // stopped part way. All worth one more try.
-        None => error.is_timeout() || error.is_connect() || error.is_request(),
+        None => error.is_timeout() || error.is_connect() || error.is_request()
+            || interrupted_body(error),
     }
+}
+
+fn interrupted_body(error: &reqwest::Error) -> bool {
+    let mut cause: Option<&(dyn Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if let Some(io) = current.downcast_ref::<std::io::Error>()
+            && matches!(io.kind(), std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe) {
+            return true;
+        }
+        cause = current.source();
+    }
+    false
 }
 
 /// The half of [`is_transient`] that depends only on what the server said.
@@ -430,13 +445,13 @@ impl Client for ChunkedClient {
         end: Option<u64>,
     ) -> Result<Self::Response, Self::Error> {
         // The trait's `end` is inclusive; ours is exclusive.
-        self.fetch(url, start, end.map(|e| e + 1)).await
+        self.fetch(url, start, end.map(|e| e.saturating_add(1))).await
     }
 }
 
 impl ClientResponse for ChunkedResponse {
     type ResponseError = ChunkedError;
-    type StreamError = reqwest::Error;
+    type StreamError = ChunkedError;
     type Headers = HeaderMap;
 
     fn content_length(&self) -> Option<u64> {
@@ -458,6 +473,11 @@ impl ClientResponse for ChunkedResponse {
     fn into_result(self) -> Result<Self, Self::ResponseError> {
         let status = self.first.status();
         if status.is_success() {
+            if self.partial {
+                checked_range(self.first.headers(), self.start, chunk_end(self.start, self.limit))?;
+            } else if status != StatusCode::OK {
+                return Err(ChunkedError(format!("unexpected audio status: HTTP {status}")));
+            }
             Ok(self)
         } else {
             Err(ChunkedError(format!("chunk request failed: HTTP {status}")))
@@ -478,11 +498,44 @@ impl ClientResponse for ChunkedResponse {
             ..
         } = self;
 
-        let head = first.bytes_stream();
+        let first_length = if partial {
+            checked_range(first.headers(), start, chunk_end(start, limit)).ok()
+        } else { None };
+        let head = first.bytes_stream().map(|item| item.map_err(|e| ChunkedError(e.to_string())));
         if !partial {
-            // Server ignored the range; this one body is everything.
-            return Box::new(Box::pin(head));
+            // A full response always starts at byte zero, even on reconnect.
+            // Discard its prefix incrementally rather than splicing it into
+            // the stream or collecting the entire file in memory.
+            let full = stream::unfold((Box::pin(head), start, limit.map(|end| end.saturating_sub(start))),
+                |(mut incoming, mut skip, mut remaining)| async move {
+                    while remaining != Some(0) {
+                        let item = incoming.next().await?;
+                        let bytes = match item {
+                            Ok(bytes) => bytes,
+                            Err(error) => return Some((Err(error), (incoming, 0, Some(0)))),
+                        };
+                        let discard = skip.min(bytes.len() as u64) as usize;
+                        skip -= discard as u64;
+                        let available = bytes.len() - discard;
+                        let take = remaining.map_or(available, |n| n.min(available as u64) as usize);
+                        if take == 0 { continue; }
+                        if let Some(left) = remaining.as_mut() { *left -= take as u64; }
+                        return Some((Ok(bytes.slice(discard..discard + take)), (incoming, skip, remaining)));
+                    }
+                    None
+                });
+            return Box::new(Box::pin(full));
         }
+
+        let head = head.scan(0u64, move |count, item| {
+            let item = item.and_then(|bytes| {
+                *count += bytes.len() as u64;
+                if first_length.is_some_and(|length| *count > length) {
+                    Err(ChunkedError("audio range body exceeded its advertised extent".into()))
+                } else { Ok(bytes) }
+            });
+            futures_util::future::ready(Some(item))
+        });
 
         // The next chunk resumes from what the head *delivered*, never from the
         // end of the range that was asked for. A server may answer a 256 KB
@@ -591,7 +644,7 @@ enum Chunk {
     /// Every attempt failed. `status` is what the server said, when it said
     /// anything.
     Failed {
-        error: reqwest::Error,
+        error: ChunkedError,
         status: Option<StatusCode>,
     },
 }
@@ -625,6 +678,16 @@ async fn fetch_chunk(client: &reqwest::Client, url: &reqwest::Url, start: u64, e
                 }
 
                 let status = response.status();
+                if status == StatusCode::PARTIAL_CONTENT {
+                    if let Err(error) = checked_range(response.headers(), start, end) {
+                        return Chunk::Failed { error, status: Some(status) };
+                    }
+                } else if status.is_success() && status != StatusCode::OK {
+                    return Chunk::Failed {
+                        error: ChunkedError(format!("unexpected audio status: HTTP {status}")),
+                        status: Some(status),
+                    };
+                }
                 // Any other refusal is a failure, and is neither data nor an
                 // end. What comes back is an error page: handing its body on
                 // would splice it into the AAC bitstream, and taking an empty
@@ -633,10 +696,17 @@ async fn fetch_chunk(client: &reqwest::Client, url: &reqwest::Url, start: u64, e
                 // stopped at 1:05 with nothing reported anywhere.
                 match response.error_for_status() {
                     Err(e) => Err((Some(status), e)),
-                    Ok(response) => match response.bytes().await {
+                    Ok(response) => match read_chunk(response, start, end).await {
                         // A body that stopped part way through. The status was
                         // fine, so the fault is in transport, not in the URL.
-                        Err(e) => Err((None, e)),
+                        Err(ChunkReadError::Http(e)) => Err((None, e)),
+                        Err(ChunkReadError::Incomplete(error)) => {
+                            if attempt + 1 == CHUNK_ATTEMPTS { return Chunk::Failed { error, status: None }; }
+                            tokio::time::sleep(backoff).await;
+                            backoff *= 2;
+                            continue;
+                        }
+                        Err(ChunkReadError::Protocol(error)) => return Chunk::Failed { error, status: Some(status) },
                         Ok(bytes) if bytes.is_empty() => return Chunk::End,
                         Ok(bytes) => Ok(bytes),
                     },
@@ -649,7 +719,7 @@ async fn fetch_chunk(client: &reqwest::Client, url: &reqwest::Url, start: u64, e
             Err((status, error)) => {
                 let last = attempt + 1 == CHUNK_ATTEMPTS;
                 if last || !is_transient(status, &error) {
-                    return Chunk::Failed { error, status };
+                    return Chunk::Failed { error: ChunkedError(error.to_string()), status };
                 }
                 // Cheap against a ring buffer that holds ~30s, and the whole
                 // budget here is under a second.
@@ -660,6 +730,53 @@ async fn fetch_chunk(client: &reqwest::Client, url: &reqwest::Url, start: u64, e
     }
 
     unreachable!("the loop returns on its final attempt")
+}
+
+enum ChunkReadError {
+    Http(reqwest::Error),
+    Protocol(ChunkedError),
+    Incomplete(ChunkedError),
+}
+
+async fn read_chunk(mut response: reqwest::Response, start: u64, end: u64) -> Result<Bytes, ChunkReadError> {
+    let partial = response.status() == StatusCode::PARTIAL_CONTENT;
+    let expected = if partial {
+        checked_range(response.headers(), start, end).map_err(ChunkReadError::Protocol)?
+    } else { end - start + 1 };
+    let mut skip = if partial { 0 } else { start };
+    let mut bytes = Vec::with_capacity(expected.min(CHUNK_BYTES) as usize);
+    while let Some(chunk) = response.chunk().await.map_err(ChunkReadError::Http)? {
+        let discard = skip.min(chunk.len() as u64) as usize;
+        skip -= discard as u64;
+        let available = chunk.len() - discard;
+        let remaining = expected as usize - bytes.len();
+        if partial && available > remaining {
+            return Err(ChunkReadError::Protocol(ChunkedError("audio range body exceeded its advertised extent".into())));
+        }
+        let take = available.min(remaining);
+        bytes.extend_from_slice(&chunk[discard..discard + take]);
+        if !partial && bytes.len() == expected as usize { break; }
+    }
+    if partial && bytes.len() as u64 != expected {
+        return Err(ChunkReadError::Incomplete(ChunkedError("audio range body was incomplete".into())));
+    }
+    Ok(Bytes::from(bytes))
+}
+
+fn checked_range(headers: &HeaderMap, start: u64, end: u64) -> Result<u64, ChunkedError> {
+    let parsed = headers.get(CONTENT_RANGE).and_then(|v|v.to_str().ok())
+        .and_then(|v|v.strip_prefix("bytes "))
+        .and_then(|v|v.split_once('/'))
+        .and_then(|(range,total)| {
+            let (first,last) = range.split_once('-')?;
+            Some((first.parse::<u64>().ok()?, last.parse::<u64>().ok()?,
+                if total == "*" { None } else { Some(total.parse::<u64>().ok()?) }))
+        });
+    match parsed {
+        Some((first,last,total)) if first == start && last >= first && last <= end
+            && total.is_none_or(|total|last < total) => Ok(last - first + 1),
+        _ => Err(ChunkedError("server returned an invalid audio byte range".into())),
+    }
 }
 
 /// Walking state for the chunk sequence.
@@ -882,6 +999,58 @@ mod tests {
         assert_eq!(chunk_end(0, Some(1000)), 999);
         // A limit past the chunk size does not widen the chunk.
         assert_eq!(chunk_end(0, Some(CHUNK_BYTES * 4)), CHUNK_BYTES - 1);
+    }
+
+    #[test]
+    fn full_responses_after_a_range_do_not_duplicate_audio_bytes() {
+        use crate::source::test_http::{serve, immediate};
+        let (url, server) = serve(vec![
+            immediate(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/6\r\nContent-Length: 3\r\nConnection: close\r\n\r\nABC"),
+            immediate(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nABCDEF"),
+            immediate(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let bytes = runtime.block_on(async {
+            let client = ChunkedClient::with_link(StreamLink::default());
+            let response = Client::get(&client, &url.parse().unwrap()).await.unwrap().into_result().unwrap();
+            let mut incoming = ClientResponse::stream(response);
+            let mut bytes = Vec::new();
+            while let Some(part) = incoming.next().await { bytes.extend_from_slice(&part.unwrap()); }
+            bytes
+        });
+        assert_eq!(bytes, b"ABCDEF");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].contains("bytes=3-"));
+    }
+
+    #[test]
+    fn interrupted_bodies_retry_the_same_range_without_splicing_partial_data() {
+        use crate::source::test_http::{serve, immediate};
+        for broken in [
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6\r\nContent-Length: 3\r\nConnection: close\r\n\r\nD".as_slice(),
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nD\r\n0\r\n\r\n".as_slice(),
+        ] {
+            let (url, server) = serve(vec![immediate(broken), immediate(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6\r\nContent-Length: 3\r\nConnection: close\r\n\r\nDEF")]);
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let result = runtime.block_on(fetch_chunk(&reqwest::Client::builder().no_proxy().build().unwrap(), &url.parse().unwrap(), 3, 5));
+            match result {
+                Chunk::Data(bytes) => assert_eq!(bytes, b"DEF".as_slice()),
+                Chunk::Failed { error, status } => panic!("range retry failed: {error:?}, {status:?}"),
+                Chunk::End => panic!("range retry ended without audio"),
+            }
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests.iter().all(|request|request.contains("bytes=3-5")), "unexpected loopback requests: {requests:?}");
+        }
+    }
+
+    #[test]
+    fn mismatched_content_ranges_are_rejected() {
+        for header in ["bytes 0-5/6", "bytes 3-8/6", "bytes 3-2/6", "garbage"] {
+            assert!(checked_range(&headers_with(header), 3, 5).is_err());
+        }
+        assert_eq!(checked_range(&headers_with("bytes 3-5/6"), 3, 5).unwrap(), 3);
     }
 }
 

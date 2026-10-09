@@ -2,25 +2,29 @@
 
 #[path = "../session_helper.rs"]
 mod session_helper;
+#[path = "../session/protocol.rs"]
+mod session_protocol;
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
 const RECOVER_ARG: &str = "--recover-session";
+const SILENT_ARG: &str = "--silent-session-renewal";
 const PROFILE_ARG: &str = "--profile";
 
 fn main() -> Result<()> {
-    let (profile, recover) = arguments()?;
-    let header = session_helper::run(profile, recover)?;
+    let (profile, recover, silent) = arguments()?;
+    let header = session_helper::run(profile, recover, silent)?;
     println!("{header}");
     Ok(())
 }
 
-fn arguments() -> Result<(PathBuf, bool)> {
+fn arguments() -> Result<(PathBuf, bool, bool)> {
     let mut args = std::env::args_os().skip(1);
     let mut profile = None;
     let mut recover = false;
+    let mut silent = false;
     while let Some(arg) = args.next() {
         if arg == std::ffi::OsStr::new(PROFILE_ARG) {
             let value = args
@@ -29,12 +33,14 @@ fn arguments() -> Result<(PathBuf, bool)> {
             profile = Some(PathBuf::from(value));
         } else if arg == RECOVER_ARG {
             recover = true;
+        } else if arg == SILENT_ARG {
+            silent = true;
         } else {
             bail!("unknown sign-in helper argument: {}", arg.to_string_lossy());
         }
     }
     let profile = profile.context("the sign-in helper needs a profile path")?;
-    Ok((profile, recover))
+    Ok((profile, recover, silent))
 }
 
 #[cfg(test)]

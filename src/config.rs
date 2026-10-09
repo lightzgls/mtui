@@ -1,7 +1,7 @@
 //! On-disk configuration and the YouTube Music web session.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -175,10 +175,7 @@ impl Import {
         let path = dir.join(IMPORT_FILE);
 
         let body = serde_json::to_vec_pretty(self).context("could not encode the import")?;
-        fs::write(&path, body).with_context(|| format!("could not write {}", path.display()))?;
-        // This is a full account credential, so do not leave it world-readable.
-        restrict(&path)?;
-        Ok(())
+        write_atomic(&path, &body)
     }
 
     /// Forgets the session, so the next launch asks the user to sign in again.
@@ -261,7 +258,7 @@ impl Presence {
 
         let body = serde_json::to_vec_pretty(&Self { enabled })
             .context("could not encode the presence setting")?;
-        fs::write(&path, body).with_context(|| format!("could not write {}", path.display()))
+        write_atomic(&path, &body)
     }
 }
 
@@ -420,7 +417,7 @@ impl Settings {
         fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
         let path = dir.join(SETTINGS_FILE);
         let body = serde_json::to_vec_pretty(&self).context("could not encode settings")?;
-        fs::write(&path, body).with_context(|| format!("could not write {}", path.display()))
+        write_atomic(&path, &body)
     }
 }
 
@@ -432,6 +429,30 @@ fn normalize_volume(volume: f32) -> f32 {
     }
 }
 
+/// Publish a complete file in one rename, keeping the previous file on failure.
+pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut name = path.file_name().context("configuration file has no name")?.to_os_string();
+    name.push(format!(".tmp-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let temporary = path.with_file_name(name);
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_file(&self.0); } }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).with_context(||format!("could not prepare {}",path.display()))?;
+    let _cleanup = Cleanup(temporary.clone());
+    restrict(&temporary)?;
+    file.write_all(body)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, path).with_context(||format!("could not save {}",path.display()))
+}
+
 /// Pulls the value Google signs requests over out of a cookie header.
 ///
 /// `__Secure-3PAPISID` is accepted as well as `SAPISID`: a browser in a
@@ -441,7 +462,7 @@ fn sapisid(header: &str) -> Option<String> {
     let named = |name: &str| {
         header.split(';').find_map(|pair| {
             let (key, value) = pair.split_once('=')?;
-            (key.trim() == name).then(|| value.trim().to_string())
+            (key.trim() == name && !value.trim().is_empty()).then(|| value.trim().to_string())
         })
     };
     named("SAPISID").or_else(|| named("__Secure-3PAPISID"))
@@ -479,6 +500,39 @@ mod tests {
         // and not always `SAPISID`; they carry the same value for signing.
         let header = "YSC=def; __Secure-3PAPISID=SameValue; PREF=x";
         assert_eq!(sapisid(header).as_deref(), Some("SameValue"));
+    }
+
+    #[test]
+    fn blank_signing_cookies_are_skipped_and_blank_only_sessions_are_rejected() {
+        assert!(Cookies::from_header("SAPISID= ; __Secure-3PAPISID=").is_none());
+        assert_eq!(sapisid("SAPISID=; __Secure-3PAPISID=valid").as_deref(), Some("valid"));
+        assert_eq!(sapisid("SAPISID= ; SAPISID=valid").as_deref(), Some("valid"));
+    }
+
+    #[test]
+    fn atomic_settings_replacement_never_exposes_partial_json() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let folder = std::env::temp_dir().join(format!("mtui-atomic-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("settings.json");
+        write_atomic(&path, br#"{"volume":1}"#).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let reader_path = path.clone();
+        let reader_done = done.clone();
+        let reader = std::thread::spawn(move || {
+            while !reader_done.load(Ordering::Relaxed) {
+                let raw = fs::read(&reader_path).unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                assert!(value["volume"].is_number());
+            }
+        });
+        for volume in 0..20 { write_atomic(&path, format!("{{\"volume\":{volume}}}").as_bytes()).unwrap(); }
+        done.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"volume\":19}");
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(folder).unwrap();
     }
 
     #[test]

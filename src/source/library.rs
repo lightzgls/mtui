@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use super::{home, http::Http};
-use crate::config::Cookies;
+use super::account::Session;
 
 const BASE: &str = "https://music.youtube.com/youtubei/v1/";
 
@@ -12,22 +12,30 @@ const BASE: &str = "https://music.youtube.com/youtubei/v1/";
 pub struct Playlist {
     pub id: String,
     pub title: String,
-    pub contains: bool,
+    /// None when the provider's add menu does not expose membership.
+    pub contains: Option<bool>,
 }
 
-fn session() -> Result<Cookies> {
-    Cookies::available()?.ok_or_else(|| anyhow::anyhow!("Sign in to YouTube Music first."))
+#[cfg(test)]
+fn session() -> Result<Session> {
+    Session::current()
 }
 
-fn post(http: &Http, cookies: &Cookies, endpoint: &str, body: Value) -> Result<Value> {
-    let json = home::post(http, &format!("{BASE}{endpoint}"), Some(cookies), body)?;
-    validate_response(&json)?;
+fn post(http: &Http, session: &Session, endpoint: &str, body: Value) -> Result<Value> {
+    let result = home::post(http, &format!("{BASE}{endpoint}"), Some(session.cookies()?), body);
+    let json = result.map_err(|error| {
+        crate::diagnostics::warn("account", &format!("{endpoint} failed: {error:#}"));
+        error
+    })?;
+    validate_response(&json).inspect_err(|error| {
+        crate::diagnostics::warn("account", &format!("{endpoint} rejected: {error:#}"));
+    })?;
     Ok(json)
 }
 
 fn validate_response(json: &Value) -> Result<()> {
-    if json.get("error").is_some() {
-        bail!("YouTube Music refused this action. Reconnect your account and try again.");
+    if let Some(error) = json.get("error").filter(|error| !error.is_null()) {
+        bail!("{}", super::errors::message(400, Some(error)));
     }
     for key in [
         "showEngagementPanelEndpoint",
@@ -38,18 +46,19 @@ fn validate_response(json: &Value) -> Result<()> {
         home::collect(json, key, &mut dialogs);
         if !dialogs.is_empty() {
             bail!(
-                "YouTube Music requires account interaction. Reconnect your account and try again."
+                "YouTube Music requires confirmation for this action. Check the playlist in YouTube Music."
             );
         }
     }
     Ok(())
 }
 
+#[cfg(test)]
 pub fn rating(http: &Http, video_id: &str) -> Result<bool> {
     read_rating(http, &session()?, video_id)
 }
 
-fn read_rating(http: &Http, cookies: &Cookies, video_id: &str) -> Result<bool> {
+pub(crate) fn read_rating(http: &Http, cookies: &Session, video_id: &str) -> Result<bool> {
     let json = post(
         http,
         cookies,
@@ -98,10 +107,9 @@ fn parse_rating(json: &Value, video_id: &str) -> Option<bool> {
     None
 }
 
-pub fn set_rating(http: &Http, video_id: &str, liked: bool) -> Result<bool> {
-    let cookies = session()?;
+pub(crate) fn set_rating_for(http: &Http, cookies: &Session, video_id: &str, liked: bool) -> Result<bool> {
     change_rating(video_id, liked, |endpoint, body| {
-        post(http, &cookies, endpoint, body)
+        post(http, cookies, endpoint, body)
     })
 }
 
@@ -129,11 +137,12 @@ fn change_rating(
     Ok(actual)
 }
 
+#[cfg(test)]
 pub fn playlists(http: &Http, video_id: &str) -> Result<Vec<Playlist>> {
     read_playlists(http, &session()?, video_id)
 }
 
-fn read_playlists(http: &Http, cookies: &Cookies, video_id: &str) -> Result<Vec<Playlist>> {
+pub(crate) fn read_playlists(http: &Http, cookies: &Session, video_id: &str) -> Result<Vec<Playlist>> {
     let json = post(
         http,
         cookies,
@@ -170,9 +179,9 @@ fn parse_playlists(json: &Value) -> Vec<Playlist> {
             options.push(Playlist {
                 id: id.to_owned(),
                 title,
-                contains: row["containsSelectedVideos"].as_str() == Some("ALL")
-                    || row["selected"].as_bool() == Some(true)
-                    || row["checked"].as_bool() == Some(true),
+                contains: row["containsSelectedVideos"].as_str().and_then(|flag| match flag {
+                    "ALL" => Some(true), "NONE" => Some(false), _ => None,
+                }).or_else(||row["selected"].as_bool()).or_else(||row["checked"].as_bool()),
             });
             if options.len() >= 100 {
                 return options;
@@ -182,10 +191,9 @@ fn parse_playlists(json: &Value) -> Vec<Playlist> {
     options
 }
 
-pub fn save(http: &Http, video_id: &str, playlist_id: &str) -> Result<()> {
-    let cookies = session()?;
+pub(crate) fn save_for(http: &Http, cookies: &Session, video_id: &str, playlist_id: &str) -> Result<()> {
     save_with(video_id, playlist_id, |endpoint, body| {
-        post(http, &cookies, endpoint, body)
+        post(http, cookies, endpoint, body)
     })
 }
 
@@ -199,34 +207,51 @@ fn save_with(
     let Some(playlist) = options.iter().find(|p| p.id == playlist_id) else {
         bail!("This playlist is no longer available for saving.");
     };
-    if playlist.contains {
+    if playlist.contains == Some(true) {
+        return Ok(());
+    }
+    if playlist_id.strip_prefix("VL").unwrap_or(playlist_id) == "LM" {
+        change_rating(video_id, true, request)?;
         return Ok(());
     }
     let result = request(
         "browse/edit_playlist",
         json!({
             "playlistId": playlist_id.strip_prefix("VL").unwrap_or(playlist_id),
-            "actions": [{"action": "ACTION_ADD_VIDEO", "addedVideoId": video_id}]
+            "actions": [{"action": "ACTION_ADD_VIDEO", "addedVideoId": video_id, "dedupeOption":"DEDUPE_OPTION_CHECK"}]
         }),
-    )?;
-    if confirmed_save(&result, video_id) {
+    );
+    if result.as_ref().is_ok_and(|json|confirmed_save(json, video_id)) {
         return Ok(());
     }
-    // Some clients omit edit results. Verify membership, without repeating the write.
-    if parse_playlists(&request("playlist/get_add_to_playlist", body)?)
-        .iter()
-        .any(|p| p.id == playlist_id && p.contains)
-    {
+    // A duplicate dialog or lost acknowledgement can follow a committed write.
+    // Read the actual track shelf; modern add menus omit membership flags.
+    if verify_membership(video_id, playlist_id, &mut request).unwrap_or(false) {
         return Ok(());
     }
-    bail!("The save was not confirmed by YouTube Music. Refresh before trying again.")
+    result?;
+    bail!("The save was not confirmed. Check the playlist in YouTube Music before trying again.")
+}
+
+fn verify_membership(video_id: &str, playlist_id: &str, request: &mut impl FnMut(&str, Value) -> Result<Value>) -> Result<bool> {
+    let id = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
+    let mut body = json!({"browseId":format!("VL{id}")});
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..8 {
+        let json = request("browse", body)?;
+        if super::collection::contains_video(&json, video_id) { return Ok(true); }
+        let Some(token) = super::collection::page_continuation(&json).filter(|token|seen.insert(token.clone())) else { return Ok(false); };
+        body = json!({"continuation":token});
+    }
+    Ok(false)
 }
 
 fn confirmed_save(json: &Value, video_id: &str) -> bool {
     json["status"].as_str() == Some("STATUS_SUCCEEDED")
-        && json["playlistEditResults"]
+        && (json["playlistEditResults"].is_null() || json["playlistEditResults"]
             .as_array()
             .is_some_and(|results| {
+                results.is_empty() ||
                 results.iter().any(|result| {
                     result
                         .pointer("/playlistEditVideoAddedResultData/videoId")
@@ -237,7 +262,7 @@ fn confirmed_save(json: &Value, video_id: &str) -> bool {
                             .and_then(Value::as_str)
                             .is_some_and(|s| !s.is_empty())
                 })
-            })
+            }))
 }
 
 #[cfg(test)]
@@ -292,9 +317,9 @@ mod tests {
             match calls {
                 1 => { assert_eq!(endpoint, "playlist/get_add_to_playlist"); Ok(choice("NONE")) }
                 2 => { assert_eq!(endpoint, "browse/edit_playlist");
-                    assert_eq!(body, json!({"playlistId":"p", "actions":[{"action":"ACTION_ADD_VIDEO", "addedVideoId":"v"}]}));
-                    Ok(json!({"status":"STATUS_SUCCEEDED"})) }
-                3 => { assert_eq!(endpoint, "playlist/get_add_to_playlist"); Ok(choice("ALL")) }
+                    assert_eq!(body, json!({"playlistId":"p", "actions":[{"action":"ACTION_ADD_VIDEO", "addedVideoId":"v", "dedupeOption":"DEDUPE_OPTION_CHECK"}]}));
+                    Ok(json!({})) }
+                3 => { assert_eq!(endpoint, "browse"); Ok(json!({"musicPlaylistShelfRenderer":{"contents":[{"musicResponsiveListItemRenderer":{"playlistItemData":{"videoId":"v"}}}]}})) }
                 _ => panic!("write repeated"),
             }
         }).unwrap();
@@ -335,12 +360,12 @@ mod tests {
                 Playlist {
                     id: "one".into(),
                     title: "One".into(),
-                    contains: true
+                    contains: Some(true)
                 },
                 Playlist {
                     id: "two".into(),
                     title: "Two".into(),
-                    contains: false
+                    contains: None
                 }
             ]
         );
@@ -352,12 +377,67 @@ mod tests {
             validate_response(&json!({"actions":[{"showEngagementPanelEndpoint":{}}]})).is_err()
         );
         assert!(validate_response(&json!({"error":{"code":403}})).is_err());
-        assert!(!confirmed_save(&json!({"status":"STATUS_SUCCEEDED"}), "v"));
+        assert!(confirmed_save(&json!({"status":"STATUS_SUCCEEDED"}), "v"));
         let result = json!({"status":"STATUS_SUCCEEDED", "playlistEditResults":[{
             "playlistEditVideoAddedResultData":{"videoId":"v", "setVideoId":"entry"}
         }]});
         assert!(confirmed_save(&result, "v"));
         assert!(!confirmed_save(&result, "different"));
+    }
+
+    #[test]
+    fn modern_status_only_acknowledgements_do_not_report_a_false_failure() {
+        let mut writes = 0;
+        save_with("v", "p", |endpoint, _| {
+            if endpoint == "playlist/get_add_to_playlist" {
+                return Ok(json!({"playlistAddToOptionRenderer":{"playlistId":"p","title":{"simpleText":"Playlist"}}}));
+            }
+            assert_eq!(endpoint, "browse/edit_playlist");
+            writes += 1;
+            Ok(json!({"status":"STATUS_SUCCEEDED"}))
+        }).unwrap();
+        assert_eq!(writes, 1);
+        assert!(!confirmed_save(&json!({"status":"STATUS_SUCCEEDED","playlistEditResults":"invalid"}), "v"));
+    }
+
+    #[test]
+    fn liked_music_saves_use_the_like_operation_and_confirm_the_song() {
+        let mut calls = Vec::new();
+        save_with("v", "LM", |endpoint, body| {
+            calls.push(endpoint.to_owned());
+            Ok(match endpoint {
+                "playlist/get_add_to_playlist" => json!({"playlistAddToOptionRenderer":{"playlistId":"LM","title":{"simpleText":"Liked Music"}}}),
+                "like/like" => { assert_eq!(body, json!({"target":{"videoId":"v"}})); json!({}) },
+                "next" => json!({"likeButtonRenderer":{"target":{"videoId":"v"},"likeStatus":"LIKE"}}),
+                _ => panic!("wrong save operation"),
+            })
+        }).unwrap();
+        assert_eq!(calls, ["playlist/get_add_to_playlist", "like/like", "next"]);
+    }
+
+    #[test]
+    fn a_duplicate_dialog_is_confirmed_from_track_membership_without_another_write() {
+        let mut writes = 0;
+        let mut reads = 0;
+        save_with("v", "p", |endpoint, body| {
+            match endpoint {
+                "playlist/get_add_to_playlist" => Ok(json!({"playlistAddToOptionRenderer":{"playlistId":"p","title":{"simpleText":"Playlist"}}})),
+                "browse/edit_playlist" => { writes += 1; bail!("provider requires confirmation") },
+                "browse" => {
+                    reads += 1;
+                    if reads == 1 {
+                        assert_eq!(body, json!({"browseId":"VLp"}));
+                        Ok(json!({"musicPlaylistShelfRenderer":{"contents":[],"continuations":[{"nextContinuationData":{"continuation":"next"}}]},
+                            "suggestions":{"musicResponsiveListItemRenderer":{"playlistItemData":{"videoId":"v"}}}}))
+                    } else {
+                        assert_eq!(body, json!({"continuation":"next"}));
+                        Ok(json!({"musicPlaylistShelfContinuation":{"contents":[{"musicResponsiveListItemRenderer":{"playlistItemData":{"videoId":"v"}}}]}}))
+                    }
+                },
+                _ => panic!("unexpected request"),
+            }
+        }).unwrap();
+        assert_eq!((writes, reads), (1, 2));
     }
 
     #[test]

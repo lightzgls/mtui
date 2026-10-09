@@ -70,20 +70,18 @@ pub fn fetch(http: &Http, query: &str, filter: Filter, limit: usize) -> Result<V
     if filter == Filter::All {
         // Music sometimes serves only a top artist and songs in its generic
         // response. Fill the missing categories from its real filtered search.
-        for category in Filter::ALL.into_iter().skip(1) {
-            if items.len() >= limit {
-                break;
-            }
-            if !items.iter().any(|item| item.kind == category)
-                && let Ok(more) = fetch_category(
-                    http,
-                    cookies.as_ref(),
-                    query,
-                    category,
-                    5.min(limit - items.len()),
-                )
-            {
-                items.extend(more);
+        let categories: Vec<_> = Filter::ALL.into_iter().skip(1)
+            .filter(|category| !items.iter().any(|item| item.kind == *category)).collect();
+        if items.len() < limit && !categories.is_empty() {
+            let requests = categories.iter().map(|category|category_request(http, cookies.as_ref(), query, *category)).collect::<Result<Vec<_>>>()?;
+            let results = http.send_many(requests, |index, status, raw| {
+                if !(200..300).contains(&status) { bail!("optional search category refused: HTTP {status}"); }
+                Ok(parse(&serde_json::from_slice(raw)?, categories[index], 5))
+            })?;
+            let mut seen: HashSet<_> = items.iter().map(|item|item.card.art_key().to_string()).collect();
+            for more in results.into_iter().flatten() {
+                items.extend(more.into_iter().filter(|item|seen.insert(item.card.art_key().to_string()))
+                    .take(limit.saturating_sub(items.len())));
             }
         }
     }
@@ -97,24 +95,28 @@ fn fetch_category(
     filter: Filter,
     limit: usize,
 ) -> Result<Vec<Item>> {
-    let mut body = json!({"query": query});
-    if let Some(params) = filter.params() {
-        body["params"] = params.into();
-    }
-    let request = home::post_request_as(
-        http,
-        "https://music.youtube.com/youtubei/v1/search",
-        cookies,
-        super::innertube::MUSIC_CLIENT_VERSION,
-        body,
-    )?
-    .timeout(std::time::Duration::from_secs(5));
+    let request = category_request(http, cookies, query, filter)?;
     let (status, raw) = http.send(request)?;
     if !(200..300).contains(&status) {
         bail!("YouTube Music search refused the request: HTTP {status}");
     }
     let json = serde_json::from_slice(&raw)?;
     Ok(parse(&json, filter, limit))
+}
+
+fn category_request(http: &Http, cookies: Option<&Cookies>, query: &str, filter: Filter) -> Result<reqwest::RequestBuilder> {
+    let mut body = json!({"query": query});
+    if let Some(params) = filter.params() {
+        body["params"] = params.into();
+    }
+    Ok(home::post_request_as(
+        http,
+        "https://music.youtube.com/youtubei/v1/search",
+        cookies,
+        super::innertube::MUSIC_CLIENT_VERSION,
+        body,
+    )?
+    .timeout(std::time::Duration::from_secs(5)))
 }
 
 fn classify(card: &Card, category: &str) -> Filter {

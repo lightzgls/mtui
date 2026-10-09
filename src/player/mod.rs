@@ -311,6 +311,11 @@ enum Ending {
 }
 
 impl Track {
+    /// Device/source clocks can drain to zero while a replacement is opening.
+    fn resume_at(&self, clock: Duration) -> Duration {
+        self.seeking_to.unwrap_or_else(|| self.position.max(self.offset.saturating_add(clock)))
+    }
+
     fn commit_stream(&mut self, total: Option<Duration>, link: StreamLink, from: Duration) {
         self.link = link;
         if total.is_some() {
@@ -955,7 +960,7 @@ fn switch_output(
         let (decoder, total, link) = open_stream(runtime, &url)?;
         let from = track
             .as_ref()
-            .map(|cur| cur.offset + player.get_pos())
+            .map(|cur| cur.resume_at(player.get_pos()))
             .unwrap_or_default();
 
         if let Some(cur) = track.as_mut() {
@@ -1033,7 +1038,7 @@ fn replace_running_stream(
     let Some(cur) = track.as_mut() else {
         return Ok(());
     };
-    let from = cur.offset + player.get_pos();
+    let from = cur.resume_at(player.get_pos());
     cur.link.decline();
     play_source(player, decoder, from);
     if paused {
@@ -1375,6 +1380,16 @@ mod tests {
             rebuilds: 0,
             replacement: None,
         }
+    }
+
+    #[test]
+    fn output_replacement_survives_drained_clocks_and_preserves_rewinds() {
+        let mut current = track(80, Some(213));
+        assert_eq!(current.resume_at(Duration::ZERO), Duration::from_secs(80));
+        current.offset = Duration::from_secs(60);
+        assert_eq!(current.resume_at(Duration::from_secs(25)), Duration::from_secs(85));
+        current.aim_at(Duration::from_secs(20));
+        assert_eq!(current.resume_at(Duration::ZERO), Duration::from_secs(20));
     }
 
     #[test]

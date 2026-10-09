@@ -126,7 +126,15 @@ fn continuation(contents: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn page_continuation(json: &Value) -> Option<String> {
+pub(super) fn contains_video(json: &Value, video_id: &str) -> bool {
+    track_contents(json).and_then(Value::as_array).is_some_and(|items| items.iter().any(|item| {
+        let row = &item["musicResponsiveListItemRenderer"];
+        row.pointer("/playlistItemData/videoId").and_then(Value::as_str)
+            .or_else(|| row.pointer("/navigationEndpoint/watchEndpoint/videoId").and_then(Value::as_str)) == Some(video_id)
+    }))
+}
+
+pub(super) fn page_continuation(json: &Value) -> Option<String> {
     if let Some(token) = track_contents(json).and_then(continuation) { return Some(token); }
     // Older responses put the token beside contents, rather than in a final
     // continuationItemRenderer. Scope it to the track shelf, not suggestions.

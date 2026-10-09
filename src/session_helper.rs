@@ -17,6 +17,8 @@ use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::WindowBuilder;
 use wry::{PageLoadEvent, WebContext, WebViewBuilder};
 
+use crate::session_protocol as protocol;
+
 const MUSIC: &str = "https://music.youtube.com/";
 const POLL: Duration = Duration::from_secs(1);
 /// Give response cookies a moment to land after the main Music document has
@@ -28,8 +30,10 @@ const COOKIE_SETTLE: Duration = Duration::from_millis(500);
 /// lands outside Music, reveal it so an actual Google reauthentication is not
 /// hidden behind the player.
 const RECOVERY_REVEAL: Duration = Duration::from_secs(8);
+const SILENT_TIMEOUT: Duration = Duration::from_secs(45);
+const LOGIN_CHECK: &str = "(() => { const c = window.ytcfg; const v = c && c.get && c.get('LOGGED_IN'); return typeof v === 'boolean' ? v : null; })()";
 
-pub fn run(profile: PathBuf, recover: bool) -> Result<String> {
+pub fn run(profile: PathBuf, recover: bool, silent: bool) -> Result<String> {
     std::fs::create_dir_all(&profile)
         .with_context(|| format!("could not create {}", profile.display()))?;
 
@@ -38,17 +42,22 @@ pub fn run(profile: PathBuf, recover: bool) -> Result<String> {
         .with_title("MTUI - Sign in to YouTube Music")
         .with_inner_size(LogicalSize::new(980.0, 720.0))
         .with_min_inner_size(LogicalSize::new(640.0, 520.0))
-        .with_visible(!recover)
+        .with_visible(!recover && !silent)
         .build(&event_loop)
         .context("could not create the YouTube Music sign-in window")?;
     let mut context = WebContext::new(Some(profile));
     let loaded_at = Rc::new(Cell::new(None));
+    let page_generation = Rc::new(Cell::new(0_u64));
     let page_loaded_at = Rc::clone(&loaded_at);
+    let navigation_generation = Rc::clone(&page_generation);
     let builder = WebViewBuilder::new_with_web_context(&mut context)
         .with_devtools(false)
         .with_hotkeys_zoom(false)
         .with_on_page_load_handler(move |event, url| {
-            if matches!(event, PageLoadEvent::Finished) && is_music_url(&url) {
+            if matches!(event, PageLoadEvent::Started) {
+                page_loaded_at.set(None);
+                navigation_generation.set(navigation_generation.get().wrapping_add(1));
+            } else if is_music_url(&url) {
                 page_loaded_at.set(Some(Instant::now()));
             }
         });
@@ -75,25 +84,65 @@ pub fn run(profile: PathBuf, recover: bool) -> Result<String> {
     let outcome: Rc<RefCell<Option<Result<String>>>> = Rc::new(RefCell::new(None));
     let result = Rc::clone(&outcome);
     let started = Instant::now();
-    let mut visible = !recover;
+    let mut visible = !recover && !silent;
+    let (checked_tx, checked_rx) = std::sync::mpsc::channel::<(u64, Option<bool>)>();
+    let mut checking = None;
+    let mut authenticated = None;
     event_loop.run_return(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + POLL);
         match event {
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 let now = Instant::now();
-                if ready_to_capture(loaded_at.get(), now) {
+                let current_url = webview.url().unwrap_or_default();
+                while let Ok((generation, logged_in)) = checked_rx.try_recv() {
+                    if generation == page_generation.get() {
+                        checking = None;
+                        authenticated = logged_in.map(|value| (generation, value));
+                    }
+                }
+                if silent && now.duration_since(started) >= SILENT_TIMEOUT {
+                    *result.borrow_mut() = Some(Err(anyhow::anyhow!(
+                        "Automatic session renewal could not verify sign-in; retrying later."
+                    )));
+                    *control_flow = ControlFlow::Exit;
+                } else if silent && now.duration_since(started) >= RECOVERY_REVEAL && is_google_sign_in_url(&current_url) {
+                    *result.borrow_mut() = Some(Err(anyhow::anyhow!(protocol::SIGN_IN_REQUIRED)));
+                    *control_flow = ControlFlow::Exit;
+                } else if ready_to_capture(loaded_at.get(), now) && is_music_url(&current_url) {
+                    let generation = page_generation.get();
+                    let verified = authenticated.filter(|(page, _)| *page == generation).map(|(_, value)| value);
+                    if verified != Some(true) {
+                        if silent && verified == Some(false) && now.duration_since(started) >= RECOVERY_REVEAL {
+                            *result.borrow_mut() = Some(Err(anyhow::anyhow!(protocol::SIGN_IN_REQUIRED)));
+                            *control_flow = ControlFlow::Exit;
+                            return;
+                        }
+                        if checking != Some(generation) {
+                            checking = Some(generation);
+                            let tx = checked_tx.clone();
+                            if webview.evaluate_script_with_callback(LOGIN_CHECK, move |raw| {
+                                let logged_in = serde_json::from_str::<Option<bool>>(&raw).ok().flatten();
+                                let _ = tx.send((generation, logged_in));
+                            }).is_err() {
+                                checking = None;
+                            }
+                        }
+                        if verified == Some(false) && !silent { reveal(&window, &mut visible); }
+                        return;
+                    }
                     match capture(&webview) {
                         Ok(Some(header)) => {
                             *result.borrow_mut() = Some(Ok(header));
                             *control_flow = ControlFlow::Exit;
                         }
-                        Ok(None) => reveal(&window, &mut visible),
+                        Ok(None) if !silent => reveal(&window, &mut visible),
+                        Ok(None) => {},
                         Err(error) => {
                             *result.borrow_mut() = Some(Err(error));
                             *control_flow = ControlFlow::Exit;
                         }
                     }
-                } else if recover && !visible && now.duration_since(started) >= RECOVERY_REVEAL {
+                } else if recover && !silent && !visible && now.duration_since(started) >= RECOVERY_REVEAL {
                     reveal(&window, &mut visible);
                 }
             }
@@ -117,6 +166,13 @@ pub fn run(profile: PathBuf, recover: bool) -> Result<String> {
 
 fn is_music_url(url: &str) -> bool {
     url == MUSIC.trim_end_matches('/') || url.starts_with(MUSIC)
+}
+
+fn is_google_sign_in_url(url: &str) -> bool {
+    reqwest::Url::parse(url).ok().is_some_and(|url| {
+        url.scheme() == "https" && url.host_str() == Some("accounts.google.com")
+            && ["/v3/signin", "/signin", "/ServiceLogin"].iter().any(|path| url.path().starts_with(path))
+    })
 }
 
 fn ready_to_capture(loaded_at: Option<Instant>, now: Instant) -> bool {
@@ -155,6 +211,15 @@ fn has_signing_cookie(header: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_recovery_requires_a_real_google_sign_in_page() {
+        assert!(is_google_sign_in_url("https://accounts.google.com/v3/signin/challenge/pwd"));
+        assert!(is_google_sign_in_url("https://accounts.google.com/ServiceLogin?service=youtube"));
+        for url in [MUSIC, "https://accounts.google.com/", "https://accounts.google.com.evil.example/signin", "http://accounts.google.com/signin", "about:blank"] {
+            assert!(!is_google_sign_in_url(url));
+        }
+    }
 
     #[test]
     fn waits_for_a_cookie_that_can_sign_music_requests() {

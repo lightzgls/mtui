@@ -67,6 +67,9 @@ impl ArtCache {
     pub fn want_visible<'a>(&mut self, keys: impl Iterator<Item = &'a str>) -> Vec<String> {
         let keys: Vec<String> = keys.map(str::to_owned).collect();
         self.visible = keys.iter().take(CAPACITY).cloned().collect();
+        // Unfinished off-screen requests can be dropped by the worker. Returning
+        // to their page must request them again rather than strand blank tiles.
+        self.asked.retain(|key| self.visible.contains(key) || self.art.contains_key(key));
         let mut requests = Vec::new();
         for key in keys {
             if !self.visible.contains(&key) { continue; }
@@ -154,6 +157,18 @@ impl ArtCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn returning_to_a_page_requeues_unfinished_art_without_refetching_loaded_covers() {
+        let mut cache = ArtCache::default();
+        assert_eq!(cache.want_visible(["a"].into_iter()), ["a"]);
+        cache.want_visible(["b"].into_iter());
+        assert_eq!(cache.want_visible(["a"].into_iter()), ["a"]);
+        cache.store("a".into(), Some(Cover::solid(2, 2)));
+        cache.want_visible(["b"].into_iter());
+        assert!(cache.want_visible(["a"].into_iter()).is_empty());
+        assert!(cache.get("a").is_some());
+    }
 
     fn cover() -> Cover {
         Cover::solid(8, 8)
