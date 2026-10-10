@@ -182,7 +182,24 @@ pub struct Player {
     handle: Option<thread::JoinHandle<()>>,
 }
 
+/// Drives app scenarios without opening a speaker, decoder, or runtime.
+#[cfg(test)]
+pub(crate) struct TestDriver {
+    pub commands: Receiver<Command>,
+    pub snapshot: Arc<Mutex<Snapshot>>,
+    pub events: Sender<PlayerEvent>,
+}
+
 impl Player {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, TestDriver) {
+        let (tx, commands) = channel();
+        let (events_tx, events) = channel();
+        let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+        let driver = TestDriver { commands, snapshot: snapshot.clone(), events: events_tx };
+        (Self { tx, events, snapshot, handle: None }, driver)
+    }
+
     /// Spawns the player thread and its private tokio runtime.
     pub fn spawn(initial_volume: f32, output_device: Option<String>) -> Result<Self> {
         let (tx, rx) = channel();

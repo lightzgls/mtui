@@ -1232,6 +1232,8 @@ pub struct App {
     /// and what keeps the queue from advancing over a track that is still on
     /// its way. `None` means nothing is being loaded.
     pending: Option<String>,
+    /// Latest scrub requested before this track's URL has arrived.
+    pending_seek: Option<Duration>,
 
     /// Which list the main pane is showing.
     pub view: View,
@@ -1525,6 +1527,18 @@ impl App {
                 Vec::new()
             }
         };
+        let presence = Presence::spawn(config::Discord::application_id(), config::Presence::load());
+        Self::with_services(player, source, graphics, settings, output_devices, presence)
+    }
+
+    fn with_services(
+        player: Player,
+        source: SourceWorker,
+        graphics: Graphics,
+        settings: config::Settings,
+        output_devices: Vec<OutputDevice>,
+        presence: Presence,
+    ) -> Self {
         let output_device = settings.output_device.clone();
         let muted = settings.volume == 0.0;
         let volume_before_mute = if muted {
@@ -1568,6 +1582,7 @@ impl App {
             prefetching: None,
             ready: None,
             pending: None,
+            pending_seek: None,
             view: View::Home,
             home: Vec::new(),
             home_shelf: 0,
@@ -1612,7 +1627,7 @@ impl App {
             // Started whether or not Discord is running and whether or not the
             // switch is on: what this costs while idle is one sleeping thread,
             // and deciding later would mean deciding on the render path.
-            presence: Presence::spawn(config::Discord::application_id(), config::Presence::load()),
+            presence,
             player,
             source,
         };
@@ -2755,6 +2770,7 @@ impl App {
             return;
         }
         self.pending = None;
+        let pending_seek = self.pending_seek.take();
 
         let why = match stream {
             Ok(stream) => {
@@ -2771,6 +2787,9 @@ impl App {
                     title,
                     id: id.to_string(),
                 });
+                if let Some(target) = pending_seek {
+                    let _ = self.player.send(Command::Seek(target));
+                }
                 return;
             }
             Err(why) => why,
@@ -3067,6 +3086,7 @@ impl App {
     }
 
     fn start_track(&mut self, track: Track, auto: bool, bypass_cache: bool) {
+        self.pending_seek = None;
         // A page whose response can still replace its contents must remain live,
         // not be cloned into Player's return slot. Queue advancement is allowed
         // to continue behind it without changing the visible route.
@@ -3268,9 +3288,10 @@ impl App {
     /// Advances the queue when a track ends. Called once per frame.
     ///
     /// The snapshot only says what is true now, so the end of a track is an
-    /// edge rather than a state: `Playing` last frame and `Idle` this one, with
-    /// no error to explain it. A stream that died reports one, and a stop
-    /// clears the page outright -- neither is a track that ended.
+    /// edge rather than a state: an active stream last frame and `Idle` this
+    /// one, with no error to explain it. A seek straight to EOF can drain while
+    /// the UI still observes Buffering, before it ever draws a Playing frame.
+    /// A stream that died reports an error; a stop clears the page outright.
     pub fn tick_playback(&mut self) {
         let snap = self.snapshot();
         if self.playback_error.is_none()
@@ -3281,9 +3302,10 @@ impl App {
         {
             self.record_playback_failure(error);
         }
-        let ended = self.last_state == PlayState::Playing
+        let ended = matches!(self.last_state, PlayState::Playing | PlayState::Buffering)
             && snap.state == PlayState::Idle
-            && snap.error.is_none();
+            && snap.error.is_none()
+            && self.playback_error.is_none();
         self.last_state = snap.state;
 
         // Sampled every frame rather than read once at the end, because at the
@@ -3298,16 +3320,15 @@ impl App {
                 let _ = self.source.send(Request::RetryReports);
             }
         }
-        if ended {
-            self.finish_listening();
-        }
-
         // Never while a track is on its way. `busy` used to stand in for this
         // and is not the same question: it is set by a search or a playlist
         // fetch as well, and cleared by any of their responses -- so a search
         // that returned during a resolve would let the queue advance over the
         // track the user had just chosen.
         if ended && self.pending.is_none() {
+            // start_track already finalized the previous song. Its late EOF
+            // must not take the replacement song's listening/recovery state.
+            self.finish_listening();
             self.advance(1, true);
         }
     }
@@ -3597,7 +3618,8 @@ impl App {
 
     fn clear_upcoming_queue(&mut self) {
         let removed = self.now.as_mut().map_or(0, NowPlaying::clear_upcoming);
-        if removed == 0 {
+        let paging = self.now.as_ref().is_some_and(|now| now.topping_up || now.continuation.is_some());
+        if removed == 0 && !paging {
             return;
         }
         // A continuation already in flight belongs to the queue before the
@@ -4986,6 +5008,7 @@ impl App {
         // same hazard by the other route.
         self.pending = None;
         self.resuming = None;
+        self.pending_seek = None;
         self.playback_error = None;
         // Nothing is playing, so nothing owns the cover pane.
         self.cover = None;
@@ -5471,14 +5494,19 @@ impl App {
 
     /// Seeks to an absolute point selected on the progress bar.
     fn seek_to_fraction(&mut self, position: u16) {
-        let snap = self.snapshot();
-        if snap.state == PlayState::Idle {
-            return;
-        }
         let Some(total) = self.now.as_ref().and_then(|now| now.duration) else {
             return;
         };
         let target = duration_at_pointer(total, position);
+        // Load may not have published its snapshot yet; never seek the old
+        // decoder or lose the user's intent while the new URL is resolving.
+        if self.pending.is_some() {
+            self.pending_seek = Some(target);
+            return;
+        }
+        // Play is asynchronous too: its command may already be queued while
+        // the last published snapshot still says Idle. The player can safely
+        // ignore a seek with no decoder; the UI must not discard a valid one.
         let _ = self.player.send(Command::Seek(target));
         if let Some((_, listening)) = self.listening.as_mut() { listening.seeked(); }
     }
@@ -5656,19 +5684,19 @@ pub(crate) fn account_menu_items(connected: bool, signing_in: bool) -> Vec<MenuI
     items
 }
 
-/// Pure state tests. [`App`] itself is not constructed because it owns live
-/// audio and source workers.
+/// Deterministic App scenarios use inert services; live checks stay ignored.
+#[cfg(test)]
+#[path = "app/scenarios.rs"]
+mod scenarios;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "renders fixture UI with a zero-volume audio worker; run with isolated APPDATA"]
     fn preview_search_palette_and_player_links() {
         use crate::source::search::{Filter, Item};
-        let player = Player::spawn(0.0, None).unwrap();
-        let source = SourceWorker::spawn(crate::source::youtube::YouTube::default()).unwrap();
-        let mut app = App::new(player, source, Graphics::blocks(), config::Settings::default());
+        let (mut app, _driver, _requests) = super::scenarios::fixture();
         let artist = ArtistRef { name: "Evening Artist".into(), endpoint: BrowseEndpoint::new("UCfixture") };
         let track = Track { id: "fixtureSong".into(), title: "A quieter evening".into(), uploader: artist.name.clone(),
             album: Some("Evening Album".into()), artist_ref: Some(artist.clone()), duration: Some(Duration::from_secs(180)) };

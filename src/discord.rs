@@ -284,6 +284,12 @@ pub struct Presence {
 }
 
 impl Presence {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (tx, _) = channel();
+        Self { tx, last: None, cleared: true, enabled: false, unavailable: None }
+    }
+
     /// Starts the worker. Never fails: a Discord that is not running, and a
     /// build with no application id, are both states this reports through
     /// [`Presence::status`] rather than errors that would have to be handled on

@@ -26,6 +26,7 @@ mod imp {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn AllocConsole() -> i32;
+        fn SetConsoleTitleW(title: *const u16) -> i32;
         fn GetConsoleWindow() -> isize;
         fn DuplicateHandle(
             source_process: isize,
@@ -534,6 +535,9 @@ mod imp {
                 io::Error::last_os_error()
             ));
         }
+        // Windows otherwise uses the executable's full path as the title.
+        let title: Vec<u16> = "MTUI".encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { SetConsoleTitleW(title.as_ptr()); }
         let input = File::from(open_console("CONIN$", GENERIC_READ | GENERIC_WRITE)?);
         let mut output = File::from(open_console("CONOUT$", GENERIC_READ | GENERIC_WRITE)?);
         let input_raw = input.as_raw_handle() as isize;

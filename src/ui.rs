@@ -5036,6 +5036,8 @@ mod tests {
 
     #[test]
     fn mini_player_combines_known_progress_clock_and_track() {
+        // Fit all metadata so the assertion is independent of the marquee clock.
+        let width = 64;
         let snap = Snapshot {
             state: PlayState::Playing,
             title: "Let It Happen".to_string(),
@@ -5051,7 +5053,7 @@ mod tests {
             }),
             "idle",
             true,
-            44,
+            width,
             Color::Magenta,
         );
         let text = line_text(&line);
@@ -5061,7 +5063,8 @@ mod tests {
         assert!(text.contains("1:05/3:00"), "{text:?}");
         assert!(text.contains('━') && text.contains('─'), "{text:?}");
         assert!(text.contains("Let It Happen"), "{text:?}");
-        assert!(display_width(&text) <= 44, "{text:?}");
+        assert!(text.contains("Tame Impala"), "{text:?}");
+        assert!(display_width(&text) <= width, "{text:?}");
     }
 
     #[test]

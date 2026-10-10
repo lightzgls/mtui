@@ -306,6 +306,8 @@ struct AccountWork {
 }
 
 pub struct SourceWorker {
+    #[cfg(test)]
+    test_requests: Option<Sender<Request>>,
     tx: Sender<Request>,
     cover_tx: Arc<Inbox>,
     metadata_tx: Arc<Inbox>,
@@ -328,6 +330,25 @@ pub struct SourceWorker {
 }
 
 impl SourceWorker {
+    /// Records every request without spawning providers or capturing credentials.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, Receiver<Request>) {
+        let (tx, requests) = channel();
+        let (res_tx, rx) = channel();
+        let (account_tx, _) = sync_channel(32);
+        let (history_tx, _) = channel();
+        let worker = Self {
+            test_requests: Some(tx.clone()), tx,
+            cover_tx: Inbox::new(Kind::Cover),
+            metadata_tx: Inbox::new(Kind::Browse),
+            account_tx, account_generation: Arc::new(AtomicU64::new(0)),
+            history_tx, page_tx: Inbox::new(Kind::Panels),
+            art_tx: Inbox::new(Kind::Artwork), res_tx, rx,
+            resolves: Arc::new(AtomicU64::new(0)), handle: None,
+        };
+        (worker, requests)
+    }
+
     pub fn spawn(yt: YouTube) -> Result<Self> {
         let (req_tx, req_rx) = channel::<Request>();
         let cover_req_tx = Inbox::new(Kind::Cover);
@@ -396,6 +417,8 @@ impl SourceWorker {
             .context("failed to spawn artwork worker")?;
 
         Ok(Self {
+            #[cfg(test)]
+            test_requests: None,
             tx: req_tx,
             cover_tx: cover_req_tx,
             metadata_tx: metadata_req_tx,
@@ -437,6 +460,10 @@ impl SourceWorker {
     /// Split out of [`Self::send`] so the resolve count above has a single
     /// place to be undone, rather than one per routing arm.
     fn route(&self, req: Request) -> Result<()> {
+        #[cfg(test)]
+        if let Some(tx) = &self.test_requests {
+            return tx.send(req).context("scenario source is gone");
+        }
         match req {
             Request::Cover { .. } => self.cover_tx.send(req).context("cover worker is gone"),
             Request::Art { .. } => self.art_tx.send(req).context("artwork worker is gone"),

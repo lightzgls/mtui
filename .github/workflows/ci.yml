@@ -51,11 +51,19 @@ jobs:
       # The `#[ignore]`d tests are excluded by default and must stay that way:
       # they hit YouTube, Google and LRCLIB, and several write to a real account
       # behind a saved cookie. See their doc comments for how to run them.
-      - name: Test
-        run: cargo test --all-targets
+      - name: Isolated tests and Clippy
+        shell: pwsh
+        run: ./scripts/test.ps1 -Suite Full -Online
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Save test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: |
+            target/test-runs/*/*.log
+            target/test-runs/*/summary.json
+          if-no-files-found: ignore
 
 # Deliberately no `cargo fmt --check`. This codebase is hand-formatted in
 # places rustfmt disagrees with -- one-line struct variants, import order,

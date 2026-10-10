@@ -425,16 +425,8 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "isolated zero-volume App state and mouse regression; no account writes"]
     fn player_actions_keep_requests_scoped_and_dialogs_owned() {
-        let player = Player::spawn(0.0, None).unwrap();
-        let source = SourceWorker::spawn(YouTubeForTest::default()).unwrap();
-        let mut app = App::new(
-            player,
-            source,
-            Graphics::blocks(),
-            config::Settings::default(),
-        );
+        let (mut app, _driver, _requests) = super::super::scenarios::fixture();
         let track = Track {
             id: "first".into(),
             title: "First song".into(),
@@ -538,5 +530,4 @@ mod tests {
         assert!(app.listening.is_none());
     }
 
-    use crate::source::youtube::YouTube as YouTubeForTest;
 }

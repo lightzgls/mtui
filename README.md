@@ -96,6 +96,11 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 Windows output: `target/release/mtui.exe`. Live network/account tests are ignored by default. See [requirements](docs/requirements.md), [analysis](docs/analysis.md), and [design](docs/design.md) for scope and architecture. Focused pull requests and bug reports are welcome.
 
+For isolated smoke, full, and repeated test runs, use `./scripts/test.ps1`.
+See the [testing guide](docs/testing.md), [edge-case scenarios](docs/test-cases.md),
+and [latest bug-hunt findings](docs/test-findings.md). The runner keeps logs and
+a JSON summary under `target/test-runs/` and leaves live/account tests ignored.
+
 ## Acknowledgments and references
 
 [Pear Desktop](https://github.com/pear-devs/pear-desktop) was the main inspiration for MTUI's listening experience. Thank you to the Pear Desktop team, and to the maintainers and contributors whose work supports this project:
