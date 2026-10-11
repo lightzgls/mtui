@@ -570,6 +570,7 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
                 app.status = format!("could not create the tray icon: {err:#}");
                 if let Err(save) = (config::Settings {
                     start_in_tray: false,
+                    tray_click_stops: app.tray_click_stops,
                     icon_theme: app.icon_theme(),
                     cover_style: app.cover_style(),
                     image_renderer: app.image_renderer(),
@@ -601,6 +602,7 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
         *tray = None;
         if let Err(save) = (config::Settings {
             start_in_tray: false,
+            tray_click_stops: app.tray_click_stops,
             icon_theme: app.icon_theme(),
             cover_style: app.cover_style(),
             image_renderer: app.image_renderer(),
@@ -616,6 +618,7 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
     }
     if let Some(command) = icon.next_command(Duration::ZERO)
         && command != tray::TrayCommand::Show
+        && (command != tray::TrayCommand::Click || app.tray_click_stops)
     {
         app.handle_tray(command);
     }
@@ -664,10 +667,11 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
     // Said on the terminal that is about to be given up, since it is the last
     // thing this window will ever show and the icon is small.
     if let Ok(mut out) = console::output() {
+        let click_action = if app.tray_click_stops { "stop playback" } else { "bring this back" };
         let _ = writeln!(
             out,
             "MTUI is running in the background. Its icon is in the notification area, \
-             by the clock -- click it to bring this back, or right-click for controls. \
+             by the clock -- click it to {click_action}, or right-click for controls. \
              This window can be closed."
         );
         let _ = out.flush();

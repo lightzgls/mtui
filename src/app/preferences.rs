@@ -13,17 +13,19 @@ pub enum Setting {
     Icon,
     Discord,
     Tray,
+    TrayClick,
     Updates,
 }
 
 impl Setting {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Output,
         Self::Cover,
         Self::Renderer,
         Self::Icon,
         Self::Discord,
         Self::Tray,
+        Self::TrayClick,
         Self::Updates,
     ];
 
@@ -38,7 +40,7 @@ impl Setting {
         match self {
             Self::Output => "Playback",
             Self::Cover | Self::Renderer | Self::Icon => "Appearance",
-            Self::Discord | Self::Tray => "Integrations",
+            Self::Discord | Self::Tray | Self::TrayClick => "Integrations",
             Self::Updates => "App",
         }
     }
@@ -51,6 +53,7 @@ impl Setting {
             Self::Icon => "Tray icon",
             Self::Discord => "Discord presence",
             Self::Tray => "Keep tray icon visible",
+            Self::TrayClick => "Click tray icon to stop",
             Self::Updates => "Updates",
         }
     }
@@ -63,16 +66,17 @@ impl Setting {
             Self::Icon => "The icon shown in the Windows notification area.",
             Self::Discord => "Share your current song and playback state on Discord.",
             Self::Tray => "Keep tray controls available while the terminal is open.",
+            Self::TrayClick => "Left-click stops playback. Right-click and choose Show the player to open MTUI.",
             Self::Updates => "Check for new versions and install them here.",
         }
     }
 
     pub fn is_toggle(self) -> bool {
-        matches!(self, Self::Discord | Self::Tray)
+        matches!(self, Self::Discord | Self::Tray | Self::TrayClick)
     }
 
     pub fn enabled(self) -> bool {
-        cfg!(windows) || !matches!(self, Self::Tray | Self::Icon | Self::Updates)
+        cfg!(windows) || !matches!(self, Self::Tray | Self::TrayClick | Self::Icon | Self::Updates)
     }
 }
 
@@ -212,6 +216,7 @@ impl App {
                         if self.presence_enabled() { "On" } else { "Off" }.to_string()
                     }
                     Setting::Tray => if self.start_in_tray { "On" } else { "Off" }.to_string(),
+                    Setting::TrayClick => if self.tray_click_stops { "On" } else { "Off" }.to_string(),
                     Setting::Updates => self.updater.label(),
                 },
             })
@@ -256,7 +261,7 @@ impl App {
             .into_iter()
             .map(|value| (value.label().to_string(), ChoiceValue::Icon(value)))
             .collect(),
-            Setting::Discord | Setting::Tray | Setting::Updates => Vec::new(),
+            Setting::Discord | Setting::Tray | Setting::TrayClick | Setting::Updates => Vec::new(),
         };
         values
             .into_iter()
@@ -340,6 +345,7 @@ impl App {
             Setting::Icon => self.cycle_icon_theme(forward),
             Setting::Discord => self.toggle_presence(),
             Setting::Tray => self.toggle_start_in_tray(),
+            Setting::TrayClick => self.toggle_tray_click_stops(),
             Setting::Updates => return,
         }
         self.preferences.notice = Some((self.status.clone(), self.status.starts_with("could not")));

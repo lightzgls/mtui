@@ -40,7 +40,7 @@ pub(super) fn draw(
         Chrome {
             title: "Settings",
             width: 68,
-            height: 23,
+            height: 24,
             close_label: if state.return_to_menu {
                 "Back"
             } else {
@@ -314,6 +314,7 @@ mod tests {
                 "Signal",
                 "Off",
                 "On",
+                "Off",
                 "v0.10.0 · Check",
             ])
             .map(|(setting, value)| SettingRow {
@@ -370,6 +371,7 @@ mod tests {
             "Tray icon",
             "Discord presence",
             "Keep tray icon visible",
+            "Click tray icon to stop",
         ] {
             assert!(text.contains(label), "missing {label:?}: {text}");
         }
@@ -382,7 +384,7 @@ mod tests {
                     MouseTarget::Area(_, MouseAction::ActivateSetting(_))
                 ))
                 .count(),
-            7
+            Setting::ALL.len()
         );
         assert_eq!(mouse.action_at(0, 0), Some(MouseAction::CloseSettings));
         let heading_y = (0..buf.area.height)
@@ -419,8 +421,8 @@ mod tests {
                                 MouseTarget::Area(_, MouseAction::ActivateSetting(_))
                             ))
                             .count(),
-                        7,
-                        "all seven settings should fit at {width}x{height}"
+                        Setting::ALL.len(),
+                        "all settings should fit at {width}x{height}"
                     );
                 }
                 assert!(mouse.targets.iter().any(|target| matches!(target, MouseTarget::Area(_, MouseAction::ActivateSetting(setting)) if *setting == state.selected_setting())), "selection lost at {width}x{height}");

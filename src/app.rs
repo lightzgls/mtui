@@ -521,6 +521,7 @@ pub struct NowPlaying {
     pub artist_ref: Option<ArtistRef>,
     pub album: Option<String>,
     pub album_route: Option<(String, BrowseEndpoint)>,
+    pub artwork_url: Option<String>,
     /// The track's length, which the player itself does not report -- rodio
     /// knows only how far it has got. Without this there is no progress bar,
     /// only a clock.
@@ -610,6 +611,7 @@ impl NowPlaying {
             artist_ref: track.artist_ref.clone(),
             album: track.album.clone(),
             album_route: None,
+            artwork_url: None,
             duration: track.duration,
             queue_title: String::new(),
             queue: Vec::new(),
@@ -1196,6 +1198,8 @@ pub struct App {
     pub wants_foreground: bool,
     /// Whether the notification-area icon stays available while the UI is open.
     pub start_in_tray: bool,
+    /// Whether a left-click stops playback instead of opening the terminal.
+    pub tray_click_stops: bool,
     /// Artwork selected for runtime-owned windows and the notification area.
     pub icon_theme: IconTheme,
     /// Thumbnail for the track being played, once it has arrived. Exactly one
@@ -1579,6 +1583,7 @@ impl App {
             wants_background: false,
             wants_foreground: false,
             start_in_tray: settings.start_in_tray,
+            tray_click_stops: settings.tray_click_stops,
             icon_theme: settings.icon_theme,
             cover: None,
             cover_id: None,
@@ -2357,6 +2362,7 @@ impl App {
                     self.refresh_output_devices();
                     let settings = config::Settings {
                         start_in_tray: self.start_in_tray,
+                        tray_click_stops: self.tray_click_stops,
                         icon_theme: self.icon_theme,
                         cover_style: self.cover_style,
                         image_renderer: self.image_renderer,
@@ -2900,6 +2906,7 @@ impl App {
 
         now.lyrics_id = watch.lyrics_id;
         now.related_id = watch.related_id;
+        now.artwork_url = watch.artwork_url;
         if let Some((title, endpoint)) = watch.album_route {
             now.album = Some(title.clone());
             now.album_route = Some((title, endpoint));
@@ -3410,6 +3417,7 @@ impl App {
                 artist => artist.to_string(),
             },
             album: now.album.clone(),
+            artwork_url: now.artwork_url.clone(),
             paused,
             clock,
         })
@@ -3441,6 +3449,7 @@ impl App {
         let enabled = !self.start_in_tray;
         let settings = config::Settings {
             start_in_tray: enabled,
+            tray_click_stops: self.tray_click_stops,
             icon_theme: self.icon_theme,
             cover_style: self.cover_style,
             image_renderer: self.image_renderer,
@@ -3463,6 +3472,37 @@ impl App {
         }
     }
 
+    fn toggle_tray_click_stops(&mut self) {
+        if !cfg!(windows) {
+            self.status = "tray click controls are only available on Windows".to_string();
+            return;
+        }
+        let enabled = !self.tray_click_stops;
+        let settings = config::Settings {
+            start_in_tray: self.start_in_tray,
+            tray_click_stops: enabled,
+            icon_theme: self.icon_theme,
+            cover_style: self.cover_style,
+            image_renderer: self.image_renderer,
+            volume: self.snapshot().volume,
+            output_device: self.output_device.clone(),
+        };
+        match settings.save() {
+            Ok(()) => {
+                self.tray_click_stops = enabled;
+                self.status = if enabled {
+                    "tray clicks stop playback; right-click to show the player".to_string()
+                } else {
+                    "tray clicks show the player".to_string()
+                };
+            }
+            Err(err) => {
+                crate::diagnostics::error("config", &format!("could not save settings: {err:#}"));
+                self.status = format!("could not save settings: {err:#}");
+            }
+        }
+    }
+
     fn cycle_icon_theme(&mut self, forward: bool) {
         let theme = if forward {
             self.icon_theme.next()
@@ -3475,6 +3515,7 @@ impl App {
     fn set_icon_theme(&mut self, theme: IconTheme) {
         let settings = config::Settings {
             start_in_tray: self.start_in_tray,
+            tray_click_stops: self.tray_click_stops,
             icon_theme: theme,
             cover_style: self.cover_style,
             image_renderer: self.image_renderer,
@@ -3505,6 +3546,7 @@ impl App {
     fn set_cover_style(&mut self, style: CoverStyle) {
         let settings = config::Settings {
             start_in_tray: self.start_in_tray,
+            tray_click_stops: self.tray_click_stops,
             icon_theme: self.icon_theme,
             cover_style: style,
             image_renderer: self.image_renderer,
@@ -3536,6 +3578,7 @@ impl App {
     fn set_image_renderer(&mut self, renderer: ImageRenderer) {
         let settings = config::Settings {
             start_in_tray: self.start_in_tray,
+            tray_click_stops: self.tray_click_stops,
             icon_theme: self.icon_theme,
             cover_style: self.cover_style,
             image_renderer: renderer,
@@ -5436,6 +5479,8 @@ impl App {
     /// here is what someone with no window in front of them can still want.
     pub fn handle_tray(&mut self, command: TrayCommand) {
         match command {
+            TrayCommand::Click if self.tray_click_stops => self.stop(),
+            TrayCommand::Click => self.wants_foreground = true,
             TrayCommand::Show => self.wants_foreground = true,
             TrayCommand::TogglePause => self.toggle_pause(),
             TrayCommand::Next => self.advance(1, false),
@@ -5559,6 +5604,7 @@ impl App {
     fn flush_volume(&mut self) {
         let Some((_, volume)) = self.volume_save.take() else { return; };
         let settings = config::Settings { start_in_tray: self.start_in_tray,
+            tray_click_stops: self.tray_click_stops,
             icon_theme: self.icon_theme, cover_style: self.cover_style,
             image_renderer: self.image_renderer, volume, output_device: self.output_device.clone() };
         if let Err(error) = settings.save() {

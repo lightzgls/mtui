@@ -89,6 +89,49 @@ fn window_close_keeps_the_tray_but_end_task_and_explicit_quit_stop_the_player() 
 }
 
 #[test]
+fn tray_click_obeys_the_setting_and_stop_cancels_late_playback() {
+    let (mut app, driver, _requests) = fixture();
+    app.play_track(track(0), false);
+    driver.commands.try_iter().for_each(drop);
+    app.handle_tray(TrayCommand::Click);
+    assert!(app.wants_foreground && app.now.is_some());
+    assert!(driver.commands.try_iter().next().is_none());
+
+    app.wants_foreground = false;
+    app.tray_click_stops = true;
+    app.handle_mouse_action(MouseAction::SeekTo(POINTER_SCALE)).unwrap();
+    app.handle_tray(TrayCommand::Click);
+    resolve(&mut app, 0);
+    let commands: Vec<_> = driver.commands.try_iter().collect();
+    assert!(matches!(commands.as_slice(), [Command::Stop]), "{commands:?}");
+    assert!(app.now.is_none() && app.pending.is_none() && app.pending_seek.is_none());
+    assert!(!app.wants_foreground && !app.should_quit);
+    assert!(app.activity().is_none());
+
+    app.handle_tray(TrayCommand::Show);
+    assert!(app.wants_foreground, "the menu can still show MTUI when clicks stop playback");
+}
+
+#[test]
+fn discord_artwork_follows_only_the_current_tracks_watch_response() {
+    let (mut app, driver, _requests) = fixture();
+    app.play_track(track(0), false);
+    state(&driver, PlayState::Playing, Duration::from_secs(10));
+    let watch = || Watch { artwork_url: Some("https://example.com/sleeve.jpg".into()), ..Default::default() };
+    app.apply_watch("song-1", Ok(watch()));
+    assert!(app.activity().unwrap().artwork_url.is_none());
+    app.apply_watch("song-0", Ok(watch()));
+    assert_eq!(app.activity().unwrap().artwork_url.as_deref(), Some("https://example.com/sleeve.jpg"));
+
+    app.play_track(track(1), false);
+    app.apply_watch("song-0", Ok(watch()));
+    assert!(app.activity().unwrap().artwork_url.is_none(), "the next song must not inherit artwork");
+    app.stop();
+    app.apply_watch("song-1", Ok(watch()));
+    assert!(app.activity().is_none());
+}
+
+#[test]
 fn volume_buttons_and_pointer_use_five_percent_steps_at_the_bounds_and_after_dragging() {
     let (mut app, driver, _requests) = fixture();
     driver.commands.try_iter().for_each(drop);

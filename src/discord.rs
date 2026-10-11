@@ -83,14 +83,8 @@ const MAX_FIELD: usize = 128;
 const OP_HANDSHAKE: u32 = 0;
 const OP_FRAME: u32 = 1;
 
-/// Where the card's picture comes from.
-///
-/// The same thumbnail [`crate::source::cover`] draws in the terminal, and free
-/// for the same reason: the address is derived from the video id, so putting a
-/// picture on the card costs no request from here at all. `hqdefault` rather
-/// than the larger names that module ladders through -- Discord scales the
-/// image down to a thumbnail either way, and this is the one name YouTube
-/// generates for every upload, so it cannot come back missing.
+/// Fallback while native square artwork is unavailable. Video thumbnails can
+/// contain padding, so the Music watch response's sleeve is preferred.
 fn cover_url(video_id: &str) -> String {
     format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
 }
@@ -127,6 +121,8 @@ pub struct Activity {
     /// lines are already spent on the title and the artist. `None` for the
     /// singles and plain YouTube uploads that genuinely have no album.
     pub album: Option<String>,
+    /// Native square artwork, once the Music watch response has arrived.
+    pub artwork_url: Option<String>,
     pub paused: bool,
     /// Where the progress bar should be, or `None` for no bar at all.
     ///
@@ -160,6 +156,7 @@ impl Activity {
             && self.title == other.title
             && self.artist == other.artist
             && self.album == other.album
+            && self.artwork_url == other.artwork_url
             && self.paused == other.paused
     }
 
@@ -199,7 +196,7 @@ impl Activity {
                 // it. The documented alternative is uploading named assets to
                 // the application, which would mean one upload per album --
                 // which is to say, it is not an alternative.
-                "large_image": cover_url(&self.video_id),
+                "large_image": self.artwork_url.clone().unwrap_or_else(|| cover_url(&self.video_id)),
                 "large_text": clamp(self.album.as_deref().unwrap_or(&self.title)),
                 // Discord does not show activity buttons on every compact
                 // surface. Linking the artwork gives the repository a second
@@ -793,6 +790,7 @@ mod tests {
             title: "Let It Happen".to_string(),
             artist: "Tame Impala".to_string(),
             album: Some("Currents".to_string()),
+            artwork_url: None,
             paused: false,
             clock: Some(Clock {
                 start_ms: 1_700_000_000_000,
@@ -908,6 +906,16 @@ mod tests {
         // The important half: no timestamps at all, rather than stale ones that
         // would leave the bar advancing through a track nobody is hearing.
         assert_eq!(payload["timestamps"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn native_square_artwork_replaces_the_video_thumbnail_and_refreshes_the_card() {
+        let fallback = activity();
+        assert_eq!(fallback.payload()["assets"]["large_image"], cover_url(&fallback.video_id));
+        let mut sleeve = fallback.clone();
+        sleeve.artwork_url = Some("https://lh3.googleusercontent.com/sleeve=w544-h544-l90-rj".into());
+        assert!(!fallback.same_as(&sleeve));
+        assert_eq!(sleeve.payload()["assets"]["large_image"], sleeve.artwork_url.unwrap());
     }
 
     #[test]

@@ -112,6 +112,8 @@ pub struct Watch {
     /// The queue itself, starting with the track that seeded it.
     pub queue: Vec<Track>,
     pub album_route: Option<(String, super::BrowseEndpoint)>,
+    /// Native square artwork for this track, without video-thumbnail padding.
+    pub artwork_url: Option<String>,
     /// Browse id of the "Lyrics" tab, when this track has one. Instrumentals
     /// and most videos do not.
     pub lyrics_id: Option<String>,
@@ -252,6 +254,7 @@ pub fn fetch(http: &Http, video_id: &str) -> Result<Watch> {
         queue_title: queue_title(&json).unwrap_or_default(),
         queue: queue(&json),
         album_route: playing_album(&json, video_id),
+        artwork_url: playing_artwork(&json, video_id),
         lyrics_id: tab_id(&json, "Lyrics"),
         related_id: tab_id(&json, "Related"),
         continuation: queue_token(&json),
@@ -270,6 +273,24 @@ fn playing_album(json: &Value, video_id: &str) -> Option<(String, super::BrowseE
     home::collect(json, "playlistPanelVideoRenderer", &mut rows);
     rows.into_iter().find(|row| row["videoId"].as_str() == Some(video_id))?
         .pointer("/longBylineText/runs").and_then(home::album_ref)
+}
+
+fn playing_artwork(json: &Value, video_id: &str) -> Option<String> {
+    let mut rows = Vec::new();
+    home::collect(json, "playlistPanelVideoRenderer", &mut rows);
+    let row = rows.into_iter().find(|row| row["videoId"].as_str() == Some(video_id))?;
+    let thumbnails = row.pointer("/thumbnail/thumbnails")
+        .or_else(|| row.pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails"))?
+        .as_array()?;
+    // Keep the original CDN URL: its size/crop parameters belong to YouTube.
+    // Rectangular video frames still use the presence's reliable fallback.
+    thumbnails.iter().filter_map(|thumbnail| {
+        let width = thumbnail["width"].as_u64()?;
+        let height = thumbnail["height"].as_u64()?;
+        let url = thumbnail["url"].as_str()?;
+        (width > 0 && width == height && url.starts_with("https://"))
+            .then_some((width, url))
+    }).max_by_key(|(width, _)| *width).map(|(_, url)| url.to_string())
 }
 
 /// The next page of a queue, and the token for the page after it.
@@ -923,6 +944,43 @@ mod tests {
         let queue = queue(&json);
         assert_eq!(queue[0].uploader, "Daft Punk");
         assert_eq!(queue[0].album, None);
+    }
+
+    #[test]
+    fn playing_artwork_uses_the_largest_native_square_for_the_requested_song() {
+        let mut current = row("song", "Song", "Artist", "3:00");
+        current["playlistPanelVideoRenderer"]["thumbnail"] = serde_json::json!({
+            "thumbnails": [
+                { "url": "https://lh3.googleusercontent.com/sleeve=w60-h60-l90-rj", "width": 60, "height": 60 },
+                { "url": "https://i.ytimg.com/vi/song/hqdefault.jpg", "width": 480, "height": 360 },
+                { "url": "https://lh3.googleusercontent.com/sleeve=w544-h544-l90-rj", "width": 544, "height": 544 },
+                { "url": "http://example.com/insecure.jpg", "width": 1000, "height": 1000 }
+            ]
+        });
+        let mut other = row("other", "Other song", "Artist", "3:00");
+        other["playlistPanelVideoRenderer"]["thumbnail"] = serde_json::json!({
+            "thumbnails": [{ "url": "https://example.com/other.jpg", "width": 1000, "height": 1000 }]
+        });
+        let json = serde_json::json!({ "contents": [other, current] });
+        assert_eq!(playing_artwork(&json, "song").as_deref(),
+            Some("https://lh3.googleusercontent.com/sleeve=w544-h544-l90-rj"));
+        assert!(playing_artwork(&json, "missing").is_none());
+    }
+
+    #[test]
+    fn video_or_missing_artwork_leaves_the_presence_fallback_available() {
+        let mut json = row("song", "Song", "Artist", "3:00");
+        assert!(playing_artwork(&json, "song").is_none());
+        json["playlistPanelVideoRenderer"]["thumbnail"] = serde_json::json!({
+            "thumbnails": [{ "url": "https://i.ytimg.com/vi/song/hqdefault.jpg", "width": 480, "height": 360 }]
+        });
+        assert!(playing_artwork(&json, "song").is_none());
+        json["playlistPanelVideoRenderer"]["thumbnail"] = serde_json::json!({
+            "musicThumbnailRenderer": { "thumbnail": { "thumbnails": [
+                { "url": "https://example.com/sleeve.jpg", "width": 120, "height": 120 }
+            ] } }
+        });
+        assert_eq!(playing_artwork(&json, "song").as_deref(), Some("https://example.com/sleeve.jpg"));
     }
 
     #[test]

@@ -376,6 +376,8 @@ impl IconTheme {
 #[serde(default)]
 pub struct Settings {
     pub start_in_tray: bool,
+    /// Left-clicking the tray icon stops playback instead of opening MTUI.
+    pub tray_click_stops: bool,
     pub icon_theme: IconTheme,
     pub cover_style: CoverStyle,
     pub image_renderer: ImageRenderer,
@@ -389,6 +391,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             start_in_tray: false,
+            tray_click_stops: false,
             icon_theme: IconTheme::default(),
             cover_style: CoverStyle::default(),
             image_renderer: ImageRenderer::default(),
@@ -565,6 +568,7 @@ mod tests {
         assert!(!Settings::default().start_in_tray);
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert!(!settings.start_in_tray);
+        assert!(!settings.tray_click_stops);
         assert_eq!(settings.icon_theme, IconTheme::Signal);
         assert_eq!(settings.cover_style, CoverStyle::Pixel);
         assert_eq!(settings.image_renderer, ImageRenderer::Automatic);
@@ -573,6 +577,7 @@ mod tests {
 
         let legacy: Settings = serde_json::from_str(r#"{"start_in_tray":true}"#).unwrap();
         assert!(legacy.start_in_tray);
+        assert!(!legacy.tray_click_stops);
         assert_eq!(legacy.icon_theme, IconTheme::Signal);
         assert_eq!(legacy.cover_style, CoverStyle::Pixel);
         assert_eq!(legacy.image_renderer, ImageRenderer::Automatic);
@@ -584,6 +589,7 @@ mod tests {
     fn the_tray_preference_round_trips() {
         let body = serde_json::to_string(&Settings {
             start_in_tray: true,
+            tray_click_stops: true,
             icon_theme: IconTheme::Wave,
             cover_style: CoverStyle::ColoredAscii,
             image_renderer: ImageRenderer::Kitty,
@@ -593,6 +599,7 @@ mod tests {
         .unwrap();
         let settings: Settings = serde_json::from_str(&body).unwrap();
         assert!(settings.start_in_tray);
+        assert!(settings.tray_click_stops);
         assert_eq!(settings.icon_theme, IconTheme::Wave);
         assert_eq!(settings.cover_style, CoverStyle::ColoredAscii);
         assert_eq!(settings.image_renderer, ImageRenderer::Kitty);

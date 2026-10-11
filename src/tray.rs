@@ -205,6 +205,8 @@ mod imp {
     /// What the user asked of the icon.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TrayCommand {
+        /// Apply the user's left-click preference.
+        Click,
         /// Put the terminal interface back up.
         Show,
         TogglePause,
@@ -246,10 +248,8 @@ mod imp {
             // mouse message arrives in the low word of `lparam`.
             WM_TRAY => {
                 match lparam as u32 {
-                    // The plain click does what double-clicking a tray icon
-                    // conventionally does, because a background player is a
-                    // thing users click once and expect to see.
-                    WM_LBUTTONUP | WM_LBUTTONDBLCLK => send(TrayCommand::Show),
+                    // The app applies the current preference on its own thread.
+                    WM_LBUTTONUP | WM_LBUTTONDBLCLK => send(TrayCommand::Click),
                     WM_RBUTTONUP => unsafe { popup_menu(hwnd) },
                     _ => {}
                 }
@@ -441,7 +441,7 @@ mod imp {
                 copy_wide(&mut data.info_title, "MTUI is running in the tray");
                 copy_wide(
                     &mut data.info,
-                    "Click the MTUI icon to open it. Windows may place new icons under the ^ hidden-icons menu.",
+                    "Right-click the MTUI icon for controls or to show the player. Windows may place new icons under the ^ hidden-icons menu.",
                 );
             }
             data
@@ -614,6 +614,7 @@ mod imp {
     #[allow(dead_code)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TrayCommand {
+        Click,
         Show,
         TogglePause,
         Next,

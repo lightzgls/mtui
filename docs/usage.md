@@ -234,6 +234,11 @@ before opening an updated build.
 Enable **Keep tray icon visible** under Settings → Integrations to retain the icon while the
 terminal UI is open. Windows may place new icons under the hidden-icons `^` menu.
 
+Enable **Click tray icon to stop** in the same section to make a left-click stop
+playback and clear the current queue. This setting is off by default, so a click
+normally opens MTUI. With it enabled, use **right-click → Show the player** to
+open the terminal. The preference is saved across restarts.
+
 ### Configuration
 
 | Platform | Configuration directory |
