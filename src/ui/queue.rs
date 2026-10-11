@@ -238,7 +238,9 @@ mod tests {
         now.queue = (0..30)
             .map(|i| Track {
                 id: i.to_string(),
-                title: format!("Song {i:02} 日本語"),
+                // Fits the narrowest title column so geometry assertions do
+                // not depend on when the independently tested marquee moves.
+                title: format!("{i:02} 日本語"),
                 ..track.clone()
             })
             .collect();
@@ -274,7 +276,10 @@ mod tests {
                     let index = geometry.first + slot;
                     let rendered: String =
                         (0..width).map(|x| buffer[(x, row.y)].symbol()).collect();
-                    assert!(rendered.contains(&format!("Song {index:02}")), "{rendered}");
+                    let title: String = rendered.chars().skip(MARKER_WIDTH).collect();
+                    assert!(title.starts_with(&format!("{index:02} ")), "{rendered}");
+                    // Wide glyphs leave continuation cells in the buffer.
+                    assert!(['日', '本', '語'].into_iter().all(|glyph| title.contains(glyph)), "{rendered}");
                     assert_eq!(
                         mouse.action_at(0, row.y),
                         Some(MouseAction::OpenPageRow(index))
