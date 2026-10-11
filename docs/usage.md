@@ -123,6 +123,10 @@ Complete Google's flow and the window closes as soon as the session is ready.
 MTUI stores the resulting YouTube session cookies in its private configuration
 directory; it does not receive the password entered into the page.
 
+Radio queues use this saved session so YouTube Music can personalize the tracks
+it recommends. Initial queues, additional pages, and fallback stations all use
+the current session. Without a saved session, radio remains available anonymously.
+
 On Linux and macOS, the WebKit sign-in code lives in the small `mtui-sign-in`
 companion installed automatically with MTUI. It runs only during sign-in and
 exits immediately afterward, keeping the long-running player free of the browser

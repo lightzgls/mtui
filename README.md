@@ -1,8 +1,18 @@
 # MTUI
 
-A lightweight YouTube Music player with a mouse-friendly terminal interface and native audio playback. Built with Rust, primarily for Windows.
+**Your music, in the terminal.**
 
-[Download](https://github.com/lightzgls/mtui/releases/latest) · [Report an issue](https://github.com/lightzgls/mtui/issues) · [Usage guide](docs/usage.md)
+A lightweight YouTube Music player with cover art, lyrics, playlists, and controls you can click. Free and open source, built with Rust, primarily for Windows.
+
+**[Download for Windows](https://github.com/lightzgls/mtui/releases/latest)** · [See it in action](#preview) · [Usage guide](docs/usage.md) · [Report an issue](https://github.com/lightzgls/mtui/issues)
+
+![MTUI playing music in a terminal, with pixel cover art, a queue, and playback controls](assets/previews/now-playing.png)
+
+- **Mouse or keyboard.** Click a track, drag to seek, or use shortcuts to search and control playback.
+- **More than a track list.** Browse Home, build a queue, and follow lyrics alongside cover art that sets the player's colors.
+- **Easy to try.** Windows installer or portable executable; no Rust setup needed. Search and playback work without signing in.
+
+First launch needs an internet connection to download playback tools. MTUI is an independent project, unaffiliated with YouTube or Google.
 
 ## Preview
 
@@ -57,7 +67,7 @@ Download **MTUI-<version>-Setup-x64.exe** from the [latest release](https://gith
 
 On first launch, MTUI downloads missing playback tools: yt-dlp, a supported JavaScript runtime, and the bgutil PO-token provider. Setup needs an internet connection. Sign-in uses Microsoft Edge WebView2; playback runs without a browser window.
 
-Search and playback work without an account. Press **M** or open **Menu → Account & Sessions** to sign in for personalized Home, playlists, likes, and listening-history sync. YouTube account history must be enabled for history writes.
+Search and playback work without an account. Press **M** or open **Menu → Account & Sessions** to sign in for personalized Home and radio queues, playlists, likes, and listening-history sync. YouTube account history must be enabled for history writes.
 
 Sign in once; MTUI maintains the saved session automatically, including in the tray. It renews every 48 hours and recovers early after authentication failures. Temporary failures retry quietly; a sign-in window appears only when Google requires verification.
 
@@ -94,11 +104,10 @@ cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-Windows output: `target/release/mtui.exe`. Live network/account tests are ignored by default. See [requirements](docs/requirements.md), [analysis](docs/analysis.md), and [design](docs/design.md) for scope and architecture. Focused pull requests and bug reports are welcome.
+Windows output: `target/release/mtui.exe`. Live network/account tests are ignored by default. Focused pull requests and bug reports are welcome.
 
 For isolated smoke, full, and repeated test runs, use `./scripts/test.ps1`.
-See the [testing guide](docs/testing.md), [edge-case scenarios](docs/test-cases.md),
-and [latest bug-hunt findings](docs/test-findings.md). The runner keeps logs and
+See the [testing guide](docs/testing.md). The runner keeps logs and
 a JSON summary under `target/test-runs/` and leaves live/account tests ignored.
 
 ## Acknowledgments and references

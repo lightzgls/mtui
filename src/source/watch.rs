@@ -38,6 +38,7 @@ use super::innertube::parse_duration;
 use super::journal::Journal;
 use super::sapisid;
 use super::{Track, UNKNOWN_ARTIST};
+use crate::config::Cookies;
 
 /// youtube.com's own watch endpoint. Not the music one: comments live here.
 const YOUTUBE_NEXT_URL: &str = "https://www.youtube.com/youtubei/v1/next";
@@ -237,11 +238,10 @@ pub struct Comments {
 /// what its own player does when a track is played from search rather than from
 /// inside a playlist. Without it the response carries the one track and nothing
 /// to play afterwards.
+/// The saved Music session personalizes the radio when the user is signed in.
 pub fn fetch(http: &Http, video_id: &str) -> Result<Watch> {
-    let json = home::post(
+    let json = queue_next(
         http,
-        home::NEXT_URL,
-        None,
         serde_json::json!({
             "videoId": video_id,
             "playlistId": format!("RDAMVM{video_id}"),
@@ -284,10 +284,8 @@ fn playing_album(json: &Value, video_id: &str) -> Option<(String, super::BrowseE
 /// the same rows [`queue`] parses, and a continuation redeemed under a client
 /// that was not issued it comes back empty rather than refused.
 pub fn continue_queue(http: &Http, token: &str) -> Result<QueuePage> {
-    let json = home::post(
+    let json = queue_next(
         http,
-        home::NEXT_URL,
-        None,
         serde_json::json!({ "continuation": token }),
     )?;
 
@@ -320,10 +318,9 @@ pub fn continue_queue(http: &Http, token: &str) -> Result<QueuePage> {
 /// `rotation` steps through those candidates, so a second call after a station
 /// that led nowhere builds a different one instead of the same one again.
 ///
-/// Deliberately asked with no like list. Likes need a session and this runs on
-/// the page thread, but that is not the reason: a like is something people do
-/// once and forget, and what should play next is better predicted by what they
-/// keep coming back to. The journal knows that and the like list does not.
+/// Seed selection uses the local play journal without fetching a like list.
+/// YouTube Music builds the resulting radio with the saved session when one
+/// is available, just as it does for the initial queue and continuation pages.
 pub fn seeded_page(http: &Http, journal: &Journal, rotation: usize) -> Result<QueuePage> {
     let taste = journal.taste(&[], sapisid::unix_now());
     // A first run, or close to it. There is no opinion to build a station from
@@ -346,10 +343,8 @@ pub fn seeded_page(http: &Http, journal: &Journal, rotation: usize) -> Result<Qu
         bail!("everything worth building a station from has just been played");
     };
 
-    let json = home::post(
+    let json = queue_next(
         http,
-        home::NEXT_URL,
-        None,
         serde_json::json!({
             "videoId": seed.id,
             "playlistId": format!("RDAMVM{}", seed.id),
@@ -374,6 +369,13 @@ pub fn seeded_page(http: &Http, journal: &Journal, rotation: usize) -> Result<Qu
         // these tracks came from.
         title: Some(queue_title(&json).unwrap_or_else(|| format!("Station from {}", seed.label()))),
     })
+}
+
+/// Every radio request uses the latest saved session, including renewed cookies
+/// and explicit logout. With no usable session it remains an anonymous radio.
+fn queue_next(http: &Http, extra: Value) -> Result<Value> {
+    let cookies = Cookies::available().ok().flatten();
+    home::post(http, home::NEXT_URL, cookies.as_ref(), extra)
 }
 
 /// The lyrics behind the browse id [`fetch`] handed back.
@@ -1287,6 +1289,29 @@ mod tests {
         assert!(queue(&serde_json::json!({})).is_empty());
         assert!(parse_comments(&serde_json::json!({ "contents": 5 })).is_empty());
         assert_eq!(queue_title(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    #[ignore = "reads live YouTube Music radio and continuation; checks saved or guest session"]
+    fn live_queue_session_and_continuation() {
+        let signed_in = Cookies::available().expect("saved session should load").is_some();
+        println!("queue session: {}", if signed_in { "signed in" } else { "guest" });
+        let http = Http::new().expect("client should build");
+        let id = std::env::var("MTUI_VIDEO_ID").unwrap_or_else(|_| "dQw4w9WgXcQ".into());
+        let json = queue_next(&http, serde_json::json!({
+            "videoId": id,
+            "playlistId": format!("RDAMVM{id}"),
+        })).expect("initial radio should answer");
+        assert_eq!(super::super::account::logged_in(&json), Some(signed_in),
+            "radio must use the saved account when present, otherwise a guest session");
+        assert!(!queue(&json).is_empty(), "initial radio should contain tracks");
+
+        let token = queue_token(&json).expect("radio should offer a continuation");
+        let next = queue_next(&http, serde_json::json!({"continuation": token}))
+            .expect("continuation should answer");
+        assert_eq!(super::super::account::logged_in(&next), Some(signed_in),
+            "continuation must preserve the radio's account or guest context");
+        assert!(!queue(&next).is_empty(), "continuation should contain tracks");
     }
 
     /// Confirms the player page still parses against the live endpoints.

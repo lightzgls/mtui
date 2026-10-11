@@ -2,8 +2,8 @@
 
 Mục tiêu là tìm lỗi qua **chuỗi thao tác và thứ tự sự kiện**, bên cạnh kiểm tra
 từng chức năng riêng lẻ. Không coi số test pass là bằng chứng đã tìm hết bug.
-Danh sách ca cụ thể nằm trong [test-cases.md](test-cases.md); kết quả đã quan sát
-nằm trong [test-findings.md](test-findings.md).
+Các regression tự động nằm trong source; lưu kết quả từng lần chạy trong
+`target/test-runs/` hoặc issue tương ứng.
 
 ## Chạy bộ kiểm tra
 
@@ -78,8 +78,8 @@ Buffering → Idle có lỗi phải được báo lỗi, không bị hiểu thà
    range/retry, giới hạn body, parser, session, journal, config và Ratatui.
    Fixture HTTP chỉ trỏ localhost; account-write dùng callback giả lập.
 3. **Audio/Windows tích hợp:** AAC thật, thiết bị thật, console/tray, sleep/wake,
-   resize lúc drag và nghe để đối chiếu clock/lyrics. Chạy theo ca trong catalog,
-   ghi thiết bị, terminal, thời gian và kết quả riêng.
+   resize lúc drag và nghe để đối chiếu clock/lyrics. Ghi thao tác, thiết bị,
+   terminal, thời gian và kết quả riêng.
 4. **Provider/account trực tiếp:** kiểm tra nội dung/search/account thật khi có
    điều kiện. Dùng tài khoản test và playlist test cho ca ghi dữ liệu. Các test
    history có thể ghi lên tài khoản đang đăng nhập, nên không chạy cả danh sách
@@ -109,7 +109,7 @@ terminal cho mọi thao tác. Không tự coi việc thiếu các nút ở 1×1 
 
 ## Ma trận và cách tăng khả năng bắt lỗi
 
-Với SEEK-01, kết hợp các trục: trạng thái trước click (Idle/Buffering/Playing),
+Với ca chọn bài rồi seek ngay, kết hợp các trục: trạng thái trước click (Idle/Buffering/Playing),
 duration (0/1 giây/240 giây/không biết), repeat (Off/All/One), vị trí queue
 (đầu/cuối), thời điểm response (trước/sau click) và thao tác tiếp theo
 (không có/Next/Stop/seek lại/Pause). Các tổ hợp P0/P1 được ưu tiên theo nguy cơ:
@@ -138,12 +138,10 @@ Không suy diễn một mô phỏng event đã pass thành một luồng âm tha
 - Bug tái hiện được có regression test trước khi sửa; lưu kết quả trước/sau.
 - Keyboard-only và mouse-only hoàn thành launch → search → play → seek → queue
   → background → restore → quit trên Windows thật.
-- Bộ 100 bài và soak 8 giờ được ghi riêng. Theo requirements: >=98/100 start
-  lần đầu, >=99/100 sau fallback, tách riêng hạn chế account/region đã xác nhận;
-  steady state 40–60 MiB, tăng không quá 8 MiB sau soak, vẫn dưới 60 MiB.
-- Đánh dấu thiếu tính năng theo requirements là gap; không ghi Pass cho nút
-  không tồn tại. Library đầy đủ, import/export, media-key và persistence queue
-  cần đối chiếu lại implementation trước khi kết luận.
+- Bộ 100 bài và soak 8 giờ được ghi riêng: tỷ lệ start lần đầu/sau fallback,
+  hạn chế account/region đã xác nhận, bộ nhớ steady state và mức tăng sau soak.
+- Không ghi Pass cho nút không tồn tại hoặc tính năng chưa được triển khai;
+  đối chiếu hành vi thực tế trước khi kết luận.
 
 ## Mẫu ghi kết quả / bug
 
