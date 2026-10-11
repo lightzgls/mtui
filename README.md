@@ -88,7 +88,7 @@ Settings and sessions live in `%APPDATA%\mtui`; downloaded tools live in `%LOCAL
 | `S`, `?` | Settings, full keyboard help |
 | `Esc`, `q` | Back, quit |
 
-Click cards, links, tabs, and player controls; hover highlights clickable items. Artist sections have mouse paging, and Related shows artwork cards. Drag the progress bar to seek; use the volume −/+ buttons or wheel over volume for 5% steps. Closing the Windows window continues playback in the tray. **End task**, **Menu → Quit**, and the tray's Quit command exit the player.
+Click cards, links, tabs, and player controls. Artist sections have mouse paging, and Related shows artwork cards. Drag the progress bar to seek; use the volume −/+ buttons or wheel over volume for 5% steps. Closing the Windows window continues playback in the tray. **End task**, **Menu → Quit**, and the tray's Quit command exit the player.
 
 ## Resource use
 

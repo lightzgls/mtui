@@ -1142,7 +1142,7 @@ mod imp {
             if record.button_state & 0x0001 != 0 { MouseEventKind::Drag(MouseButton::Left) }
             else if record.button_state & 0x0002 != 0 { MouseEventKind::Drag(MouseButton::Right) }
             else if record.button_state & 0x0004 != 0 { MouseEventKind::Drag(MouseButton::Middle) }
-            else { MouseEventKind::Moved }
+            else { return None; }
         } else if record.event_flags == 0 {
             let button = if record.button_state & 0x0001 != 0 {
                 MouseButton::Left
@@ -1440,8 +1440,9 @@ mod tests {
     }
 
     #[test]
-    fn native_mouse_movement_and_left_drag_are_forwarded_for_hover_and_scrubbing() {
-        for (buttons, kind) in [(0, MouseEventKind::Moved), (1, MouseEventKind::Drag(MouseButton::Left))] {
+    fn native_mouse_movement_is_ignored_and_drags_are_forwarded_for_scrubbing() {
+        assert!(mouse_event(MouseRecord { position: [12, 7], button_state: 0, control: 0, event_flags: 1 }).is_none());
+        for (buttons, kind) in [(1, MouseEventKind::Drag(MouseButton::Left)), (2, MouseEventKind::Drag(MouseButton::Right)), (4, MouseEventKind::Drag(MouseButton::Middle))] {
             let event = mouse_event(MouseRecord { position: [12, 7], button_state: buttons, control: 0, event_flags: 1 }).unwrap();
             assert_eq!(event.kind, kind);
             assert_eq!((event.column, event.row), (12, 7));

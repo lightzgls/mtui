@@ -278,8 +278,8 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
                 .context("could not poll foreground input")?
             {
                 match event {
-                    Event::Key(key) if key.is_press() => { mouse.clear_pointer(); app.handle_key(key)?; }
-                    Event::Mouse(event) => { mouse.move_pointer(event.column, event.row); match event.kind {
+                    Event::Key(key) if key.is_press() => app.handle_key(key)?,
+                    Event::Mouse(event) => match event.kind {
                         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                             let up = event.kind == MouseEventKind::ScrollUp;
                             if mouse.over_volume(event.column, event.row) {
@@ -305,9 +305,8 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
                             app.handle_mouse_action(app::MouseAction::OpenPageActions)?;
                         }
                         _ => {}
-                    } },
+                    },
                     Event::Resize(width, height) => {
-                        mouse.clear_pointer();
                         #[cfg(not(windows))]
                         let _ = (width, height);
                         #[cfg(windows)]

@@ -228,7 +228,6 @@ const MIN_SHELF_TITLE: usize = 8;
 #[derive(Default)]
 pub struct MouseMap {
     targets: Vec<MouseTarget>,
-    pointer: Option<(u16, u16)>,
 }
 
 #[derive(Clone, Copy)]
@@ -241,10 +240,6 @@ enum MouseTarget {
 }
 
 impl MouseMap {
-    pub fn move_pointer(&mut self, column: u16, row: u16) { self.pointer = Some((column, row)); }
-
-    pub fn clear_pointer(&mut self) { self.pointer = None; }
-
     pub fn over_volume(&self, column: u16, row: u16) -> bool {
         self.targets.iter().rev().find_map(|target| match *target {
             MouseTarget::Area(area, action) if contains(area, column, row) => Some(matches!(action, MouseAction::AdjustVolume(_) | MouseAction::ToggleMute)),
@@ -252,34 +247,6 @@ impl MouseMap {
             MouseTarget::Progress(area) | MouseTarget::TrackRows { area, .. } if contains(area, column, row) => Some(false),
             _ => None,
         }).unwrap_or(false)
-    }
-
-    /// Feedback belongs to the current hit map; hovering never changes selection.
-    fn render_hover(&self, frame: &mut Frame) {
-        let Some((column, row)) = self.pointer else { return; };
-        let Some(action) = self.action_at(column, row) else { return; };
-        if action == MouseAction::IgnoreOverlay { return; }
-        let Some(area) = self.targets.iter().rev().find_map(|target| match *target {
-            MouseTarget::Area(area, _) | MouseTarget::Progress(area) | MouseTarget::Volume(area)
-                if contains(area, column, row) => Some(area),
-            MouseTarget::TrackRows { area, .. }
-                if contains(area, column, row) => Some(Rect::new(area.x, row, area.width, 1)),
-            _ => None,
-        }) else { return; };
-        if area == frame.area() { return; }
-        for y in area.y..area.bottom() {
-            for x in area.x..area.right() {
-                let cell = &mut frame.buffer_mut()[(x, y)];
-                if cell.diff_option == CellDiffOption::Skip || matches!(cell.symbol(), "▀" | "▄" | "█" | "▌" | "▐") { continue; }
-                if matches!(cell.bg, Color::Reset | Color::Black | Color::DarkGray | shell::BACKGROUND | shell::SURFACE)
-                    || matches!(cell.bg, Color::Rgb(r, g, b) if r == g && g == b && r < 100)
-                { cell.bg = Color::Rgb(38, 38, 38); }
-                cell.modifier.insert(Modifier::BOLD);
-                if area.height == 1 && !matches!(action, MouseAction::SeekTo(_) | MouseAction::SetVolume(_)) {
-                    cell.modifier.insert(Modifier::UNDERLINED);
-                }
-            }
-        }
     }
 
     pub fn action_at(&self, column: u16, row: u16) -> Option<MouseAction> {
@@ -431,7 +398,6 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
     // Menus are the final layer. Input keeps them mutually exclusive with the
     // ordinary overlays, but drawing last preserves that invariant visually.
     menu::render(frame, app, mouse);
-    mouse.render_hover(frame);
     palette::apply(frame, app.cover.as_ref(), if app.cover_style == CoverStyle::ColoredAscii { cover_area } else { None });
 }
 
@@ -5112,7 +5078,6 @@ mod tests {
         let area = Rect::new(5, 7, 11, 1);
         let mouse = MouseMap {
             targets: vec![MouseTarget::Progress(area)],
-            ..MouseMap::default()
         };
 
         assert_eq!(mouse.action_at(5, 7), Some(MouseAction::SeekTo(0)));
@@ -5125,31 +5090,6 @@ mod tests {
             Some(MouseAction::SeekTo(POINTER_SCALE))
         );
         assert_eq!(mouse.action_at(16, 7), None, "the clock is not a scrubber");
-    }
-
-    #[test]
-    fn hover_uses_the_current_hit_map_without_activating_or_recoloring_artwork() {
-        let area = Rect::new(2, 2, 8, 2);
-        let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
-        let mut mouse = MouseMap::default();
-        mouse.targets.push(MouseTarget::Area(area, MouseAction::OpenHomeCard { shelf: 0, card: 1 }));
-        let draw = |frame: &mut Frame, mouse: &MouseMap| {
-            frame.render_widget(Paragraph::new("Cover\nArtist").style(Style::default().bg(shell::BACKGROUND)), area);
-            frame.buffer_mut()[(area.x, area.y)].set_symbol("▀").set_fg(Color::Red).set_bg(Color::Blue);
-            mouse.render_hover(frame);
-        };
-        mouse.move_pointer(4, 2);
-        terminal.draw(|frame| draw(frame, &mouse)).unwrap();
-        let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(4, 2)].bg, Color::Rgb(38, 38, 38));
-        assert_eq!((buffer[(2, 2)].fg, buffer[(2, 2)].bg), (Color::Red, Color::Blue));
-        assert_eq!(mouse.context_action_at(4, 2), Some(MouseAction::SelectHomeCard { shelf: 0, card: 1 }));
-        mouse.targets.push(MouseTarget::Area(Rect::new(0, 0, 20, 8), MouseAction::IgnoreOverlay));
-        terminal.draw(|frame| draw(frame, &mouse)).unwrap();
-        assert_eq!(terminal.backend().buffer()[(4, 2)].bg, shell::BACKGROUND, "the modal blocks hover behind it");
-        mouse.targets.pop(); mouse.clear_pointer();
-        terminal.draw(|frame| draw(frame, &mouse)).unwrap();
-        assert_eq!(terminal.backend().buffer()[(4, 2)].bg, shell::BACKGROUND);
     }
 
     #[test]
@@ -5166,7 +5106,6 @@ mod tests {
                 },
                 MouseTarget::Area(Rect::new(25, 6, 20, 1), MouseAction::OpenPageRow(10)),
             ],
-            ..MouseMap::default()
         };
 
         assert_eq!(
@@ -5498,7 +5437,6 @@ mod tests {
         let area = Rect::new(20, 4, 11, 1);
         let mouse = MouseMap {
             targets: vec![MouseTarget::Volume(area)],
-            ..MouseMap::default()
         };
 
         assert_eq!(mouse.action_at(20, 4), Some(MouseAction::SetVolume(0)));

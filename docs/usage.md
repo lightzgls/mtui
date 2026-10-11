@@ -113,8 +113,8 @@ when the artist column is visible.
 
 Artist top songs and catalogue cards are clickable, with previous/next buttons
 to reach items beyond the visible section. Related uses cover thumbnails with
-titles and details underneath its section headings. Hover highlights clickable
-items; right-click selects the item before opening its actions.
+titles and details underneath its section headings. Right-click selects the item
+before opening its actions.
 
 The volume −/+ buttons, keyboard `-`/`+`, and mouse wheel over the volume control
 change the level in 5% steps. Clicking or dragging its bar snaps to a 5% value.
