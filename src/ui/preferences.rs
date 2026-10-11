@@ -40,7 +40,7 @@ pub(super) fn draw(
         Chrome {
             title: "Settings",
             width: 68,
-            height: 21,
+            height: 23,
             close_label: if state.return_to_menu {
                 "Back"
             } else {
@@ -314,6 +314,7 @@ mod tests {
                 "Signal",
                 "Off",
                 "On",
+                "v0.10.0 · Check",
             ])
             .map(|(setting, value)| SettingRow {
                 setting,
@@ -353,13 +354,16 @@ mod tests {
     }
 
     #[test]
-    fn settings_show_all_existing_preferences_in_three_groups() {
+    fn settings_show_all_preferences_and_updates_in_their_groups() {
         let (buf, mouse) = drawn(&State::default(), 100, 36);
+        super::super::preview_buffer("settings-updates", &buf);
         let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
         for label in [
             "Playback",
             "Appearance",
             "Integrations",
+            "App",
+            "Updates",
             "Audio output",
             "Cover style",
             "Artwork display",
@@ -378,11 +382,19 @@ mod tests {
                     MouseTarget::Area(_, MouseAction::ActivateSetting(_))
                 ))
                 .count(),
-            6
+            7
         );
         assert_eq!(mouse.action_at(0, 0), Some(MouseAction::CloseSettings));
+        let heading_y = (0..buf.area.height)
+            .find(|&y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("Appearance")
+            })
+            .unwrap();
         assert_eq!(
-            mouse.action_at(18, 12),
+            mouse.action_at(18, heading_y),
             Some(MouseAction::IgnoreOverlay),
             "a section heading consumes clicks"
         );
@@ -397,7 +409,7 @@ mod tests {
                     ..Default::default()
                 };
                 let (_, mouse) = drawn(&state, width, height);
-                if width >= 48 {
+                if width >= 48 && height >= 24 {
                     assert_eq!(
                         mouse
                             .targets
@@ -407,8 +419,8 @@ mod tests {
                                 MouseTarget::Area(_, MouseAction::ActivateSetting(_))
                             ))
                             .count(),
-                        6,
-                        "all six settings should fit at {width}x{height}"
+                        7,
+                        "all seven settings should fit at {width}x{height}"
                     );
                 }
                 assert!(mouse.targets.iter().any(|target| matches!(target, MouseTarget::Area(_, MouseAction::ActivateSetting(setting)) if *setting == state.selected_setting())), "selection lost at {width}x{height}");

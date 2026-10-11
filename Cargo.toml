@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "mtui"
-version = "0.9.3"
+version = "0.10.0"
 default-run = "mtui"
 edition = "2024"
 description = "A terminal music player for YouTube Music, built to stay small in memory"
@@ -19,6 +19,7 @@ anyhow = "1.0.104"
 mtui-resolver = { path = "crates/mtui-resolver" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.10.9"
 
 # Audio output. Only `playback` + the two symphonia features we actually need.
 # Deliberately excludes `recording`, `dither`/`noise` (pulls rand), and every

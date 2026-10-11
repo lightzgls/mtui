@@ -14,7 +14,8 @@ pub(super) fn background(cover: Option<&Cover>) -> (u8, u8, u8) {
     let Some(cover) = cover else {
         return (26, 26, 26);
     };
-    let Color::Rgb(r, g, b) = tint(10, cover.accent) else {
+    // Native pixels beyond the last full terminal cell extend the footer.
+    let Color::Rgb(r, g, b) = tint(22, cover.accent) else {
         unreachable!()
     };
     (r, g, b)

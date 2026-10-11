@@ -47,6 +47,13 @@ preferences, or listening history in `%APPDATA%\mtui`. An existing portable
 copy uses that same data automatically. A standalone portable executable is
 still attached to each release for users who explicitly want one.
 
+On Windows v0.10.0 and later, open **Settings → Updates** and check for a newer
+stable release. Select **Update to v…** to download it and restart MTUI after
+installation. The updater displays progress, verifies the release's SHA-256
+checksum, and preserves your account data and settings. Installed copies update
+in their existing directory; portable copies replace their current executable.
+Playback stops for the restart. A failed download leaves the running app intact.
+
 **Linux and macOS** — clone the repository, then build and install MTUI with one
 Cargo command:
 
@@ -103,6 +110,15 @@ Queue entries have space between songs and clear title, artist, and duration
 columns. Short windows use compact rows. Click the current artist or album to
 open its page when YouTube Music provides that link; queue artists are clickable
 when the artist column is visible.
+
+Artist top songs and catalogue cards are clickable, with previous/next buttons
+to reach items beyond the visible section. Related uses cover thumbnails with
+titles and details underneath its section headings. Hover highlights clickable
+items; right-click selects the item before opening its actions.
+
+The volume −/+ buttons, keyboard `-`/`+`, and mouse wheel over the volume control
+change the level in 5% steps. Clicking or dragging its bar snaps to a 5% value.
+Click **vol** to mute and restore the previous level.
 
 The playback bar offers **Like, Share, Save to playlist, Shuffle, Repeat, and
 Output**. Smaller windows keep the full set in **Actions**, also available with

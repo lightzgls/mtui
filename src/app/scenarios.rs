@@ -25,6 +25,98 @@ fn track(index: usize) -> Track {
 }
 
 #[test]
+fn artist_songs_and_catalogue_are_clickable_and_page_without_starting_playback() {
+    for (width, height) in [(160, 42), (80, 32), (28, 24)] {
+        let (mut app, driver, requests) = fixture();
+        driver.commands.try_iter().for_each(drop);
+        let artist = ArtistRef { name: "Artist".into(), endpoint: BrowseEndpoint::new("UCartist") };
+        app.artist = Some(ArtistView::loading(artist.clone()));
+        app.artist.as_mut().unwrap().set_page(Ok(ArtistPage {
+            artist, audience: None, description: None, art: None,
+            top_songs: (0..20).map(|index| ArtistSong { track: track(index), plays: None }).collect(),
+            shelves: vec![Shelf { title: "Albums".into(), cards: (0..20).map(|index| Card {
+                title: format!("Album {index}"), subtitle: "Artist".into(), art: None, duration: None, artist_ref: None,
+                target: Target::Open { endpoint: BrowseEndpoint::new(format!("MPRE{index}")) },
+            }).collect() }],
+        }));
+        app.view = View::Artist;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let mut mouse = crate::ui::MouseMap::default();
+        for section in 0..2 {
+            app.artist.as_mut().unwrap().section = section;
+            terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+            let mut pages = 0;
+            loop {
+                let view = app.artist.as_ref().unwrap();
+                let first = if section == 0 { view.song_offset } else { view.scroll[0] };
+                let next = (0..height).find_map(|y| (0..width).find_map(|x| match mouse.action_at(x, y) {
+                    Some(action @ MouseAction::PageArtistSongs { offset, .. }) if section == 0 && offset > first => Some(action),
+                    Some(action @ MouseAction::PageArtistShelf { offset, .. }) if section == 1 && offset > first => Some(action),
+                    _ => None,
+                }));
+                let Some(action) = next else { break; };
+                app.handle_mouse_action(action).unwrap();
+                terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+                pages += 1; assert!(pages < 21);
+            }
+            let action = if section == 0 { MouseAction::OpenArtistSong(19) } else { MouseAction::OpenArtistCard { shelf: 0, card: 19 } };
+            let position = (0..height).find_map(|y| (0..width).find_map(|x| (mouse.action_at(x, y) == Some(action)).then_some((x, y))));
+            let (x, y) = position.expect("the last artist item must be reachable using only mouse paging");
+            let select = mouse.context_action_at(x, y).unwrap();
+            app.handle_mouse_action(select).unwrap();
+            assert_eq!(app.artist.as_ref().unwrap().section, section);
+            assert!(driver.commands.try_iter().next().is_none(), "paging or right-click selection cannot play music");
+        }
+        app.handle_mouse_action(MouseAction::OpenArtistCard { shelf: 0, card: 19 }).unwrap();
+        assert_eq!(app.browsing_endpoint.as_ref().unwrap().browse_id, "MPRE19");
+        app.go_back();
+        app.handle_mouse_action(MouseAction::OpenArtistSong(19)).unwrap();
+        assert_eq!(app.now.as_ref().unwrap().video_id, "song-19");
+        assert!(requests.try_iter().next().is_some());
+    }
+}
+
+#[test]
+fn window_close_keeps_the_tray_but_end_task_and_explicit_quit_stop_the_player() {
+    let (mut app, _driver, _requests) = fixture();
+    app.handle_window_loss(false);
+    assert!(app.wants_background && !app.should_quit);
+    app.wants_foreground = true;
+    app.handle_window_loss(true);
+    assert!(app.should_quit && !app.wants_background && !app.wants_foreground);
+    app.handle_window_loss(false);
+    assert!(app.should_quit && !app.wants_background, "a late close event cannot undo a quit");
+}
+
+#[test]
+fn volume_buttons_and_pointer_use_five_percent_steps_at_the_bounds_and_after_dragging() {
+    let (mut app, driver, _requests) = fixture();
+    driver.commands.try_iter().for_each(drop);
+    for (initial, action, expected) in [
+        (0.10, MouseAction::AdjustVolume(true), 0.15),
+        (0.10, MouseAction::AdjustVolume(false), 0.05),
+        (0.0, MouseAction::AdjustVolume(false), 0.0),
+        (2.0, MouseAction::AdjustVolume(true), 2.0),
+        (0.72, MouseAction::AdjustVolume(true), 0.75),
+        (0.5, MouseAction::SetVolume(1234), 0.10),
+        (0.5, MouseAction::SetVolume(6789), 0.70),
+    ] {
+        driver.snapshot.lock().unwrap().volume = initial;
+        app.volume_save = None;
+        app.handle_mouse_action(action).unwrap();
+        let Command::SetVolume(volume) = driver.commands.try_recv().unwrap() else { panic!("wrong playback command") };
+        assert!((volume - expected).abs() < 0.00001, "{initial}, {action:?}: {volume}");
+    }
+    driver.snapshot.lock().unwrap().volume = 0.10;
+    app.volume_save = None;
+    for expected in [0.15, 0.20, 0.25] {
+        app.handle_mouse_action(MouseAction::AdjustVolume(true)).unwrap();
+        let Command::SetVolume(volume) = driver.commands.try_recv().unwrap() else { panic!("wrong playback command") };
+        assert!((volume - expected).abs() < 0.00001, "rapid clicks must accumulate before the audio thread responds");
+    }
+}
+
+#[test]
 fn home_order_refresh_and_grid_input_keep_the_selected_song() {
     let (mut app, _driver, _requests) = fixture();
     let shelf = |title: &str, start| Shelf {

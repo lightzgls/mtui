@@ -65,6 +65,8 @@ https://github.com/user-attachments/assets/27cdd7f8-daf9-4ccc-b736-d903014b5be1
 
 Download **MTUI-<version>-Setup-x64.exe** from the [latest release](https://github.com/lightzgls/mtui/releases/latest). The Windows installer requires no administrator permission. A single portable executable is also available.
 
+From v0.10.0, open **Settings → Updates** to check for a new version, then select **Update to v…** to download, install, and restart. Installed and portable copies both support this flow.
+
 On first launch, MTUI downloads missing playback tools: yt-dlp, a supported JavaScript runtime, and the bgutil PO-token provider. Setup needs an internet connection. Sign-in uses Microsoft Edge WebView2; playback runs without a browser window.
 
 Search and playback work without an account. Press **M** or open **Menu → Account & Sessions** to sign in for personalized Home and radio queues, playlists, likes, and listening-history sync. YouTube account history must be enabled for history writes.
@@ -80,13 +82,13 @@ Settings and sessions live in `%APPDATA%\mtui`; downloaded tools live in `%LOCAL
 | `/` | Search |
 | Arrows / `hjkl`, `Enter` | Navigate and open or play |
 | `Space`, `n` / `p` | Pause/resume, next/previous track |
-| `+` / `-`, `m` | Volume, mute |
+| `+` / `-`, `m` | Volume in 5% steps, mute |
 | `Tab` / `1`–`4` | Queue, Lyrics, Related, Comments |
 | `Ctrl-K`, `Ctrl-P` | App menu, playback actions |
 | `S`, `?` | Settings, full keyboard help |
 | `Esc`, `q` | Back, quit |
 
-Click cards, links, tabs, and player controls; drag the progress bar to seek. Closing the Windows window continues playback in the tray. Use **Menu → Quit** or the tray's Quit command to exit fully.
+Click cards, links, tabs, and player controls; hover highlights clickable items. Artist sections have mouse paging, and Related shows artwork cards. Drag the progress bar to seek; use the volume −/+ buttons or wheel over volume for 5% steps. Closing the Windows window continues playback in the tray. **End task**, **Menu → Quit**, and the tray's Quit command exit the player.
 
 ## Resource use
 

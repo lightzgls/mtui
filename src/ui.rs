@@ -38,6 +38,8 @@ mod home;
 mod menu;
 mod preferences;
 mod queue;
+mod paging;
+mod related;
 mod shell;
 
 /// Width reserved for the right-aligned duration column, including padding.
@@ -92,7 +94,7 @@ const HINTS_WIDTH: u16 = 40;
 const MINI_PLAYER_FLOOR: u16 = 12;
 /// Space reserved for `vol`, its bar, and the percentage in the persistent
 /// player. It is shown only when the full row can still identify the track.
-const STATUS_VOLUME_WIDTH: u16 = 22;
+const STATUS_VOLUME_WIDTH: u16 = 30;
 const MIN_WIDTH_WITH_STATUS_VOLUME: u16 = 80;
 /// Three four-cell transport buttons: previous, play/pause, and next.
 const TRANSPORT_WIDTH: u16 = 12;
@@ -226,26 +228,65 @@ const MIN_SHELF_TITLE: usize = 8;
 #[derive(Default)]
 pub struct MouseMap {
     targets: Vec<MouseTarget>,
+    pointer: Option<(u16, u16)>,
 }
 
 #[derive(Clone, Copy)]
 enum MouseTarget {
     Area(Rect, MouseAction),
     TrackRows { area: Rect, first: usize },
-    PageRows { area: Rect, first: usize },
     Progress(Rect),
     Volume(Rect),
+    VolumeControl(Rect),
 }
 
 impl MouseMap {
+    pub fn move_pointer(&mut self, column: u16, row: u16) { self.pointer = Some((column, row)); }
+
+    pub fn clear_pointer(&mut self) { self.pointer = None; }
+
+    pub fn over_volume(&self, column: u16, row: u16) -> bool {
+        self.targets.iter().rev().find_map(|target| match *target {
+            MouseTarget::Area(area, action) if contains(area, column, row) => Some(matches!(action, MouseAction::AdjustVolume(_) | MouseAction::ToggleMute)),
+            MouseTarget::Volume(area) | MouseTarget::VolumeControl(area) if contains(area, column, row) => Some(true),
+            MouseTarget::Progress(area) | MouseTarget::TrackRows { area, .. } if contains(area, column, row) => Some(false),
+            _ => None,
+        }).unwrap_or(false)
+    }
+
+    /// Feedback belongs to the current hit map; hovering never changes selection.
+    fn render_hover(&self, frame: &mut Frame) {
+        let Some((column, row)) = self.pointer else { return; };
+        let Some(action) = self.action_at(column, row) else { return; };
+        if action == MouseAction::IgnoreOverlay { return; }
+        let Some(area) = self.targets.iter().rev().find_map(|target| match *target {
+            MouseTarget::Area(area, _) | MouseTarget::Progress(area) | MouseTarget::Volume(area)
+                if contains(area, column, row) => Some(area),
+            MouseTarget::TrackRows { area, .. }
+                if contains(area, column, row) => Some(Rect::new(area.x, row, area.width, 1)),
+            _ => None,
+        }) else { return; };
+        if area == frame.area() { return; }
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                let cell = &mut frame.buffer_mut()[(x, y)];
+                if cell.diff_option == CellDiffOption::Skip || matches!(cell.symbol(), "▀" | "▄" | "█" | "▌" | "▐") { continue; }
+                if matches!(cell.bg, Color::Reset | Color::Black | Color::DarkGray | shell::BACKGROUND | shell::SURFACE)
+                    || matches!(cell.bg, Color::Rgb(r, g, b) if r == g && g == b && r < 100)
+                { cell.bg = Color::Rgb(38, 38, 38); }
+                cell.modifier.insert(Modifier::BOLD);
+                if area.height == 1 && !matches!(action, MouseAction::SeekTo(_) | MouseAction::SetVolume(_)) {
+                    cell.modifier.insert(Modifier::UNDERLINED);
+                }
+            }
+        }
+    }
+
     pub fn action_at(&self, column: u16, row: u16) -> Option<MouseAction> {
         self.targets.iter().rev().find_map(|target| match *target {
             MouseTarget::Area(area, action) if contains(area, column, row) => Some(action),
             MouseTarget::TrackRows { area, first } if contains(area, column, row) => Some(
                 MouseAction::PlayTrack(first + usize::from(row.saturating_sub(area.y))),
-            ),
-            MouseTarget::PageRows { area, first } if contains(area, column, row) => Some(
-                MouseAction::OpenPageRow(first + usize::from(row.saturating_sub(area.y))),
             ),
             MouseTarget::Progress(area) if contains(area, column, row) => {
                 Some(MouseAction::SeekTo(horizontal_position(area, column)))
@@ -270,6 +311,8 @@ impl MouseMap {
     /// actually clicked rather than whichever row the keyboard last selected.
     pub fn context_action_at(&self, column: u16, row: u16) -> Option<MouseAction> {
         self.targets.iter().rev().find_map(|target| match *target {
+            MouseTarget::Area(area, MouseAction::OpenArtistSong(index)) if contains(area, column, row) => Some(MouseAction::SelectArtistSong(index)),
+            MouseTarget::Area(area, MouseAction::OpenArtistCard { shelf, card }) if contains(area, column, row) => Some(MouseAction::SelectArtistCard { shelf, card }),
             MouseTarget::Area(area, MouseAction::OpenHomeCard { shelf, card })
                 if contains(area, column, row) =>
             {
@@ -279,9 +322,6 @@ impl MouseMap {
                 MouseAction::SelectTrack(first + usize::from(row.saturating_sub(area.y))),
             ),
             MouseTarget::Area(area, MouseAction::PlayTrack(index)) if contains(area, column, row) => Some(MouseAction::SelectTrack(index)),
-            MouseTarget::PageRows { area, first } if contains(area, column, row) => Some(
-                MouseAction::SelectPageRow(first + usize::from(row.saturating_sub(area.y))),
-            ),
             MouseTarget::Area(area, MouseAction::OpenPageRow(index)) if contains(area, column, row) => Some(MouseAction::SelectPageRow(index)),
             _ => None,
         })
@@ -337,7 +377,7 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
             match app.view {
                 View::Home => render_home(frame, app, area, mouse),
                 View::Tracks => render_results(frame, app, area, mouse),
-                View::Artist => render_artist(frame, app, area),
+                View::Artist => render_artist(frame, app, area, mouse),
                 // Handled above.
                 View::Playing => {}
             }
@@ -391,6 +431,7 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
     // Menus are the final layer. Input keeps them mutually exclusive with the
     // ordinary overlays, but drawing last preserves that invariant visually.
     menu::render(frame, app, mouse);
+    mouse.render_hover(frame);
     palette::apply(frame, app.cover.as_ref(), if app.cover_style == CoverStyle::ColoredAscii { cover_area } else { None });
 }
 
@@ -856,7 +897,7 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMa
 
 const ARTIST_TOP_SONG_ROWS: u16 = 6;
 
-fn render_artist(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_artist(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMap) {
     let inner = shell::inset(area);
 
     let accent = ambient(app);
@@ -953,6 +994,17 @@ fn render_artist(frame: &mut Frame, app: &mut App, area: Rect) {
                         &mut view.song_offset,
                         accent,
                     );
+                    let list = artist_song_list(layout.area);
+                    let visible = usize::from(list.height);
+                    for index in view.song_offset..(view.song_offset + visible).min(page.top_songs.len()) {
+                        mouse.targets.push(MouseTarget::Area(
+                            Rect::new(list.x, list.y + (index - view.song_offset) as u16, list.width, 1),
+                            MouseAction::OpenArtistSong(index),
+                        ));
+                    }
+                    if let Some(controls) = paging::Controls::new(layout.area, page.top_songs.len(), view.song_offset, visible, 1) {
+                        controls.register(mouse, |offset| MouseAction::PageArtistSongs { offset, visible });
+                    }
                 }
                 ArtistSection::Shelf(index) => {
                     let Some(shelf) = page.shelves.get(index) else {
@@ -980,6 +1032,17 @@ fn render_artist(frame: &mut Frame, app: &mut App, area: Rect) {
                         (layout.across, layout.slot),
                         &mut tiles,
                     );
+                    for column in 0..layout.across {
+                        let card = cursor.offset + usize::from(column);
+                        if card >= shelf.cards.len() { break; }
+                        mouse.targets.push(MouseTarget::Area(
+                            shelf_card_rect(layout.area, layout.slot, column),
+                            MouseAction::OpenArtistCard { shelf: index, card },
+                        ));
+                    }
+                    if let Some(controls) = paging::Controls::new(layout.area, shelf.cards.len(), cursor.offset, usize::from(layout.across), 1) {
+                        controls.register(mouse, |offset| MouseAction::PageArtistShelf { shelf: index, offset, visible: usize::from(layout.across) });
+                    }
                 }
             }
         }
@@ -1193,6 +1256,15 @@ fn render_artist_songs(
     accent: Color,
 ) {
     let [heading, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let list = artist_song_list(area);
+    let viewport = usize::from(list.height);
+    if focused && viewport > 0 {
+        if selected < *offset { *offset = selected; }
+        else if selected >= *offset + viewport { *offset = selected + 1 - viewport; }
+    }
+    *offset = (*offset).min(songs.len().saturating_sub(viewport));
+    let controls = paging::Controls::new(area, songs.len(), *offset, viewport, 1);
+    let heading = controls.as_ref().map_or(heading, |controls| controls.heading);
     let marker = if focused { accent } else { Color::DarkGray };
     let title = if focused {
         Style::default()
@@ -1212,30 +1284,20 @@ fn render_artist_songs(
         ])),
         heading,
     );
+    if let Some(controls) = controls { controls.render(frame); }
     if body.is_empty() {
         return;
     }
 
     let width = body.width as usize;
     let columns = artist_song_columns(width);
-    let list = if body.height >= 2 {
-        let [header, list] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+    if body.height >= 2 {
+        let header = Rect::new(body.x, body.y, body.width, 1);
         frame.render_widget(Paragraph::new(artist_song_header(columns)), header);
-        list
-    } else {
-        body
-    };
-    let viewport = list.height as usize;
+    }
     if viewport == 0 {
         return;
     }
-    if selected < *offset {
-        *offset = selected;
-    } else if selected >= *offset + viewport {
-        *offset = selected + 1 - viewport;
-    }
-    *offset = (*offset).min(songs.len().saturating_sub(viewport));
     let end = (*offset + viewport).min(songs.len());
     let items = songs[*offset..end]
         .iter()
@@ -1250,6 +1312,11 @@ fn render_artist_songs(
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items), list);
+}
+
+fn artist_song_list(area: Rect) -> Rect {
+    let header = if area.height >= 3 { 2 } else { area.height.min(1) };
+    Rect::new(area.x, area.y + header, area.width, area.height - header)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1506,27 +1573,26 @@ fn render_shelf(
     (across, slot): (u16, u16),
     tiles: &mut Tiles,
 ) {
-    let cards_height = area.height.saturating_sub(1);
-    let [heading, cards] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(cards_height)]).areas(area);
+    let controls = paging::Controls::new(area, shelf.cards.len(), cursor.offset, usize::from(across), 1);
+    let heading = controls.as_ref().map_or(Rect::new(area.x, area.y, area.width, area.height.min(1)), |controls| controls.heading);
     frame.render_widget(
-        Paragraph::new(heading_line(shelf, cursor, area.width as usize)),
+        Paragraph::new(heading_line(shelf, cursor, heading.width as usize)),
         heading,
     );
+    if let Some(controls) = controls { controls.render(frame); }
 
     for column in 0..across {
         let Some(card) = shelf.cards.get(cursor.offset + column as usize) else {
             break;
         };
-        let rect = Rect {
-            x: cards.x + column * slot,
-            // One column of the slot is left as the gap between cards.
-            width: slot.saturating_sub(1),
-            ..cards
-        };
+        let rect = shelf_card_rect(area, slot, column);
         let selected = cursor.focused && cursor.offset + column as usize == cursor.selected;
         render_card(frame, card, rect, selected, tiles);
     }
+}
+
+fn shelf_card_rect(area: Rect, slot: u16, column: u16) -> Rect {
+    Rect::new(area.x + column * slot, area.y + area.height.min(1), slot.saturating_sub(1), area.height.saturating_sub(1))
 }
 
 /// A shelf's heading: the name YouTube gave it, and -- when the cursor is in it
@@ -2422,6 +2488,7 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseM
     // the borrow below is what stops either being asked for down there.
     let snap = app.snapshot();
     let accent = ambient(app);
+    let use_kitty = app.kitty_images() && !app.overlay.is_open() && app.menu().is_none();
     let inner = shell::panel_inset(area);
     if inner.height < 2 {
         return;
@@ -2446,26 +2513,21 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseM
 
     match tab {
         Tab::UpNext => queue::register_targets(mouse, now, content),
-        Tab::Related => {
-            let total = now.related_rows().len();
-            let viewport = content.height as usize;
-            let cursor = now.cursor().min(total.saturating_sub(1));
-            let first = centred_offset(cursor, viewport, total);
-            let count = viewport.min(total.saturating_sub(first));
-            mouse.targets.push(MouseTarget::PageRows {
-                area: Rect {
-                    height: count as u16,
-                    ..content
-                },
-                first,
-            });
-        }
+        Tab::Related => related::register_targets(mouse, now, content),
         _ => {}
     }
 
     // Set only by the lyrics panel, and only while it is following the singer:
     // where it scrolled itself to, which becomes the cursor the keys move.
-    let (total, following) = render_panel_body(frame, now, &snap, content, accent);
+    let (total, following) = if tab == Tab::Related {
+        let mut wanted = Vec::new();
+        let total = related::render(frame, now, content, accent, &mut Tiles {
+            shape: CardShape::Tile, art: &app.art, wanted: &mut wanted,
+            images: use_kitty.then_some((&mut app.images, app.graphics)),
+        });
+        app.want_art(wanted);
+        (total, None)
+    } else { render_panel_body(frame, now, &snap, content, accent) };
     if let Some(offset) = following {
         app.follow_page(offset);
     }
@@ -2815,63 +2877,9 @@ fn render_comments(frame: &mut Frame, now: &NowPlaying, area: Rect) -> usize {
 /// The Related tab: shelves of recommendations, flattened into one list.
 /// Returns its length in rows.
 fn render_related(frame: &mut Frame, now: &NowPlaying, area: Rect, ambient: Color) -> usize {
-    if !matches!(now.related, Panel::Ready(_)) {
-        message(frame, waiting_on(&now.related), area);
-        return 0;
-    }
-
-    let viewport = area.height as usize;
-    let width = area.width as usize;
-    let rows = now.related_rows();
-    let cursor = now.cursor().min(rows.len().saturating_sub(1));
-    let offset = centred_offset(cursor, viewport, rows.len());
-
-    let lines: Vec<Line> = rows
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(viewport)
-        .map(|(index, row)| match row {
-            RelatedRow::Heading(title) => Line::from(Span::styled(
-                format!(" {}", truncate(title, width.saturating_sub(1))),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            RelatedRow::Card(card) => related_line(card, index == cursor, width, ambient),
-        })
-        .collect();
-
-    frame.render_widget(Paragraph::new(lines), area);
-    rows.len()
-}
-
-/// One recommendation: its title, and under it whatever YouTube wrote about it.
-fn related_line<'a>(card: &Card, selected: bool, width: usize, ambient: Color) -> Line<'a> {
-    let style = if selected {
-        highlight(ambient)
-    } else {
-        Style::default()
-    };
-    let subtitle = if selected {
-        style
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    // Split across the row rather than stacked, because a card's subtitle names
-    // its type as often as its artist -- "Playlist • 405 views" is not worth a
-    // line of a panel this short.
-    let title_width = (width.saturating_sub(2) * 3 / 5).max(1);
-    let rest = width.saturating_sub(title_width + 2);
-
-    Line::from(vec![
-        Span::styled(
-            format!("   {}", focused_cell(&card.title, title_width, selected)),
-            style,
-        ),
-        Span::styled(cell(&card.subtitle, rest), subtitle),
-    ])
+    related::render(frame, now, area, ambient, &mut Tiles {
+        shape: CardShape::Tile, art: &ArtCache::default(), wanted: &mut Vec::new(), images: None,
+    })
 }
 
 /// The panel's contents when it has none: what it is waiting for, or why there
@@ -3359,7 +3367,7 @@ fn render_player_strip(
             highlight(accent).add_modifier(Modifier::BOLD), transport.width as usize)), transport);
         register_transport_targets(mouse, transport);
         if volume.width > 0 {
-            frame.render_widget(Paragraph::new(volume_line(snap.volume, volume.width as usize)), volume);
+            render_volume_control(frame, snap.volume, volume);
             register_volume_targets(mouse, volume, snap.volume);
         }
         frame.render_widget(Paragraph::new(truncate(hint, hint_area.width as usize))
@@ -3393,10 +3401,7 @@ fn render_player_strip(
         register_transport_targets(mouse, now_playing);
     }
     if volume.width > 0 {
-        frame.render_widget(
-            Paragraph::new(volume_line(snap.volume, volume.width as usize)),
-            volume,
-        );
+        render_volume_control(frame, snap.volume, volume);
         register_volume_targets(mouse, volume, snap.volume);
     }
     let hints = if hint_area.height > 0 {
@@ -3488,6 +3493,13 @@ fn register_transport_targets(mouse: &mut MouseMap, area: Rect) {
 }
 
 fn register_volume_targets(mouse: &mut MouseMap, area: Rect, volume: f32) {
+    mouse.targets.push(MouseTarget::VolumeControl(area));
+    let inner = volume_control_inner(area);
+    if inner != area {
+        mouse.targets.push(MouseTarget::Area(Rect::new(area.x, area.y, 3, area.height.min(1)), MouseAction::AdjustVolume(false)));
+        mouse.targets.push(MouseTarget::Area(Rect::new(area.right() - 3, area.y, 3, area.height.min(1)), MouseAction::AdjustVolume(true)));
+    }
+    let area = inner;
     const LABEL_WIDTH: u16 = 4;
     mouse.targets.push(MouseTarget::Area(
         Rect::new(area.x, area.y, LABEL_WIDTH.min(area.width), 1),
@@ -3501,6 +3513,20 @@ fn register_volume_targets(mouse: &mut MouseMap, area: Rect, volume: f32) {
             bar_width as u16,
             1,
         )));
+    }
+}
+
+fn volume_control_inner(area: Rect) -> Rect {
+    if area.width >= 18 { Rect::new(area.x + 4, area.y, area.width - 8, area.height) } else { area }
+}
+
+fn render_volume_control(frame: &mut Frame, volume: f32, area: Rect) {
+    let inner = volume_control_inner(area);
+    frame.render_widget(Paragraph::new(volume_line(volume, usize::from(inner.width))), inner);
+    if inner != area {
+        for (x, label) in [(area.x, " - "), (area.right() - 3, " + ")] {
+            frame.render_widget(Paragraph::new(label).style(Style::default().fg(Color::White).bg(shell::SURFACE)), Rect::new(x, area.y, 3, area.height.min(1)));
+        }
     }
 }
 
@@ -4352,7 +4378,7 @@ mod tests {
 
     use crate::source::home::Target;
 
-    fn song(title: &str, subtitle: &str) -> Card {
+    pub(super) fn song(title: &str, subtitle: &str) -> Card {
         Card {
             title: title.to_string(),
             subtitle: subtitle.to_string(),
@@ -4566,7 +4592,7 @@ mod tests {
     }
 
     /// The player page as it looks a second into a track, queue and all.
-    fn playing() -> NowPlaying {
+    pub(super) fn playing() -> NowPlaying {
         let mut now = NowPlaying::new(&Track {
             id: "letithappen".to_string(),
             title: "Let It Happen".to_string(),
@@ -5043,7 +5069,7 @@ mod tests {
         let rows = drawn_panel(&now, 44, 10);
         assert!(rows[2].contains("You might also like"), "{rows:#?}");
         assert!(rows[3].contains("Eventually"));
-        assert!(rows[3].contains("Tame Impala"));
+        assert!(rows[4].contains("Tame Impala"));
         assert!(rows.iter().any(|row| row.contains("Recommended playlists")));
         assert!(
             rows.iter()
@@ -5086,6 +5112,7 @@ mod tests {
         let area = Rect::new(5, 7, 11, 1);
         let mouse = MouseMap {
             targets: vec![MouseTarget::Progress(area)],
+            ..MouseMap::default()
         };
 
         assert_eq!(mouse.action_at(5, 7), Some(MouseAction::SeekTo(0)));
@@ -5101,6 +5128,31 @@ mod tests {
     }
 
     #[test]
+    fn hover_uses_the_current_hit_map_without_activating_or_recoloring_artwork() {
+        let area = Rect::new(2, 2, 8, 2);
+        let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+        let mut mouse = MouseMap::default();
+        mouse.targets.push(MouseTarget::Area(area, MouseAction::OpenHomeCard { shelf: 0, card: 1 }));
+        let draw = |frame: &mut Frame, mouse: &MouseMap| {
+            frame.render_widget(Paragraph::new("Cover\nArtist").style(Style::default().bg(shell::BACKGROUND)), area);
+            frame.buffer_mut()[(area.x, area.y)].set_symbol("▀").set_fg(Color::Red).set_bg(Color::Blue);
+            mouse.render_hover(frame);
+        };
+        mouse.move_pointer(4, 2);
+        terminal.draw(|frame| draw(frame, &mouse)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(4, 2)].bg, Color::Rgb(38, 38, 38));
+        assert_eq!((buffer[(2, 2)].fg, buffer[(2, 2)].bg), (Color::Red, Color::Blue));
+        assert_eq!(mouse.context_action_at(4, 2), Some(MouseAction::SelectHomeCard { shelf: 0, card: 1 }));
+        mouse.targets.push(MouseTarget::Area(Rect::new(0, 0, 20, 8), MouseAction::IgnoreOverlay));
+        terminal.draw(|frame| draw(frame, &mouse)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(4, 2)].bg, shell::BACKGROUND, "the modal blocks hover behind it");
+        mouse.targets.pop(); mouse.clear_pointer();
+        terminal.draw(|frame| draw(frame, &mouse)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(4, 2)].bg, shell::BACKGROUND);
+    }
+
+    #[test]
     fn context_click_selects_the_item_under_the_pointer_without_opening_it() {
         let mouse = MouseMap {
             targets: vec![
@@ -5112,11 +5164,9 @@ mod tests {
                     area: Rect::new(2, 5, 20, 3),
                     first: 6,
                 },
-                MouseTarget::PageRows {
-                    area: Rect::new(25, 5, 20, 3),
-                    first: 9,
-                },
+                MouseTarget::Area(Rect::new(25, 6, 20, 1), MouseAction::OpenPageRow(10)),
             ],
+            ..MouseMap::default()
         };
 
         assert_eq!(
@@ -5217,7 +5267,7 @@ mod tests {
             assert_eq!(mouse.drag_action_at(x, y), None);
         }
         assert!(matches!(mouse.drag_action_at(10, 2), Some(MouseAction::SeekTo(_))));
-        assert!(matches!(mouse.drag_action_at(46, 1), Some(MouseAction::SetVolume(_))));
+        assert!(matches!(mouse.drag_action_at(50, 1), Some(MouseAction::SetVolume(_))));
     }
 
     #[test]
@@ -5448,6 +5498,7 @@ mod tests {
         let area = Rect::new(20, 4, 11, 1);
         let mouse = MouseMap {
             targets: vec![MouseTarget::Volume(area)],
+            ..MouseMap::default()
         };
 
         assert_eq!(mouse.action_at(20, 4), Some(MouseAction::SetVolume(0)));
@@ -5468,12 +5519,17 @@ mod tests {
         let mut mouse = MouseMap::default();
         register_volume_targets(&mut mouse, area, 0.8);
 
-        assert_eq!(mouse.action_at(20, 4), Some(MouseAction::ToggleMute));
-        assert_eq!(mouse.action_at(23, 4), Some(MouseAction::ToggleMute));
-        assert_eq!(mouse.action_at(24, 4), Some(MouseAction::SetVolume(0)));
-        assert_eq!(mouse.action_at(36, 4), None, "the percentage is only a label");
+        assert_eq!(mouse.action_at(20, 4), Some(MouseAction::AdjustVolume(false)));
+        assert_eq!(mouse.action_at(24, 4), Some(MouseAction::ToggleMute));
+        assert_eq!(mouse.action_at(27, 4), Some(MouseAction::ToggleMute));
+        assert_eq!(mouse.action_at(28, 4), Some(MouseAction::SetVolume(0)));
+        assert_eq!(mouse.action_at(40, 4), None, "the percentage is only a label");
+        assert!(mouse.over_volume(40, 4), "the wheel also works over the percentage");
+        assert_eq!(mouse.action_at(area.right() - 1, 4), Some(MouseAction::AdjustVolume(true)));
         assert!(line_text(&volume_line(0.0, area.width as usize)).starts_with("mut "));
         assert!(line_text(&volume_line(0.8, area.width as usize)).starts_with("vol "));
+        mouse.targets.push(MouseTarget::Area(Rect::new(0, 0, 80, 12), MouseAction::IgnoreOverlay));
+        assert!(!mouse.over_volume(40, 4), "dialogs block the volume wheel behind them");
     }
 
     #[test]
@@ -5678,6 +5734,12 @@ mod tests {
                 let (buf, mouse) = drawn_screen(width, height, view, &now, &[], &ArtCache::default(), &cover);
                 let outer = shell::regions(buf.area)[2];
                 let content = shell::footer_content(outer);
+                #[cfg(windows)]
+                {
+                    let (r, g, b) = canvas_color(Some(&cover));
+                    assert_eq!(buf[(outer.x, outer.bottom() - 1)].bg, Color::Rgb(r, g, b));
+                    assert_eq!(buf[(outer.right() - 1, outer.bottom() - 1)].bg, Color::Rgb(r, g, b), "the surface must fill the resized footer width");
+                }
                 for y in outer.y..outer.bottom() {
                     for x in outer.x..outer.right() {
                         if x < content.x || x >= content.right() || y >= content.bottom() {

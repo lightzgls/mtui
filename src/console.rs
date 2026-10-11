@@ -46,6 +46,10 @@ mod imp {
         fn GetConsoleFontSize(handle: isize, number: u32) -> Coord;
         fn SetCurrentConsoleFontEx(handle: isize, maximum: i32, info: *const ConsoleFontInfo) -> i32;
         fn WaitForSingleObject(handle: isize, timeout: u32) -> u32;
+        fn CreateEventW(security: *const c_void, manual: i32, set: i32, name: *const u16) -> isize;
+        fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> isize;
+        fn SetEvent(event: isize) -> i32;
+        fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
         fn SetConsoleScreenBufferSize(handle: isize, size: Coord) -> i32;
         fn SetConsoleWindowInfo(handle: isize, absolute: i32, window: *const [i16; 4]) -> i32;
         fn SetConsoleCursorPosition(handle: isize, position: Coord) -> i32;
@@ -186,6 +190,7 @@ mod imp {
     const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
     const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
     const MOUSE_WHEELED: u32 = 0x0004;
+    const MOUSE_MOVED: u32 = 0x0001;
     const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
     const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
@@ -206,6 +211,7 @@ mod imp {
     static WINDOW: AtomicIsize = AtomicIsize::new(0);
     static CELL: AtomicU32 = AtomicU32::new((16 << 16) | 8);
     static NAVIGATION_ICONS: AtomicU32 = AtomicU32::new(0);
+    static CLOSE_NOTIFICATION: AtomicIsize = AtomicIsize::new(0);
 
     pub fn navigation_icon_mask() -> u32 {
         NAVIGATION_ICONS.load(Ordering::Acquire)
@@ -229,6 +235,7 @@ mod imp {
         child: Child,
         input: ChildStdout,
         output: ChildStdin,
+        close_request: OwnedHandle,
     }
 
     struct HostConsole {
@@ -280,6 +287,13 @@ mod imp {
             mut output,
             size,
         } = console;
+        let close_name = std::env::args().nth(2).context("missing console close notification")?;
+        let name: Vec<u16> = close_name.encode_utf16().chain(Some(0)).collect();
+        let close_handle = unsafe { OpenEventW(0x0002 /* EVENT_MODIFY_STATE */, 0, name.as_ptr()) };
+        if close_handle == 0 { return Err(io::Error::last_os_error().into()); }
+        let _close_request = unsafe { OwnedHandle::from_raw_handle(close_handle as *mut c_void) };
+        CLOSE_NOTIFICATION.store(close_handle, Ordering::Release);
+        if unsafe { SetConsoleCtrlHandler(Some(notify_close), 1) } == 0 { return Err(io::Error::last_os_error().into()); }
         let main_screen = output
             .try_clone()
             .context("could not retain the console screen handle")?;
@@ -302,6 +316,34 @@ mod imp {
         forward_input(input, parent_output, main_screen, size)
     }
 
+    unsafe extern "system" fn notify_close(control: u32) -> i32 {
+        signal_close(CLOSE_NOTIFICATION.load(Ordering::Acquire), control);
+        0
+    }
+
+    fn signal_close(event: isize, control: u32) {
+        if control == 2 /* CTRL_CLOSE_EVENT */ && event != 0 { unsafe { SetEvent(event); } }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn only_a_window_close_signals_backgrounding() {
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        assert_ne!(event, 0);
+        let handle = unsafe { OwnedHandle::from_raw_handle(event as *mut c_void) };
+        signal_close(event, 5);
+        assert_ne!(unsafe { WaitForSingleObject(handle.as_raw_handle() as isize, 0) }, 0);
+        signal_close(event, 2);
+        assert_eq!(unsafe { WaitForSingleObject(handle.as_raw_handle() as isize, 0) }, 0);
+    }
+
+    /// A forced task termination has no window-close notification.
+    pub fn end_task_requested() -> bool {
+        let Some(sessions) = SESSION.get() else { return false; };
+        let Ok(slot) = sessions.lock() else { return true; };
+        slot.as_ref().is_some_and(|session| unsafe { WaitForSingleObject(session.close_request.as_raw_handle() as isize, 0) } != 0)
+    }
+
     /// Starts a fresh console helper and waits for it to prove setup succeeded.
     pub fn attach() -> Result<()> {
         let sessions = SESSION.get_or_init(|| Mutex::new(None));
@@ -319,8 +361,14 @@ mod imp {
         }
 
         let executable = std::env::current_exe().context("could not locate the MTUI executable")?;
+        let event_name = format!("Local\\MTUI-close-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+        let name: Vec<u16> = event_name.encode_utf16().chain(Some(0)).collect();
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
+        if event == 0 { return Err(io::Error::last_os_error().into()); }
+        let close_request = unsafe { OwnedHandle::from_raw_handle(event as *mut c_void) };
         let mut child = Command::new(executable)
             .arg(HOST_ARGUMENT)
+            .arg(event_name)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -341,6 +389,7 @@ mod imp {
                 child,
                 input,
                 output,
+                close_request,
             });
             return Err(err);
         }
@@ -351,6 +400,7 @@ mod imp {
             child,
             input,
             output,
+            close_request,
         });
         Ok(())
     }
@@ -417,6 +467,7 @@ mod imp {
             mut child,
             input,
             output,
+            close_request: _,
         } = session;
         drop(input);
         drop(output);
@@ -1087,6 +1138,11 @@ mod imp {
             } else {
                 MouseEventKind::ScrollDown
             }
+        } else if record.event_flags == MOUSE_MOVED {
+            if record.button_state & 0x0001 != 0 { MouseEventKind::Drag(MouseButton::Left) }
+            else if record.button_state & 0x0002 != 0 { MouseEventKind::Drag(MouseButton::Right) }
+            else if record.button_state & 0x0004 != 0 { MouseEventKind::Drag(MouseButton::Middle) }
+            else { MouseEventKind::Moved }
         } else if record.event_flags == 0 {
             let button = if record.button_state & 0x0001 != 0 {
                 MouseButton::Left
@@ -1288,6 +1344,12 @@ mod imp {
 pub use imp::{Input, Output, attach, closed, detach, focus, output, report_error};
 
 #[cfg(windows)]
+pub use imp::end_task_requested;
+
+#[cfg(not(windows))]
+pub fn end_task_requested() -> bool { false }
+
+#[cfg(windows)]
 pub use imp::{cell_size, is_host, navigation_icon_mask, prepare_parent, run_host, size};
 
 #[cfg(all(test, windows))]
@@ -1375,6 +1437,15 @@ mod tests {
         .unwrap();
         assert_eq!(event.kind, MouseEventKind::Down(MouseButton::Left));
         assert_eq!((event.column, event.row), (12, 7));
+    }
+
+    #[test]
+    fn native_mouse_movement_and_left_drag_are_forwarded_for_hover_and_scrubbing() {
+        for (buttons, kind) in [(0, MouseEventKind::Moved), (1, MouseEventKind::Drag(MouseButton::Left))] {
+            let event = mouse_event(MouseRecord { position: [12, 7], button_state: buttons, control: 0, event_flags: 1 }).unwrap();
+            assert_eq!(event.kind, kind);
+            assert_eq!((event.column, event.row), (12, 7));
+        }
     }
 
     #[test]

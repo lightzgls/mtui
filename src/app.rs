@@ -228,6 +228,12 @@ pub enum MouseAction {
     OpenHomeCard { shelf: usize, card: usize },
     SelectHomeCard { shelf: usize, card: usize },
     PageHomeShelf { shelf: usize, offset: usize, columns: usize, rows: usize },
+    OpenArtistSong(usize),
+    SelectArtistSong(usize),
+    OpenArtistCard { shelf: usize, card: usize },
+    SelectArtistCard { shelf: usize, card: usize },
+    PageArtistSongs { offset: usize, visible: usize },
+    PageArtistShelf { shelf: usize, offset: usize, visible: usize },
     PlayTrack(usize),
     SelectTrack(usize),
     PlayCollection,
@@ -263,6 +269,7 @@ pub enum MouseAction {
     SeekTo(u16),
     /// Set ordinary output volume from the persistent player's volume bar.
     SetVolume(u16),
+    AdjustVolume(bool),
     /// Toggle silence while retaining the user's last audible volume.
     ToggleMute,
     /// Open the actions for the current page or selection.
@@ -1298,6 +1305,7 @@ pub struct App {
     menu: Option<Menu>,
     /// Settings selection, choice picker, and return navigation.
     preferences: preferences::State,
+    updater: crate::update::State,
     /// What is playing and the page around it. `None` before the first play and
     /// after a stop -- there is no player page for silence.
     pub now: Option<NowPlaying>,
@@ -1567,6 +1575,7 @@ impl App {
             status: "loading the home feed ...".to_string(),
             busy: false,
             should_quit: false,
+            updater: crate::update::State::default(),
             wants_background: false,
             wants_foreground: false,
             start_in_tray: settings.start_in_tray,
@@ -2303,6 +2312,7 @@ impl App {
     /// so a cover and a resolve can land in the same frame and handling only
     /// the first would leave the other a frame stale.
     pub fn poll_source(&mut self) {
+        self.poll_update();
         if self.volume_save.is_some_and(|(at, _)| at.elapsed() >= Duration::from_millis(250)) {
             self.flush_volume();
         }
@@ -4365,6 +4375,51 @@ impl App {
                     self.selection_settled = Some(Instant::now());
                 }
             }
+            MouseAction::OpenArtistSong(index) | MouseAction::SelectArtistSong(index) if self.view == View::Artist => {
+                if let Some(view) = self.artist.as_mut()
+                    && matches!(&view.page, Panel::Ready(page) if index < page.top_songs.len())
+                {
+                    view.section = 0;
+                    view.song = index;
+                    self.selection_settled = Some(Instant::now());
+                    if matches!(action, MouseAction::OpenArtistSong(_)) { self.open_artist_selection(); }
+                }
+            }
+            MouseAction::OpenArtistCard { shelf, card } | MouseAction::SelectArtistCard { shelf, card } if self.view == View::Artist => {
+                if let Some(view) = self.artist.as_mut()
+                    && let Panel::Ready(page) = &view.page
+                    && page.shelves.get(shelf).is_some_and(|row| card < row.cards.len())
+                {
+                    view.section = shelf + usize::from(!page.top_songs.is_empty());
+                    view.card = card;
+                    self.selection_settled = Some(Instant::now());
+                    if matches!(action, MouseAction::OpenArtistCard { .. }) { self.open_artist_selection(); }
+                }
+            }
+            MouseAction::PageArtistSongs { offset, visible } if self.view == View::Artist && visible > 0 => {
+                if let Some(view) = self.artist.as_mut()
+                    && let Panel::Ready(page) = &view.page
+                    && !page.top_songs.is_empty()
+                {
+                    view.section = 0;
+                    view.song_offset = offset.min(page.top_songs.len().saturating_sub(visible));
+                    view.song = view.song_offset;
+                    self.selection_settled = Some(Instant::now());
+                }
+            }
+            MouseAction::PageArtistShelf { shelf, offset, visible } if self.view == View::Artist && visible > 0 => {
+                if let Some(view) = self.artist.as_mut()
+                    && let Panel::Ready(page) = &view.page
+                    && let Some(row) = page.shelves.get(shelf)
+                    && !row.cards.is_empty()
+                {
+                    view.section = shelf + usize::from(!page.top_songs.is_empty());
+                    view.scroll.resize(page.shelves.len(), 0);
+                    view.scroll[shelf] = offset.min(row.cards.len().saturating_sub(visible));
+                    view.card = view.scroll[shelf];
+                    self.selection_settled = Some(Instant::now());
+                }
+            }
             MouseAction::PlayTrack(index) if self.view == View::Tracks => {
                 if index < self.result_count() {
                     self.selected = index;
@@ -4431,8 +4486,9 @@ impl App {
             MouseAction::NextTrack => self.advance(1, false),
             MouseAction::SeekTo(position) => self.seek_to_fraction(position),
             MouseAction::SetVolume(position) => {
-                self.set_volume(pointer_fraction(position) as f32)
+                self.set_volume((pointer_fraction(position) as f32 / VOLUME_STEP).round() * VOLUME_STEP)
             }
+            MouseAction::AdjustVolume(up) => self.nudge_volume(if up { VOLUME_STEP } else { -VOLUME_STEP }),
             MouseAction::ToggleMute => self.toggle_mute(),
             _ => {}
         }
@@ -5388,6 +5444,12 @@ impl App {
         }
     }
 
+    pub fn handle_window_loss(&mut self, end_task: bool) {
+        self.should_quit |= end_task;
+        self.wants_background = !self.should_quit;
+        if self.should_quit { self.wants_foreground = false; }
+    }
+
     /// What hovering the icon says.
     ///
     /// The tooltip is the only thing MTUI shows while it is detached, so it
@@ -5476,7 +5538,8 @@ impl App {
     }
 
     fn nudge_volume(&mut self, delta: f32) {
-        self.set_volume(self.snapshot().volume + delta);
+        let current = self.volume_save.map_or_else(|| self.snapshot().volume, |(_, volume)| volume);
+        self.set_volume(((current / VOLUME_STEP).round() * VOLUME_STEP + delta).clamp(0.0, 2.0));
     }
 
     fn set_volume(&mut self, volume: f32) {

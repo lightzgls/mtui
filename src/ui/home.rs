@@ -92,17 +92,7 @@ pub(super) fn render_shelf(
         heading,
     );
     if let Some(controls) = controls {
-        for (button, label) in [(controls.previous, " < "), (controls.next, " > ")] {
-            let style = if button.offset.is_some() {
-                Style::default()
-                    .fg(Color::White)
-                    .bg(shell::SURFACE)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            frame.render_widget(Paragraph::new(Span::styled(label, style)), button.area);
-        }
+        controls.render(frame);
     }
     for slot in 0..layout.across * layout.rows {
         let index = cursor.offset + usize::from(slot);
@@ -119,39 +109,16 @@ pub(super) fn render_shelf(
     }
 }
 
-struct ShelfButton {
-    area: Rect,
-    offset: Option<usize>,
-}
-
-struct ShelfControls {
-    heading: Rect,
-    previous: ShelfButton,
-    next: ShelfButton,
-}
-
 /// Page by complete columns so compact grids keep their row alignment.
 /// The same geometry supplies both the visible controls and their mouse targets.
-fn controls(layout: ShelfLayout, count: usize, offset: usize) -> Option<ShelfControls> {
-    let rows = usize::from(layout.rows.max(1));
-    let columns = usize::from(layout.across);
-    let capacity = columns * rows;
-    if count <= capacity || capacity == 0 || layout.area.width < MIN_HOME_WIDTH {
-        return None;
-    }
-    let maximum = count.div_ceil(rows).saturating_sub(columns) * rows;
-    let first = (offset / rows * rows).min(maximum);
-    Some(ShelfControls {
-        heading: Rect::new(layout.area.x, layout.area.y, layout.area.width - 9, 1),
-        previous: ShelfButton {
-            area: Rect::new(layout.area.right() - 7, layout.area.y, 3, 1),
-            offset: (first > 0).then_some(first.saturating_sub(capacity)),
-        },
-        next: ShelfButton {
-            area: Rect::new(layout.area.right() - 3, layout.area.y, 3, 1),
-            offset: (first < maximum).then_some(first.saturating_add(capacity).min(maximum)),
-        },
-    })
+fn controls(layout: ShelfLayout, count: usize, offset: usize) -> Option<paging::Controls> {
+    paging::Controls::new(
+        layout.area,
+        count,
+        offset,
+        usize::from(layout.across),
+        usize::from(layout.rows),
+    )
 }
 
 pub(super) fn register_controls(
@@ -161,19 +128,12 @@ pub(super) fn register_controls(
     offset: usize,
 ) {
     if let Some(controls) = controls(layout, count, offset) {
-        for button in [controls.previous, controls.next] {
-            if let Some(offset) = button.offset {
-                mouse.targets.push(MouseTarget::Area(
-                    button.area,
-                    MouseAction::PageHomeShelf {
-                        shelf: layout.index,
-                        offset,
-                        columns: usize::from(layout.across),
-                        rows: usize::from(layout.rows),
-                    },
-                ));
-            }
-        }
+        controls.register(mouse, |offset| MouseAction::PageHomeShelf {
+            shelf: layout.index,
+            offset,
+            columns: usize::from(layout.across),
+            rows: usize::from(layout.rows),
+        });
     }
 }
 

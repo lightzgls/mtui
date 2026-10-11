@@ -31,6 +31,7 @@ mod sixel;
 mod source;
 mod tray;
 mod ui;
+mod update;
 
 #[cfg(windows)]
 use std::io;
@@ -82,6 +83,11 @@ const BUSY_TICK: Duration = Duration::from_millis(50);
 const IDLE_TICK: Duration = Duration::from_millis(500);
 
 fn main() -> Result<()> {
+    if update::helper_requested() {
+        let result = update::run_helper();
+        if let Err(error) = &result { console::report_error(&format!("Could not finish the MTUI update: {error:#}")); }
+        return result;
+    }
     #[cfg(windows)]
     if let Some((recover, silent)) = session::helper_request() {
         return session::run_helper(recover, silent);
@@ -181,7 +187,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
     app.wants_foreground = false;
 
     if console::closed() {
-        app.wants_background = true;
+        app.handle_window_loss(console::end_task_requested());
         return Ok(());
     }
 
@@ -190,7 +196,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
     let mut foreground = match Foreground::open() {
         Ok(foreground) => foreground,
         Err(_) if console::closed() => {
-            app.wants_background = true;
+            app.handle_window_loss(console::end_task_requested());
             return Ok(());
         }
         Err(err) => return Err(err),
@@ -198,7 +204,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
     let mut input = match console::Input::open().context("could not open foreground input") {
         Ok(input) => input,
         Err(_) if console::closed() => {
-            app.wants_background = true;
+            app.handle_window_loss(console::end_task_requested());
             return Ok(());
         }
         Err(err) => return Err(err),
@@ -206,7 +212,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
     let mut mouse = ui::MouseMap::default();
     let mut activation_until = None;
 
-    (|| -> Result<()> {
+    let result = (|| -> Result<()> {
         while !app.should_quit && !app.wants_background {
             if instance.take_activation() {
                 // Closing the helper and relaunching can happen before its pipe
@@ -260,8 +266,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
             paint_cover(app, foreground.terminal.backend_mut())
                 .context("could not draw the cover")?;
             if console::closed() {
-                // Unlike explicit B, X always backgrounds, including idle.
-                app.wants_background = true;
+                app.handle_window_loss(console::end_task_requested());
                 app.wants_foreground |= activation_until.is_some_and(|until| Instant::now() <= until);
                 break;
             }
@@ -273,10 +278,14 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
                 .context("could not poll foreground input")?
             {
                 match event {
-                    Event::Key(key) if key.is_press() => app.handle_key(key)?,
-                    Event::Mouse(event) => match event.kind {
-                        MouseEventKind::ScrollDown => app.handle_mouse_scroll(true)?,
-                        MouseEventKind::ScrollUp => app.handle_mouse_scroll(false)?,
+                    Event::Key(key) if key.is_press() => { mouse.clear_pointer(); app.handle_key(key)?; }
+                    Event::Mouse(event) => { mouse.move_pointer(event.column, event.row); match event.kind {
+                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                            let up = event.kind == MouseEventKind::ScrollUp;
+                            if mouse.over_volume(event.column, event.row) {
+                                app.handle_mouse_action(app::MouseAction::AdjustVolume(up))?;
+                            } else { app.handle_mouse_scroll(!up)?; }
+                        }
                         MouseEventKind::Down(MouseButton::Left) => {
                             if let Some(action) = mouse.action_at(event.column, event.row) {
                                 app.handle_mouse_action(action)?;
@@ -296,8 +305,9 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
                             app.handle_mouse_action(app::MouseAction::OpenPageActions)?;
                         }
                         _ => {}
-                    },
+                    } },
                     Event::Resize(width, height) => {
+                        mouse.clear_pointer();
                         #[cfg(not(windows))]
                         let _ = (width, height);
                         #[cfg(windows)]
@@ -320,12 +330,16 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
                 }
             }
             if console::closed() {
-                app.wants_background = true;
+                app.handle_window_loss(console::end_task_requested());
                 app.wants_foreground |= activation_until.is_some_and(|until| Instant::now() <= until);
             }
         }
         Ok(())
-    })()
+    })();
+    if console::closed() {
+        app.handle_window_loss(console::end_task_requested());
+        Ok(())
+    } else { result }
 }
 
 #[cfg(windows)]

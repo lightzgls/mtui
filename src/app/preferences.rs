@@ -13,16 +13,18 @@ pub enum Setting {
     Icon,
     Discord,
     Tray,
+    Updates,
 }
 
 impl Setting {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Output,
         Self::Cover,
         Self::Renderer,
         Self::Icon,
         Self::Discord,
         Self::Tray,
+        Self::Updates,
     ];
 
     pub fn index(self) -> usize {
@@ -37,6 +39,7 @@ impl Setting {
             Self::Output => "Playback",
             Self::Cover | Self::Renderer | Self::Icon => "Appearance",
             Self::Discord | Self::Tray => "Integrations",
+            Self::Updates => "App",
         }
     }
 
@@ -48,6 +51,7 @@ impl Setting {
             Self::Icon => "Tray icon",
             Self::Discord => "Discord presence",
             Self::Tray => "Keep tray icon visible",
+            Self::Updates => "Updates",
         }
     }
 
@@ -59,6 +63,7 @@ impl Setting {
             Self::Icon => "The icon shown in the Windows notification area.",
             Self::Discord => "Share your current song and playback state on Discord.",
             Self::Tray => "Keep tray controls available while the terminal is open.",
+            Self::Updates => "Check for new versions and install them here.",
         }
     }
 
@@ -67,7 +72,7 @@ impl Setting {
     }
 
     pub fn enabled(self) -> bool {
-        cfg!(windows) || !matches!(self, Self::Tray | Self::Icon)
+        cfg!(windows) || !matches!(self, Self::Tray | Self::Icon | Self::Updates)
     }
 }
 
@@ -207,6 +212,7 @@ impl App {
                         if self.presence_enabled() { "On" } else { "Off" }.to_string()
                     }
                     Setting::Tray => if self.start_in_tray { "On" } else { "Off" }.to_string(),
+                    Setting::Updates => self.updater.label(),
                 },
             })
             .collect()
@@ -250,7 +256,7 @@ impl App {
             .into_iter()
             .map(|value| (value.label().to_string(), ChoiceValue::Icon(value)))
             .collect(),
-            Setting::Discord | Setting::Tray => Vec::new(),
+            Setting::Discord | Setting::Tray | Setting::Updates => Vec::new(),
         };
         values
             .into_iter()
@@ -288,7 +294,10 @@ impl App {
             Intent::Activate(setting) if setting.enabled() => {
                 self.preferences.selected = setting.index();
                 self.preferences.notice = None;
-                if setting.is_toggle() {
+                if setting == Setting::Updates {
+                    self.updater.activate();
+                    self.update_notice();
+                } else if setting.is_toggle() {
                     self.change_setting(setting, true);
                 } else {
                     if setting == Setting::Output {
@@ -331,8 +340,25 @@ impl App {
             Setting::Icon => self.cycle_icon_theme(forward),
             Setting::Discord => self.toggle_presence(),
             Setting::Tray => self.toggle_start_in_tray(),
+            Setting::Updates => return,
         }
         self.preferences.notice = Some((self.status.clone(), self.status.starts_with("could not")));
+    }
+
+    fn update_notice(&mut self) {
+        if self.preferences.selected_setting() == Setting::Updates {
+            self.preferences.notice = Some((self.updater.detail(), self.updater.failed()));
+        }
+    }
+
+    pub(super) fn poll_update(&mut self) {
+        if let Some(package) = self.updater.poll() {
+            match crate::update::prepare_restart(package) {
+                Ok(()) => self.should_quit = true,
+                Err(error) => self.updater.fail(format!("Could not install the update: {error:#}")),
+            }
+        }
+        self.update_notice();
     }
 }
 
