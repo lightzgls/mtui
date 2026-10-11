@@ -30,6 +30,7 @@ use crate::tray::TrayCommand;
 
 pub mod preferences;
 pub mod actions;
+pub(crate) mod home;
 
 /// How much of the window the cover is allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -226,6 +227,7 @@ pub enum MouseAction {
     EditSearch,
     OpenHomeCard { shelf: usize, card: usize },
     SelectHomeCard { shelf: usize, card: usize },
+    PageHomeShelf { shelf: usize, offset: usize, columns: usize, rows: usize },
     PlayTrack(usize),
     SelectTrack(usize),
     PlayCollection,
@@ -247,6 +249,8 @@ pub enum MouseAction {
     RetryPlaylists,
     CopyShareLink,
     OpenTab(Tab),
+    ToggleLyricsExpanded,
+    ToggleLyricsFollow,
     OpenPageRow(usize),
     SelectPageRow(usize),
     /// Toggle the current transport from the persistent player strip.
@@ -571,6 +575,8 @@ pub struct NowPlaying {
     /// timings there is nothing to follow, and the panel scrolls as it always
     /// did.
     pub follow_lyrics: bool,
+    /// An explicit reading view; ordinary playback keeps the large artwork.
+    pub lyrics_expanded: bool,
     pub lyrics: Panel<Lyrics>,
     pub comments: Panel<Comments>,
     pub related: Panel<Vec<Shelf>>,
@@ -616,6 +622,7 @@ impl NowPlaying {
             tab: Tab::UpNext,
             cursor: [0; Tab::ALL.len()],
             follow_lyrics: true,
+            lyrics_expanded: false,
             lyrics: Panel::Idle,
             comments: Panel::Idle,
             related: Panel::Idle,
@@ -3142,6 +3149,7 @@ impl App {
         let mut page = NowPlaying::new(&track);
         page.tab = tab;
         page.repeat = repeat;
+        page.lyrics_expanded = self.now.as_ref().is_some_and(|now| now.lyrics_expanded);
         // The queue survives moving *within* it -- that is what makes advancing
         // through a radio keep one stable "Up next" rather than reshuffling on
         // every track. Playing something from outside it drops it instead of
@@ -3815,7 +3823,7 @@ impl App {
         }
     }
 
-    fn apply_home(&mut self, shelves: Vec<Shelf>) {
+    fn apply_home(&mut self, mut shelves: Vec<Shelf>) {
         let focused = self.home.get(self.home_shelf).and_then(|shelf| {
             shelf
                 .cards
@@ -3827,6 +3835,7 @@ impl App {
         } else {
             "Enter to play, / to search".to_string()
         };
+        home::arrange(&mut shelves);
         self.home_scroll = vec![0; shelves.len()];
         self.home = shelves;
         if let Some((title, key)) = focused
@@ -4343,6 +4352,19 @@ impl App {
                     self.selection_settled = Some(Instant::now());
                 }
             }
+            MouseAction::PageHomeShelf { shelf, offset, columns, rows } if self.view == View::Home => {
+                if let Some(len) = self.home.get(shelf).map(|row| row.cards.len())
+                    && len > 0 && columns > 0 && rows > 0
+                {
+                    let first = (offset / rows).min(len.div_ceil(rows).saturating_sub(columns)) * rows;
+                    self.home_scroll.resize(self.home.len(), 0);
+                    self.home_scroll[shelf] = first;
+                    self.home_shelf = shelf;
+                    self.home_card = first;
+                    self.home_grid_rows = rows;
+                    self.selection_settled = Some(Instant::now());
+                }
+            }
             MouseAction::PlayTrack(index) if self.view == View::Tracks => {
                 if index < self.result_count() {
                     self.selected = index;
@@ -4386,6 +4408,12 @@ impl App {
                 if self.now.as_mut().is_some_and(|now| now.open(tab)) {
                     self.request_tab();
                 }
+            }
+            MouseAction::ToggleLyricsExpanded if self.view == View::Playing => {
+                self.toggle_lyrics_expanded();
+            }
+            MouseAction::ToggleLyricsFollow if self.view == View::Playing => {
+                self.toggle_lyrics_follow();
             }
             MouseAction::OpenPageRow(index) if self.view == View::Playing => {
                 if let Some(now) = self.now.as_mut() {
@@ -4890,12 +4918,13 @@ impl App {
     /// seek, because this is the view most likely to be open while a long track
     /// plays, and up and down move with `j`/`k`.
     fn handle_playing_key(&mut self, key: KeyEvent) -> Result<()> {
-        let mut tab = self.now.as_ref().map(|now| now.tab);
+        let current_tab = self.now.as_ref().map(|now| now.tab);
+        let mut tab = None;
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('l') | KeyCode::Tab => tab = tab.map(|tab| tab.shifted(1)),
-            KeyCode::Char('h') | KeyCode::BackTab => tab = tab.map(|tab| tab.shifted(-1)),
+            KeyCode::Char('l') | KeyCode::Tab => tab = current_tab.map(|tab| tab.shifted(1)),
+            KeyCode::Char('h') | KeyCode::BackTab => tab = current_tab.map(|tab| tab.shifted(-1)),
             KeyCode::Char(digit @ '1'..='4') => {
                 tab = Tab::ALL.get(digit as usize - '1' as usize).copied();
             }
@@ -4909,11 +4938,13 @@ impl App {
             // each of them is -- clamp it to the last one.
             KeyCode::Char('G') | KeyCode::End => self.jump_page(usize::MAX),
             KeyCode::Enter => self.open_page_row(),
-            KeyCode::Char('d') if tab == Some(Tab::UpNext) => self.remove_queue_selection(),
-            KeyCode::Char('K') if tab == Some(Tab::UpNext) => self.move_queue_selection(-1),
-            KeyCode::Char('J') if tab == Some(Tab::UpNext) => self.move_queue_selection(1),
-            KeyCode::Char('C') if tab == Some(Tab::UpNext) => self.clear_upcoming_queue(),
-            KeyCode::Char('z') if tab == Some(Tab::UpNext) => self.shuffle_upcoming_queue(),
+            KeyCode::Char('d') if current_tab == Some(Tab::UpNext) => self.remove_queue_selection(),
+            KeyCode::Char('K') if current_tab == Some(Tab::UpNext) => self.move_queue_selection(-1),
+            KeyCode::Char('J') if current_tab == Some(Tab::UpNext) => self.move_queue_selection(1),
+            KeyCode::Char('C') if current_tab == Some(Tab::UpNext) => self.clear_upcoming_queue(),
+            KeyCode::Char('z') if current_tab == Some(Tab::UpNext) => self.shuffle_upcoming_queue(),
+            KeyCode::Char('e') if current_tab == Some(Tab::Lyrics) => self.toggle_lyrics_expanded(),
+            KeyCode::Char('f') if current_tab == Some(Tab::Lyrics) => self.toggle_lyrics_follow(),
             KeyCode::Char('R') => self.cycle_repeat(),
             KeyCode::Char('r') if self.playback_failed(&self.snapshot()) => {
                 self.retry_current_track()
@@ -4936,6 +4967,9 @@ impl App {
             // Back to the list the track was started from. The music keeps
             // playing -- leaving the page is not stopping it, and `P` brings it
             // back.
+            KeyCode::Esc if self.now.as_ref().is_some_and(|now| now.tab == Tab::Lyrics && now.lyrics_expanded) => {
+                self.toggle_lyrics_expanded();
+            }
             KeyCode::Esc => self.return_from_player(),
             KeyCode::Char('H') => self.go_home(),
             _ => {}
@@ -4949,6 +4983,22 @@ impl App {
             self.request_tab();
         }
         Ok(())
+    }
+
+    fn toggle_lyrics_expanded(&mut self) {
+        if let Some(now) = self.now.as_mut().filter(|now| now.tab == Tab::Lyrics) {
+            now.lyrics_expanded = !now.lyrics_expanded;
+            // A cover-only view must not conceal the requested reading view.
+            self.cover_size = CoverSize::Side;
+        }
+    }
+
+    fn toggle_lyrics_follow(&mut self) {
+        if let Some(now) = self.now.as_mut().filter(|now| now.tab == Tab::Lyrics)
+            && matches!(&now.lyrics, Panel::Ready(lyrics) if !lyrics.timed.is_empty())
+        {
+            now.follow_lyrics = !now.follow_lyrics;
+        }
     }
 
     /// Moves the cursor of the open tab, when there is a page to move it on.
@@ -5645,6 +5695,8 @@ pub(crate) fn keyboard_help_items() -> Vec<MenuItem> {
         MenuItem::help("Next or previous", "n / p", None),
         MenuItem::help("Repeat off / all / one", "R", None),
         MenuItem::help("Player actions", "Ctrl+P", None),
+        MenuItem::help("Lyrics: expand / restore", "e", None),
+        MenuItem::help("Lyrics: pause / resume follow", "f", None),
             MenuItem::help("Queue: remove / shuffle", "d / z", None),
             MenuItem::help("Queue: move row", "K / J", None),
             MenuItem::help("Queue: clear upcoming", "C", None),

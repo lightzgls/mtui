@@ -22,6 +22,7 @@ mod discord;
 mod graphics;
 mod instance;
 mod kitty;
+mod navigation;
 mod player;
 mod session;
 #[path = "session/protocol.rs"]

@@ -24,6 +24,144 @@ fn track(index: usize) -> Track {
     }
 }
 
+#[test]
+fn home_order_refresh_and_grid_input_keep_the_selected_song() {
+    let (mut app, _driver, _requests) = fixture();
+    let shelf = |title: &str, start| Shelf {
+        title: title.into(),
+        cards: (start..start + 9).map(|index| Card {
+            title: format!("Song {index}"), subtitle: "Artist".into(), art: None,
+            duration: None, artist_ref: None,
+            target: Target::Play { video_id: format!("song-{index}") },
+        }).collect(),
+    };
+    let feed = vec![shelf("Quick picks", 0), shelf("Albums for you", 20), shelf("Listen again", 40)];
+    app.apply_home(feed.clone());
+    app.view = View::Home;
+    assert_eq!(app.home.iter().map(|shelf| shelf.title.as_str()).collect::<Vec<_>>(),
+        ["Listen again", "Quick picks", "Albums for you"]);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 42)).unwrap();
+    let mut mouse = crate::ui::MouseMap::default();
+    terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+    assert_eq!(app.home_shelf, 1);
+    terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+    assert!(app.home_grid_rows > 1, "Quick picks should use a grid");
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).unwrap();
+    assert_eq!(app.home_card, app.home_grid_rows);
+    let point = (0..42).find_map(|y| (0..160).find_map(|x|
+        (mouse.context_action_at(x, y) == Some(MouseAction::SelectHomeCard { shelf: 1, card: 2 })).then_some((x, y)))).unwrap();
+    app.handle_mouse_action(mouse.context_action_at(point.0, point.1).unwrap()).unwrap();
+    assert_eq!(app.home_card().unwrap().art_key(), "song-2");
+    app.apply_home(vec![feed[1].clone(), feed[0].clone(), feed[2].clone()]);
+    assert_eq!(app.home_shelf, 1);
+    assert_eq!(app.home_card().unwrap().art_key(), "song-2", "a refresh must retain the song, not the API position");
+}
+
+#[test]
+fn home_sections_can_be_paged_with_only_mouse_clicks() {
+    for (width, height) in [(160, 42), (80, 32), (28, 24)] {
+        let (mut app, driver, _requests) = fixture();
+        driver.commands.try_iter().for_each(drop);
+        let shelf = |title: &str| Shelf {
+            title: title.into(),
+            cards: (0..20).map(|index| Card {
+                title: format!("Song {index}"), subtitle: "Artist".into(), art: None,
+                duration: None, artist_ref: None,
+                target: Target::Play { video_id: format!("song-{index}") },
+            }).collect(),
+        };
+        app.apply_home(vec![shelf("Listen again"), shelf("Quick picks")]);
+        app.view = View::Home;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let mut mouse = crate::ui::MouseMap::default();
+        for section in 0..2 {
+            // A short window first reaches Quick picks by the normal vertical navigation.
+            app.home_shelf = section;
+            app.home_card = 0;
+            terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+            let next = |mouse: &crate::ui::MouseMap, first: usize, forward: bool| {
+                (0..height).find_map(|y| (0..width).find_map(|x| {
+                    match mouse.action_at(x, y) {
+                        Some(action @ MouseAction::PageHomeShelf { shelf, offset, .. })
+                            if shelf == section && if forward { offset > first } else { offset < first } => Some((x, y, action)),
+                        _ => None,
+                    }
+                }))
+            };
+            assert!(next(&mouse, 0, false).is_none(), "the first page has no previous action");
+            let mut pages = 0;
+            while let Some((x, y, action)) = next(&mouse, app.home_scroll[section], true) {
+                assert_eq!(mouse.action_at(x + 2, y), Some(action), "the whole button is clickable");
+                assert_ne!(mouse.action_at(x, y + 1), Some(action), "the heading gap cannot trigger a page");
+                app.handle_mouse_action(action).unwrap();
+                let first = app.home_scroll[section];
+                terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+                assert_eq!(app.home_scroll[section], first, "redraw must keep the requested page");
+                assert_eq!(app.home_card, first);
+                assert_eq!(first % app.home_grid_rows, 0, "grid pages start at a whole column");
+                pages += 1;
+                assert!(pages <= 20, "paging must terminate");
+            }
+            assert!(pages > 0, "{width}x{height}: section {section} has offscreen songs");
+            assert!((0..height).any(|y| (0..width).any(|x|
+                mouse.action_at(x, y) == Some(MouseAction::OpenHomeCard { shelf: section, card: 19 }))),
+                "the last card must be reachable with the mouse");
+            while let Some((_, _, action)) = next(&mouse, app.home_scroll[section], false) {
+                app.handle_mouse_action(action).unwrap();
+                terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+            }
+            assert_eq!(app.home_scroll[section], 0);
+        }
+        assert_eq!(driver.commands.try_iter().count(), 0, "browsing a shelf must not start playback");
+        app.handle_mouse_action(MouseAction::PageHomeShelf { shelf: 99, offset: 10, columns: 4, rows: 3 }).unwrap();
+        assert_eq!(app.home_shelf, 1, "stale actions for a replaced shelf must be ignored");
+    }
+}
+
+#[test]
+fn lyrics_scrolling_follow_and_expand_work_through_real_keyboard_actions() {
+    let (mut app, _driver, _requests) = fixture();
+    queue(&mut app, RepeatMode::Off, 0);
+    let now = app.now.as_mut().unwrap();
+    now.open(Tab::Lyrics);
+    now.lyrics = Panel::Ready(Lyrics {
+        text: "An invented test line".into(), source: None,
+        timed: vec![crate::source::watch::TimedLine { text: "An invented test line".into(), start: Duration::ZERO }],
+    });
+    for key in [KeyCode::Down, KeyCode::Char(' '), KeyCode::Char('+')] {
+        app.handle_key(KeyEvent::new(key, KeyModifiers::NONE)).unwrap();
+        assert!(!app.now.as_ref().unwrap().follow_lyrics, "scrolling must keep control of the lyrics");
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)).unwrap();
+    assert!(app.now.as_ref().unwrap().follow_lyrics);
+    app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)).unwrap();
+    assert!(!app.now.as_ref().unwrap().follow_lyrics);
+    app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)).unwrap();
+    assert!(app.now.as_ref().unwrap().lyrics_expanded);
+    assert!(!app.now.as_ref().unwrap().follow_lyrics, "expanding must not change follow mode");
+    app.handle_mouse_action(MouseAction::ToggleLyricsFollow).unwrap();
+    assert!(app.now.as_ref().unwrap().follow_lyrics);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+    assert!(!app.now.as_ref().unwrap().lyrics_expanded);
+    assert_eq!(app.view, View::Playing, "first Esc restores the artwork");
+}
+
+#[test]
+fn the_lyrics_reading_view_survives_track_changes_and_ignores_queue_actions() {
+    let (mut app, _driver, _requests) = fixture();
+    queue(&mut app, RepeatMode::Off, 0);
+    app.now.as_mut().unwrap().open(Tab::Lyrics);
+    app.cover_size = CoverSize::Full;
+    app.handle_mouse_action(MouseAction::ToggleLyricsExpanded).unwrap();
+    assert_eq!(app.cover_size, CoverSize::Side);
+    app.advance(1, false);
+    assert!(app.now.as_ref().unwrap().lyrics_expanded);
+    app.handle_mouse_action(MouseAction::OpenTab(Tab::UpNext)).unwrap();
+    app.handle_mouse_action(MouseAction::ToggleLyricsExpanded).unwrap();
+    assert!(app.now.as_ref().unwrap().lyrics_expanded, "hidden lyrics controls must not alter another panel");
+}
+
 fn resolve(app: &mut App, index: usize) {
     app.apply(Response::Resolved {
         id: track(index).id, title: track(index).title,

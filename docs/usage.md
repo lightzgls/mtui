@@ -71,11 +71,33 @@ installs require network access but not administrator access.
 
 ## Usage
 
-The top bar provides Home, Playing, search, and Menu. Home uses artwork shelves;
+The top bar provides Home, Playing, search, and Menu. Home opens with large cover
+cards from Listen again (or the first available collection), followed by compact
+Quick picks. Shelf headings, artwork, and song grids keep clear spacing, and
+short windows adapt to smaller complete cards. Navigation and footer controls
+have side margins, with a blank row below the footer actions.
+
 Now Playing shows artwork beside Queue, Lyrics, Related, and Comments. In a
 narrow window the track header moves above the tabs. Progress and playback
 controls stay at the bottom on every page. The cover supplies a muted solid
 background, matching surfaces, and an accent throughout the app.
+
+The active page and panel are highlighted. Normal playback gives about 60% of
+the content width to the artwork, with the track title and artist directly below
+it. Playing shows the song identity once, below its cover; other pages keep it
+in the footer. Playback buttons stay centered, including on Home.
+
+Navigation symbols need no font installation. In the native Windows console,
+MTUI checks the current font and uses supported Unicode symbols, with simpler
+alternatives where available. Missing symbols retain the text label. Terminals
+whose visible font cannot be inspected use text labels for compatibility.
+The player and queue share the supported Playing symbol, with an ASCII `>`
+fallback when the font is unknown.
+
+On Lyrics, click **Expand** or press `e` for a full-width reading view; `e` or
+Esc restores the artwork. Click **Follow lyrics** or press `f` to resume synced
+lyrics after scrolling, or pause following to read ahead. Expanded lyrics use
+more space and centered lines; the terminal still controls the actual font size.
 
 Queue entries have space between songs and clear title, artist, and duration
 columns. Short windows use compact rows. Click the current artist or album to
@@ -86,6 +108,8 @@ The playback bar offers **Like, Share, Save to playlist, Shuffle, Repeat, and
 Output**. Smaller windows keep the full set in **Actions**, also available with
 `Ctrl-P` outside search entry. Share shows the song's YouTube Music link; the
 Windows build also provides a Copy link button.
+**System default** follows output changes, including unplugging headphones,
+and reconnects at the current song position while retaining pause and volume.
 Like and playlist saves use the signed-in account and show pending, confirmed,
 or failed states. The playlist picker marks songs already saved and keeps the
 song it was opened for even if playback moves to another track.
@@ -100,7 +124,10 @@ choice list, then returns to Settings and the menu it was opened from.
 `Ctrl-K` opens the global App Menu. Outside search entry, `.` opens actions for
 the current page or selection. The terminal UI also accepts the mouse: use the
 wheel to navigate, click the search box to edit, and click visible cards, rows,
-player tabs, or queue entries to open them. Click or drag the progress bar to
+player tabs, or queue entries to open them. Home sections also have clickable
+`<` / `>` buttons beside their headings to browse beyond the visible songs;
+they dim at the beginning or end. Click the
+cover or caption to play or open a card. Click or drag the progress bar to
 seek; the persistent player also exposes previous, play/pause, next, and volume
 controls wherever the terminal is wide enough to show them clearly. Press `m`
 or click the `vol`/`mut` label to mute or restore the previous volume. Right-click
@@ -168,6 +195,8 @@ sign-in profile without stopping current playback.
 | `K` / `J` | Move the selected upcoming queue track |
 | `z` / `C` | Shuffle or clear upcoming tracks |
 | `1`-`4` or `Tab` | Open Queue, Lyrics, Related, or Comments |
+| `e` on Lyrics | Expand or restore the lyrics reading view |
+| `f` on Lyrics | Pause or resume following synced lyrics |
 | `c` | Change cover-art size |
 | `M` | Import or refresh the personalized Home session |
 | `D` | Toggle Discord Rich Presence directly |

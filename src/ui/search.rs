@@ -52,7 +52,8 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut M
         x += width + 3;
     }
     let height = if list.height >= 4 && list.width >= 32 {
-        3
+        // Keep two complete results visible when footer padding leaves five rows.
+        if list.height >= 6 { 3 } else { 2 }
     } else {
         1
     };

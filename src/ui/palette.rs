@@ -38,8 +38,8 @@ pub(super) fn apply(frame: &mut Frame, cover: Option<&Cover>, artwork: Option<Re
             }
             cell.bg = match cell.bg {
                 Color::Reset | Color::Black => tint(10, cover.accent),
-                // The persistent strip shares the canvas; it has no black slab.
-                shell::BACKGROUND | shell::SURFACE => tint(10, cover.accent),
+                shell::BACKGROUND => tint(10, cover.accent),
+                shell::SURFACE => tint(22, cover.accent),
                 Color::Rgb(r, g, b) if r == g && g == b && r < 100 => tint(r, cover.accent),
                 other => other,
             };

@@ -633,6 +633,7 @@ mod tests {
                                 accent: Color::Gray,
                                 has_player: true,
                                 accepts_input: true,
+                                symbols: crate::navigation::Symbols::ALL,
                             },
                             &mut mouse,
                         );

@@ -91,6 +91,21 @@ mod imp {
         fn SetThreadDpiAwarenessContext(context: isize) -> isize;
     }
 
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateCompatibleDC(dc: isize) -> isize;
+        fn DeleteDC(dc: isize) -> i32;
+        fn CreateFontW(height: i32, width: i32, escapement: i32, orientation: i32,
+            weight: i32, italic: u32, underline: u32, strikeout: u32,
+            charset: u32, precision: u32, clipping: u32, quality: u32,
+            family: u32, face: *const u16) -> isize;
+        fn SelectObject(dc: isize, object: isize) -> isize;
+        fn DeleteObject(object: isize) -> i32;
+        fn GetTextFaceW(dc: isize, count: i32, name: *mut u16) -> i32;
+        fn GetGlyphIndicesW(dc: isize, text: *const u16, count: i32,
+            glyphs: *mut u16, flags: u32) -> u32;
+    }
+
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub(super) struct InputRecord {
@@ -190,6 +205,11 @@ mod imp {
     static SIZE: AtomicU32 = AtomicU32::new((24 << 16) | 80);
     static WINDOW: AtomicIsize = AtomicIsize::new(0);
     static CELL: AtomicU32 = AtomicU32::new((16 << 16) | 8);
+    static NAVIGATION_ICONS: AtomicU32 = AtomicU32::new(0);
+
+    pub fn navigation_icon_mask() -> u32 {
+        NAVIGATION_ICONS.load(Ordering::Acquire)
+    }
 
     pub fn cell_size() -> (u16, u16) {
         let packed = CELL.load(Ordering::Acquire);
@@ -449,6 +469,7 @@ mod imp {
             WINDOW.store(i64::from_le_bytes(message[15..23].try_into().unwrap()) as isize, Ordering::Release);
             let cell = u32::from_le_bytes(message[23..27].try_into().unwrap());
             if cell as u16 != 0 && (cell >> 16) != 0 { CELL.store(cell, Ordering::Release); }
+            NAVIGATION_ICONS.store(u32::from_le_bytes(message[27..31].try_into().unwrap()), Ordering::Release);
         }
         let height = u16::from_le_bytes([message[11], message[12]]);
         let length =
@@ -479,6 +500,10 @@ mod imp {
                 if let Ok(handle) = open_console("CONOUT$", GENERIC_READ) {
                     let cell = font_size(handle.as_raw_handle() as isize);
                     message[23..27].copy_from_slice(&pack(cell).to_le_bytes());
+                    let icons = if native_geometry().is_some() {
+                        read_font(handle.as_raw_handle() as isize).as_ref().map_or(0, font_icon_mask)
+                    } else { 0 };
+                    message[27..31].copy_from_slice(&icons.to_le_bytes());
                 }
             }
             Err(err) => {
@@ -663,6 +688,8 @@ mod imp {
         let mut cell = font_size(main_screen.as_raw_handle() as isize);
         let mut pixels = native_geometry();
         let mut locked_font = read_font(main_screen.as_raw_handle() as isize);
+        let mut icon_font = None;
+        let mut icons = 0;
         loop {
             // Font zoom and a monitor DPI transition can keep the same number
             // of columns. Poll pixels as well as cells rather than relying only
@@ -672,8 +699,11 @@ mod imp {
             let mut new_cell = font_size(active_raw);
             let mut new_pixels = native_geometry();
             let mut zoom_reset = false;
-            if pixels.map(|(_, _, dpi)| dpi) != new_pixels.map(|(_, _, dpi)| dpi) {
-                // Moving to another DPI follows the host's new font metrics.
+            let chosen_font = read_font(active_raw);
+            let font_changed = locked_font.as_ref().zip(chosen_font.as_ref())
+                .is_some_and(|(old, new)| old.face != new.face || old.weight != new.weight);
+            if pixels.map(|(_, _, dpi)| dpi) != new_pixels.map(|(_, _, dpi)| dpi) || font_changed {
+                // Respect an explicit font choice as well as a monitor change.
                 locked_font = read_font(active_raw);
             } else if new_pixels.is_some() && new_cell != cell
                 && let Some(font) = &locked_font
@@ -686,11 +716,21 @@ mod imp {
             }
             let new_size = fit_console_to_window(active_raw)?;
             hide_host_scrollbars();
-            if new_size != size || new_cell != cell || new_pixels != pixels || zoom_reset {
+            let font = read_font(active_raw);
+            let font_key = font.as_ref().map(|font| (font.face, font.weight, new_pixels.is_some()));
+            let mut icons_changed = false;
+            if icon_font != font_key {
+                icon_font = font_key;
+                // A pseudoconsole cannot tell us the font in its visible tab.
+                let new_icons = if new_pixels.is_some() { font.as_ref().map_or(0, font_icon_mask) } else { 0 };
+                icons_changed = new_icons != icons;
+                icons = new_icons;
+            }
+            if new_size != size || new_cell != cell || new_pixels != pixels || zoom_reset || icons_changed {
                 size = new_size;
                 cell = new_cell;
                 pixels = new_pixels;
-                let record = InputRecord { event_type: GEOMETRY_EVENT, event: [pack(size), pack(cell), 0, 0] };
+                let record = InputRecord { event_type: GEOMETRY_EVENT, event: [pack(size), pack(cell), icons, 0] };
                 if output.write_all(&encode_record(record)).is_err() { return Ok(()); }
             }
             drop(active);
@@ -736,6 +776,57 @@ mod imp {
         let mut info = ConsoleFontInfo { bytes: std::mem::size_of::<ConsoleFontInfo>() as u32,
             number: 0, size: Coord { x: 0, y: 0 }, family: 0, weight: 0, face: [0; 32] };
         (unsafe { GetCurrentConsoleFontEx(handle, 0, &mut info) } != 0).then_some(info)
+    }
+
+    /// Query the actual face, without installing a font or relying on fallback
+    /// fonts that the console may not use. Failed or substituted faces stay text-only.
+    fn font_icon_mask(info: &ConsoleFontInfo) -> u32 {
+        // Raster console fonts cannot be inspected reliably with glyph indices.
+        if info.family & 4 == 0 || info.face[0] == 0 { return 0; }
+        let mut face = info.face;
+        face[31] = 0;
+        let dc = unsafe { CreateCompatibleDC(0) };
+        if dc == 0 { return 0; }
+        let font = unsafe { CreateFontW(i32::from(info.size.y.max(1)), 0, 0, 0,
+            info.weight as i32, 0, 0, 0, 0, 0, 0, 0, 0, face.as_ptr()) };
+        if font == 0 {
+            unsafe { DeleteDC(dc); }
+            return 0;
+        }
+        let previous = unsafe { SelectObject(dc, font) };
+        if previous == 0 || previous == -1 {
+            unsafe { DeleteObject(font); DeleteDC(dc); }
+            return 0;
+        }
+        let mut actual = [0u16; 32];
+        let name_ok = unsafe { GetTextFaceW(dc, actual.len() as i32, actual.as_mut_ptr()) } > 0;
+        let name = |wide: &[u16]| String::from_utf16_lossy(&wide[..wide.iter().position(|unit| *unit == 0).unwrap_or(wide.len())]).to_lowercase();
+        let same_face = name_ok && name(&face) == name(&actual);
+        let mut indices = [u16::MAX; crate::navigation::GLYPHS.len()];
+        // GGI_MARK_NONEXISTING_GLYPHS marks absent characters as 0xffff.
+        let count = unsafe { GetGlyphIndicesW(dc, crate::navigation::GLYPHS.as_ptr(),
+            indices.len() as i32, indices.as_mut_ptr(), 1) };
+        unsafe { SelectObject(dc, previous); DeleteObject(font); DeleteDC(dc); }
+        if !same_face || count != indices.len() as u32 { return 0; }
+        indices.iter().enumerate().fold(0, |mask, (bit, glyph)| {
+            mask | if *glyph != u16::MAX && *glyph != 0 { 1 << bit } else { 0 }
+        })
+    }
+
+    #[test]
+    fn navigation_font_probe_uses_the_requested_face_and_fails_closed() {
+        let mut font = ConsoleFontInfo { bytes: std::mem::size_of::<ConsoleFontInfo>() as u32,
+            number: 0, size: Coord { x: 8, y: 16 }, family: 4, weight: 400, face: [0; 32] };
+        for (target, unit) in font.face.iter_mut().zip("Consolas".encode_utf16()) { *target = unit; }
+        let mask = font_icon_mask(&font);
+        assert_ne!(mask & 1, 0, "Consolas contains the home glyph");
+        assert_ne!(mask & (1 << 2), 0, "Consolas contains the simpler play glyph");
+        assert_ne!(mask & (1 << 4), 0, "Consolas contains the simpler menu glyph");
+        font.face = [0; 32];
+        for (target, unit) in font.face.iter_mut().zip("MTUI nonexistent test font".encode_utf16()) { *target = unit; }
+        assert_eq!(font_icon_mask(&font), 0, "a substituted face cannot certify the console's glyphs");
+        font.family = 0;
+        assert_eq!(font_icon_mask(&font), 0, "an unknown raster font keeps text labels");
     }
 
     fn font_size(handle: isize) -> (u16, u16) {
@@ -872,6 +963,7 @@ mod imp {
                     if dimensions.0 != 0 && dimensions.1 != 0 && pixels as u16 != 0 && (pixels >> 16) != 0 {
                         set_size(dimensions.0, dimensions.1);
                         CELL.store(pixels, Ordering::Release);
+                        NAVIGATION_ICONS.store(record.event[2], Ordering::Release);
                         return Ok(Some(Event::Resize(dimensions.0, dimensions.1)));
                     }
                     continue;
@@ -1196,7 +1288,7 @@ mod imp {
 pub use imp::{Input, Output, attach, closed, detach, focus, output, report_error};
 
 #[cfg(windows)]
-pub use imp::{cell_size, is_host, prepare_parent, run_host, size};
+pub use imp::{cell_size, is_host, navigation_icon_mask, prepare_parent, run_host, size};
 
 #[cfg(all(test, windows))]
 mod tests {

@@ -8,6 +8,7 @@
 pub mod backend;
 pub mod chunked;
 mod decoder;
+mod output;
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -468,8 +469,9 @@ fn run(
 
     // Opening the device can fail on a machine with no audio output at all.
     // Report it and idle rather than killing the app.
-    let mut device = match open_output(output_device.as_deref()) {
-        Ok((device, _)) => device,
+    let mut follow_default = output::DefaultFollow::new(output_device.is_none());
+    let mut device = match output::open(output_device.as_deref()) {
+        Ok(device) => device,
         Err(selected_error) if output_device.is_some() => {
             crate::diagnostics::warn(
                 "player",
@@ -478,8 +480,12 @@ fn run(
             update(&snapshot, |s| {
                 s.error = Some("saved audio output unavailable; using system default".to_string());
             });
-            match open_output(None) {
-                Ok((device, _)) => device,
+            match output::open(None) {
+                Ok(device) => {
+                    follow_default.select(true);
+                    let _ = events.send(PlayerEvent::OutputChanged { id: None, name: device.name.clone() });
+                    device
+                }
                 Err(default_error) => {
                     set_error(
                         &snapshot,
@@ -494,10 +500,7 @@ fn run(
             return;
         }
     };
-    // rodio otherwise prints a notice to stderr when the sink drops, which
-    // would scribble over the alternate screen on exit.
-    device.log_on_drop(false);
-    let mut player = rodio::Player::connect_new(device.mixer());
+    let mut player = rodio::Player::connect_new(device.sink.mixer());
     let mut volume = initial_volume;
     player.set_volume(volume);
 
@@ -783,7 +786,7 @@ fn run(
                     update(&snapshot, |s| s.volume = volume);
                 }
                 Command::SetOutput(id) => {
-                    match switch_output(
+                    match output::switch(
                         &runtime,
                         &mut device,
                         &mut player,
@@ -793,6 +796,7 @@ fn run(
                         id.as_deref(),
                     ) {
                         Ok(name) => {
+                            follow_default.select(id.is_none());
                             let _ = events.send(PlayerEvent::OutputChanged { id, name });
                         }
                         Err(error) => {
@@ -817,6 +821,15 @@ fn run(
             }
             let position = cur.position;
             update(&snapshot, |s| s.position = position);
+        }
+
+        let active = device.id.clone();
+        let failed = device.failed();
+        if let Some(Err(error)) = follow_default.poll(
+            Instant::now(), active.as_deref(), failed, output::default_id,
+            || output::switch(&runtime, &mut device, &mut player, &mut track, state, volume, None),
+        ) {
+            crate::diagnostics::warn("player", &format!("could not follow the system default audio output; will retry: {error:#}"));
         }
 
         // A download that has been refused mid-stream, asking for a signature
@@ -918,90 +931,6 @@ fn normalized_volume(volume: f32) -> f32 {
     } else {
         1.0
     }
-}
-
-/// Opens the named device without disturbing the current one.
-fn open_output(id: Option<&str>) -> Result<(rodio::MixerDeviceSink, String)> {
-    let (mut sink, name) = match id {
-        Some(id) => {
-            let id = id
-                .parse::<rodio::cpal::DeviceId>()
-                .with_context(|| format!("invalid audio output id `{id}`"))?;
-            let host = rodio::cpal::default_host();
-            let device = host
-                .device_by_id(&id)
-                .with_context(|| format!("audio output `{id}` is not connected"))?;
-            let name = device
-                .description()
-                .map(|description| description.name().to_string())
-                .unwrap_or_else(|_| "Selected output".to_string());
-            let sink = rodio::DeviceSinkBuilder::from_device(device)
-                .context("could not read the audio output configuration")?
-                .open_sink_or_fallback()
-                .context("could not open the selected audio output")?;
-            (sink, name)
-        }
-        None => (
-            rodio::DeviceSinkBuilder::open_default_sink()
-                .context("could not open the system audio output")?,
-            "System default".to_string(),
-        ),
-    };
-    // Rodio otherwise prints a notice over the alternate screen when a sink is
-    // replaced or dropped on exit.
-    sink.log_on_drop(false);
-    Ok((sink, name))
-}
-
-/// Commits a new output only after both its sink and the current track reopen.
-fn switch_output(
-    runtime: &tokio::runtime::Runtime,
-    device: &mut rodio::MixerDeviceSink,
-    player: &mut rodio::Player,
-    track: &mut Option<Track>,
-    state: PlayState,
-    volume: f32,
-    id: Option<&str>,
-) -> Result<String> {
-    let (next_device, name) = open_output(id)?;
-    let next_player = rodio::Player::connect_new(next_device.mixer());
-    next_player.set_volume(volume);
-
-    if matches!(state, PlayState::Playing | PlayState::Paused) {
-        let url = track
-            .as_ref()
-            .context("the playing track has no stream to move")?
-            .url
-            .clone();
-        // Leave the current device audible while the replacement stream opens.
-        let (decoder, total, link) = open_stream(runtime, &url)?;
-        let from = track
-            .as_ref()
-            .map(|cur| cur.resume_at(player.get_pos()))
-            .unwrap_or_default();
-
-        if let Some(cur) = track.as_mut() {
-            cur.link.decline();
-            cur.link = link;
-            if total.is_some() {
-                cur.total = total;
-            }
-            cur.offset = from;
-            cur.position = from;
-            cur.seeking_to = None;
-        }
-        player.stop();
-        play_source(&next_player, decoder, from);
-        if state == PlayState::Paused {
-            next_player.pause();
-        }
-    } else {
-        player.stop();
-    }
-
-    *player = next_player;
-    *device = next_device;
-    Ok(name)
 }
 
 /// Whether byte offsets in two resolved URLs name the same media bytes.

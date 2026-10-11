@@ -169,11 +169,12 @@ pub(super) fn line(
             Style::default().fg(colour)
         }
     };
+    let marker = if playing { crate::navigation::current().play() } else { " " };
     let duration = track.duration_str();
     if width < MARKER_WIDTH + display_width(&duration) + COLUMN_GAP + 1 {
         return Line::from(Span::styled(
             truncate(
-                &format!(" {} {}", if playing { "▶" } else { " " }, track.title),
+                &format!(" {marker} {}", track.title),
                 width,
             ),
             style,
@@ -182,7 +183,7 @@ pub(super) fn line(
     let columns = Columns::new(track, width);
     let mut spans = vec![
         Span::styled(
-            format!(" {} ", if playing { "▶" } else { " " }),
+            format!(" {marker} "),
             if playing { style } else { dim(Color::DarkGray) },
         ),
         Span::styled(focused_cell(&track.title, columns.title, selected), style),
