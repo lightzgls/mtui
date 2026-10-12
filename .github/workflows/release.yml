@@ -19,7 +19,7 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component clippy
           rustup default stable-x86_64-pc-windows-msvc
 
       - name: Verify release tag
@@ -32,8 +32,9 @@ jobs:
           }
           "MTUI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Test
-        run: cargo test --workspace --all-targets --locked
+      - name: Isolated tests and Clippy
+        shell: pwsh
+        run: ./scripts/test.ps1 -Suite Full -Online
 
       # webview2-com statically links WebView2Loader on MSVC. GNU links the DLL
       # dynamically, which would turn the release into a two-file download.

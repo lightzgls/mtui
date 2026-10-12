@@ -106,7 +106,8 @@ try {
         # Only these local-fixture probes. Never run all ignored tests.
         $taskAudioTests = @(
             'player::decoder::packet_tests::real_aac_resume_matches_the_original_audio_at_eight_seconds',
-            'player::tests::initial_403_recovers_once_and_stop_cancels_a_late_replacement'
+            'player::tests::initial_403_recovers_once_and_stop_cancels_a_late_replacement',
+            'player::seek_tests::stalled_middle_seeks_allow_another_song_stop_and_shutdown_in_the_same_session'
         )
         for ($taskIndex = 0; $taskIndex -lt $taskAudioTests.Count; $taskIndex++) {
             Invoke-CargoPhase "audio-$($taskIndex + 1)" ($taskBase + @($taskAudioTests[$taskIndex], '--', '--exact', '--ignored', '--test-threads=1'))

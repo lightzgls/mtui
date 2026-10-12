@@ -19,14 +19,14 @@ Chạy từ thư mục dự án bằng PowerShell 5.1 hoặc PowerShell 7:
 # Chạy toàn bộ test nhiều lần để tìm lỗi phụ thuộc timing/thread
 ./scripts/test.ps1 -Suite Stress -Iterations 10 -Threads 8
 
-# Hai probe AAC trên localhost: decoder và recovery/Stop, volume 0
+# Ba probe AAC trên localhost: decoder, recovery/Stop và seek bị kẹt, volume 0
 ./scripts/test.ps1 -Suite Audio -AudioFixture ./target/playback-regression.m4a
 ```
 
 Mặc định dùng dependency đã có trên máy và Cargo.lock. Nếu máy mới chưa tải
 dependency, thêm `-Online`. Cờ này cho phép Cargo tải dependency; **không bật
 các test `#[ignore]`**. CI chạy Full trên Windows, Linux và macOS.
-Suite Audio chỉ chạy đúng hai test AAC local được chọn sẵn. Nó cần file fixture
+Suite Audio chỉ chạy đúng ba test AAC local được chọn sẵn. Nó cần file fixture
 có sẵn; không tải audio. Probe recovery mở output device với volume 0.
 
 Mỗi lần chạy tạo `target/test-runs/<timestamp>-<id>/`, gồm:
@@ -88,6 +88,10 @@ Buffering → Idle có lỗi phải được báo lỗi, không bị hiểu thà
 Các test ignored được giữ nguyên trừ hai regression UI/actions đã được đổi sang
 fixture thuần offline. Preview, live API, audio thật và history write trong
 inventory **không có nghĩa đã pass**.
+
+Regression seek dùng stream AAC localhost bị từ chối sau 64 KiB. Trong lúc seek
+đến giữa bài đang chờ byte, kiểm tra chọn bài khác, seek lại, Stop và Quit. Cùng
+một player phải phát được bài kế tiếp; Quit phải kết thúc trong thời gian hữu hạn.
 
 ## Dữ liệu và môi trường cần chuẩn bị cho các ca tích hợp
 

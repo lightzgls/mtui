@@ -79,10 +79,14 @@ pub type AudioStream = StreamDownload<BoundedStorageProvider<MemoryStorageProvid
 /// read into "no more samples" and rodio ends that source exactly as it ends a
 /// finished one, so without this a refused byte range and a song that reached
 /// its end arrive identically.
+#[cfg(test)]
 pub async fn open(url: &str) -> Result<(AudioStream, StreamLink)> {
+    open_with_link(url, StreamLink::default()).await
+}
+
+pub(super) async fn open_with_link(url: &str, link: StreamLink) -> Result<(AudioStream, StreamLink)> {
     let capacity = NonZeroUsize::new(BUFFER_BYTES).expect("BUFFER_BYTES is a non-zero constant");
     let storage = BoundedStorageProvider::new(MemoryStorageProvider, capacity);
-    let link = StreamLink::default();
 
     // Built here and handed in, rather than through `StreamDownload::new` and
     // the `Client::create` it calls: that trait method takes no arguments, so
@@ -107,6 +111,8 @@ pub async fn open(url: &str) -> Result<(AudioStream, StreamLink)> {
     .await
     .context("failed to open audio stream")?;
 
+    let cancellation = download.cancellation_token();
+    link.set_cancellation(move || cancellation.cancel());
     Ok((download, link))
 }
 

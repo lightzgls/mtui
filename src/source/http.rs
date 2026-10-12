@@ -41,7 +41,7 @@ impl Http {
             .context("could not start a runtime for YouTube Music calls")?;
         let client = reqwest::Client::builder()
             .timeout(TIMEOUT)
-            .pool_max_idle_per_host(2)
+            .pool_max_idle_per_host(8)
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .context("could not build the YouTube Music HTTP client")?;

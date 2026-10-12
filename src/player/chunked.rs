@@ -154,9 +154,110 @@ struct LinkState {
     /// Set when the player has nothing to offer, so the wait can end early
     /// rather than run out the clock on an answer that is not coming.
     declined: bool,
+    cancel: Option<DownloadCancellation>,
+    cancelled: bool,
+    seeking: bool,
+    seek_timed_out: bool,
+    identity: Option<StreamIdentity>,
+}
+
+#[derive(Clone)]
+struct StreamIdentity { id: String, format: mtui_resolver::AudioFormat, url: String }
+
+impl fmt::Debug for StreamIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("StreamIdentity") }
+}
+
+#[derive(Clone)]
+struct DownloadCancellation(Arc<dyn Fn() + Send + Sync>);
+
+impl fmt::Debug for DownloadCancellation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DownloadCancellation")
+    }
+}
+
+/// Limits synchronous decoder work and lets new commands interrupt its reads.
+pub(super) struct SeekGuard {
+    link: StreamLink,
+    timer: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SeekGuard {
+    fn drop(&mut self) {
+        self.timer.abort();
+        if let Ok(mut state) = self.link.0.lock() {
+            state.seeking = false;
+        }
+    }
 }
 
 impl StreamLink {
+    pub(super) fn set_identity(&self, id: &str, format: mtui_resolver::AudioFormat, url: &str) {
+        if let Ok(mut state) = self.0.lock() {
+            state.identity = Some(StreamIdentity { id: id.into(), format, url: url.into() });
+        }
+    }
+
+    /// A seek can be waiting for bytes while the command worker is winding it.
+    /// Deliver compatible replacement URLs without waiting for that worker.
+    pub(super) fn replace_during_seek(&self, id: &str, format: mtui_resolver::AudioFormat, url: &str) {
+        let identity = self.0.lock().ok().and_then(|state| state.identity.clone());
+        let Some(identity) = identity.filter(|identity| identity.id == id) else { return; };
+        if super::same_representation(identity.format, format) && super::same_file(&identity.url, url) {
+            self.supply_url(url);
+        } else {
+            // Different media bytes require a new decoder. The queued
+            // replacement command will rebuild at the requested track time.
+            self.cancel();
+        }
+    }
+
+    pub(super) fn set_cancellation(&self, cancel: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut state) = self.0.lock() {
+            state.cancel = Some(DownloadCancellation(Arc::new(cancel)));
+        }
+    }
+
+    pub(super) fn cancel(&self) {
+        let cancel = self.0.lock().ok().and_then(|mut state| {
+            state.cancelled = true;
+            state.declined = true;
+            state.cancel.clone()
+        });
+        if let Some(cancel) = cancel {
+            (cancel.0)();
+        }
+    }
+
+    pub(super) fn cancelled(&self) -> bool {
+        self.0.lock().is_ok_and(|state| state.cancelled)
+    }
+
+    pub(super) fn seeking(&self) -> bool {
+        self.0.lock().is_ok_and(|state| state.seeking)
+    }
+
+    pub(super) fn seek_timed_out(&self) -> bool {
+        self.0.lock().is_ok_and(|state| state.seek_timed_out)
+    }
+
+    pub(super) fn begin_seek(&self, runtime: &tokio::runtime::Runtime, timeout: Duration) -> SeekGuard {
+        if let Ok(mut state) = self.0.lock() {
+            state.seeking = true;
+            state.seek_timed_out = false;
+        }
+        let link = self.clone();
+        let timer = runtime.spawn(async move {
+            tokio::time::sleep(timeout).await;
+            if let Ok(mut state) = link.0.lock() {
+                state.seek_timed_out = true;
+            }
+            link.cancel();
+        });
+        SeekGuard { link: self.clone(), timer }
+    }
+
     fn record(&self, fault: StreamFault) {
         if let Ok(mut state) = self.0.lock() {
             state.fault.get_or_insert(fault);
@@ -246,6 +347,9 @@ impl StreamLink {
     /// buffer rather than blocking anything the user can hear -- there are
     /// about thirty seconds of cushion and this gives up after ten.
     async fn refresh(&self, offset: u64) -> Option<reqwest::Url> {
+        if self.cancelled() {
+            return None;
+        }
         // A replacement armed before the refusal, which is the case the resolve
         // path sets up when it already knows this URL is capped. Answered here
         // without a wait and without troubling the player at all.
@@ -825,6 +929,23 @@ fn parse_total(headers: &HeaderMap) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compatible_seek_replacements_are_delivered_without_the_command_worker() {
+        let link = StreamLink::default();
+        let format = mtui_resolver::AudioFormat { itag: Some(140) };
+        let old = "https://old.test/audio?clen=1234&lmt=5678";
+        let fresh = "https://fresh.test/audio?clen=1234&lmt=5678";
+        link.set_identity("song", format, old);
+        link.replace_during_seek("another-song", format, fresh);
+        assert!(link.take_url().is_none());
+        assert!(!link.cancelled());
+        link.replace_during_seek("song", format, fresh);
+        assert_eq!(link.take_url().unwrap().as_str(), fresh);
+        assert!(!link.cancelled());
+        link.replace_during_seek("song", mtui_resolver::AudioFormat { itag: Some(141) }, fresh);
+        assert!(link.cancelled(), "different media bytes must interrupt the old preparation");
+    }
 
     fn headers_with(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();

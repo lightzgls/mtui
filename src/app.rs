@@ -1274,7 +1274,7 @@ pub struct App {
     /// its way. `None` means nothing is being loaded.
     pending: Option<String>,
     /// Latest scrub requested before this track's URL has arrived.
-    pending_seek: Option<Duration>,
+    pending_seek: Option<Command>,
 
     /// Which list the main pane is showing.
     pub view: View,
@@ -2851,8 +2851,8 @@ impl App {
                     title,
                     id: id.to_string(),
                 });
-                if let Some(target) = pending_seek {
-                    let _ = self.player.send(Command::Seek(target));
+                if let Some(seek) = pending_seek {
+                    let _ = self.player.send(seek);
                 }
                 return;
             }
@@ -5745,16 +5745,17 @@ impl App {
             return;
         };
         let target = duration_at_pointer(total, position);
+        let seek = if position >= POINTER_SCALE { Command::SeekToEnd(target) } else { Command::Seek(target) };
         // Load may not have published its snapshot yet; never seek the old
         // decoder or lose the user's intent while the new URL is resolving.
         if self.pending.is_some() {
-            self.pending_seek = Some(target);
+            self.pending_seek = Some(seek);
             return;
         }
         // Play is asynchronous too: its command may already be queued while
         // the last published snapshot still says Idle. The player can safely
         // ignore a seek with no decoder; the UI must not discard a valid one.
-        let _ = self.player.send(Command::Seek(target));
+        let _ = self.player.send(seek);
         if let Some((_, listening)) = self.listening.as_mut() { listening.seeked(); }
     }
 }

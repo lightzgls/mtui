@@ -74,7 +74,7 @@ pub(super) fn open(id: Option<&str>) -> Result<Output> {
 /// Commit only after the endpoint and decoder are ready; failed attempts leave
 /// the old player intact so a default change can be retried.
 pub(super) fn switch(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &PlaybackRuntime,
     output: &mut Output,
     player: &mut rodio::Player,
     track: &mut Option<Track>,
@@ -92,7 +92,7 @@ pub(super) fn switch(
             .context("the playing track has no stream to move")?
             .url
             .clone();
-        let (decoder, total, link) = open_stream(runtime, &url)?;
+        let (decoder, total, link) = open_stream(runtime, &url, true)?;
         let from = track
             .as_ref()
             .map(|cur| cur.resume_at(player.get_pos()))

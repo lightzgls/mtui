@@ -234,7 +234,7 @@ impl Resolver {
             .build()
             .map_err(|e| ResolveError::from_message(format!("could not start resolver: {e}")))?;
         let client = reqwest::Client::builder()
-            .pool_max_idle_per_host(2)
+            .pool_max_idle_per_host(8)
             .pool_idle_timeout(Duration::from_secs(30))
             .timeout(PLAYER_TIMEOUT)
             .build()

@@ -30,6 +30,28 @@ use chunked::{StreamFault, StreamLink};
 /// of a second, and a livestream's duration is a guess. Anything inside this is
 /// the track ending, not the stream dying.
 const END_GRACE: Duration = Duration::from_secs(3);
+/// A seek must release the command worker even when the stream cannot supply bytes.
+const SEEK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Keeps the currently opened download reachable by Stop and Shutdown while
+/// synchronous decoder reads are running on the command worker.
+struct PlaybackRuntime {
+    runtime: tokio::runtime::Runtime,
+    active_stream: Arc<Mutex<Option<StreamLink>>>,
+}
+
+impl std::ops::Deref for PlaybackRuntime {
+    type Target = tokio::runtime::Runtime;
+    fn deref(&self) -> &Self::Target { &self.runtime }
+}
+
+impl PlaybackRuntime {
+    fn activate(&self, link: &StreamLink) {
+        if let Ok(mut active) = self.active_stream.lock() {
+            *active = Some(link.clone());
+        }
+    }
+}
 
 /// Rebuilds allowed before a track is given up on.
 ///
@@ -95,6 +117,8 @@ pub enum Command {
     TogglePause,
     Stop,
     Seek(Duration),
+    /// The progress bar endpoint is explicit: no unread audio is needed to finish.
+    SeekToEnd(Duration),
     /// Clamped to 0.0..=1.0 by the player thread.
     SetVolume(f32),
     /// `None` follows the operating-system default; `Some` names a CPAL device id.
@@ -180,6 +204,7 @@ pub struct Player {
     /// Requests from the player thread back to the app. See [`PlayerEvent`].
     events: Receiver<PlayerEvent>,
     snapshot: Arc<Mutex<Snapshot>>,
+    active_stream: Arc<Mutex<Option<StreamLink>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -198,7 +223,7 @@ impl Player {
         let (events_tx, events) = channel();
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let driver = TestDriver { commands, snapshot: snapshot.clone(), events: events_tx };
-        (Self { tx, events, snapshot, handle: None }, driver)
+        (Self { tx, events, snapshot, active_stream: Arc::default(), handle: None }, driver)
     }
 
     /// Spawns the player thread and its private tokio runtime.
@@ -212,6 +237,8 @@ impl Player {
         }));
 
         let thread_snapshot = Arc::clone(&snapshot);
+        let active_stream = Arc::new(Mutex::new(None));
+        let thread_active_stream = active_stream.clone();
         let handle = thread::Builder::new()
             .name("mtui-player".to_string())
             .spawn(move || {
@@ -221,6 +248,7 @@ impl Player {
                     thread_snapshot,
                     initial_volume,
                     output_device,
+                    thread_active_stream,
                 )
             })
             .context("failed to spawn player thread")?;
@@ -229,13 +257,31 @@ impl Player {
             tx,
             events,
             snapshot,
+            active_stream,
             handle: Some(handle),
         })
     }
 
     /// Sends a command. Fails only if the player thread has died.
     pub fn send(&self, cmd: Command) -> Result<()> {
-        self.tx.send(cmd).context("player thread is gone")
+        let active = self.active_stream.lock().ok().and_then(|active| active.clone());
+        let replacement = match &cmd {
+            Command::ArmReplacement { id, url, format } => Some((id.clone(), url.clone(), *format)),
+            _ => None,
+        };
+        let interrupt = active.clone()
+            .filter(|link| matches!(cmd, Command::Load { .. } | Command::Play { .. } | Command::Stop | Command::Shutdown)
+                || (link.seeking() && matches!(cmd, Command::Seek(_) | Command::SeekToEnd(_) | Command::SetOutput(_))));
+        self.tx.send(cmd).context("player thread is gone")?;
+        if let Some(link) = interrupt {
+            link.cancel();
+        }
+        if let Some((id, url, format)) = replacement
+            && let Some(link) = active.filter(StreamLink::seeking)
+        {
+            link.replace_during_seek(&id, format, &url);
+        }
+        Ok(())
     }
 
     /// Takes the next thing the player is waiting on, if there is one.
@@ -258,7 +304,7 @@ impl Player {
 
 impl Drop for Player {
     fn drop(&mut self) {
-        let _ = self.tx.send(Command::Shutdown);
+        let _ = self.send(Command::Shutdown);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -371,6 +417,7 @@ impl Track {
     /// nothing left for the stream to have failed to reach, and holding a
     /// target it can never play past would answer the last seek of a track with
     /// a stream reopened only to find it over.
+    #[cfg(test)]
     fn aim_at(&mut self, target: Duration) {
         self.seeking_to = match self.total {
             Some(total) if target + END_GRACE >= total => None,
@@ -447,6 +494,7 @@ fn run(
     snapshot: Arc<Mutex<Snapshot>>,
     initial_volume: f32,
     output_device: Option<String>,
+    active_stream: Arc<Mutex<Option<StreamLink>>>,
 ) {
     // One worker thread, dedicated to stream-download's downloader task.
     //
@@ -466,6 +514,7 @@ fn run(
             return;
         }
     };
+    let runtime = PlaybackRuntime { runtime, active_stream: active_stream.clone() };
 
     // Opening the device can fail on a machine with no audio output at all.
     // Report it and idle rather than killing the app.
@@ -567,7 +616,7 @@ fn run(
                     // The loop's own copy is left alone until this settles: the
                     // open below blocks, and nothing can read it in the
                     // meantime. What the UI renders is the snapshot above.
-                    match open_stream(&runtime, &url) {
+                    match open_stream(&runtime, &url, false) {
                         Ok((decoder, total, link)) => {
                             // Opening blocks this thread for a second or more,
                             // and whatever arrived during it is newer than this
@@ -577,7 +626,10 @@ fn run(
                             if drain(&rx, &mut queued) {
                                 continue;
                             }
-                            play_source(&player, decoder, Duration::ZERO);
+                            link.set_identity(&id, format, &url);
+                            if play_source(&runtime, &player, decoder, &link, Duration::ZERO).is_err() {
+                                continue;
+                            }
                             track = Some(Track {
                                 url,
                                 format,
@@ -664,7 +716,7 @@ fn run(
                     cur.replacement = None;
 
                     let url = cur.url.clone();
-                    match start_stream(&runtime, &player, &url, from) {
+                    match start_stream(&runtime, &player, &url, from, (&cur.id, format)) {
                         Ok((total, link)) => {
                             // The fresh stream reports its own faults, and its
                             // own length -- a re-resolve can land on a
@@ -702,6 +754,9 @@ fn run(
                         continue;
                     };
                     cur.arm_replacement(url, format);
+                    if state == PlayState::Buffering && cur.link.cancelled() {
+                        queued.push_front(Command::Seek(cur.position));
+                    }
                 }
                 Command::ResumeFailed { why } => {
                     failed_start = None;
@@ -737,48 +792,25 @@ fn run(
                     });
                 }
                 Command::Seek(target) => {
-                    // rodio's clock is relative to the source it was given,
-                    // which after a rebuild does not begin at the track's
-                    // start. Everywhere else here speaks in track time.
-                    // Aimed before the attempt, because a seek that kills the
-                    // source has to be recovered at the target and by then this
-                    // is the only thing that remembers it.
-                    let aimed = track.as_mut().map(|cur| {
-                        let seek = (cur.offset, target < cur.position);
-                        cur.aim_at(target);
-                        seek
-                    });
-                    if let Some((offset, backwards)) = aimed {
-                        match target.checked_sub(offset) {
-                            // Forwards, symphonia reads ahead and discards,
-                            // which lands exactly.
-                            //
-                            // The position is left to the tick below rather
-                            // than written from the target here: rodio answers
-                            // with the position it was asked for whether or not
-                            // the stream could follow, and a clock running
-                            // ahead of the audio takes the lyrics with it.
-                            Some(within) if !backwards && player.try_seek(within).is_ok() => {}
-                            // Backwards, or before this source begins: only a
-                            // fresh stream can reach it.
-                            //
-                            // A rewind is never attempted in place, however
-                            // little of it there is. The bytes are usually
-                            // still in the ring buffer, but the decoder has
-                            // been told it cannot seek in that buffer -- so it
-                            // answers by moving its own sample pointer,
-                            // reports success, and fails the next read, which
-                            // rodio reads as a source that ended. That is the
-                            // silent path that left the clock, and the lyrics
-                            // marked off it, describing a rewind the audio
-                            // never made. Winding a fresh stream forward costs
-                            // the time it takes to open one and lands where it
-                            // was sent.
-                            _ => {
-                                state = rebuild(&runtime, &player, &snapshot, &mut track, target);
-                            }
-                        }
+                    // Never wait for rodio's seek feedback on this worker. Its
+                    // audio callback can be waiting for a URL that only this
+                    // worker can deliver, or end before acknowledging the seek.
+                    // Prepare a cancellable decoder in track time instead.
+                    if drain(&rx, &mut queued)
+                        || queued.iter().any(|cmd| matches!(cmd, Command::Seek(_) | Command::SeekToEnd(_)))
+                    {
+                        continue;
                     }
+                    state = rebuild(&runtime, &player, &snapshot, &mut track, target, &rx, &mut queued);
+                    if drain(&rx, &mut queued)
+                        || queued.iter().any(|cmd| matches!(cmd, Command::Seek(_) | Command::SeekToEnd(_)))
+                    {
+                        continue;
+                    }
+                }
+                Command::SeekToEnd(target) => {
+                    state = finish_at_end(&player, &snapshot, &mut track, state, target);
+                    continue;
                 }
                 Command::SetVolume(v) => {
                     volume = normalized_volume(v);
@@ -810,6 +842,9 @@ fn run(
             }
         }
 
+        if let Ok(mut active) = active_stream.lock() {
+            *active = track.as_ref().map(|cur| cur.link.clone());
+        }
         // Runs on every tick as well as after every command.
         let drained = player.empty();
         if let Some(cur) = track.as_mut() {
@@ -933,6 +968,25 @@ fn normalized_volume(volume: f32) -> f32 {
     }
 }
 
+fn finish_at_end(
+    player: &rodio::Player,
+    snapshot: &Arc<Mutex<Snapshot>>,
+    track: &mut Option<Track>,
+    state: PlayState,
+    target: Duration,
+) -> PlayState {
+    let Some(cur) = track.as_mut() else { return state; };
+    cur.link.cancel();
+    player.stop();
+    cur.position = cur.total.unwrap_or(target);
+    cur.offset = cur.position;
+    cur.seeking_to = None;
+    update(snapshot, |s| s.position = cur.position);
+    if state == PlayState::Paused { return state; }
+    *track = None;
+    set_state(snapshot, PlayState::Idle)
+}
+
 /// Whether byte offsets in two resolved URLs name the same media bytes.
 /// Unknown identities are rebuilt by track time; guessing here can splice two
 /// different AAC encodes at the same numeric byte offset.
@@ -973,20 +1027,21 @@ fn resume_position(state: PlayState, requested: Duration, current: Duration) -> 
 /// Opens a different representation while the old buffered source keeps
 /// playing, then commits at the position reached after the open completed.
 fn replace_running_stream(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &PlaybackRuntime,
     player: &rodio::Player,
     track: &mut Option<Track>,
     url: String,
     format: AudioFormat,
     paused: bool,
 ) -> Result<()> {
-    let (decoder, total, link) = open_stream(runtime, &url)?;
+    let (decoder, total, link) = open_stream(runtime, &url, true)?;
     let Some(cur) = track.as_mut() else {
         return Ok(());
     };
     let from = cur.resume_at(player.get_pos());
-    cur.link.decline();
-    play_source(player, decoder, from);
+    cur.link.cancel();
+    link.set_identity(&cur.id, format, &url);
+    play_source(runtime, player, decoder, &link, from)?;
     if paused {
         player.pause();
     }
@@ -1067,11 +1122,13 @@ fn request_url(
 /// it. A fresh stream can be wound forward to any point in the track, so that
 /// is what a rebuild is.
 fn rebuild(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &PlaybackRuntime,
     player: &rodio::Player,
     snapshot: &Arc<Mutex<Snapshot>>,
     track: &mut Option<Track>,
     from: Duration,
+    rx: &Receiver<Command>,
+    queued: &mut VecDeque<Command>,
 ) -> PlayState {
     let Some(cur) = track.as_mut() else {
         return PlayState::Idle;
@@ -1081,14 +1138,21 @@ fn rebuild(
     // A fresh stream wound forward lands where it was told to by construction,
     // so nothing is left outstanding for the recovery above to aim at.
     cur.seeking_to = None;
+    if let Some((url, format)) = cur.replacement.take() {
+        cur.url = url;
+        cur.format = format;
+    }
     let url = cur.url.clone();
+    let id = cur.id.clone();
+    cur.link.cancel();
 
     update(snapshot, |s| {
         s.state = PlayState::Buffering;
         s.position = from;
     });
 
-    match start_stream(runtime, player, &url, from) {
+    let paused = player.is_paused();
+    match start_stream(runtime, player, &url, from, (&cur.id, cur.format)) {
         Ok((total, link)) => {
             // The old stream's log described a stream that no longer exists.
             // Leaving it in place would let a fault from before the seek decide
@@ -1096,9 +1160,20 @@ fn rebuild(
             if let Some(cur) = track.as_mut() {
                 cur.commit_stream(total, link, from);
             }
-            set_state(snapshot, PlayState::Playing)
+            if paused { player.pause(); }
+            set_state(snapshot, if paused { PlayState::Paused } else { PlayState::Playing })
         }
         Err(e) => {
+            // The newer command owns the next state. Keep the track identity
+            // for a replacement seek and do not report cancellation as failure.
+            let interrupted = drain(rx, queued) || queued.iter().any(|cmd| match cmd {
+                Command::Seek(_) | Command::SeekToEnd(_) | Command::SetOutput(_) => true,
+                Command::ArmReplacement { id: replacing, .. } => *replacing == id,
+                _ => false,
+            });
+            if interrupted {
+                return set_state(snapshot, if paused { PlayState::Paused } else { PlayState::Buffering });
+            }
             player.stop();
             *track = None;
             set_error(
@@ -1142,15 +1217,29 @@ fn drain(rx: &Receiver<Command>, queued: &mut VecDeque<Command>) -> bool {
 /// How the stream is handed to symphonia -- and why it is left unable to seek
 /// backwards in it -- is [`backend::decoder`].
 fn open_stream(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &PlaybackRuntime,
     url: &str,
+    seeking: bool,
 ) -> Result<(
     decoder::AacDecoder,
     Option<Duration>,
     StreamLink,
 )> {
     let started = Instant::now();
-    let opened = runtime.block_on(backend::open(url));
+    let link = StreamLink::default();
+    runtime.activate(&link);
+    let guard = seeking.then(|| link.begin_seek(runtime, SEEK_TIMEOUT));
+    let opened = runtime.block_on(async {
+        let mut opening = std::pin::pin!(backend::open_with_link(url, link.clone()));
+        loop {
+            if link.cancelled() {
+                anyhow::bail!(if link.seek_timed_out() { "seek timed out" } else { "stream opening interrupted" });
+            }
+            if let Ok(result) = tokio::time::timeout(Duration::from_millis(40), &mut opening).await {
+                break result;
+            }
+        }
+    });
     let elapsed = started.elapsed().as_millis();
     crate::diagnostics::info(
         "player",
@@ -1167,6 +1256,10 @@ fn open_stream(
 
     let started = Instant::now();
     let decoded = backend::decoder(stream);
+    drop(guard);
+    if link.cancelled() {
+        anyhow::bail!(if link.seek_timed_out() { "seek timed out" } else { "stream opening interrupted" });
+    }
     let elapsed = started.elapsed().as_millis();
     crate::diagnostics::info(
         "player",
@@ -1186,36 +1279,43 @@ fn open_stream(
 
 /// Hands an opened stream to rodio, starting `skip` into the track.
 fn play_source(
+    runtime: &PlaybackRuntime,
     player: &rodio::Player,
     decoder: decoder::AacDecoder,
+    link: &StreamLink,
     skip: Duration,
-) {
+) -> Result<()> {
+    let guard = link.begin_seek(runtime, SEEK_TIMEOUT);
+    // Winding happens before touching rodio. Waiting for the audio callback's
+    // seek acknowledgement can permanently strand the command worker.
+    let source: Box<dyn Source<Item = f32> + Send> = if skip.is_zero() {
+        Box::new(decoder)
+    } else {
+        Box::new(decoder.skip_duration(skip))
+    };
+    drop(guard);
+    if link.cancelled() {
+        anyhow::bail!(if link.seek_timed_out() { "seek timed out" } else { "seek interrupted" });
+    }
     // Replace whatever was playing; rodio queues appended sources otherwise.
     player.stop();
-    if skip.is_zero() {
-        player.append(decoder);
-    } else {
-        // `skip_duration` decodes and discards on this thread, so the player
-        // takes no commands until it lands. It is bounded by how fast the
-        // chunked downloader can feed it, which is far above playback rate --
-        // winding to the middle of a track costs about a second.
-        player.append(decoder.skip_duration(skip));
-    }
+    player.append(source);
     player.play();
+    Ok(())
 }
 
-/// Opens and starts in one step, for the rebuild path -- which is recovering a
-/// track that is already playing rather than starting one the user chose, so
-/// there is nothing for a newer choice to supersede. A choice that does arrive
-/// stops it through the [`Command::Load`] queued behind this.
+/// Opens and prepares a replacement for the current track. Its download stays
+/// reachable from the UI so a newer command can interrupt synchronous reads.
 fn start_stream(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &PlaybackRuntime,
     player: &rodio::Player,
     url: &str,
     skip: Duration,
+    identity: (&str, AudioFormat),
 ) -> Result<(Option<Duration>, StreamLink)> {
-    let (decoder, total, link) = open_stream(runtime, url)?;
-    play_source(player, decoder, skip);
+    let (decoder, total, link) = open_stream(runtime, url, true)?;
+    link.set_identity(identity.0, identity.1, url);
+    play_source(runtime, player, decoder, &link, skip)?;
     Ok((total, link))
 }
 
@@ -1239,6 +1339,10 @@ fn set_error(snapshot: &Arc<Mutex<Snapshot>>, msg: String) {
         s.error = Some(msg);
     });
 }
+
+#[cfg(test)]
+#[path = "seek_tests.rs"]
+mod seek_tests;
 
 #[cfg(test)]
 mod tests {

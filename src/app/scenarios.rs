@@ -497,7 +497,7 @@ fn selecting_a_song_then_immediately_seeking_to_end_keeps_the_seek() {
         app.handle_mouse_action(MouseAction::SeekTo(POINTER_SCALE)).unwrap();
         resolve(&mut app, 0);
         let commands: Vec<_> = driver.commands.try_iter().collect();
-        assert!(matches!(commands.as_slice(), [Command::Load { .. }, Command::Play { id, .. }, Command::Seek(target)]
+        assert!(matches!(commands.as_slice(), [Command::Load { .. }, Command::Play { id, .. }, Command::SeekToEnd(target)]
             if id == "song-0" && *target == Duration::from_secs(240)), "{initial:?}: {commands:?}");
     }
 }
@@ -510,7 +510,7 @@ fn an_end_click_after_resolution_but_before_the_player_snapshot_is_kept() {
     assert_eq!(app.snapshot().state, PlayState::Idle);
     app.handle_mouse_action(MouseAction::SeekTo(POINTER_SCALE)).unwrap();
     let commands: Vec<_> = driver.commands.try_iter().collect();
-    assert!(matches!(commands.as_slice(), [Command::Load { .. }, Command::Play { .. }, Command::Seek(target)]
+    assert!(matches!(commands.as_slice(), [Command::Load { .. }, Command::Play { .. }, Command::SeekToEnd(target)]
         if *target == Duration::from_secs(240)), "{commands:?}");
 }
 
@@ -566,7 +566,7 @@ fn clicking_the_end_of_an_unknown_duration_does_not_invent_a_seek() {
         state(&driver, playback, Duration::ZERO);
         app.handle_mouse_action(MouseAction::SeekTo(POINTER_SCALE)).unwrap();
         resolve(&mut app, 0);
-        assert!(driver.commands.try_iter().all(|cmd| !matches!(cmd, Command::Seek(_))));
+        assert!(driver.commands.try_iter().all(|cmd| !matches!(cmd, Command::Seek(_) | Command::SeekToEnd(_))));
     }
 }
 
@@ -582,7 +582,7 @@ fn seeks_with_known_duration_are_bounded_in_all_active_states() {
                 state(&driver, playback, Duration::ZERO);
                 app.handle_mouse_action(MouseAction::SeekTo(pointer)).unwrap();
                 let commands: Vec<_> = driver.commands.try_iter().collect();
-                assert!(matches!(commands.as_slice(), [Command::Seek(target)] if *target <= total), "{commands:?}");
+                assert!(matches!(commands.as_slice(), [Command::Seek(target) | Command::SeekToEnd(target)] if *target <= total), "{commands:?}");
                 assert_eq!(app.snapshot().state, playback, "seeking must not toggle pause");
             }
         }
@@ -750,7 +750,7 @@ fn an_end_click_while_paused_does_not_autoplay_the_next_song() {
     assert_eq!(app.now.as_ref().unwrap().video_id, "song-0");
     assert_eq!(app.snapshot().state, PlayState::Paused);
     assert!(!requests.try_iter().any(|r| matches!(r, Request::Resolve { .. })));
-    assert!(matches!(driver.commands.try_recv().unwrap(), Command::Seek(target) if target == Duration::from_secs(240)));
+    assert!(matches!(driver.commands.try_recv().unwrap(), Command::SeekToEnd(target) if target == Duration::from_secs(240)));
 }
 
 // QUE-03: changing repeat during a top-up invalidates the older queue epoch.
