@@ -45,7 +45,7 @@ use super::account::Session;
 use super::inbox::{Inbox, Kind};
 use super::journal::Journal;
 use super::{ArtistRef, BrowseEndpoint, StreamUrl};
-use super::{amll, lrclib, watch};
+use super::{lrclib, watch};
 use crate::config::Cookies;
 use crate::source::youtube::YouTube;
 use mtui_resolver::{PlaybackSession, ResolveRequest, Resolver};
@@ -187,12 +187,6 @@ pub enum Request {
         browse_id: Option<String>,
         query: Option<lrclib::Query>,
     },
-    /// Opt-in provider romaji, with original cues to verify the recording.
-    Romaji {
-        video_id: String,
-        query: lrclib::Query,
-        original: Option<watch::Lyrics>,
-    },
     Related {
         video_id: String,
         browse_id: String,
@@ -286,10 +280,6 @@ pub enum Response {
         page: Result<crate::source::watch::QueuePage, String>,
     },
     Lyrics {
-        video_id: String,
-        lyrics: Result<crate::source::watch::Lyrics, String>,
-    },
-    Romaji {
         video_id: String,
         lyrics: Result<crate::source::watch::Lyrics, String>,
     },
@@ -512,7 +502,6 @@ impl SourceWorker {
             | Request::MoreQueue { .. }
             | Request::SeedQueue { .. }
             | Request::Lyrics { .. }
-            | Request::Romaji { .. }
             | Request::Related { .. }
             | Request::Comments { .. } => {
                 self.page_tx.send(req).context("player page worker is gone")
@@ -591,7 +580,6 @@ fn name(req: &Request) -> &'static str {
         Request::MoreQueue { .. } => "MoreQueue",
         Request::SeedQueue { .. } => "SeedQueue",
         Request::Lyrics { .. } => "Lyrics",
-        Request::Romaji { .. } => "Romaji",
         Request::Related { .. } => "Related",
         Request::Comments { .. } => "Comments",
         Request::Shutdown => "Shutdown",
@@ -1062,10 +1050,6 @@ fn run_pages(rx: Arc<Inbox>, tx: Sender<Response>) {
                     .map_err(|e| format!("{e:#}")),
                 video_id,
             },
-            Request::Romaji { video_id, query, original } => Response::Romaji {
-                video_id,
-                lyrics: amll::fetch(&http, &query, original.as_ref()).map_err(|error| format!("{error:#}")),
-            },
             Request::Related {
                 video_id,
                 browse_id,
@@ -1101,8 +1085,8 @@ fn run_pages(rx: Arc<Inbox>, tx: Sender<Response>) {
 /// without them the panel is a wall of text with nothing to follow. LRCLIB is
 /// asked only for what is missing, in one of two ways:
 ///
-/// - YouTube gave words but no timings: keep its words, use LRCLIB's timings
-///   only if every line matches, and say so in the credit.
+/// - YouTube gave words but no timings: keep its words, lay LRCLIB's timings
+///   over them, and say so in the credit.
 /// - YouTube has no lyrics page at all, or the fetch failed: LRCLIB is the only
 ///   chance, and its own words are better than an empty tab.
 ///
@@ -1124,9 +1108,8 @@ fn lyrics(
         // Words but no timings -- a cover, a live take, most of what is not in
         // YouTube's own catalogue.
         Some(Ok(mut lyrics)) => {
-            if let Some(timed) = query.and_then(|query| lrclib::timed(http, query))
-                && align_lyrics_timing(&mut lyrics, timed)
-            {
+            if let Some(timed) = query.and_then(|query| lrclib::timed(http, query)) {
+                lyrics.timed = timed;
                 // The words on screen are still YouTube's; what changed is that
                 // they now scroll. Crediting both is the honest version, and
                 // the panel has one line to say it in.
@@ -1149,24 +1132,6 @@ fn lyrics(
             }
         }
     }
-}
-
-/// Line counts alone cannot establish that a fallback has the same verses.
-/// Preserve YouTube's spelling while accepting harmless punctuation changes.
-fn align_lyrics_timing(lyrics: &mut watch::Lyrics, mut timed: Vec<watch::TimedLine>) -> bool {
-    use unicode_normalization::UnicodeNormalization;
-    let key = |text: &str| text.nfkc().flat_map(char::to_lowercase).filter(|c| c.is_alphanumeric()).collect::<String>();
-    let lines: Vec<_> = lyrics.text.lines().filter(|line| !line.trim().is_empty()).collect();
-    let candidate: Vec<_> = timed.iter().filter(|line| !line.text.trim().is_empty()).collect();
-    if lines.is_empty() || lines.len() != candidate.len()
-        || !lines.iter().zip(candidate).all(|(text, line)| key(text) == key(&line.text))
-    { return false; }
-    let mut original = lines.into_iter();
-    for line in timed.iter_mut().filter(|line| !line.text.trim().is_empty()) {
-        line.text = original.next().unwrap_or_default().to_string();
-    }
-    lyrics.timed = timed;
-    true
 }
 
 fn run_covers(rx: Arc<Inbox>, tx: Sender<Response>) {
@@ -1267,21 +1232,6 @@ fn run_art(rx: &Arc<Inbox>, tx: &Sender<Response>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fallback_timing_requires_matching_words_and_preserves_original_spelling() {
-        use std::time::Duration;
-        let mut lyrics = watch::Lyrics { text: "Hello, sky!\n\nねこ".into(), source: None, timed: Vec::new() };
-        let wrong = vec![watch::TimedLine { text: "Hello sky".into(), start: Duration::ZERO },
-            watch::TimedLine { text: "そら".into(), start: Duration::from_secs(3) }];
-        assert!(!align_lyrics_timing(&mut lyrics, wrong));
-        assert!(lyrics.timed.is_empty());
-        let matching = vec![watch::TimedLine { text: "Hello sky".into(), start: Duration::ZERO },
-            watch::TimedLine { text: "ねこ".into(), start: Duration::from_secs(3) }];
-        assert!(align_lyrics_timing(&mut lyrics, matching));
-        assert_eq!(lyrics.timed[0].text, "Hello, sky!");
-        assert_eq!(lyrics.timed[1].start, Duration::from_secs(3));
-    }
 
     #[test]
     fn resolver_startup_failure_is_answered_per_playback_request() {

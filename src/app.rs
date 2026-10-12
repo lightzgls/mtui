@@ -32,8 +32,6 @@ pub mod preferences;
 pub mod actions;
 pub(crate) mod home;
 pub(crate) mod library;
-#[cfg(test)]
-mod lyrics_tests;
 
 /// How much of the window the cover is allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -272,7 +270,6 @@ pub enum MouseAction {
     OpenTab(Tab),
     ToggleLyricsExpanded,
     ToggleLyricsFollow,
-    ToggleLyricsRomaji,
     OpenPageRow(usize),
     SelectPageRow(usize),
     /// Toggle the current transport from the persistent player strip.
@@ -606,8 +603,6 @@ pub struct NowPlaying {
     /// An explicit reading view; ordinary playback keeps the large artwork.
     pub lyrics_expanded: bool,
     pub lyrics: Panel<Lyrics>,
-    pub romaji: Panel<Lyrics>,
-    pub lyrics_romaji: bool,
     pub comments: Panel<Comments>,
     pub related: Panel<Vec<Shelf>>,
     /// Browse ids from the watch response, held until the tab they belong to is
@@ -655,8 +650,6 @@ impl NowPlaying {
             follow_lyrics: true,
             lyrics_expanded: false,
             lyrics: Panel::Idle,
-            romaji: Panel::Idle,
-            lyrics_romaji: false,
             comments: Panel::Idle,
             related: Panel::Idle,
             lyrics_id: None,
@@ -677,11 +670,6 @@ impl NowPlaying {
             self.album.as_deref(),
             self.duration,
         )
-    }
-
-    /// The chosen representation has its own words, timing, and source credit.
-    pub fn shown_lyrics(&self) -> &Panel<Lyrics> {
-        if self.lyrics_romaji { &self.romaji } else { &self.lyrics }
     }
 
     /// One line under the title, as YouTube Music writes it: "Tame Impala •
@@ -2184,7 +2172,7 @@ impl App {
                     MenuAction::OpenPageSelection,
                 ));
             }
-            Tab::Lyrics if matches!(now.shown_lyrics(), Panel::Ready(lyrics) if !lyrics.timed.is_empty()) =>
+            Tab::Lyrics if matches!(&now.lyrics, Panel::Ready(lyrics) if !lyrics.timed.is_empty()) =>
             {
                 items.push(MenuItem::action(
                     "Follow current lyric",
@@ -2537,7 +2525,6 @@ impl App {
                 | Response::Watch { .. }
                 | Response::MoreQueue { .. }
                 | Response::Lyrics { .. }
-                | Response::Romaji { .. }
                 | Response::Related { .. }
                 | Response::Comments { .. }
                 | Response::Home { .. }
@@ -2766,11 +2753,6 @@ impl App {
             Response::Lyrics { video_id, lyrics } => {
                 if let Some(now) = self.for_track(&video_id) {
                     now.lyrics = panel(lyrics);
-                }
-            }
-            Response::Romaji { video_id, lyrics } => {
-                if let Some(now) = self.for_track(&video_id) {
-                    now.romaji = panel(lyrics);
                 }
             }
             Response::Related { video_id, related } => {
@@ -3229,7 +3211,6 @@ impl App {
         page.tab = tab;
         page.repeat = repeat;
         page.lyrics_expanded = self.now.as_ref().is_some_and(|now| now.lyrics_expanded);
-        page.lyrics_romaji = self.now.as_ref().is_some_and(|now| now.lyrics_romaji);
         // The queue survives moving *within* it -- that is what makes advancing
         // through a radio keep one stable "Up next" rather than reshuffling on
         // every track. Playing something from outside it drops it instead of
@@ -3337,16 +3318,6 @@ impl App {
                     query: now.lyrics_query(),
                 }
             }
-            Tab::Lyrics if now.lyrics_romaji && now.romaji.is_idle() && !matches!(now.lyrics, Panel::Loading) => {
-                if !now.watched { return; }
-                let Some(query) = now.lyrics_query() else {
-                    now.romaji = Panel::Empty("romaji needs a song title and artist".into());
-                    return;
-                };
-                let original = match &now.lyrics { Panel::Ready(lyrics) => Some(lyrics.clone()), _ => None };
-                now.romaji = Panel::Loading;
-                Request::Romaji { video_id, query, original }
-            }
             Tab::Related if now.related.is_idle() => match now.related_id.clone() {
                 Some(browse_id) => {
                     now.related = Panel::Loading;
@@ -3365,11 +3336,7 @@ impl App {
             _ => return,
         };
 
-        let romaji_request = matches!(request, Request::Romaji { .. });
         if self.source.send(request).is_err() {
-            if romaji_request && let Some(now) = self.now.as_mut() {
-                now.romaji = Panel::Empty("romaji service is unavailable; toggle back to retry".into());
-            }
             self.status = "source worker is not running".to_string();
         }
     }
@@ -3381,8 +3348,7 @@ impl App {
     /// tab in that window would otherwise leave it idle forever.
     pub fn tick_page(&mut self) {
         let waiting = self.now.as_ref().is_some_and(|now| match now.tab {
-            Tab::Lyrics => now.watched && (now.lyrics.is_idle()
-                || (now.lyrics_romaji && now.romaji.is_idle() && !matches!(now.lyrics, Panel::Loading))),
+            Tab::Lyrics => now.lyrics.is_idle() && now.watched,
             Tab::Related => now.related.is_idle() && now.related_id.is_some(),
             _ => false,
         });
@@ -4618,9 +4584,6 @@ impl App {
             MouseAction::ToggleLyricsFollow if self.view == View::Playing => {
                 self.toggle_lyrics_follow();
             }
-            MouseAction::ToggleLyricsRomaji if self.view == View::Playing => {
-                self.toggle_lyrics_romaji();
-            }
             MouseAction::OpenPageRow(index) if self.view == View::Playing => {
                 if let Some(now) = self.now.as_mut() {
                     *now.cursor_mut() = index;
@@ -5156,7 +5119,6 @@ impl App {
             KeyCode::Char('z') if current_tab == Some(Tab::UpNext) => self.shuffle_upcoming_queue(),
             KeyCode::Char('e') if current_tab == Some(Tab::Lyrics) => self.toggle_lyrics_expanded(),
             KeyCode::Char('f') if current_tab == Some(Tab::Lyrics) => self.toggle_lyrics_follow(),
-            KeyCode::Char('t') if current_tab == Some(Tab::Lyrics) => self.toggle_lyrics_romaji(),
             KeyCode::Char('R') => self.cycle_repeat(),
             KeyCode::Char('r') if self.playback_failed(&self.snapshot()) => {
                 self.retry_current_track()
@@ -5207,19 +5169,10 @@ impl App {
 
     fn toggle_lyrics_follow(&mut self) {
         if let Some(now) = self.now.as_mut().filter(|now| now.tab == Tab::Lyrics)
-            && matches!(now.shown_lyrics(), Panel::Ready(lyrics) if !lyrics.timed.is_empty())
+            && matches!(&now.lyrics, Panel::Ready(lyrics) if !lyrics.timed.is_empty())
         {
             now.follow_lyrics = !now.follow_lyrics;
         }
-    }
-
-    fn toggle_lyrics_romaji(&mut self) {
-        let Some(now) = self.now.as_mut().filter(|now| now.tab == Tab::Lyrics) else { return };
-        now.lyrics_romaji = !now.lyrics_romaji;
-        if now.lyrics_romaji && matches!(now.romaji, Panel::Empty(_)) { now.romaji = Panel::Idle; }
-        now.cursor[Tab::Lyrics.index()] = 0;
-        now.follow_lyrics = true;
-        self.request_tab();
     }
 
     /// Moves the cursor of the open tab, when there is a page to move it on.
@@ -5944,7 +5897,6 @@ pub(crate) fn keyboard_help_items() -> Vec<MenuItem> {
         MenuItem::help("Repeat off / all / one", "R", None),
         MenuItem::help("Player actions", "Ctrl+P", None),
         MenuItem::help("Lyrics: expand / restore", "e", None),
-        MenuItem::help("Lyrics: original / romaji", "t", None),
         MenuItem::help("Lyrics: pause / resume follow", "f", None),
             MenuItem::help("Queue: remove / shuffle", "d / z", None),
             MenuItem::help("Queue: move row", "K / J", None),

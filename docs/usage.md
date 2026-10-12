@@ -126,13 +126,6 @@ Esc restores the artwork. Click **Follow lyrics** or press `f` to resume synced
 lyrics after scrolling, or pause following to read ahead. Expanded lyrics use
 more space and centered lines; the terminal still controls the actual font size.
 
-Click **Romaji** or press `t` to fetch Japanese romaji from AMLL TTML DB; click
-**Original** or press `t` again to switch back. The selection carries to the next
-song. Romaji follows playback when its original lines and timestamps agree with
-the existing synchronized lyrics. Otherwise it appears as scrollable text marked
-**unsynced**. Availability depends on the provider's song coverage; switching back
-keeps the original lyrics available. Toggle back to Romaji to retry a failed lookup.
-
 Queue entries have space between songs and clear title, artist, and duration
 columns. Short windows use compact rows. Click the current artist or album to
 open its page when YouTube Music provides that link; queue artists are clickable
@@ -245,7 +238,6 @@ sign-in profile without stopping current playback.
 | `1`-`4` or `Tab` | Open Queue, Lyrics, Related, or Comments |
 | `e` on Lyrics | Expand or restore the lyrics reading view |
 | `f` on Lyrics | Pause or resume following synced lyrics |
-| `t` on Lyrics | Switch between original lyrics and provider romaji |
 | `c` | Change cover-art size |
 | `M` | Import or refresh the personalized Home session |
 | `D` | Toggle Discord Rich Presence directly |

@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "mtui"
-version = "0.11.0"
+version = "0.11.1"
 default-run = "mtui"
 edition = "2024"
 description = "A terminal music player for YouTube Music, built to stay small in memory"
@@ -95,11 +95,6 @@ form_urlencoded = { version = "1", default-features = false }
 # row and pushes every column out of line.
 unicode-width = { version = "0.2", default-features = false }
 unicode-segmentation = { version = "1.13", default-features = false }
-
-# Provider-supplied romaji comes as TTML. Parse its paired lines without a
-# browser or a Japanese dictionary; normalization is only for song matching.
-roxmltree = "0.21.1"
-unicode-normalization = "0.1"
 
 [target.'cfg(any(windows, target_os = "linux", target_os = "macos"))'.dependencies]
 # One first-party sign-in surface for YouTube Music Home on every desktop.

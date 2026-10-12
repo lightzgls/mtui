@@ -2511,7 +2511,7 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseM
     render_tabs(frame, tab, tabs, accent, mouse);
     let content = if tab == Tab::Lyrics && content.height >= 4 {
         let [controls, body] = Layout::vertical([
-            Constraint::Length(if content.width < 44 && content.height >= 6 { 3 } else { 2 }), Constraint::Min(0),
+            Constraint::Length(2), Constraint::Min(0),
         ]).areas(content);
         render_lyrics_controls(frame, now, controls, accent, mouse);
         body
@@ -2566,27 +2566,15 @@ fn render_panel_body(
 }
 
 fn render_lyrics_controls(frame: &mut Frame, now: &NowPlaying, area: Rect, accent: Color, mouse: &mut MouseMap) {
-    let timed = matches!(now.shown_lyrics(), Panel::Ready(lyrics) if !lyrics.timed.is_empty());
+    let timed = matches!(&now.lyrics, Panel::Ready(lyrics) if !lyrics.timed.is_empty());
     let expand = if now.lyrics_expanded { " Restore e " } else { " Expand e " };
     let expand_width = (display_width(expand) as u16).min(area.width);
     let expand_area = Rect::new(area.right() - expand_width, area.y, expand_width, 1);
     frame.render_widget(Paragraph::new(expand).style(Style::default().fg(accent).bg(shell::SURFACE)), expand_area);
     mouse.targets.push(MouseTarget::Area(expand_area, MouseAction::ToggleLyricsExpanded));
-    let mode = if now.lyrics_romaji { " Original t " } else { " Romaji t " };
-    let mode_width = (display_width(mode) as u16).min(area.width.saturating_sub(expand_width + 1));
-    let mode_area = Rect::new(area.x, area.y, mode_width, 1);
-    frame.render_widget(Paragraph::new(truncate(mode, mode_width as usize)).style(Style::default().fg(accent).bg(shell::SURFACE)), mode_area);
-    if mode_width > 0 {
-        mouse.targets.push(MouseTarget::Area(mode_area, MouseAction::ToggleLyricsRomaji));
-    }
     let follow = if timed && now.follow_lyrics { " Following · f pause " } else if timed { " Follow lyrics f " } else { " Lyrics " };
-    let (follow_x, follow_y, available) = if area.height >= 3 {
-        (area.x, area.y + 1, area.width)
-    } else {
-        (area.x + mode_width + 1, area.y, area.width.saturating_sub(expand_width + mode_width + 2))
-    };
-    let follow_width = (display_width(follow) as u16).min(available);
-    let follow_area = Rect::new(follow_x, follow_y, follow_width, 1);
+    let follow_width = (display_width(follow) as u16).min(area.width.saturating_sub(expand_width + 1));
+    let follow_area = Rect::new(area.x, area.y, follow_width, 1);
     frame.render_widget(Paragraph::new(truncate(follow, follow_width as usize)).style(Style::default().fg(if timed { Color::Gray } else { Color::DarkGray })), follow_area);
     if timed && follow_width > 0 {
         mouse.targets.push(MouseTarget::Area(follow_area, MouseAction::ToggleLyricsFollow));
@@ -2680,8 +2668,8 @@ fn render_lyrics(
 ) -> (usize, Option<usize>) {
     let area = Rect::new(area.x + u16::from(area.width > 8), area.y, area.width.saturating_sub(if area.width > 8 { 2 } else { 0 }), area.height);
     let width = (area.width as usize).saturating_sub(LYRIC_GUTTER + 1);
-    let Panel::Ready(lyrics) = now.shown_lyrics() else {
-        message(frame, waiting_on(now.shown_lyrics()), area);
+    let Panel::Ready(lyrics) = &now.lyrics else {
+        message(frame, waiting_on(&now.lyrics), area);
         return (0, None);
     };
 
@@ -2696,11 +2684,9 @@ fn render_lyrics(
     // under it belong to no lyric and stay `None`, which is also what every
     // line of an untimed track is.
     let mut lines: Vec<(String, Option<usize>, bool)> = Vec::new();
-    if let Some(source) = &lyrics.source
-        && area.height > 1
-    {
+    if let Some(source) = &lyrics.source {
         lines.push((source.clone(), None, false));
-        if area.height >= 4 { lines.push((String::new(), None, false)); }
+        lines.push((String::new(), None, false));
     }
     let credit = lines.len();
 
@@ -5640,7 +5626,7 @@ mod tests {
                 render_tabs(frame, now.tab, tabs, accent, &mut mouse);
                 let content = if now.tab == Tab::Lyrics && content.height >= 4 {
                     let [controls, body] = Layout::vertical([
-                        Constraint::Length(if content.width < 44 && content.height >= 6 { 3 } else { 2 }), Constraint::Min(0),
+                        Constraint::Length(2), Constraint::Min(0),
                     ]).areas(content);
                     render_lyrics_controls(frame, now, controls, accent, &mut mouse);
                     body
@@ -5815,7 +5801,7 @@ mod tests {
             for (width, height) in [(1, 1), (12, 6), (48, 18), (100, 36), (160, 42)] {
                 let (buf, mouse) = drawn_screen(width, height, View::Playing, &now, &[], &ArtCache::default(), &cover);
                 for target in &mouse.targets {
-                    if let MouseTarget::Area(rect, action @ (MouseAction::ToggleLyricsExpanded | MouseAction::ToggleLyricsFollow | MouseAction::ToggleLyricsRomaji)) = target {
+                    if let MouseTarget::Area(rect, action @ (MouseAction::ToggleLyricsExpanded | MouseAction::ToggleLyricsFollow)) = target {
                         assert!(rect.right() <= width && rect.bottom() <= height);
                         assert_eq!(mouse.action_at(rect.x, rect.y), Some(*action));
                     }
@@ -5824,35 +5810,12 @@ mod tests {
                     let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
                     assert!(text.contains(if expanded { "Restore e" } else { "Expand e" }));
                     assert!(text.contains("Following"));
-                    assert!(text.contains("Romaji t"));
-                    for action in [MouseAction::ToggleLyricsExpanded, MouseAction::ToggleLyricsFollow, MouseAction::ToggleLyricsRomaji] {
+                    for action in [MouseAction::ToggleLyricsExpanded, MouseAction::ToggleLyricsFollow] {
                         assert!(mouse.targets.iter().any(|target| matches!(target, MouseTarget::Area(_, found) if *found == action)));
                     }
                 }
             }
         }
-    }
-
-    #[test]
-    fn unsynced_romaji_has_its_own_text_credit_and_no_follow_target() {
-        let mut now = preview_now();
-        now.tab = Tab::Lyrics;
-        now.lyrics_romaji = true;
-        now.romaji = Panel::Ready(Lyrics {
-            text: "neko sora".into(), source: Some("AMLL • Romaji (unsynced)".into()), timed: Vec::new(),
-        });
-        let cover = Cover::from_rgb(4, 4, [180, 90, 60].repeat(16));
-        for (width, height) in [(48, 18), (100, 36)] {
-            let (buf, mouse) = drawn_screen(width, height, View::Playing, &now, &[], &ArtCache::default(), &cover);
-            let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
-            assert!(text.contains("Original t"));
-            assert!(text.contains("neko sora"), "{width}x{height}: {text:?}");
-            assert!(!text.contains("Following"));
-            assert!(!mouse.targets.iter().any(|target| matches!(target, MouseTarget::Area(_, MouseAction::ToggleLyricsFollow))));
-        }
-        now.lyrics_romaji = false;
-        let (_, mouse) = drawn_screen(100, 36, View::Playing, &now, &[], &ArtCache::default(), &cover);
-        assert!(mouse.targets.iter().any(|target| matches!(target, MouseTarget::Area(_, MouseAction::ToggleLyricsFollow))));
     }
 
     #[test]
