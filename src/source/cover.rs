@@ -258,8 +258,8 @@ fn lift((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
 }
 
 /// Fetches the Music sleeve first, then the largest available video thumbnail.
-/// The returned URL is present only when the native Music artwork loaded, so
-/// Discord can follow the same fallback decision as the player.
+/// The returned URL is present only when the native Music artwork loaded.
+/// Video fallback pixels are used only by the player, not Discord.
 pub fn fetch_cancellable(
     video_id: &str,
     artwork_url: Option<&str>,
@@ -414,8 +414,9 @@ async fn read(client: &reqwest::Client, url: &str, timeout: Duration) -> Result<
         .context("thumbnail is implausibly large or incomplete")
 }
 
-/// Decodes a JPEG, trims the padding YouTube fitted it into, centre-crops the
-/// artwork to a square sleeve, and shrinks it to `edge`.
+/// Decodes a JPEG and shrinks it to `edge`. Square sleeves retain their complete
+/// composition; rectangular video thumbnails have their padding removed and
+/// are centre-cropped to a square.
 ///
 /// `edge` is a parameter rather than [`MAX_EDGE`] because the two callers want
 /// different pictures from the same code: the cover pane wants every pixel
@@ -460,13 +461,24 @@ fn decode(jpeg: &[u8], edge: u32) -> Result<Cover> {
         bail!("thumbnail pixel data does not match its {width}x{height} header");
     }
 
-    let square = square_crop(trim_bars(width, height, &rgb));
+    Ok(prepare_cover(width, height, rgb, edge))
+}
+
+fn prepare_cover(width: u32, height: u32, rgb: Vec<u8>, edge: u32) -> Cover {
+    // A square album sleeve is already composed for this canvas. Its flat
+    // borders may be part of the design, so trimming them shifts the subject
+    // and can cut off text or artwork when the result is cropped again.
+    let square = if width == height {
+        (0, 0, width, height)
+    } else {
+        square_crop(trim_bars(width, height, &rgb))
+    };
     let cropped = crop_owned(width, rgb, square.0, square.1, square.2, square.3);
     let side = square.2;
     if side <= edge {
-        return Ok(Cover::build(side, side, cropped));
+        return Cover::build(side, side, cropped);
     }
-    Ok(shrink(side, side, &cropped, edge))
+    shrink(side, side, &cropped, edge)
 }
 
 fn crop_owned(width: u32, mut rgb: Vec<u8>, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
@@ -753,6 +765,39 @@ mod tests {
     }
 
     #[test]
+    fn square_sleeves_keep_dark_margins_and_off_centre_text() {
+        let mut rgb = [4, 5, 6].repeat(32 * 32);
+        for y in 9..28 {
+            for x in 10..22 {
+                let at = (y * 32 + x) * 3;
+                rgb[at..at + 3].copy_from_slice(&[180, 120, 60]);
+            }
+        }
+        // Album text near the edge and a subject surrounded by a dark canvas
+        // must retain their original positions, like the reported sleeve.
+        let text = (2 * 32 + 1) * 3;
+        rgb[text..text + 3].copy_from_slice(&[240, 240, 240]);
+        assert_ne!(trim_bars(32, 32, &rgb), (0, 0, 32, 32), "the old trimming must reproduce this case");
+        let cover = prepare_cover(32, 32, rgb.clone(), MAX_EDGE);
+        assert_eq!((cover.width, cover.height), (32, 32));
+        assert_eq!(cover.rgb, rgb, "keep the complete composition without moving or cropping any pixel");
+        assert_eq!(cover.pixel(1, 2), (240, 240, 240));
+        assert_eq!(cover.pixel(31, 31), (4, 5, 6));
+
+        let tile = prepare_cover(32, 32, rgb, 16);
+        assert_eq!((tile.width, tile.height), (16, 16));
+        assert_eq!(tile.pixel(0, 0), (4, 5, 6));
+        assert_eq!(tile.pixel(15, 15), (4, 5, 6));
+    }
+
+    #[test]
+    fn rectangular_video_padding_is_still_removed() {
+        let cover = prepare_cover(20, 10, pillarboxed(20, 10, 5), MAX_EDGE);
+        assert_eq!((cover.width, cover.height), (10, 10));
+        assert_eq!(cover.rgb, [200, 30, 90].repeat(100));
+    }
+
+    #[test]
     fn leaves_a_full_bleed_image_alone() {
         // Every edge differs from its neighbour, so there is nothing to trim.
         let mut rgb = Vec::new();
@@ -887,7 +932,7 @@ mod tests {
                 }
                 Ok(Cover::solid(720, 720))
             }).unwrap();
-            assert!(source.is_none(), "Discord must use the video fallback too");
+            assert!(source.is_none(), "video fallback must not be exposed as native Music artwork");
             assert_eq!(requested.last(), Some(&url("song", "maxresdefault")));
             assert_eq!(requested.len(), if mode == 0 { 1 } else { 2 });
         }

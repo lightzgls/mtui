@@ -83,12 +83,6 @@ const MAX_FIELD: usize = 128;
 const OP_HANDSHAKE: u32 = 0;
 const OP_FRAME: u32 = 1;
 
-/// Fallback while native square artwork is unavailable. Video thumbnails can
-/// contain padding, so the Music watch response's sleeve is preferred.
-fn cover_url(video_id: &str) -> String {
-    format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
-}
-
 fn watch_url(video_id: &str) -> String {
     format!("https://www.youtube.com/watch?v={video_id}")
 }
@@ -122,6 +116,7 @@ pub struct Activity {
     /// singles and plain YouTube uploads that genuinely have no album.
     pub album: Option<String>,
     /// Native square artwork, once the Music watch response has arrived.
+    /// `None` publishes no cover image; video thumbnails are never substituted.
     pub artwork_url: Option<String>,
     pub paused: bool,
     /// Where the progress bar should be, or `None` for no bar at all.
@@ -196,7 +191,6 @@ impl Activity {
                 // it. The documented alternative is uploading named assets to
                 // the application, which would mean one upload per album --
                 // which is to say, it is not an alternative.
-                "large_image": self.artwork_url.clone().unwrap_or_else(|| cover_url(&self.video_id)),
                 "large_text": clamp(self.album.as_deref().unwrap_or(&self.title)),
                 // Discord does not show activity buttons on every compact
                 // surface. Linking the artwork gives the repository a second
@@ -211,6 +205,10 @@ impl Activity {
                 { "label": "Get MTUI", "url": REPOSITORY },
             ],
         });
+
+        if let Some(artwork_url) = &self.artwork_url {
+            activity["assets"]["large_image"] = artwork_url.clone().into();
+        }
 
         if let Some(clock) = self.clock {
             let mut timestamps = serde_json::json!({ "start": clock.start_ms });
@@ -872,11 +870,7 @@ mod tests {
         assert_eq!(payload["large_text"], serde_json::Value::Null);
         assert_eq!(payload["assets"]["large_text"], "Currents");
         assert_eq!(payload["assets"]["large_url"], REPOSITORY);
-        assert!(
-            payload["assets"]["large_image"]
-                .as_str()
-                .is_some_and(|url| url.contains("dQw4w9WgXcQ"))
-        );
+        assert!(payload["assets"].get("large_image").is_none(), "wait for Music artwork instead of publishing a video thumbnail");
         assert_eq!(payload["timestamps"]["start"], 1_700_000_000_000u64);
         assert_eq!(payload["timestamps"]["end"], 1_700_000_467_000u64);
 
@@ -909,12 +903,12 @@ mod tests {
     }
 
     #[test]
-    fn native_square_artwork_replaces_the_video_thumbnail_and_refreshes_the_card() {
-        let fallback = activity();
-        assert_eq!(fallback.payload()["assets"]["large_image"], cover_url(&fallback.video_id));
-        let mut sleeve = fallback.clone();
+    fn native_music_artwork_is_the_only_image_published() {
+        let waiting = activity();
+        assert!(waiting.payload()["assets"].get("large_image").is_none());
+        let mut sleeve = waiting.clone();
         sleeve.artwork_url = Some("https://lh3.googleusercontent.com/sleeve=w544-h544-l90-rj".into());
-        assert!(!fallback.same_as(&sleeve));
+        assert!(!waiting.same_as(&sleeve));
         assert_eq!(sleeve.payload()["assets"]["large_image"], sleeve.artwork_url.unwrap());
     }
 

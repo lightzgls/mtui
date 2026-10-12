@@ -2784,7 +2784,10 @@ impl App {
             Response::Cover { id, art, artwork_url } => {
                 // Stale unless it is still the track we asked about.
                 if self.cover_id.as_deref() == Some(id.as_str()) {
-                    if let Some(now) = self.for_track(&id) {
+                    // The terminal may fall back to video pixels if its fetch
+                    // fails. Discord keeps the native Music metadata URL and
+                    // can load it independently of the terminal's image worker.
+                    if artwork_url.is_some() && let Some(now) = self.for_track(&id) {
                         now.artwork_url = artwork_url;
                     }
                     self.cover = art;

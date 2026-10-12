@@ -283,7 +283,7 @@ fn playing_artwork(json: &Value, video_id: &str) -> Option<String> {
         .or_else(|| row.pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails"))?
         .as_array()?;
     // Keep the original CDN URL: its size/crop parameters belong to YouTube.
-    // Rectangular video frames still use the presence's reliable fallback.
+    // Rectangular video frames are excluded from Discord artwork.
     thumbnails.iter().filter_map(|thumbnail| {
         let width = thumbnail["width"].as_u64()?;
         let height = thumbnail["height"].as_u64()?;
@@ -968,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn video_or_missing_artwork_leaves_the_presence_fallback_available() {
+    fn video_or_missing_artwork_does_not_supply_a_discord_image() {
         let mut json = row("song", "Song", "Artist", "3:00");
         assert!(playing_artwork(&json, "song").is_none());
         json["playlistPanelVideoRenderer"]["thumbnail"] = serde_json::json!({

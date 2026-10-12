@@ -211,7 +211,7 @@ fn loaded_cover_source_updates_discord_and_late_images_cannot_replace_it() {
 
     // A failed Music fetch can still return a decoded video thumbnail.
     app.apply(Response::Cover { id: "song-0".into(), art: Some(Cover::solid(720, 720)), artwork_url: None });
-    assert!(app.activity().unwrap().artwork_url.is_none());
+    assert_eq!(app.activity().unwrap().artwork_url.as_deref(), Some(sleeve), "video fallback pixels must not replace Discord's native Music artwork");
     assert_eq!(app.cover.as_ref().unwrap().width, 720);
     app.stop();
     requests.try_iter().for_each(drop);
