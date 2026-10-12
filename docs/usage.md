@@ -78,11 +78,26 @@ installs require network access but not administrator access.
 
 ## Usage
 
-The top bar provides Home, Playing, search, and Menu. Home opens with large cover
+The top bar provides Home, Library, Playing, search, and Menu. Home opens with large cover
 cards from Listen again (or the first available collection), followed by compact
 Quick picks. Shelf headings, artwork, and song grids keep clear spacing, and
 short windows adapt to smaller complete cards. Navigation and footer controls
 have side margins, with a blank row below the footer actions.
+
+Open **Library** in the top bar, App Menu, or with `L`. Sign in with `M` to
+access **All, Playlists, Songs, Albums, Artists, and Subscriptions**. `1`–`6`
+or `Tab` switches categories; narrow windows show the current category with
+previous/next buttons. **Liked Music** (`f`) opens your liked-song playlist.
+Songs show title, artist, album, and duration; other collections use compact
+artwork cards. Artists open the music saved from that artist, while Subscriptions
+open followed artists' full pages. There is no additional Library search box.
+
+Library remembers each category's selection and position, including after
+opening a collection or returning from playback. Use the arrows, `hjkl`, or
+page buttons to browse; **More** loads another page when available. `o` cycles
+the sort orders supplied by YouTube Music, and `r` refreshes the collection.
+Loading failures preserve previously loaded items and offer a retry. The account
+name and playback controls remain visible while browsing.
 
 Now Playing shows artwork beside Queue, Lyrics, Related, and Comments. In a
 narrow window the track header moves above the tabs. Progress and playback
@@ -101,10 +116,22 @@ whose visible font cannot be inspected use text labels for compatibility.
 The player and queue share the supported Playing symbol, with an ASCII `>`
 fallback when the font is unknown.
 
+MTUI uses the mint strip icon for the app, installer, and Windows tray. The tray
+strips rise while playing and smoothly settle into a flat silver strip when
+paused or stopped. The icon is fixed; older icon preferences are ignored while
+other settings are preserved.
+
 On Lyrics, click **Expand** or press `e` for a full-width reading view; `e` or
 Esc restores the artwork. Click **Follow lyrics** or press `f` to resume synced
 lyrics after scrolling, or pause following to read ahead. Expanded lyrics use
 more space and centered lines; the terminal still controls the actual font size.
+
+Click **Romaji** or press `t` to fetch Japanese romaji from AMLL TTML DB; click
+**Original** or press `t` again to switch back. The selection carries to the next
+song. Romaji follows playback when its original lines and timestamps agree with
+the existing synchronized lyrics. Otherwise it appears as scrollable text marked
+**unsynced**. Availability depends on the provider's song coverage; switching back
+keeps the original lyrics available. Toggle back to Romaji to retry a failed lookup.
 
 Queue entries have space between songs and clear title, artist, and duration
 columns. Short windows use compact rows. Click the current artist or album to
@@ -118,7 +145,12 @@ before opening its actions.
 
 The volume −/+ buttons, keyboard `-`/`+`, and mouse wheel over the volume control
 change the level in 5% steps. Clicking or dragging its bar snaps to a 5% value.
-Click **vol** to mute and restore the previous level.
+Volume is capped at 100%. Click **vol** to mute and restore the previous level.
+
+Enable **Settings → Playback → Precision volume** to adjust volume by 1% per
+wheel step over the current song's cover art. Scroll up to increase and down
+to decrease. The preference is saved across restarts; other volume controls
+continue to use 5% steps.
 
 The playback bar offers **Like, Share, Save to playlist, Shuffle, Repeat, and
 Output**. Smaller windows keep the full set in **Actions**, also available with
@@ -132,7 +164,7 @@ song it was opened for even if playback moves to another track.
 
 `Ctrl-K` shows a compact menu grouped into navigation, app preferences, and
 window actions. Its displayed shortcuts work while the menu is open. Settings
-groups audio output under Playback, cover and icon choices under Appearance,
+groups audio output and precision volume under Playback, cover choices under Appearance,
 and Discord/tray switches under Integrations. Click a value or press Enter to
 choose it; a choice list changes nothing until you confirm. Esc cancels the
 choice list, then returns to Settings and the menu it was opened from.
@@ -213,6 +245,7 @@ sign-in profile without stopping current playback.
 | `1`-`4` or `Tab` | Open Queue, Lyrics, Related, or Comments |
 | `e` on Lyrics | Expand or restore the lyrics reading view |
 | `f` on Lyrics | Pause or resume following synced lyrics |
+| `t` on Lyrics | Switch between original lyrics and provider romaji |
 | `c` | Change cover-art size |
 | `M` | Import or refresh the personalized Home session |
 | `D` | Toggle Discord Rich Presence directly |
@@ -234,10 +267,17 @@ before opening an updated build.
 Enable **Keep tray icon visible** under Settings → Integrations to retain the icon while the
 terminal UI is open. Windows may place new icons under the hidden-icons `^` menu.
 
-Enable **Click tray icon to stop** in the same section to make a left-click stop
-playback and clear the current queue. This setting is off by default, so a click
+The mint strip icon uses four slim strips. They settle into a flat silver strip
+when playback is paused, stopped, or loading, and rise again when playing. The
+transition takes 280 ms, then stays still. The icon follows playback whether
+MTUI is in the terminal or running in the background.
+
+Enable **Click tray icon to pause / resume** in the same section to make a left-click
+pause the music and a second click resume the same song at the same position.
+The current song and queue are kept. This setting is off by default, so a click
 normally opens MTUI. With it enabled, use **right-click → Show the player** to
-open the terminal. The preference is saved across restarts.
+open the terminal. The preference is saved across restarts; existing installations
+with the former click-to-stop preference enabled keep these controls enabled.
 
 ### Configuration
 
@@ -265,6 +305,10 @@ duration comes from the audio track. A replacement keeps the current listening
 position; byte ranges are spliced only when format, file size, and revision
 match. Automatic recovery and manual Retry both bypass failed cached URLs.
 An opening HTTP 403 triggers one fresh-URL recovery before an error is shown.
+
+**Cover art.** The player and Discord prefer the track's square YouTube Music
+artwork. If Music artwork is missing or cannot be downloaded or decoded, MTUI
+falls back to the YouTube video thumbnail.
 
 **Graphics.** MTUI detects Kitty graphics and Sixel support automatically. The
 Settings panel's **Artwork display** choice can keep automatic detection, force

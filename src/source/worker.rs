@@ -45,7 +45,7 @@ use super::account::Session;
 use super::inbox::{Inbox, Kind};
 use super::journal::Journal;
 use super::{ArtistRef, BrowseEndpoint, StreamUrl};
-use super::{lrclib, watch};
+use super::{amll, lrclib, watch};
 use crate::config::Cookies;
 use crate::source::youtube::YouTube;
 use mtui_resolver::{PlaybackSession, ResolveRequest, Resolver};
@@ -61,6 +61,14 @@ struct CompletionRequest {
 }
 
 pub enum Request {
+    Library {
+        request_id: u64,
+        generation: u64,
+        category: super::library::browse::Category,
+        endpoint: BrowseEndpoint,
+        token: Option<String>,
+        read_account: bool,
+    },
     Rating { request_id: u64, video_id: String },
     SetRating { request_id: u64, video_id: String, liked: bool },
     Playlists { request_id: u64, video_id: String },
@@ -86,9 +94,10 @@ pub enum Request {
     Prefetch {
         id: String,
     },
-    /// Thumbnail for a track. Runs on its own thread; see the module header.
+    /// Music sleeve for a track, with a video-thumbnail fallback.
     Cover {
         id: String,
+        artwork_url: Option<String>,
     },
     /// Artwork for one card of the landing page.
     ///
@@ -178,6 +187,12 @@ pub enum Request {
         browse_id: Option<String>,
         query: Option<lrclib::Query>,
     },
+    /// Opt-in provider romaji, with original cues to verify the recording.
+    Romaji {
+        video_id: String,
+        query: lrclib::Query,
+        original: Option<watch::Lyrics>,
+    },
     Related {
         video_id: String,
         browse_id: String,
@@ -189,6 +204,12 @@ pub enum Request {
 }
 
 pub enum Response {
+    Library {
+        request_id: u64,
+        generation: u64,
+        category: super::library::browse::Category,
+        page: Box<Result<super::library::browse::Page, String>>,
+    },
     Rating { request_id: u64, video_id: String, changed: bool, result: Result<bool, String> },
     Playlists { request_id: u64, choices: Result<Vec<super::library::Playlist>, String> },
     PlaylistSaved { request_id: u64, result: Result<(), String> },
@@ -268,6 +289,10 @@ pub enum Response {
         video_id: String,
         lyrics: Result<crate::source::watch::Lyrics, String>,
     },
+    Romaji {
+        video_id: String,
+        lyrics: Result<crate::source::watch::Lyrics, String>,
+    },
     Related {
         video_id: String,
         related: Result<Vec<Shelf>, String>,
@@ -288,6 +313,8 @@ pub enum Response {
     Cover {
         id: String,
         art: Option<Cover>,
+        /// Native Music URL only if that image loaded successfully.
+        artwork_url: Option<String>,
     },
     /// One card's artwork. `art` is `None` when there was no usable picture,
     /// which the cache records as firmly as a success -- see
@@ -391,9 +418,10 @@ impl SourceWorker {
             .spawn(move || run_covers(cover_req_rx, cover_res_tx))
             .context("failed to spawn cover worker")?;
 
+        let metadata_generation = account_generation.clone();
         thread::Builder::new()
             .name("mtui-metadata".to_string())
-            .spawn(move || run_metadata(metadata_req_rx, metadata_res_tx))
+            .spawn(move || run_metadata(metadata_req_rx, metadata_res_tx, metadata_generation))
             .context("failed to spawn metadata worker")?;
 
         thread::Builder::new()
@@ -484,6 +512,7 @@ impl SourceWorker {
             | Request::MoreQueue { .. }
             | Request::SeedQueue { .. }
             | Request::Lyrics { .. }
+            | Request::Romaji { .. }
             | Request::Related { .. }
             | Request::Comments { .. } => {
                 self.page_tx.send(req).context("player page worker is gone")
@@ -498,7 +527,8 @@ impl SourceWorker {
                 self.account_tx.try_send(AccountWork { request: req, session })
                     .map_err(|_| anyhow::anyhow!("account worker is busy or unavailable; try again shortly"))
             }
-            Request::OpenBrowse { .. }
+            Request::Library { .. }
+            | Request::OpenBrowse { .. }
             | Request::Search { .. }
             | Request::OpenArtist { .. } => self
                 .metadata_tx
@@ -540,6 +570,7 @@ impl SourceWorker {
 /// would leave whoever hit it re-reading [`SourceWorker::send`] to guess.
 fn name(req: &Request) -> &'static str {
     match req {
+        Request::Library { .. } => "Library",
         Request::Rating { .. } => "Rating",
         Request::SetRating { .. } => "SetRating",
         Request::Playlists { .. } => "Playlists",
@@ -560,6 +591,7 @@ fn name(req: &Request) -> &'static str {
         Request::MoreQueue { .. } => "MoreQueue",
         Request::SeedQueue { .. } => "SeedQueue",
         Request::Lyrics { .. } => "Lyrics",
+        Request::Romaji { .. } => "Romaji",
         Request::Related { .. } => "Related",
         Request::Comments { .. } => "Comments",
         Request::Shutdown => "Shutdown",
@@ -932,11 +964,21 @@ fn run_accounts(rx: Receiver<AccountWork>, tx: Sender<Response>) {
     }
 }
 
-fn run_metadata(rx: Arc<Inbox>, tx: Sender<Response>) {
+fn run_metadata(rx: Arc<Inbox>, tx: Sender<Response>, account_generation: Arc<AtomicU64>) {
     let Ok(mut http) = Http::new() else { return; };
     while let Some(work) = rx.recv() {
         http.set_cancellation(work.cancel.clone());
         let response = match work.request {
+            Request::Library { request_id, generation, category, endpoint, token, read_account } => {
+                let page = (|| {
+                    if generation != account_generation.load(Ordering::SeqCst) {
+                        bail!("Your account changed. Refresh Library to continue.");
+                    }
+                    let session = Session::capture(account_generation.clone())?;
+                    super::library::browse::fetch(&http, &session, category, &endpoint, token.as_deref(), read_account)
+                })().map_err(|error| format!("{error:#}"));
+                Some(Response::Library { request_id, generation, category, page: Box::new(page) })
+            }
             Request::Search { request_id, query, limit, filter } => Some(Response::Results {
                 request_id, tracks: super::search::fetch(&http, &query, filter, limit)
                     .map_err(|error| format!("{error:#}")),
@@ -1020,6 +1062,10 @@ fn run_pages(rx: Arc<Inbox>, tx: Sender<Response>) {
                     .map_err(|e| format!("{e:#}")),
                 video_id,
             },
+            Request::Romaji { video_id, query, original } => Response::Romaji {
+                video_id,
+                lyrics: amll::fetch(&http, &query, original.as_ref()).map_err(|error| format!("{error:#}")),
+            },
             Request::Related {
                 video_id,
                 browse_id,
@@ -1055,8 +1101,8 @@ fn run_pages(rx: Arc<Inbox>, tx: Sender<Response>) {
 /// without them the panel is a wall of text with nothing to follow. LRCLIB is
 /// asked only for what is missing, in one of two ways:
 ///
-/// - YouTube gave words but no timings: keep its words, lay LRCLIB's timings
-///   over them, and say so in the credit.
+/// - YouTube gave words but no timings: keep its words, use LRCLIB's timings
+///   only if every line matches, and say so in the credit.
 /// - YouTube has no lyrics page at all, or the fetch failed: LRCLIB is the only
 ///   chance, and its own words are better than an empty tab.
 ///
@@ -1078,8 +1124,9 @@ fn lyrics(
         // Words but no timings -- a cover, a live take, most of what is not in
         // YouTube's own catalogue.
         Some(Ok(mut lyrics)) => {
-            if let Some(timed) = query.and_then(|query| lrclib::timed(http, query)) {
-                lyrics.timed = timed;
+            if let Some(timed) = query.and_then(|query| lrclib::timed(http, query))
+                && align_lyrics_timing(&mut lyrics, timed)
+            {
                 // The words on screen are still YouTube's; what changed is that
                 // they now scroll. Crediting both is the honest version, and
                 // the panel has one line to say it in.
@@ -1104,10 +1151,28 @@ fn lyrics(
     }
 }
 
+/// Line counts alone cannot establish that a fallback has the same verses.
+/// Preserve YouTube's spelling while accepting harmless punctuation changes.
+fn align_lyrics_timing(lyrics: &mut watch::Lyrics, mut timed: Vec<watch::TimedLine>) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    let key = |text: &str| text.nfkc().flat_map(char::to_lowercase).filter(|c| c.is_alphanumeric()).collect::<String>();
+    let lines: Vec<_> = lyrics.text.lines().filter(|line| !line.trim().is_empty()).collect();
+    let candidate: Vec<_> = timed.iter().filter(|line| !line.text.trim().is_empty()).collect();
+    if lines.is_empty() || lines.len() != candidate.len()
+        || !lines.iter().zip(candidate).all(|(text, line)| key(text) == key(&line.text))
+    { return false; }
+    let mut original = lines.into_iter();
+    for line in timed.iter_mut().filter(|line| !line.text.trim().is_empty()) {
+        line.text = original.next().unwrap_or_default().to_string();
+    }
+    lyrics.timed = timed;
+    true
+}
+
 fn run_covers(rx: Arc<Inbox>, tx: Sender<Response>) {
     while let Some(work) = rx.recv() {
-        let id = match work.request {
-            Request::Cover { id } => id,
+        let (id, artwork_url) = match work.request {
+            Request::Cover { id, artwork_url } => (id, artwork_url),
             Request::Shutdown => break,
             // Routed elsewhere by `send`; reaching here would mean that routing
             // and this match had drifted apart. Skipped rather than taken as a
@@ -1124,10 +1189,11 @@ fn run_covers(rx: Arc<Inbox>, tx: Sender<Response>) {
         // what is playing, and a missing picture is not worth replacing that
         // with an error the user can do nothing about. The UI renders no cover
         // pane and says nothing.
-        let response = Response::Cover {
-            art: cover::fetch_cancellable(&id, work.cancel.as_ref()).ok(),
-            id,
+        let (art, artwork_url) = match cover::fetch_cancellable(&id, artwork_url.as_deref(), work.cancel.as_ref()) {
+            Ok((art, url)) => (Some(art), url),
+            Err(_) => (None, None),
         };
+        let response = Response::Cover { id, art, artwork_url };
         if work.cancel.is_some_and(|cancel| !cancel.active()) { continue; }
         if tx.send(response).is_err() {
             break;
@@ -1201,6 +1267,21 @@ fn run_art(rx: &Arc<Inbox>, tx: &Sender<Response>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_timing_requires_matching_words_and_preserves_original_spelling() {
+        use std::time::Duration;
+        let mut lyrics = watch::Lyrics { text: "Hello, sky!\n\nねこ".into(), source: None, timed: Vec::new() };
+        let wrong = vec![watch::TimedLine { text: "Hello sky".into(), start: Duration::ZERO },
+            watch::TimedLine { text: "そら".into(), start: Duration::from_secs(3) }];
+        assert!(!align_lyrics_timing(&mut lyrics, wrong));
+        assert!(lyrics.timed.is_empty());
+        let matching = vec![watch::TimedLine { text: "Hello sky".into(), start: Duration::ZERO },
+            watch::TimedLine { text: "ねこ".into(), start: Duration::from_secs(3) }];
+        assert!(align_lyrics_timing(&mut lyrics, matching));
+        assert_eq!(lyrics.timed[0].text, "Hello, sky!");
+        assert_eq!(lyrics.timed[1].start, Duration::from_secs(3));
+    }
 
     #[test]
     fn resolver_startup_failure_is_answered_per_playback_request() {

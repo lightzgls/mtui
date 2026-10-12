@@ -35,6 +35,7 @@ mod browse;
 mod search;
 mod palette;
 mod home;
+mod library;
 mod menu;
 mod preferences;
 mod queue;
@@ -237,9 +238,21 @@ enum MouseTarget {
     Progress(Rect),
     Volume(Rect),
     VolumeControl(Rect),
+    Cover(Rect),
 }
 
 impl MouseMap {
+    pub fn over_cover(&self, column: u16, row: u16) -> bool {
+        self.targets.iter().rev().find_map(|target| match *target {
+            MouseTarget::Cover(area) if contains(area, column, row) => Some(true),
+            MouseTarget::Area(area, _) | MouseTarget::Progress(area)
+                | MouseTarget::Volume(area) | MouseTarget::VolumeControl(area)
+                | MouseTarget::TrackRows { area, .. }
+                if contains(area, column, row) => Some(false),
+            _ => None,
+        }).unwrap_or(false)
+    }
+
     pub fn over_volume(&self, column: u16, row: u16) -> bool {
         self.targets.iter().rev().find_map(|target| match *target {
             MouseTarget::Area(area, action) if contains(area, column, row) => Some(matches!(action, MouseAction::AdjustVolume(_) | MouseAction::ToggleMute)),
@@ -279,6 +292,7 @@ impl MouseMap {
     pub fn context_action_at(&self, column: u16, row: u16) -> Option<MouseAction> {
         self.targets.iter().rev().find_map(|target| match *target {
             MouseTarget::Area(area, MouseAction::OpenArtistSong(index)) if contains(area, column, row) => Some(MouseAction::SelectArtistSong(index)),
+            MouseTarget::Area(area, MouseAction::OpenLibraryItem(index)) if contains(area, column, row) => Some(MouseAction::SelectLibraryItem(index)),
             MouseTarget::Area(area, MouseAction::OpenArtistCard { shelf, card }) if contains(area, column, row) => Some(MouseAction::SelectArtistCard { shelf, card }),
             MouseTarget::Area(area, MouseAction::OpenHomeCard { shelf, card })
                 if contains(area, column, row) =>
@@ -338,6 +352,9 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
     // so it reserves its own rect instead of going through `split_cover`.
     let cover_area = if app.view == View::Playing {
         render_player(frame, app, main_area, mouse)
+    } else if app.view == View::Library {
+        library::render(frame, app, main_area, mouse);
+        None
     } else {
         let (list_area, cover_area) = split_cover(app, main_area);
         if let Some(area) = list_area {
@@ -345,6 +362,7 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
                 View::Home => render_home(frame, app, area, mouse),
                 View::Tracks => render_results(frame, app, area, mouse),
                 View::Artist => render_artist(frame, app, area, mouse),
+                View::Library => library::render(frame, app, area, mouse),
                 // Handled above.
                 View::Playing => {}
             }
@@ -391,6 +409,14 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
             source: ImageSource::Playing,
             plan,
         });
+    }
+    if app.precision_volume && !app.overlay.is_open() && app.menu().is_none()
+        && let (Some(area), Some(cover)) = (cover_area, app.cover.as_ref())
+    {
+        let cell = if app.cover_style == CoverStyle::Pixel && app.protocol_images() {
+            app.graphics.cell
+        } else { cell_pixels() };
+        register_cover_target(mouse, cover, area, size, cell);
     }
 
     // Over everything, including the cover pane's cells.
@@ -730,6 +756,24 @@ fn usable(area: Rect, size: CoverSize) -> (u16, u16) {
         CoverSize::Side => Block::bordered().inner(area),
     };
     (inner.width, inner.height)
+}
+
+/// Match the painted picture rather than the empty margins of its pane.
+fn register_cover_target(
+    mouse: &mut MouseMap, cover: &Cover, area: Rect, size: CoverSize, cell: (u16, u16),
+) {
+    let (cols, rows) = fit_cells(cover, usable(area, size), cell);
+    if cols == 0 || rows == 0 { return; }
+    let inner = match size {
+        CoverSize::Full => area,
+        CoverSize::Side => Block::bordered().inner(Rect {
+            height: (rows + 2).min(area.height), ..area
+        }),
+    };
+    let y = if size == CoverSize::Full { inner.y + (inner.height - rows) / 2 } else { inner.y };
+    mouse.targets.push(MouseTarget::Cover(Rect::new(
+        inner.x + (inner.width - cols) / 2, y, cols, rows,
+    )));
 }
 
 /// Draws whatever frame the mode calls for and returns the picture's top-left
@@ -2186,6 +2230,14 @@ fn render_player(
     };
     render_player_identity(frame, identity, &layout, images);
     register_player_identity_targets(mouse, now, &layout);
+    if app.precision_volume && app.cover.is_some() && !app.overlay.is_open() && app.menu().is_none()
+        && let Some(hero) = layout.hero
+    {
+        let height = hero.height.min(3);
+        mouse.targets.push(MouseTarget::Cover(Rect::new(
+            hero.x, hero.y, (height * 2).min(hero.width), height,
+        )));
+    }
     render_panel(frame, app, layout.panel, mouse);
     layout.art
 }
@@ -2398,11 +2450,7 @@ fn progress_bar_width(snap: &Snapshot, total: Option<Duration>, width: usize) ->
 
 /// The volume, as a bar and the number beside it: `vol ━━━━━━━━────  80%`.
 ///
-/// The bar is drawn against 100% rather than against the 200% the player will
-/// accept, because 100% is where every track plays until the user says
-/// otherwise -- a bar sitting half-full at the ordinary volume reads as a
-/// fault. A boost fills it and colours it instead, which says "past the end of
-/// the scale" without pretending the scale is twice as long.
+/// The bar fills across the supported 0% to 100% volume range.
 fn volume_line<'a>(volume: f32, width: usize) -> Line<'a> {
     let lead = if volume == 0.0 { "mut " } else { "vol " };
     let label = format!("  {:.0}%", volume * 100.0);
@@ -2418,15 +2466,9 @@ fn volume_line<'a>(volume: f32, width: usize) -> Line<'a> {
     }
 
     let filled = (f64::from(volume.min(1.0)) * bar_width as f64).round() as usize;
-    let fill = if volume > 1.0 {
-        Color::Yellow
-    } else {
-        Color::Gray
-    };
-
     Line::from(vec![
         Span::styled(lead, Style::default().fg(Color::DarkGray)),
-        Span::styled("━".repeat(filled), Style::default().fg(fill)),
+        Span::styled("━".repeat(filled), Style::default().fg(Color::Gray)),
         Span::styled(
             "─".repeat(bar_width - filled),
             Style::default().fg(Color::DarkGray),
@@ -2469,7 +2511,7 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseM
     render_tabs(frame, tab, tabs, accent, mouse);
     let content = if tab == Tab::Lyrics && content.height >= 4 {
         let [controls, body] = Layout::vertical([
-            Constraint::Length(2), Constraint::Min(0),
+            Constraint::Length(if content.width < 44 && content.height >= 6 { 3 } else { 2 }), Constraint::Min(0),
         ]).areas(content);
         render_lyrics_controls(frame, now, controls, accent, mouse);
         body
@@ -2524,15 +2566,27 @@ fn render_panel_body(
 }
 
 fn render_lyrics_controls(frame: &mut Frame, now: &NowPlaying, area: Rect, accent: Color, mouse: &mut MouseMap) {
-    let timed = matches!(&now.lyrics, Panel::Ready(lyrics) if !lyrics.timed.is_empty());
+    let timed = matches!(now.shown_lyrics(), Panel::Ready(lyrics) if !lyrics.timed.is_empty());
     let expand = if now.lyrics_expanded { " Restore e " } else { " Expand e " };
     let expand_width = (display_width(expand) as u16).min(area.width);
     let expand_area = Rect::new(area.right() - expand_width, area.y, expand_width, 1);
     frame.render_widget(Paragraph::new(expand).style(Style::default().fg(accent).bg(shell::SURFACE)), expand_area);
     mouse.targets.push(MouseTarget::Area(expand_area, MouseAction::ToggleLyricsExpanded));
+    let mode = if now.lyrics_romaji { " Original t " } else { " Romaji t " };
+    let mode_width = (display_width(mode) as u16).min(area.width.saturating_sub(expand_width + 1));
+    let mode_area = Rect::new(area.x, area.y, mode_width, 1);
+    frame.render_widget(Paragraph::new(truncate(mode, mode_width as usize)).style(Style::default().fg(accent).bg(shell::SURFACE)), mode_area);
+    if mode_width > 0 {
+        mouse.targets.push(MouseTarget::Area(mode_area, MouseAction::ToggleLyricsRomaji));
+    }
     let follow = if timed && now.follow_lyrics { " Following · f pause " } else if timed { " Follow lyrics f " } else { " Lyrics " };
-    let follow_width = (display_width(follow) as u16).min(area.width.saturating_sub(expand_width + 1));
-    let follow_area = Rect::new(area.x, area.y, follow_width, 1);
+    let (follow_x, follow_y, available) = if area.height >= 3 {
+        (area.x, area.y + 1, area.width)
+    } else {
+        (area.x + mode_width + 1, area.y, area.width.saturating_sub(expand_width + mode_width + 2))
+    };
+    let follow_width = (display_width(follow) as u16).min(available);
+    let follow_area = Rect::new(follow_x, follow_y, follow_width, 1);
     frame.render_widget(Paragraph::new(truncate(follow, follow_width as usize)).style(Style::default().fg(if timed { Color::Gray } else { Color::DarkGray })), follow_area);
     if timed && follow_width > 0 {
         mouse.targets.push(MouseTarget::Area(follow_area, MouseAction::ToggleLyricsFollow));
@@ -2626,8 +2680,8 @@ fn render_lyrics(
 ) -> (usize, Option<usize>) {
     let area = Rect::new(area.x + u16::from(area.width > 8), area.y, area.width.saturating_sub(if area.width > 8 { 2 } else { 0 }), area.height);
     let width = (area.width as usize).saturating_sub(LYRIC_GUTTER + 1);
-    let Panel::Ready(lyrics) = &now.lyrics else {
-        message(frame, waiting_on(&now.lyrics), area);
+    let Panel::Ready(lyrics) = now.shown_lyrics() else {
+        message(frame, waiting_on(now.shown_lyrics()), area);
         return (0, None);
     };
 
@@ -2642,9 +2696,11 @@ fn render_lyrics(
     // under it belong to no lyric and stay `None`, which is also what every
     // line of an untimed track is.
     let mut lines: Vec<(String, Option<usize>, bool)> = Vec::new();
-    if let Some(source) = &lyrics.source {
+    if let Some(source) = &lyrics.source
+        && area.height > 1
+    {
         lines.push((source.clone(), None, false));
-        lines.push((String::new(), None, false));
+        if area.height >= 4 { lines.push((String::new(), None, false)); }
     }
     let credit = lines.len();
 
@@ -3504,6 +3560,8 @@ fn render_volume_control(frame: &mut Frame, volume: f32, area: Rect) {
 fn hint_line(app: &App) -> &'static str {
     if app.mode == Mode::Editing {
         HINTS_EDITING
+    } else if app.view == View::Library {
+        "1–6 categories  f liked  o sort  r refresh"
     } else if app.view == View::Playing {
         HINTS_PLAYING
     } else if app.now.is_some() {
@@ -5425,10 +5483,6 @@ mod tests {
         assert_eq!(bar(0.0), 0);
         assert_eq!(bar(0.5), VOLUME_BAR_WIDTH / 2);
         assert_eq!(bar(1.0), VOLUME_BAR_WIDTH);
-        // Boost: the bar has nowhere further to go, so it says so in colour
-        // rather than by growing a scale nothing else is measured against.
-        assert_eq!(bar(2.0), VOLUME_BAR_WIDTH);
-        assert_eq!(volume_line(2.0, 40).spans[1].style.fg, Some(Color::Yellow));
         assert_eq!(volume_line(1.0, 40).spans[1].style.fg, Some(Color::Gray));
     }
 
@@ -5586,7 +5640,7 @@ mod tests {
                 render_tabs(frame, now.tab, tabs, accent, &mut mouse);
                 let content = if now.tab == Tab::Lyrics && content.height >= 4 {
                     let [controls, body] = Layout::vertical([
-                        Constraint::Length(2), Constraint::Min(0),
+                        Constraint::Length(if content.width < 44 && content.height >= 6 { 3 } else { 2 }), Constraint::Min(0),
                     ]).areas(content);
                     render_lyrics_controls(frame, now, controls, accent, &mut mouse);
                     body
@@ -5761,7 +5815,7 @@ mod tests {
             for (width, height) in [(1, 1), (12, 6), (48, 18), (100, 36), (160, 42)] {
                 let (buf, mouse) = drawn_screen(width, height, View::Playing, &now, &[], &ArtCache::default(), &cover);
                 for target in &mouse.targets {
-                    if let MouseTarget::Area(rect, action @ (MouseAction::ToggleLyricsExpanded | MouseAction::ToggleLyricsFollow)) = target {
+                    if let MouseTarget::Area(rect, action @ (MouseAction::ToggleLyricsExpanded | MouseAction::ToggleLyricsFollow | MouseAction::ToggleLyricsRomaji)) = target {
                         assert!(rect.right() <= width && rect.bottom() <= height);
                         assert_eq!(mouse.action_at(rect.x, rect.y), Some(*action));
                     }
@@ -5770,12 +5824,35 @@ mod tests {
                     let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
                     assert!(text.contains(if expanded { "Restore e" } else { "Expand e" }));
                     assert!(text.contains("Following"));
-                    for action in [MouseAction::ToggleLyricsExpanded, MouseAction::ToggleLyricsFollow] {
+                    assert!(text.contains("Romaji t"));
+                    for action in [MouseAction::ToggleLyricsExpanded, MouseAction::ToggleLyricsFollow, MouseAction::ToggleLyricsRomaji] {
                         assert!(mouse.targets.iter().any(|target| matches!(target, MouseTarget::Area(_, found) if *found == action)));
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn unsynced_romaji_has_its_own_text_credit_and_no_follow_target() {
+        let mut now = preview_now();
+        now.tab = Tab::Lyrics;
+        now.lyrics_romaji = true;
+        now.romaji = Panel::Ready(Lyrics {
+            text: "neko sora".into(), source: Some("AMLL • Romaji (unsynced)".into()), timed: Vec::new(),
+        });
+        let cover = Cover::from_rgb(4, 4, [180, 90, 60].repeat(16));
+        for (width, height) in [(48, 18), (100, 36)] {
+            let (buf, mouse) = drawn_screen(width, height, View::Playing, &now, &[], &ArtCache::default(), &cover);
+            let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("Original t"));
+            assert!(text.contains("neko sora"), "{width}x{height}: {text:?}");
+            assert!(!text.contains("Following"));
+            assert!(!mouse.targets.iter().any(|target| matches!(target, MouseTarget::Area(_, MouseAction::ToggleLyricsFollow))));
+        }
+        now.lyrics_romaji = false;
+        let (_, mouse) = drawn_screen(100, 36, View::Playing, &now, &[], &ArtCache::default(), &cover);
+        assert!(mouse.targets.iter().any(|target| matches!(target, MouseTarget::Area(_, MouseAction::ToggleLyricsFollow))));
     }
 
     #[test]

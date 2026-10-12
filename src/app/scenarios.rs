@@ -89,27 +89,69 @@ fn window_close_keeps_the_tray_but_end_task_and_explicit_quit_stop_the_player() 
 }
 
 #[test]
-fn tray_click_obeys_the_setting_and_stop_cancels_late_playback() {
+fn tray_click_pauses_and_resumes_without_clearing_the_song_or_queue() {
     let (mut app, driver, _requests) = fixture();
     app.play_track(track(0), false);
+    resolve(&mut app, 0);
+    let position = Duration::from_secs(83);
+    state(&driver, PlayState::Playing, position);
+    app.now.as_mut().unwrap().queue = (0..4).map(track).collect();
     driver.commands.try_iter().for_each(drop);
     app.handle_tray(TrayCommand::Click);
     assert!(app.wants_foreground && app.now.is_some());
     assert!(driver.commands.try_iter().next().is_none());
 
     app.wants_foreground = false;
-    app.tray_click_stops = true;
-    app.handle_mouse_action(MouseAction::SeekTo(POINTER_SCALE)).unwrap();
+    app.tray_click_pauses = true;
     app.handle_tray(TrayCommand::Click);
-    resolve(&mut app, 0);
     let commands: Vec<_> = driver.commands.try_iter().collect();
-    assert!(matches!(commands.as_slice(), [Command::Stop]), "{commands:?}");
-    assert!(app.now.is_none() && app.pending.is_none() && app.pending_seek.is_none());
+    assert!(matches!(commands.as_slice(), [Command::TogglePause]), "{commands:?}");
+    state(&driver, PlayState::Paused, position);
+    assert!(!app.tray_playing());
+    assert_eq!(app.snapshot().position, position);
+    assert_eq!(app.now.as_ref().unwrap().video_id, "song-0");
+    assert_eq!(app.now.as_ref().unwrap().queue.len(), 4);
     assert!(!app.wants_foreground && !app.should_quit);
-    assert!(app.activity().is_none());
+
+    app.handle_tray(TrayCommand::Click);
+    let commands: Vec<_> = driver.commands.try_iter().collect();
+    assert!(matches!(commands.as_slice(), [Command::TogglePause]), "{commands:?}");
+    state(&driver, PlayState::Playing, position);
+    assert!(app.tray_playing());
+    assert_eq!(app.snapshot().position, position);
+    assert_eq!(app.now.as_ref().unwrap().video_id, "song-0");
+    assert_eq!(app.now.as_ref().unwrap().queue.len(), 4);
 
     app.handle_tray(TrayCommand::Show);
-    assert!(app.wants_foreground, "the menu can still show MTUI when clicks stop playback");
+    assert!(app.wants_foreground, "the menu can still show MTUI when clicks toggle pause");
+}
+
+#[test]
+fn tray_wave_rests_on_pause_loading_and_stop_before_the_worker_catches_up() {
+    let (mut app, driver, _requests) = fixture();
+    assert!(!app.tray_playing());
+    app.play_track(track(0), false);
+    resolve(&mut app, 0);
+    state(&driver, PlayState::Playing, Duration::from_secs(10));
+    assert!(app.tray_playing());
+
+    for playback in [PlayState::Paused, PlayState::Buffering, PlayState::Idle] {
+        state(&driver, playback, Duration::from_secs(10));
+        assert!(!app.tray_playing(), "{playback:?} should show the resting line");
+        state(&driver, PlayState::Playing, Duration::from_secs(10));
+        assert!(app.tray_playing(), "resuming should restore the waveform");
+    }
+
+    app.play_track(track(1), false);
+    assert!(!app.tray_playing(), "a new resolve must not inherit the old playing snapshot");
+    resolve(&mut app, 1);
+    assert!(app.tray_playing());
+
+    app.stop();
+    assert_eq!(
+        app.snapshot().state, PlayState::Playing, "the worker is still catching up"
+    );
+    assert!(!app.tray_playing(), "Stop should immediately select the resting icon");
 }
 
 #[test]
@@ -132,6 +174,54 @@ fn discord_artwork_follows_only_the_current_tracks_watch_response() {
 }
 
 #[test]
+fn cover_requests_wait_for_music_metadata_and_use_video_only_as_fallback() {
+    let sleeve = "https://lh3.googleusercontent.com/sleeve=w544-h544-l90-rj";
+    for (watch, expected) in [
+        (Ok(Watch { artwork_url: Some(sleeve.into()), ..Default::default() }), Some(sleeve)),
+        (Ok(Watch::default()), None),
+        (Err("Music metadata unavailable".into()), None),
+    ] {
+        let (mut app, _driver, requests) = fixture();
+        app.cover = Some(Cover::solid(10, 10));
+        app.play_track(track(0), false);
+        assert!(app.cover.is_none());
+        assert!(requests.try_iter().all(|request| !matches!(request, Request::Cover { .. })),
+            "a video thumbnail must not be requested before Music metadata arrives");
+        app.apply_watch("song-0", watch);
+        let covers: Vec<_> = requests.try_iter().filter(|request| matches!(request, Request::Cover { .. })).collect();
+        assert_eq!(covers.len(), 1);
+        assert!(matches!(&covers[0], Request::Cover { id, artwork_url }
+            if id == "song-0" && artwork_url.as_deref() == expected));
+    }
+}
+
+#[test]
+fn loaded_cover_source_updates_discord_and_late_images_cannot_replace_it() {
+    let (mut app, driver, requests) = fixture();
+    let sleeve = "https://example.com/sleeve.jpg";
+    app.play_track(track(0), false);
+    state(&driver, PlayState::Playing, Duration::from_secs(10));
+    app.apply_watch("song-0", Ok(Watch { artwork_url: Some(sleeve.into()), ..Default::default() }));
+    app.apply(Response::Cover { id: "song-0".into(), art: Some(Cover::solid(544, 544)), artwork_url: Some(sleeve.into()) });
+    assert_eq!(app.cover.as_ref().unwrap().width, 544);
+    assert_eq!(app.activity().unwrap().artwork_url.as_deref(), Some(sleeve));
+    app.apply(Response::Cover { id: "old-song".into(), art: Some(Cover::solid(10, 10)), artwork_url: None });
+    assert_eq!(app.activity().unwrap().artwork_url.as_deref(), Some(sleeve));
+    assert_eq!(app.cover.as_ref().unwrap().width, 544);
+
+    // A failed Music fetch can still return a decoded video thumbnail.
+    app.apply(Response::Cover { id: "song-0".into(), art: Some(Cover::solid(720, 720)), artwork_url: None });
+    assert!(app.activity().unwrap().artwork_url.is_none());
+    assert_eq!(app.cover.as_ref().unwrap().width, 720);
+    app.stop();
+    requests.try_iter().for_each(drop);
+    app.apply_watch("song-0", Ok(Watch::default()));
+    app.apply(Response::Cover { id: "song-0".into(), art: Some(Cover::solid(544, 544)), artwork_url: Some(sleeve.into()) });
+    assert!(app.cover.is_none() && app.activity().is_none());
+    assert!(requests.try_iter().all(|request| !matches!(request, Request::Cover { .. })));
+}
+
+#[test]
 fn volume_buttons_and_pointer_use_five_percent_steps_at_the_bounds_and_after_dragging() {
     let (mut app, driver, _requests) = fixture();
     driver.commands.try_iter().for_each(drop);
@@ -139,7 +229,9 @@ fn volume_buttons_and_pointer_use_five_percent_steps_at_the_bounds_and_after_dra
         (0.10, MouseAction::AdjustVolume(true), 0.15),
         (0.10, MouseAction::AdjustVolume(false), 0.05),
         (0.0, MouseAction::AdjustVolume(false), 0.0),
-        (2.0, MouseAction::AdjustVolume(true), 2.0),
+        (0.95, MouseAction::AdjustVolume(true), 1.0),
+        (1.0, MouseAction::AdjustVolume(true), 1.0),
+        (1.63, MouseAction::AdjustVolume(true), 1.0),
         (0.72, MouseAction::AdjustVolume(true), 0.75),
         (0.5, MouseAction::SetVolume(1234), 0.10),
         (0.5, MouseAction::SetVolume(6789), 0.70),
@@ -156,6 +248,76 @@ fn volume_buttons_and_pointer_use_five_percent_steps_at_the_bounds_and_after_dra
         app.handle_mouse_action(MouseAction::AdjustVolume(true)).unwrap();
         let Command::SetVolume(volume) = driver.commands.try_recv().unwrap() else { panic!("wrong playback command") };
         assert!((volume - expected).abs() < 0.00001, "rapid clicks must accumulate before the audio thread responds");
+    }
+}
+
+#[test]
+fn precision_cover_volume_uses_one_percent_steps_and_accumulates_rapid_wheel_input() {
+    let (mut app, driver, _requests) = fixture();
+    driver.commands.try_iter().for_each(drop);
+    app.handle_mouse_action(MouseAction::AdjustPrecisionVolume(true)).unwrap();
+    assert!(driver.commands.try_iter().next().is_none(), "disabled precision is inert");
+    app.precision_volume = true;
+    for (initial, up, expected) in [
+        (0.50, true, 0.51), (0.51, false, 0.50),
+        (0.0, false, 0.0), (0.0, true, 0.01),
+        (0.01, false, 0.0), (0.99, true, 1.0), (1.0, true, 1.0),
+        (1.63, true, 1.0),
+    ] {
+        app.volume_save = None;
+        driver.snapshot.lock().unwrap().volume = initial;
+        app.handle_mouse_action(MouseAction::AdjustPrecisionVolume(up)).unwrap();
+        let Command::SetVolume(volume) = driver.commands.try_recv().unwrap() else { panic!("wrong command") };
+        assert!((volume - expected).abs() < 0.00001, "{initial}, {up}: {volume}");
+    }
+    app.volume_save = None;
+    driver.snapshot.lock().unwrap().volume = 0.50;
+    for (up, expected) in [(true, 0.51), (true, 0.52), (false, 0.51), (false, 0.50)] {
+        app.handle_mouse_action(MouseAction::AdjustPrecisionVolume(up)).unwrap();
+        let Command::SetVolume(volume) = driver.commands.try_recv().unwrap() else { panic!("wrong command") };
+        assert!((volume - expected).abs() < 0.00001, "wheel ticks must accumulate before the audio snapshot updates");
+    }
+    assert_eq!(mute_transition(true, 0.0, 0.03).0, 0.03, "mute restores precision levels below 5%");
+}
+
+#[test]
+fn precision_volume_only_targets_visible_current_song_artwork() {
+    use crate::ui::MouseMap;
+    use ratatui::{Terminal, backend::TestBackend};
+    for (width, height, style, full, sixel, kitty) in [
+        (132, 42, CoverStyle::Pixel, false, false, false),
+        (132, 42, CoverStyle::ColoredAscii, false, false, false),
+        (60, 24, CoverStyle::Pixel, false, false, false),
+        (60, 24, CoverStyle::Pixel, true, false, false),
+        (132, 42, CoverStyle::Pixel, false, true, false),
+        (132, 42, CoverStyle::Pixel, false, false, true),
+        (60, 24, CoverStyle::Pixel, false, false, true),
+        (60, 24, CoverStyle::Pixel, true, true, false),
+    ] {
+        let (mut app, _driver, _requests) = fixture();
+        app.play_track(track(0), false);
+        app.cover = Some(Cover::solid(32, 32));
+        app.cover_style = style;
+        app.graphics = Graphics { sixel, kitty, cell: (9, 20) };
+        if full { app.cover_size = CoverSize::Full; }
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut mouse = MouseMap::default();
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        assert!((0..height).all(|y| (0..width).all(|x| !mouse.over_cover(x, y))));
+        app.precision_volume = true;
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        let points: Vec<_> = (0..height).flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|&(x, y)| mouse.over_cover(x, y)).collect();
+        assert!(!points.is_empty(), "missing cover target at {width}x{height}");
+        assert!(!mouse.over_cover(0, 0), "header is not artwork");
+        assert!(!mouse.over_cover(width - 1, height - 1), "footer is not artwork");
+        app.overlay = Overlay::Settings;
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        assert!(points.iter().all(|&(x, y)| !mouse.over_cover(x, y)), "settings block artwork behind them");
+        app.overlay = Overlay::None;
+        app.cover = None;
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        assert!(points.iter().all(|&(x, y)| !mouse.over_cover(x, y)), "missing art has no volume target");
     }
 }
 
@@ -570,7 +732,7 @@ fn late_content_for_a_skipped_song_does_not_replace_the_current_song() {
     app.play_track(track(0), false);
     app.play_track(track(1), false);
     app.apply(Response::Lyrics { video_id: "song-0".into(), lyrics: Ok(Lyrics { text: "old lyric".into(), source: None, timed: Vec::new() }) });
-    app.apply(Response::Cover { id: "song-0".into(), art: Some(Cover::from_rgb(1, 1, vec![255, 0, 0])) });
+    app.apply(Response::Cover { id: "song-0".into(), art: Some(Cover::from_rgb(1, 1, vec![255, 0, 0])), artwork_url: None });
     assert!(matches!(app.now.as_ref().unwrap().lyrics, Panel::Idle));
     assert!(app.cover.is_none());
     assert_eq!(app.now.as_ref().unwrap().video_id, "song-1");

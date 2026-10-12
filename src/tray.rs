@@ -12,15 +12,19 @@
 //! visible from outside this module.
 
 #[cfg(windows)]
+mod animation;
+
+#[cfg(windows)]
 mod imp {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result, anyhow};
 
-    use crate::config::IconTheme;
+    use super::animation::{self, Transition};
 
     type Handle = isize;
     type Wparam = usize;
@@ -61,6 +65,16 @@ mod imp {
             flags: u32,
         ) -> Handle;
         fn GetSystemMetrics(index: i32) -> i32;
+        fn CreateIconFromResourceEx(
+            bits: *mut u8, size: u32, icon: i32, version: u32,
+            width: i32, height: i32, flags: u32,
+        ) -> Handle;
+        fn DestroyIcon(icon: Handle) -> i32;
+        fn SetTimer(
+            hwnd: Handle, id: usize, interval: u32,
+            callback: Option<unsafe extern "system" fn(Handle, u32, usize, u32)>,
+        ) -> usize;
+        fn KillTimer(hwnd: Handle, id: usize) -> i32;
         fn CreatePopupMenu() -> Handle;
         fn AppendMenuW(menu: Handle, flags: u32, id: usize, item: *const u16) -> i32;
         fn TrackPopupMenu(
@@ -147,6 +161,7 @@ mod imp {
     const WM_DESTROY: u32 = 0x0002;
     const WM_CLOSE: u32 = 0x0010;
     const WM_COMMAND: u32 = 0x0111;
+    const WM_TIMER: u32 = 0x0113;
     const WM_LBUTTONUP: u32 = 0x0202;
     const WM_LBUTTONDBLCLK: u32 = 0x0203;
     const WM_RBUTTONUP: u32 = 0x0205;
@@ -154,6 +169,9 @@ mod imp {
     /// above `WM_APP` is reserved for the application, so it cannot collide with
     /// a system message the default window procedure expects to handle.
     const WM_TRAY: u32 = 0x8000 + 1;
+    const WM_ANIMATE: u32 = 0x8000 + 2;
+    const ANIMATION_TIMER: usize = 1;
+    const FRAME_INTERVAL: u32 = 20;
 
     const NIM_ADD: u32 = 0;
     const NIM_MODIFY: u32 = 1;
@@ -221,6 +239,8 @@ mod imp {
     thread_local! {
         static SENDER: std::cell::RefCell<Option<Sender<TrayCommand>>> =
             const { std::cell::RefCell::new(None) };
+        static DISPLAY: std::cell::RefCell<Option<Arc<Mutex<Display>>>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     fn wide(text: &str) -> Vec<u16> {
@@ -243,6 +263,27 @@ mod imp {
         lparam: Lparam,
     ) -> Lresult {
         match msg {
+            WM_ANIMATE => {
+                let running = animation_tick(hwnd);
+                if running && unsafe { SetTimer(hwnd, ANIMATION_TIMER, FRAME_INTERVAL, None) } == 0 {
+                    // If a timer cannot be created, finish with the correct state.
+                    DISPLAY.with_borrow(|slot| {
+                        if let Some(display) = slot && let Ok(mut display) = display.lock() {
+                            display.transition.finish();
+                        }
+                    });
+                    animation_tick(hwnd);
+                } else if !running {
+                    unsafe { KillTimer(hwnd, ANIMATION_TIMER) };
+                }
+                0
+            }
+            WM_TIMER if wparam == ANIMATION_TIMER => {
+                if !animation_tick(hwnd) {
+                    unsafe { KillTimer(hwnd, ANIMATION_TIMER) };
+                }
+                0
+            }
             // Without version 4 of the icon protocol -- which this deliberately
             // does not ask for, since all it adds is balloon behaviour -- the
             // mouse message arrives in the low word of `lparam`.
@@ -271,6 +312,7 @@ mod imp {
                 0
             }
             WM_DESTROY => {
+                unsafe { KillTimer(hwnd, ANIMATION_TIMER) };
                 unsafe { PostQuitMessage(0) };
                 0
             }
@@ -326,6 +368,78 @@ mod imp {
         }
     }
 
+    /// Owned handles for the small strip frames, built once per size.
+    struct StripFrames {
+        width: i32,
+        height: i32,
+        icons: Vec<Handle>,
+    }
+
+    impl StripFrames {
+        fn new(width: i32, height: i32) -> Result<Self> {
+            let mut frames = Self { width, height, icons: Vec::with_capacity(animation::STEPS + 1) };
+            for frame in 0..=animation::STEPS {
+                let mut bits = animation::icon_bits(
+                    [141, 239, 193], frame as f32 / animation::STEPS as f32,
+                    width as u32, height as u32,
+                );
+                let icon = unsafe {
+                    CreateIconFromResourceEx(
+                        bits.as_mut_ptr().cast(), (bits.len() * 4) as u32, 1, 0x0003_0000,
+                        width, height, 0,
+                    )
+                };
+                if icon == 0 { return Err(anyhow!("could not create a tray animation frame")); }
+                frames.icons.push(icon);
+            }
+            Ok(frames)
+        }
+    }
+
+    impl Drop for StripFrames {
+        fn drop(&mut self) {
+            for &icon in &self.icons { unsafe { DestroyIcon(icon) }; }
+        }
+    }
+
+    struct Display {
+        visible: bool,
+        transition: Transition,
+        frames: Option<StripFrames>,
+        last_frame: usize,
+    }
+
+    impl Display {
+        fn frame(&self, now: Instant) -> usize {
+            (self.transition.value(now) * animation::STEPS as f32).round() as usize
+        }
+
+        fn icon(&self, now: Instant) -> Handle {
+            self.frames.as_ref().map_or_else(
+                || app_icon(self.transition.playing()),
+                |frames| frames.icons[self.frame(now)],
+            )
+        }
+    }
+
+    /// The message pump advances frames independently of the player's slow
+    /// foreground/background ticks. No timer remains after the transition.
+    fn animation_tick(hwnd: Handle) -> bool {
+        DISPLAY.with_borrow(|slot| {
+            let Some(display) = slot else { return false; };
+            let Ok(mut display) = display.lock() else { return false; };
+            if !display.visible || display.frames.is_none() { return false; }
+            let now = Instant::now();
+            let frame = display.frame(now);
+            if frame != display.last_frame {
+                let data = icon_descriptor(hwnd, display.icon(now));
+                if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } == 0 { return false; }
+                display.last_frame = frame;
+            }
+            display.transition.running(now)
+        })
+    }
+
     /// A live icon in the notification area, and the thread that serves it.
     pub struct Tray {
         hwnd: Handle,
@@ -335,6 +449,7 @@ mod imp {
         /// showing or hiding twice is not an error and the icon is not left
         /// behind on the way out.
         visible: bool,
+        display: Arc<Mutex<Display>>,
     }
 
     impl Tray {
@@ -342,11 +457,18 @@ mod imp {
         pub fn spawn() -> Result<Self> {
             let (tx, rx) = channel();
             let (ready_tx, ready_rx) = channel();
+            let display = Arc::new(Mutex::new(Display {
+                visible: false,
+                transition: Transition::new(false, Instant::now()),
+                frames: None, last_frame: 0,
+            }));
+            let pump_display = Arc::clone(&display);
 
             let pump = thread::Builder::new()
                 .name("mtui-tray".to_string())
                 .spawn(move || {
                     SENDER.with_borrow_mut(|slot| *slot = Some(tx));
+                    DISPLAY.with_borrow_mut(|slot| *slot = Some(pump_display));
                     let hwnd = unsafe { create_window() };
                     // Reported before the loop starts either way: a failure here
                     // has to reach the caller, not hang it.
@@ -355,6 +477,7 @@ mod imp {
                         return;
                     }
                     unsafe { pump_messages() };
+                    DISPLAY.with_borrow_mut(|slot| *slot = None);
                 })
                 .context("failed to spawn the tray thread")?;
 
@@ -370,26 +493,51 @@ mod imp {
                 rx,
                 pump: Some(pump),
                 visible: false,
+                display,
             })
         }
 
         /// Puts the icon in the notification area, or updates the tooltip of one
-        /// already there. `tip` is what hovering the icon says.
-        pub fn show(&mut self, tip: &str, theme: IconTheme) -> Result<()> {
+        /// already there. `playing` selects the raised or resting artwork;
+        /// `tip` is what hovering the icon says.
+        pub fn show(&mut self, tip: &str, playing: bool) -> Result<()> {
+            let mut display = self.display.lock().map_err(|_| anyhow!("tray display lock poisoned"))?;
+            let now = Instant::now();
+            let retargeted = if !self.visible {
+                display.transition = Transition::new(playing, now);
+                true
+            } else { display.transition.retarget(playing, now) };
+            let width = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(1);
+            let height = unsafe { GetSystemMetrics(SM_CYSMICON) }.max(1);
+            if display.frames.is_none() || display.frames.as_ref().is_some_and(|frames| {
+                frames.width != width || frames.height != height
+            }) {
+                display.frames = Some(StripFrames::new(width, height)?);
+            }
+            let icon = display.icon(now);
             let message = if self.visible { NIM_MODIFY } else { NIM_ADD };
             let announce = !self.visible && !ANNOUNCED.swap(true, Ordering::Relaxed);
-            if unsafe { Shell_NotifyIconW(message, &self.icon_data(tip, announce, theme)) } == 0 {
+            if unsafe { Shell_NotifyIconW(message, &self.icon_data(tip, announce, icon)) }
+                == 0
+            {
                 // Explorer drops all icons when its notification area restarts.
                 // A failed modify is therefore retried as a fresh add.
                 if !self.visible
-                    || unsafe { Shell_NotifyIconW(NIM_ADD, &self.icon_data(tip, false, theme)) }
+                    || unsafe { Shell_NotifyIconW(NIM_ADD, &self.icon_data(tip, false, icon)) }
                         == 0
                 {
                     self.visible = false;
+                    display.visible = false;
                     return Err(anyhow!("the notification area refused the icon"));
                 }
             }
             self.visible = true;
+            display.visible = true;
+            display.last_frame = display.frame(now);
+            drop(display);
+            if retargeted {
+                unsafe { PostMessageW(self.hwnd, WM_ANIMATE, 0, 0) };
+            }
             Ok(())
         }
 
@@ -397,10 +545,15 @@ mod imp {
         /// so that MTUI is in one place at a time rather than two.
         pub fn hide(&mut self) {
             if self.visible {
+                // Serialize removal with the timer so a late frame cannot
+                // update an icon after the terminal has hidden it.
+                let mut display = self.display.lock().unwrap_or_else(|err| err.into_inner());
+                display.visible = false;
                 unsafe {
-                    Shell_NotifyIconW(NIM_DELETE, &self.icon_data("", false, IconTheme::Signal))
+                    Shell_NotifyIconW(NIM_DELETE, &icon_descriptor(self.hwnd, 0))
                 };
                 self.visible = false;
+                unsafe { PostMessageW(self.hwnd, WM_ANIMATE, 0, 0) };
             }
         }
 
@@ -413,24 +566,14 @@ mod imp {
             self.rx.recv_timeout(timeout).ok()
         }
 
-        fn icon_data(&self, tip: &str, announce: bool, theme: IconTheme) -> NotifyIconDataW {
-            let mut data = NotifyIconDataW {
-                cb_size: size_of::<NotifyIconDataW>() as u32,
-                hwnd: self.hwnd,
-                id: 1,
-                flags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
-                callback_message: WM_TRAY,
-                icon: app_icon(theme),
-                tip: [0; 128],
-                state: 0,
-                state_mask: 0,
-                info: [0; 256],
-                version: 0,
-                info_title: [0; 64],
-                info_flags: if announce { NIIF_INFO } else { 0 },
-                guid: [0; 16],
-                balloon_icon: 0,
-            };
+        fn icon_data(
+            &self,
+            tip: &str,
+            announce: bool,
+            icon: Handle,
+        ) -> NotifyIconDataW {
+            let mut data = icon_descriptor(self.hwnd, icon);
+            data.flags |= NIF_MESSAGE | NIF_TIP;
             // One short of the array, so the text is always terminated however
             // long the title was.
             for (slot, ch) in data.tip.iter_mut().zip(tip.encode_utf16().take(127)) {
@@ -438,6 +581,7 @@ mod imp {
             }
             if announce {
                 data.flags |= NIF_INFO;
+                data.info_flags = NIIF_INFO;
                 copy_wide(&mut data.info_title, "MTUI is running in the tray");
                 copy_wide(
                     &mut data.info,
@@ -445,6 +589,15 @@ mod imp {
                 );
             }
             data
+        }
+    }
+
+    fn icon_descriptor(hwnd: Handle, icon: Handle) -> NotifyIconDataW {
+        NotifyIconDataW {
+            cb_size: size_of::<NotifyIconDataW>() as u32,
+            hwnd, id: 1, flags: NIF_ICON, callback_message: WM_TRAY, icon,
+            tip: [0; 128], state: 0, state_mask: 0, info: [0; 256], version: 0,
+            info_title: [0; 64], info_flags: 0, guid: [0; 16], balloon_icon: 0,
         }
     }
 
@@ -474,16 +627,11 @@ mod imp {
     /// resource holds a 16px drawing made for that slot, and naming the small-
     /// icon metrics is what picks it -- on a scaled display those metrics are
     /// larger, and the request lands on one of the bigger drawings instead.
-    fn app_icon(theme: IconTheme) -> Handle {
+    fn app_icon(playing: bool) -> Handle {
         let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
         let cx = unsafe { GetSystemMetrics(SM_CXSMICON) };
         let cy = unsafe { GetSystemMetrics(SM_CYSMICON) };
-        let id = match theme {
-            IconTheme::Signal => 1,
-            IconTheme::Wave => 2,
-            IconTheme::Mono => 3,
-            IconTheme::Orbit => 4,
-        };
+        let id = if playing { 1 } else { 2 };
         let resource = std::ptr::without_provenance(id);
         let icon = unsafe { LoadImageW(instance, resource, IMAGE_ICON, cx, cy, LR_SHARED) };
 
@@ -566,6 +714,35 @@ mod imp {
     mod tests {
         use super::*;
 
+        #[test]
+        fn tray_strip_frames_create_native_icons_at_taskbar_scales() {
+            for size in [16, 20, 24, 32, 40, 48] {
+                let frames = StripFrames::new(size, size).unwrap();
+                assert_eq!(frames.icons.len(), animation::STEPS + 1);
+                assert!(frames.icons.iter().all(|&icon| icon != 0));
+            }
+        }
+
+        #[test]
+        fn embedded_tray_icons_load_both_states_at_taskbar_scales() {
+            let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+            for id in 1..=2 {
+                for size in [16, 20, 24, 32, 40, 48] {
+                    let icon = unsafe {
+                        LoadImageW(
+                            instance,
+                            std::ptr::without_provenance(id),
+                            IMAGE_ICON,
+                            size,
+                            size,
+                            LR_SHARED,
+                        )
+                    };
+                    assert_ne!(icon, 0, "missing embedded icon {id} at {size}px");
+                }
+            }
+        }
+
         /// Puts a real icon in the real notification area for a moment.
         ///
         /// Ignored by default because it is visible on the desktop of whoever
@@ -577,23 +754,34 @@ mod imp {
         /// `cargo test tray_icon -- --ignored --nocapture`
         #[test]
         #[ignore]
-        fn tray_icon_appears_and_goes_away() {
+        fn tray_icon_animates_without_main_loop_updates_and_hides_during_a_transition() {
+            // Exercise the real tray without announcing a test player.
+            ANNOUNCED.store(true, Ordering::Relaxed);
             let mut tray = Tray::spawn().expect("the tray window should be creatable");
             tray.show(
                 "MTUI test -- this should vanish in a second",
-                IconTheme::Signal,
+                true,
             )
             .expect("the shell should accept the icon");
             assert!(tray.visible);
 
-            // A second show is the tooltip update the background loop does on
-            // every tick, and must be a modify rather than a second icon.
-            tray.show("MTUI test -- updated tooltip", IconTheme::Wave)
+            tray.show("MTUI test -- updated tooltip", false)
                 .expect("the shell should accept the update");
-
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            // With no calls from the main loop, the window timer must still
+            // show an intermediate shape and reach the quiet endpoint.
+            std::thread::sleep(Duration::from_millis(100));
+            let middle = tray.display.lock().unwrap().last_frame;
+            assert!(middle > 0 && middle < animation::STEPS, "frame {middle}");
+            std::thread::sleep(animation::DURATION);
+            assert_eq!(tray.display.lock().unwrap().last_frame, 0);
+            tray.show("MTUI test -- resume", true).unwrap();
+            std::thread::sleep(animation::DURATION + Duration::from_millis(50));
+            assert_eq!(tray.display.lock().unwrap().last_frame, animation::STEPS);
+            tray.show("MTUI test -- hide while collapsing", false).unwrap();
             tray.hide();
             assert!(!tray.visible);
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!tray.display.lock().unwrap().visible);
             // Dropping joins the pump thread, which only returns if the window
             // actually went away -- so a hang here is a real failure.
             drop(tray);
@@ -607,7 +795,6 @@ mod imp {
 
     use anyhow::{Result, anyhow};
 
-    use crate::config::IconTheme;
 
     // Only the Windows message pump constructs these variants; the portable
     // shape lets the rest of the event loop compile on unsupported platforms.
@@ -636,7 +823,7 @@ mod imp {
             ))
         }
 
-        pub fn show(&mut self, _tip: &str, _theme: IconTheme) -> Result<()> {
+        pub fn show(&mut self, _tip: &str, _playing: bool) -> Result<()> {
             unreachable!("no Tray can be constructed off Windows")
         }
 

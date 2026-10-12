@@ -3,14 +3,14 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::{App, MenuPage, Overlay, moved_cursor};
-use crate::config::{CoverStyle, IconTheme, ImageRenderer};
+use crate::config::{CoverStyle, ImageRenderer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Setting {
     Output,
+    PrecisionVolume,
     Cover,
     Renderer,
-    Icon,
     Discord,
     Tray,
     TrayClick,
@@ -20,9 +20,9 @@ pub enum Setting {
 impl Setting {
     pub const ALL: [Self; 8] = [
         Self::Output,
+        Self::PrecisionVolume,
         Self::Cover,
         Self::Renderer,
-        Self::Icon,
         Self::Discord,
         Self::Tray,
         Self::TrayClick,
@@ -38,8 +38,8 @@ impl Setting {
 
     pub fn section(self) -> &'static str {
         match self {
-            Self::Output => "Playback",
-            Self::Cover | Self::Renderer | Self::Icon => "Appearance",
+            Self::Output | Self::PrecisionVolume => "Playback",
+            Self::Cover | Self::Renderer => "Appearance",
             Self::Discord | Self::Tray | Self::TrayClick => "Integrations",
             Self::Updates => "App",
         }
@@ -48,12 +48,12 @@ impl Setting {
     pub fn label(self) -> &'static str {
         match self {
             Self::Output => "Audio output",
+            Self::PrecisionVolume => "Precision volume",
             Self::Cover => "Cover style",
             Self::Renderer => "Artwork display",
-            Self::Icon => "Tray icon",
             Self::Discord => "Discord presence",
             Self::Tray => "Keep tray icon visible",
-            Self::TrayClick => "Click tray icon to stop",
+            Self::TrayClick => "Click tray icon to pause / resume",
             Self::Updates => "Updates",
         }
     }
@@ -61,22 +61,22 @@ impl Setting {
     pub fn description(self) -> &'static str {
         match self {
             Self::Output => "System default follows the output selected in Windows.",
+            Self::PrecisionVolume => "Scroll over the current song's cover to change volume by 1% per wheel step.",
             Self::Cover => "Choose detailed artwork or a cover drawn with text.",
             Self::Renderer => "Automatic detects support; Kitty needs a compatible terminal.",
-            Self::Icon => "The icon shown in the Windows notification area.",
             Self::Discord => "Share your current song and playback state on Discord.",
             Self::Tray => "Keep tray controls available while the terminal is open.",
-            Self::TrayClick => "Left-click stops playback. Right-click and choose Show the player to open MTUI.",
+            Self::TrayClick => "Left-click pauses or resumes the same song. Right-click and choose Show the player to open MTUI.",
             Self::Updates => "Check for new versions and install them here.",
         }
     }
 
     pub fn is_toggle(self) -> bool {
-        matches!(self, Self::Discord | Self::Tray | Self::TrayClick)
+        matches!(self, Self::PrecisionVolume | Self::Discord | Self::Tray | Self::TrayClick)
     }
 
     pub fn enabled(self) -> bool {
-        cfg!(windows) || !matches!(self, Self::Tray | Self::TrayClick | Self::Icon | Self::Updates)
+        cfg!(windows) || !matches!(self, Self::Tray | Self::TrayClick | Self::Updates)
     }
 }
 
@@ -85,7 +85,6 @@ pub enum ChoiceValue {
     Output(Option<String>),
     Cover(CoverStyle),
     Renderer(ImageRenderer),
-    Icon(IconTheme),
 }
 
 #[derive(Debug, Clone)]
@@ -209,14 +208,14 @@ impl App {
                 enabled: setting.enabled(),
                 value: match setting {
                     Setting::Output => self.output_device_label().to_string(),
+                    Setting::PrecisionVolume => if self.precision_volume { "On" } else { "Off" }.to_string(),
                     Setting::Cover => cover_label(self.cover_style).to_string(),
                     Setting::Renderer => renderer_label(self.image_renderer).to_string(),
-                    Setting::Icon => self.icon_theme.label().to_string(),
                     Setting::Discord => {
                         if self.presence_enabled() { "On" } else { "Off" }.to_string()
                     }
                     Setting::Tray => if self.start_in_tray { "On" } else { "Off" }.to_string(),
-                    Setting::TrayClick => if self.tray_click_stops { "On" } else { "Off" }.to_string(),
+                    Setting::TrayClick => if self.tray_click_pauses { "On" } else { "Off" }.to_string(),
                     Setting::Updates => self.updater.label(),
                 },
             })
@@ -252,16 +251,7 @@ impl App {
                 )
             })
             .collect(),
-            Setting::Icon => [
-                IconTheme::Signal,
-                IconTheme::Wave,
-                IconTheme::Orbit,
-                IconTheme::Mono,
-            ]
-            .into_iter()
-            .map(|value| (value.label().to_string(), ChoiceValue::Icon(value)))
-            .collect(),
-            Setting::Discord | Setting::Tray | Setting::TrayClick | Setting::Updates => Vec::new(),
+            Setting::PrecisionVolume | Setting::Discord | Setting::Tray | Setting::TrayClick | Setting::Updates => Vec::new(),
         };
         values
             .into_iter()
@@ -270,7 +260,6 @@ impl App {
                     ChoiceValue::Output(output) => *output == self.output_device,
                     ChoiceValue::Cover(style) => *style == self.cover_style,
                     ChoiceValue::Renderer(renderer) => *renderer == self.image_renderer,
-                    ChoiceValue::Icon(icon) => *icon == self.icon_theme,
                 };
                 Choice {
                     label,
@@ -328,7 +317,6 @@ impl App {
                     ChoiceValue::Output(output) => self.set_audio_output(output),
                     ChoiceValue::Cover(style) => self.set_cover_style(style),
                     ChoiceValue::Renderer(renderer) => self.set_image_renderer(renderer),
-                    ChoiceValue::Icon(icon) => self.set_icon_theme(icon),
                 }
                 self.preferences.notice =
                     Some((self.status.clone(), self.status.starts_with("could not")));
@@ -340,12 +328,12 @@ impl App {
     fn change_setting(&mut self, setting: Setting, forward: bool) {
         match setting {
             Setting::Output => self.cycle_audio_output(forward),
+            Setting::PrecisionVolume => self.toggle_precision_volume(),
             Setting::Cover => self.cycle_cover_style(forward),
             Setting::Renderer => self.cycle_image_renderer(forward),
-            Setting::Icon => self.cycle_icon_theme(forward),
             Setting::Discord => self.toggle_presence(),
             Setting::Tray => self.toggle_start_in_tray(),
-            Setting::TrayClick => self.toggle_tray_click_stops(),
+            Setting::TrayClick => self.toggle_tray_click_pauses(),
             Setting::Updates => return,
         }
         self.preferences.notice = Some((self.status.clone(), self.status.starts_with("could not")));

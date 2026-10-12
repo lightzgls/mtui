@@ -12,7 +12,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::art::ArtCache;
-use crate::config::{self, CoverStyle, IconTheme, ImageRenderer};
+use crate::config::{self, CoverStyle, ImageRenderer};
 use crate::discord::{Activity, Clock, Presence};
 use crate::graphics::Graphics;
 use crate::player::{Command, OutputDevice, PlayState, Player, PlayerEvent, Snapshot};
@@ -31,6 +31,9 @@ use crate::tray::TrayCommand;
 pub mod preferences;
 pub mod actions;
 pub(crate) mod home;
+pub(crate) mod library;
+#[cfg(test)]
+mod lyrics_tests;
 
 /// How much of the window the cover is allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -128,6 +131,7 @@ pub struct PlannedImage {
 const PREFETCH_IDLE: Duration = Duration::from_millis(400);
 
 const VOLUME_STEP: f32 = 0.05;
+const PRECISION_VOLUME_STEP: f32 = 0.01;
 const DEFAULT_UNMUTED_VOLUME: f32 = 1.0;
 
 /// Exact pages retained for Back. A cap keeps nested artist browsing bounded
@@ -204,6 +208,7 @@ pub enum Mode {
 /// artist and album columns for something looked at once a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
+    Library,
     /// The landing page: YouTube Music's home feed as shelves of cards. What
     /// the program opens on, because a music player that opens on an empty list
     /// asks the user to think of something before it will do anything.
@@ -222,6 +227,16 @@ pub enum View {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseAction {
     GoHome,
+    OpenLibrary,
+    LibraryCategory(crate::source::library::browse::Category),
+    OpenLibraryItem(usize),
+    SelectLibraryItem(usize),
+    PageLibrary { offset: usize, visible: usize },
+    LibrarySort,
+    MoreLibrary,
+    RefreshLibrary,
+    OpenLikedMusic,
+    LibrarySignIn,
     OpenPlayer,
     OpenAppMenu,
     EditSearch,
@@ -257,6 +272,7 @@ pub enum MouseAction {
     OpenTab(Tab),
     ToggleLyricsExpanded,
     ToggleLyricsFollow,
+    ToggleLyricsRomaji,
     OpenPageRow(usize),
     SelectPageRow(usize),
     /// Toggle the current transport from the persistent player strip.
@@ -270,6 +286,8 @@ pub enum MouseAction {
     /// Set ordinary output volume from the persistent player's volume bar.
     SetVolume(u16),
     AdjustVolume(bool),
+    /// One-percent wheel adjustment over the current song's artwork.
+    AdjustPrecisionVolume(bool),
     /// Toggle silence while retaining the user's last audible volume.
     ToggleMute,
     /// Open the actions for the current page or selection.
@@ -468,6 +486,7 @@ struct TrackPage {
 
 #[derive(Debug, Clone)]
 enum HistoryEntry {
+    Library { cursor: library::Cursor, status: String },
     Home {
         status: String,
     },
@@ -485,6 +504,7 @@ enum HistoryEntry {
 impl HistoryEntry {
     fn view(&self) -> View {
         match self {
+            Self::Library { .. } => View::Library,
             Self::Home { .. } => View::Home,
             Self::Tracks(_) => View::Tracks,
             Self::Artist { .. } => View::Artist,
@@ -586,6 +606,8 @@ pub struct NowPlaying {
     /// An explicit reading view; ordinary playback keeps the large artwork.
     pub lyrics_expanded: bool,
     pub lyrics: Panel<Lyrics>,
+    pub romaji: Panel<Lyrics>,
+    pub lyrics_romaji: bool,
     pub comments: Panel<Comments>,
     pub related: Panel<Vec<Shelf>>,
     /// Browse ids from the watch response, held until the tab they belong to is
@@ -633,6 +655,8 @@ impl NowPlaying {
             follow_lyrics: true,
             lyrics_expanded: false,
             lyrics: Panel::Idle,
+            romaji: Panel::Idle,
+            lyrics_romaji: false,
             comments: Panel::Idle,
             related: Panel::Idle,
             lyrics_id: None,
@@ -653,6 +677,11 @@ impl NowPlaying {
             self.album.as_deref(),
             self.duration,
         )
+    }
+
+    /// The chosen representation has its own words, timing, and source credit.
+    pub fn shown_lyrics(&self) -> &Panel<Lyrics> {
+        if self.lyrics_romaji { &self.romaji } else { &self.lyrics }
     }
 
     /// One line under the title, as YouTube Music writes it: "Tame Impala •
@@ -1092,6 +1121,12 @@ impl MenuItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuAction {
     GoHome,
+    OpenLibrary,
+    OpenLibrarySelection,
+    OpenLikedMusic,
+    SortLibrary,
+    MoreLibrary,
+    RefreshLibrary,
     BeginSearch,
     OpenPlayer,
     OpenAccount,
@@ -1198,10 +1233,10 @@ pub struct App {
     pub wants_foreground: bool,
     /// Whether the notification-area icon stays available while the UI is open.
     pub start_in_tray: bool,
-    /// Whether a left-click stops playback instead of opening the terminal.
-    pub tray_click_stops: bool,
+    /// Whether a left-click toggles pause instead of opening the terminal.
+    pub tray_click_pauses: bool,
+    pub precision_volume: bool,
     /// Artwork selected for runtime-owned windows and the notification area.
-    pub icon_theme: IconTheme,
     /// Thumbnail for the track being played, once it has arrived. Exactly one
     /// is ever held: covers are decoration, not a cache worth growing.
     pub cover: Option<Cover>,
@@ -1255,6 +1290,7 @@ pub struct App {
 
     /// Which list the main pane is showing.
     pub view: View,
+    pub library: library::State,
     /// The landing page, once it has arrived. Empty until then, and empty
     /// forever if YouTube would not answer -- both of which the pane says.
     pub home: Vec<Shelf>,
@@ -1583,8 +1619,8 @@ impl App {
             wants_background: false,
             wants_foreground: false,
             start_in_tray: settings.start_in_tray,
-            tray_click_stops: settings.tray_click_stops,
-            icon_theme: settings.icon_theme,
+            tray_click_pauses: settings.tray_click_pauses,
+            precision_volume: settings.precision_volume,
             cover: None,
             cover_id: None,
             graphics,
@@ -1605,6 +1641,7 @@ impl App {
             pending: None,
             pending_seek: None,
             view: View::Home,
+            library: library::State::default(),
             home: Vec::new(),
             home_shelf: 0,
             home_card: 0,
@@ -1663,6 +1700,7 @@ impl App {
     /// What the list pane is showing, for its frame title.
     pub fn list_title(&self) -> String {
         match (self.view, &self.browsing) {
+            (View::Library, _) => " library ".into(),
             (View::Home, _) => " home ".to_string(),
             (View::Playing, _) => " now playing ".to_string(),
             (View::Artist, _) => self
@@ -1712,6 +1750,7 @@ impl App {
 
     fn current_page(&self) -> Option<HistoryEntry> {
         match self.view {
+            View::Library => Some(HistoryEntry::Library { cursor: self.library.cursor(), status: self.status.clone() }),
             View::Home => Some(HistoryEntry::Home {
                 status: self.status.clone(),
             }),
@@ -1747,6 +1786,7 @@ impl App {
         let Some(page) = self.current_page() else {
             return;
         };
+        if self.view == View::Library { self.library.suspend(); }
         self.push_page(page);
     }
 
@@ -1758,6 +1798,12 @@ impl App {
         self.cancel_page_request();
         self.mode = Mode::Browse;
         match page {
+            HistoryEntry::Library { cursor, status } => {
+                self.library.restore(cursor);
+                self.view = View::Library;
+                self.status = status;
+                if self.library.connected && !self.library.collection().loaded { self.request_library(false); }
+            }
             HistoryEntry::Home { status } => {
                 self.status = status;
                 self.view = View::Home;
@@ -1835,6 +1881,7 @@ impl App {
     }
 
     fn cancel_page_request(&mut self) {
+        self.library.suspend();
         if self.pending_page_request.take().is_some() {
             self.busy = false;
         }
@@ -1864,10 +1911,6 @@ impl App {
 
     pub fn presence_enabled(&self) -> bool {
         self.presence.enabled()
-    }
-
-    pub fn icon_theme(&self) -> IconTheme {
-        self.icon_theme
     }
 
     pub fn cover_style(&self) -> CoverStyle {
@@ -1923,6 +1966,7 @@ impl App {
 
     fn page_action_items(&self) -> Vec<MenuItem> {
         match self.view {
+            View::Library => self.library_action_items(),
             View::Home => {
                 let selected = self.home_card();
                 let (label, enabled) = match selected {
@@ -2140,7 +2184,7 @@ impl App {
                     MenuAction::OpenPageSelection,
                 ));
             }
-            Tab::Lyrics if matches!(&now.lyrics, Panel::Ready(lyrics) if !lyrics.timed.is_empty()) =>
+            Tab::Lyrics if matches!(now.shown_lyrics(), Panel::Ready(lyrics) if !lyrics.timed.is_empty()) =>
             {
                 items.push(MenuItem::action(
                     "Follow current lyric",
@@ -2259,7 +2303,7 @@ impl App {
     /// that lands from cache is over in milliseconds, and waiting out the idle
     /// tick to notice would be most of the latency it has left.
     pub fn awaiting(&self) -> bool {
-        self.busy || self.pending_page_request.is_some() || self.pending.is_some()
+        self.busy || self.pending_page_request.is_some() || self.pending.is_some() || (self.view == View::Library && self.library.loading())
     }
 
     /// The cover to paint as pixels, if what the renderer planned is not
@@ -2362,8 +2406,8 @@ impl App {
                     self.refresh_output_devices();
                     let settings = config::Settings {
                         start_in_tray: self.start_in_tray,
-                        tray_click_stops: self.tray_click_stops,
-                        icon_theme: self.icon_theme,
+                        tray_click_pauses: self.tray_click_pauses,
+                        precision_volume: self.precision_volume,
                         cover_style: self.cover_style,
                         image_renderer: self.image_renderer,
                         volume: self.snapshot().volume,
@@ -2428,6 +2472,7 @@ impl App {
 
     fn apply(&mut self, response: Response) {
         let session_generation = match &response {
+            Response::Library { generation, .. } => Some(*generation),
             Response::CookiesImported { generation, .. }
             | Response::MusicSignInFailed { generation, .. }
             | Response::SessionRenewed { generation, .. } => Some(*generation),
@@ -2478,6 +2523,7 @@ impl App {
         if !matches!(
             response,
             Response::Rating { .. }
+                | Response::Library { .. }
                 | Response::Playlists { .. }
                 | Response::PlaylistSaved { .. }
                 | Response::Cover { .. }
@@ -2491,6 +2537,7 @@ impl App {
                 | Response::Watch { .. }
                 | Response::MoreQueue { .. }
                 | Response::Lyrics { .. }
+                | Response::Romaji { .. }
                 | Response::Related { .. }
                 | Response::Comments { .. }
                 | Response::Home { .. }
@@ -2503,6 +2550,7 @@ impl App {
         }
 
         match response {
+            Response::Library { request_id, generation, category, page } => self.apply_library(request_id, generation, category, *page),
             Response::Rating { request_id, video_id, changed, result } => self.apply_rating(request_id, &video_id, changed, result),
             Response::Playlists { request_id, choices } => self.apply_playlists(request_id, choices),
             Response::PlaylistSaved { request_id, result } => self.apply_playlist_saved(request_id, result),
@@ -2584,6 +2632,9 @@ impl App {
                 let _ = self.source.send(Request::RetryReports);
                 self.request_rating();
                 self.request_home();
+                let in_library = self.view == View::Library;
+                self.reset_library();
+                if in_library { self.open_library(); }
             }
             Response::SessionRenewed { result, .. } => {
                 self.music_signing_in = false;
@@ -2717,6 +2768,11 @@ impl App {
                     now.lyrics = panel(lyrics);
                 }
             }
+            Response::Romaji { video_id, lyrics } => {
+                if let Some(now) = self.for_track(&video_id) {
+                    now.romaji = panel(lyrics);
+                }
+            }
             Response::Related { video_id, related } => {
                 if let Some(now) = self.for_track(&video_id) {
                     now.related = panel(related);
@@ -2743,9 +2799,12 @@ impl App {
                 }
             }
             Response::Art { key, art } => self.art.store(key, art),
-            Response::Cover { id, art } => {
+            Response::Cover { id, art, artwork_url } => {
                 // Stale unless it is still the track we asked about.
                 if self.cover_id.as_deref() == Some(id.as_str()) {
+                    if let Some(now) = self.for_track(&id) {
+                        now.artwork_url = artwork_url;
+                    }
                     self.cover = art;
                 }
             }
@@ -2900,12 +2959,14 @@ impl App {
                 if now.lyrics_query().is_none() {
                     now.lyrics = Panel::Empty(why);
                 }
+                self.request_cover(video_id.to_string(), None);
                 return;
             }
         };
 
         now.lyrics_id = watch.lyrics_id;
         now.related_id = watch.related_id;
+        let artwork_url = watch.artwork_url.clone();
         now.artwork_url = watch.artwork_url;
         if let Some((title, endpoint)) = watch.album_route {
             now.album = Some(title.clone());
@@ -2978,6 +3039,7 @@ impl App {
         // here as well as on every play is what covers it: `play_track` runs
         // before this response and saw a queue that was still empty.
         self.top_up_queue();
+        self.request_cover(video_id.to_string(), artwork_url);
     }
 
     /// Asks for the next page of the queue, if one is wanted.
@@ -3167,6 +3229,7 @@ impl App {
         page.tab = tab;
         page.repeat = repeat;
         page.lyrics_expanded = self.now.as_ref().is_some_and(|now| now.lyrics_expanded);
+        page.lyrics_romaji = self.now.as_ref().is_some_and(|now| now.lyrics_romaji);
         // The queue survives moving *within* it -- that is what makes advancing
         // through a radio keep one stable "Up next" rather than reshuffling on
         // every track. Playing something from outside it drops it instead of
@@ -3229,7 +3292,10 @@ impl App {
         // Both behind the resolve, which is the order that matters: it is the
         // one producing audio, and these are decoration around it.
         self.request_rating();
-        self.request_cover(track.id.clone());
+        // Wait for Music metadata before choosing the cover source. Clear the
+        // previous picture now so a skipped track cannot keep its artwork.
+        self.cover = None;
+        self.cover_id = None;
         let _ = self.source.send(Request::Watch { video_id: track.id });
         // A tab the user is already on has to be fetched now; the switch that
         // would otherwise have done it is not going to happen again.
@@ -3271,6 +3337,16 @@ impl App {
                     query: now.lyrics_query(),
                 }
             }
+            Tab::Lyrics if now.lyrics_romaji && now.romaji.is_idle() && !matches!(now.lyrics, Panel::Loading) => {
+                if !now.watched { return; }
+                let Some(query) = now.lyrics_query() else {
+                    now.romaji = Panel::Empty("romaji needs a song title and artist".into());
+                    return;
+                };
+                let original = match &now.lyrics { Panel::Ready(lyrics) => Some(lyrics.clone()), _ => None };
+                now.romaji = Panel::Loading;
+                Request::Romaji { video_id, query, original }
+            }
             Tab::Related if now.related.is_idle() => match now.related_id.clone() {
                 Some(browse_id) => {
                     now.related = Panel::Loading;
@@ -3289,7 +3365,11 @@ impl App {
             _ => return,
         };
 
+        let romaji_request = matches!(request, Request::Romaji { .. });
         if self.source.send(request).is_err() {
+            if romaji_request && let Some(now) = self.now.as_mut() {
+                now.romaji = Panel::Empty("romaji service is unavailable; toggle back to retry".into());
+            }
             self.status = "source worker is not running".to_string();
         }
     }
@@ -3301,7 +3381,8 @@ impl App {
     /// tab in that window would otherwise leave it idle forever.
     pub fn tick_page(&mut self) {
         let waiting = self.now.as_ref().is_some_and(|now| match now.tab {
-            Tab::Lyrics => now.lyrics.is_idle() && now.watched,
+            Tab::Lyrics => now.watched && (now.lyrics.is_idle()
+                || (now.lyrics_romaji && now.romaji.is_idle() && !matches!(now.lyrics, Panel::Loading))),
             Tab::Related => now.related.is_idle() && now.related_id.is_some(),
             _ => false,
         });
@@ -3449,8 +3530,8 @@ impl App {
         let enabled = !self.start_in_tray;
         let settings = config::Settings {
             start_in_tray: enabled,
-            tray_click_stops: self.tray_click_stops,
-            icon_theme: self.icon_theme,
+            tray_click_pauses: self.tray_click_pauses,
+            precision_volume: self.precision_volume,
             cover_style: self.cover_style,
             image_renderer: self.image_renderer,
             volume: self.snapshot().volume,
@@ -3472,16 +3553,16 @@ impl App {
         }
     }
 
-    fn toggle_tray_click_stops(&mut self) {
+    fn toggle_tray_click_pauses(&mut self) {
         if !cfg!(windows) {
             self.status = "tray click controls are only available on Windows".to_string();
             return;
         }
-        let enabled = !self.tray_click_stops;
+        let enabled = !self.tray_click_pauses;
         let settings = config::Settings {
             start_in_tray: self.start_in_tray,
-            tray_click_stops: enabled,
-            icon_theme: self.icon_theme,
+            tray_click_pauses: enabled,
+            precision_volume: self.precision_volume,
             cover_style: self.cover_style,
             image_renderer: self.image_renderer,
             volume: self.snapshot().volume,
@@ -3489,9 +3570,9 @@ impl App {
         };
         match settings.save() {
             Ok(()) => {
-                self.tray_click_stops = enabled;
+                self.tray_click_pauses = enabled;
                 self.status = if enabled {
-                    "tray clicks stop playback; right-click to show the player".to_string()
+                    "tray clicks pause or resume; right-click to show the player".to_string()
                 } else {
                     "tray clicks show the player".to_string()
                 };
@@ -3503,29 +3584,23 @@ impl App {
         }
     }
 
-    fn cycle_icon_theme(&mut self, forward: bool) {
-        let theme = if forward {
-            self.icon_theme.next()
-        } else {
-            self.icon_theme.previous()
-        };
-        self.set_icon_theme(theme);
-    }
-
-    fn set_icon_theme(&mut self, theme: IconTheme) {
+    fn toggle_precision_volume(&mut self) {
+        let enabled = !self.precision_volume;
         let settings = config::Settings {
             start_in_tray: self.start_in_tray,
-            tray_click_stops: self.tray_click_stops,
-            icon_theme: theme,
+            tray_click_pauses: self.tray_click_pauses,
+            precision_volume: enabled,
             cover_style: self.cover_style,
             image_renderer: self.image_renderer,
-            volume: self.snapshot().volume,
+            volume: self.volume_save.map_or_else(|| self.snapshot().volume, |(_, volume)| volume),
             output_device: self.output_device.clone(),
         };
         match settings.save() {
             Ok(()) => {
-                self.icon_theme = theme;
-                self.status = format!("app icon set to {}", theme.label());
+                self.precision_volume = enabled;
+                self.status = if enabled {
+                    "precision volume on: scroll over the cover to adjust by 1%".into()
+                } else { "precision volume off".into() };
             }
             Err(err) => {
                 crate::diagnostics::error("config", &format!("could not save settings: {err:#}"));
@@ -3546,8 +3621,8 @@ impl App {
     fn set_cover_style(&mut self, style: CoverStyle) {
         let settings = config::Settings {
             start_in_tray: self.start_in_tray,
-            tray_click_stops: self.tray_click_stops,
-            icon_theme: self.icon_theme,
+            tray_click_pauses: self.tray_click_pauses,
+            precision_volume: self.precision_volume,
             cover_style: style,
             image_renderer: self.image_renderer,
             volume: self.snapshot().volume,
@@ -3578,8 +3653,8 @@ impl App {
     fn set_image_renderer(&mut self, renderer: ImageRenderer) {
         let settings = config::Settings {
             start_in_tray: self.start_in_tray,
-            tray_click_stops: self.tray_click_stops,
-            icon_theme: self.icon_theme,
+            tray_click_pauses: self.tray_click_pauses,
+            precision_volume: self.precision_volume,
             cover_style: self.cover_style,
             image_renderer: renderer,
             volume: self.snapshot().volume,
@@ -3981,6 +4056,7 @@ impl App {
     /// row in the results.
     fn selected_id(&self) -> Option<String> {
         match self.view {
+            View::Library => self.library.selected().and_then(|item| item.available.then_some(item)).and_then(|item| item.track.as_ref()).map(|track| track.id.clone()),
             View::Tracks => Some(self.selected_result_track()?.id.clone()),
             View::Home => match &self.home_card()?.target {
                 Target::Play { video_id } => Some(video_id.clone()),
@@ -4213,6 +4289,12 @@ impl App {
             MenuAction::GoHome => {
                 self.go_home();
             }
+            MenuAction::OpenLibrary => self.open_library(),
+            MenuAction::OpenLibrarySelection => self.open_library_item(self.library.collection().selected),
+            MenuAction::OpenLikedMusic => self.open_liked_music(),
+            MenuAction::SortLibrary => self.cycle_library_sort(),
+            MenuAction::MoreLibrary => self.request_library(true),
+            MenuAction::RefreshLibrary => self.refresh_library(),
             MenuAction::BeginSearch => self.begin_search(),
             MenuAction::OpenPlayer => self.open_player(),
             MenuAction::OpenAccount => self.open_menu(MenuPage::Account),
@@ -4316,9 +4398,15 @@ impl App {
             return Ok(());
         }
 
+        if self.mode == Mode::Browse && is_bare_character(key, 'L') {
+            self.open_library();
+            return Ok(());
+        }
+
         match self.mode {
             Mode::Editing => self.handle_editing_key(key),
             Mode::Browse => match self.view {
+                View::Library => self.handle_library_key(key),
                 View::Home => self.handle_home_key(key),
                 View::Tracks => self.handle_browse_key(key),
                 View::Artist => self.handle_artist_key(key),
@@ -4375,6 +4463,23 @@ impl App {
         }
         match action {
             MouseAction::GoHome => self.go_home(),
+            MouseAction::OpenLibrary => self.open_library(),
+            MouseAction::LibraryCategory(category) if self.view == View::Library => self.change_library_category(category),
+            MouseAction::OpenLibraryItem(index) if self.view == View::Library => self.open_library_item(index),
+            MouseAction::SelectLibraryItem(index) if self.view == View::Library => {
+                if index < self.library.collection().items.len() { self.library.collection_mut().selected = index; }
+            }
+            MouseAction::PageLibrary { offset, visible } if self.view == View::Library && visible > 0 => {
+                let collection = self.library.collection_mut();
+                collection.offset = offset.min(collection.items.len().saturating_sub(1));
+                collection.selected = collection.offset;
+                if offset + visible >= collection.items.len() { self.request_library(true); }
+            }
+            MouseAction::LibrarySort if self.view == View::Library => self.cycle_library_sort(),
+            MouseAction::MoreLibrary if self.view == View::Library => self.request_library(true),
+            MouseAction::RefreshLibrary if self.view == View::Library => self.refresh_library(),
+            MouseAction::OpenLikedMusic if self.view == View::Library => self.open_liked_music(),
+            MouseAction::LibrarySignIn if self.view == View::Library => self.begin_music_sign_in(false),
             MouseAction::OpenPlayer => self.open_player(),
             MouseAction::OpenAppMenu => self.toggle_root_menu(),
             MouseAction::OpenPageActions if self.mode == Mode::Browse => {
@@ -4513,6 +4618,9 @@ impl App {
             MouseAction::ToggleLyricsFollow if self.view == View::Playing => {
                 self.toggle_lyrics_follow();
             }
+            MouseAction::ToggleLyricsRomaji if self.view == View::Playing => {
+                self.toggle_lyrics_romaji();
+            }
             MouseAction::OpenPageRow(index) if self.view == View::Playing => {
                 if let Some(now) = self.now.as_mut() {
                     *now.cursor_mut() = index;
@@ -4532,6 +4640,9 @@ impl App {
                 self.set_volume((pointer_fraction(position) as f32 / VOLUME_STEP).round() * VOLUME_STEP)
             }
             MouseAction::AdjustVolume(up) => self.nudge_volume(if up { VOLUME_STEP } else { -VOLUME_STEP }),
+            MouseAction::AdjustPrecisionVolume(up) if self.precision_volume => {
+                self.nudge_volume(if up { PRECISION_VOLUME_STEP } else { -PRECISION_VOLUME_STEP });
+            }
             MouseAction::ToggleMute => self.toggle_mute(),
             _ => {}
         }
@@ -4840,6 +4951,7 @@ impl App {
 
     fn context_artist(&self) -> Option<ArtistRef> {
         match self.view {
+            View::Library => card_artist(&self.library.selected()?.card),
             View::Home => card_artist(self.home_card()?),
             View::Tracks => self.search_items.get(self.selected)
                 .filter(|_| self.browsing.is_none()).and_then(|item| card_artist(&item.card))
@@ -5044,6 +5156,7 @@ impl App {
             KeyCode::Char('z') if current_tab == Some(Tab::UpNext) => self.shuffle_upcoming_queue(),
             KeyCode::Char('e') if current_tab == Some(Tab::Lyrics) => self.toggle_lyrics_expanded(),
             KeyCode::Char('f') if current_tab == Some(Tab::Lyrics) => self.toggle_lyrics_follow(),
+            KeyCode::Char('t') if current_tab == Some(Tab::Lyrics) => self.toggle_lyrics_romaji(),
             KeyCode::Char('R') => self.cycle_repeat(),
             KeyCode::Char('r') if self.playback_failed(&self.snapshot()) => {
                 self.retry_current_track()
@@ -5094,10 +5207,19 @@ impl App {
 
     fn toggle_lyrics_follow(&mut self) {
         if let Some(now) = self.now.as_mut().filter(|now| now.tab == Tab::Lyrics)
-            && matches!(&now.lyrics, Panel::Ready(lyrics) if !lyrics.timed.is_empty())
+            && matches!(now.shown_lyrics(), Panel::Ready(lyrics) if !lyrics.timed.is_empty())
         {
             now.follow_lyrics = !now.follow_lyrics;
         }
+    }
+
+    fn toggle_lyrics_romaji(&mut self) {
+        let Some(now) = self.now.as_mut().filter(|now| now.tab == Tab::Lyrics) else { return };
+        now.lyrics_romaji = !now.lyrics_romaji;
+        if now.lyrics_romaji && matches!(now.romaji, Panel::Empty(_)) { now.romaji = Panel::Idle; }
+        now.cursor[Tab::Lyrics.index()] = 0;
+        now.follow_lyrics = true;
+        self.request_tab();
     }
 
     /// Moves the cursor of the open tab, when there is a page to move it on.
@@ -5179,6 +5301,7 @@ impl App {
             self.search_origin = self.view;
             self.search_page = self.current_page();
         }
+        if self.view == View::Library { self.library.suspend(); }
         self.view = View::Tracks;
         self.mode = Mode::Editing;
         self.status = "type to search, Enter to run".to_string();
@@ -5411,10 +5534,9 @@ impl App {
     /// the reverse order would put a picture ahead of the audio the user asked
     /// for. A send failure needs no message -- the resolve just ahead of it will
     /// have reported the same dead worker.
-    fn request_cover(&mut self, id: String) {
-        self.cover = None;
+    fn request_cover(&mut self, id: String, artwork_url: Option<String>) {
         self.cover_id = Some(id.clone());
-        let _ = self.source.send(Request::Cover { id });
+        let _ = self.source.send(Request::Cover { id, artwork_url });
     }
 
     /// Returns to the player page, which the music kept playing behind.
@@ -5479,7 +5601,7 @@ impl App {
     /// here is what someone with no window in front of them can still want.
     pub fn handle_tray(&mut self, command: TrayCommand) {
         match command {
-            TrayCommand::Click if self.tray_click_stops => self.stop(),
+            TrayCommand::Click if self.tray_click_pauses => self.toggle_pause(),
             TrayCommand::Click => self.wants_foreground = true,
             TrayCommand::Show => self.wants_foreground = true,
             TrayCommand::TogglePause => self.toggle_pause(),
@@ -5493,6 +5615,16 @@ impl App {
         self.should_quit |= end_task;
         self.wants_background = !self.should_quit;
         if self.should_quit { self.wants_foreground = false; }
+    }
+
+    /// The raised strips only appear while the current track is playing.
+    /// `now` clears synchronously on Stop, before the audio worker catches up.
+    pub fn tray_playing(&self) -> bool {
+        let snapshot = self.snapshot();
+        self.now.is_some()
+            && self.pending.is_none()
+            && snapshot.state == PlayState::Playing
+            && snapshot.error.is_none()
     }
 
     /// What hovering the icon says.
@@ -5548,6 +5680,7 @@ impl App {
     }
 
     fn log_out_music(&mut self) {
+        self.reset_library();
         self.clear_account_actions();
         self.music_signing_in = false;
         self.automatic_sign_in = false;
@@ -5584,11 +5717,12 @@ impl App {
 
     fn nudge_volume(&mut self, delta: f32) {
         let current = self.volume_save.map_or_else(|| self.snapshot().volume, |(_, volume)| volume);
-        self.set_volume(((current / VOLUME_STEP).round() * VOLUME_STEP + delta).clamp(0.0, 2.0));
+        let step = delta.abs();
+        self.set_volume(((current / step).round() * step + delta).clamp(0.0, 1.0));
     }
 
     fn set_volume(&mut self, volume: f32) {
-        let volume = volume.clamp(0.0, 2.0);
+        let volume = volume.clamp(0.0, 1.0);
         if let Err(error) = self.player.send(Command::SetVolume(volume)) {
             self.status = format!("could not change volume: {error:#}");
             return;
@@ -5604,8 +5738,9 @@ impl App {
     fn flush_volume(&mut self) {
         let Some((_, volume)) = self.volume_save.take() else { return; };
         let settings = config::Settings { start_in_tray: self.start_in_tray,
-            tray_click_stops: self.tray_click_stops,
-            icon_theme: self.icon_theme, cover_style: self.cover_style,
+            tray_click_pauses: self.tray_click_pauses,
+            precision_volume: self.precision_volume,
+            cover_style: self.cover_style,
             image_renderer: self.image_renderer, volume, output_device: self.output_device.clone() };
         if let Err(error) = settings.save() {
             crate::diagnostics::error("config", &format!("could not save volume: {error:#}"));
@@ -5682,7 +5817,7 @@ fn pointer_fraction(position: u16) -> f64 {
 fn mute_transition(muted: bool, current: f32, remembered: f32) -> (f32, f32) {
     if muted {
         (
-            remembered.clamp(VOLUME_STEP, DEFAULT_UNMUTED_VOLUME * 2.0),
+            if remembered > 0.0 { remembered.min(DEFAULT_UNMUTED_VOLUME) } else { VOLUME_STEP },
             remembered,
         )
     } else {
@@ -5753,6 +5888,7 @@ fn next_output_device(
 pub(crate) fn app_menu_items(has_player: bool) -> Vec<MenuItem> {
     let mut items = vec![
         MenuItem::action("Home", Some("H"), true, Some("Go to"), MenuAction::GoHome),
+        MenuItem::action("Library", Some("L"), true, None, MenuAction::OpenLibrary),
         MenuItem::action("Search", Some("/"), true, None, MenuAction::BeginSearch),
     ];
     items.extend([
@@ -5799,12 +5935,16 @@ pub(crate) fn keyboard_help_items() -> Vec<MenuItem> {
         MenuItem::help("Go back", "Esc", None),
         MenuItem::help("Search", "/ or i", Some("Pages")),
         MenuItem::help("Home", "H", None),
+        MenuItem::help("Library", "L", None),
+        MenuItem::help("Library categories", "1–6 / Tab", None),
+        MenuItem::help("Library: liked / sort", "f / o", None),
         MenuItem::help("Now Playing", "P", None),
         MenuItem::help("Pause or resume", "Space", Some("Playback")),
         MenuItem::help("Next or previous", "n / p", None),
         MenuItem::help("Repeat off / all / one", "R", None),
         MenuItem::help("Player actions", "Ctrl+P", None),
         MenuItem::help("Lyrics: expand / restore", "e", None),
+        MenuItem::help("Lyrics: original / romaji", "t", None),
         MenuItem::help("Lyrics: pause / resume follow", "f", None),
             MenuItem::help("Queue: remove / shuffle", "d / z", None),
             MenuItem::help("Queue: move row", "K / J", None),
@@ -5999,7 +6139,7 @@ mod tests {
     #[test]
     fn menu_navigation_skips_unavailable_player_commands() {
         let mut menu = Menu::new(MenuPage::Root, app_menu_items(false));
-        menu.selected = 1;
+        menu.selected = menu.items.iter().position(|item| item.action == Some(MenuAction::BeginSearch)).unwrap();
         menu.move_by(1, menu.items.len());
         assert_eq!(menu.items[menu.selected].action, Some(MenuAction::OpenAccount));
         menu.move_by(-1, menu.items.len());
@@ -6222,6 +6362,7 @@ mod tests {
 
         let (restored_default, _) = mute_transition(true, 0.0, 0.0);
         assert_eq!(restored_default, VOLUME_STEP);
+        assert_eq!(mute_transition(true, 0.0, 1.63).0, 1.0);
     }
 
     #[test]

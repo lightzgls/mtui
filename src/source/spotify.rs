@@ -16,10 +16,12 @@ use anyhow::{Result, bail};
 use super::{StreamUrl, Track};
 
 /// Placeholder so the module has a shape to grow into.
+#[expect(dead_code, reason = "reserved for the unimplemented optional Spotify source")]
 pub struct Spotify {
     _private: (),
 }
 
+#[expect(dead_code, reason = "reserved for the unimplemented optional Spotify source")]
 impl Spotify {
     pub fn new() -> Result<Self> {
         bail!("the Spotify source is not implemented yet")

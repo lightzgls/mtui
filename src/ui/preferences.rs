@@ -40,7 +40,7 @@ pub(super) fn draw(
         Chrome {
             title: "Settings",
             width: 68,
-            height: 24,
+            height: 25,
             close_label: if state.return_to_menu {
                 "Back"
             } else {
@@ -62,10 +62,14 @@ pub(super) fn draw(
         Layout::vertical([Constraint::Min(0), Constraint::Length(help_height)]).areas(dialog.body);
     let mut lines = Vec::new();
     let mut last_section = "";
+    let sections = rows.iter().enumerate().filter(|(index, row)| {
+        *index == 0 || rows[*index - 1].setting.section() != row.setting.section()
+    }).count();
+    let spaced_height = rows.len() + sections + sections.saturating_sub(1);
     for row in rows {
         let section = row.setting.section();
         if section != last_section {
-            if !lines.is_empty() && content.height >= 11 {
+            if !lines.is_empty() && content.height as usize >= spaced_height {
                 lines.push((None, Line::default()));
             }
             lines.push((
@@ -309,9 +313,9 @@ mod tests {
             .into_iter()
             .zip([
                 "System default",
+                "Off",
                 "Artwork",
                 "Automatic",
-                "Signal",
                 "Off",
                 "On",
                 "Off",
@@ -366,15 +370,16 @@ mod tests {
             "App",
             "Updates",
             "Audio output",
+            "Precision volume",
             "Cover style",
             "Artwork display",
-            "Tray icon",
             "Discord presence",
             "Keep tray icon visible",
-            "Click tray icon to stop",
+            "Click tray icon to pause / resume",
         ] {
             assert!(text.contains(label), "missing {label:?}: {text}");
         }
+        assert!(!text.contains("Tray icon"), "retired icon picker: {text}");
         assert_eq!(
             mouse
                 .targets
@@ -479,8 +484,8 @@ mod tests {
             enabled: true,
         };
         let disabled = SettingRow {
-            setting: Setting::Icon,
-            value: "Signal".into(),
+            setting: Setting::Updates,
+            value: "Unavailable".into(),
             enabled: false,
         };
         for width in 0..90 {

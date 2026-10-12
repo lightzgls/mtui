@@ -145,7 +145,7 @@ pub(super) struct Header<'a> {
     pub symbols: Symbols,
 }
 
-fn header_areas(area: Rect) -> [Rect; 5] {
+fn header_areas(area: Rect) -> [Rect; 6] {
     let area = inset(area);
     let row = Rect::new(
         area.x,
@@ -153,13 +153,15 @@ fn header_areas(area: Rect) -> [Rect; 5] {
         area.width,
         area.height.min(1),
     );
-    let brand = if row.width >= 72 { 8 } else { 0 };
-    let home = if row.width >= 30 { 8 } else { 0 };
-    let player = if row.width >= 50 { 12 } else { 0 };
+    let brand = if row.width >= 90 { 8 } else { 0 };
+    let home = if row.width >= 40 { 8 } else { 0 };
+    let library = if row.width >= 30 { 10 } else { 0 };
+    let player = if row.width >= 72 { 12 } else { 0 };
     let menu = if row.width >= 20 { 9 } else { 0 };
     Layout::horizontal([
         Constraint::Length(brand),
         Constraint::Length(home),
+        Constraint::Length(library),
         Constraint::Length(player),
         Constraint::Min(1),
         Constraint::Length(menu),
@@ -173,7 +175,7 @@ pub(super) fn render_header(
     header: Header<'_>,
     mouse: &mut MouseMap,
 ) {
-    let [brand, home, player, input, menu] = header_areas(area);
+    let [brand, home, library, player, input, menu] = header_areas(area);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("● ", Style::default().fg(header.accent)),
@@ -182,6 +184,7 @@ pub(super) fn render_header(
         brand,
     );
     for (icon, label, rect, active, enabled, action) in [
+        (Icon::Library, "Library", library, header.view == View::Library, true, MouseAction::OpenLibrary),
         (
             Icon::Home,
             "Home",
@@ -330,9 +333,10 @@ mod tests {
                     );
                 })
                 .unwrap();
-            let [_, home, player, input, menu] = header_areas(Rect::new(0, 0, width, 2));
+            let [_, home, library, player, input, menu] = header_areas(Rect::new(0, 0, width, 2));
             for (rect, expected) in [
                 (home, MouseAction::GoHome),
+                (library, MouseAction::OpenLibrary),
                 (player, MouseAction::OpenPlayer),
                 (input, MouseAction::EditSearch),
                 (menu, MouseAction::OpenAppMenu),
@@ -395,7 +399,7 @@ mod tests {
                     )
                 })
                 .unwrap();
-            let input = header_areas(Rect::new(0, 0, width, HEADER_HEIGHT))[3];
+            let [_, _, _, _, input, _] = header_areas(Rect::new(0, 0, width, HEADER_HEIGHT));
             if input.width > 0 {
                 let cursor = terminal.get_cursor_position().unwrap();
                 assert!(cursor.x >= input.x && cursor.x < input.right());

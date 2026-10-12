@@ -4,6 +4,7 @@
 #[derive(Debug, Clone, Copy)]
 pub enum Icon {
     Home,
+    Library,
     Playing,
     Menu,
     Search,
@@ -30,6 +31,7 @@ impl Symbols {
     pub fn symbol(self, icon: Icon) -> &'static str {
         let choices: &[(u32, &str)] = match icon {
             Icon::Home => &[(0, "⌂")],
+            Icon::Library => &[],
             Icon::Playing => &[(1, "▶"), (2, "►")],
             Icon::Menu => &[(3, "☰"), (4, "≡")],
             Icon::Search => &[(5, "⌕")],

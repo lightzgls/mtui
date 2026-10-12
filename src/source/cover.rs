@@ -2,9 +2,10 @@
 //! actually draw.
 //!
 //! Two callers want different things from that sentence, and both are served
-//! here. [`fetch_cancellable`] is the cover of the track that is playing: one picture, as
-//! large as YouTube has it, found by video id. [`ArtFetcher`] is the landing
-//! page's card artwork: many small pictures, found by URL because an album
+//! here. [`fetch_cancellable`] is the cover of the track that is playing: one
+//! picture, preferring YouTube Music's sleeve with a video-thumbnail fallback.
+//! [`ArtFetcher`] is the landing page's card artwork: many small pictures,
+//! found by URL because an album
 //! sleeve has no id to derive one from, and kept small enough that a screenful
 //! of them costs less than one cover does.
 //!
@@ -15,9 +16,8 @@
 //! runs, because a dozen tiles arriving at once is the one case where handshakes
 //! cost more than the pictures. Its doc comment makes that argument in full.
 //!
-//! What [`fetch_cancellable`] shows is the *video* thumbnail, which for auto-generated
-//! "Topic" uploads is the album art and for a music video is a frame from it.
-//! Card artwork is the real sleeve, because the feed says where it is.
+//! The Music watch response names the current track's square sleeve. When it
+//! is missing or cannot be loaded, the video thumbnail supplies a fallback.
 
 use std::time::{Duration, Instant};
 
@@ -257,11 +257,36 @@ fn lift((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
     (scale(r), scale(g), scale(b))
 }
 
-/// Fetches and decodes the thumbnail for a YouTube video id, taking the largest
-/// size that upload actually has.
-pub fn fetch_cancellable(video_id: &str, cancel: Option<&super::http::Cancellation>) -> Result<Cover> {
+/// Fetches the Music sleeve first, then the largest available video thumbnail.
+/// The returned URL is present only when the native Music artwork loaded, so
+/// Discord can follow the same fallback decision as the player.
+pub fn fetch_cancellable(
+    video_id: &str,
+    artwork_url: Option<&str>,
+    cancel: Option<&super::http::Cancellation>,
+) -> Result<(Cover, Option<String>)> {
+    fetch_preferred(video_id, artwork_url, cancel, |url, timeout| {
+        get(url, timeout, cancel).and_then(|body| decode(&body, MAX_EDGE))
+    })
+}
+
+fn fetch_preferred(
+    video_id: &str,
+    artwork_url: Option<&str>,
+    cancel: Option<&super::http::Cancellation>,
+    mut fetch: impl FnMut(&str, Duration) -> Result<Cover>,
+) -> Result<(Cover, Option<String>)> {
     let deadline = Instant::now() + TIMEOUT;
     let mut last = None;
+
+    if cancel.is_some_and(|cancel| !cancel.active()) { bail!("thumbnail request was superseded"); }
+    if let Some(url) = artwork_url {
+        // Leave half the total budget for the fallback if the Music CDN stalls.
+        match fetch(url, TIMEOUT / 2) {
+            Ok(cover) => return Ok((cover, Some(url.to_string()))),
+            Err(error) => last = Some(error),
+        }
+    }
 
     for name in SIZES {
         if cancel.is_some_and(|cancel| !cancel.active()) { bail!("thumbnail request was superseded"); }
@@ -275,8 +300,8 @@ pub fn fetch_cancellable(video_id: &str, cancel: Option<&super::http::Cancellati
         // Decode failures fall through with the fetch failures: a truncated or
         // otherwise unreadable JPEG at one size says nothing about the next,
         // and there is a smaller copy of the same picture right below it.
-        match get(&url(video_id, name), left, cancel).and_then(|body| decode(&body, MAX_EDGE)) {
-            Ok(cover) => return Ok(cover),
+        match fetch(&url(video_id, name), left) {
+            Ok(cover) => return Ok((cover, None)),
             Err(e) => last = Some(e),
         }
     }
@@ -835,13 +860,61 @@ mod tests {
         assert!(decode(b"this is not a jpeg", MAX_EDGE).is_err());
     }
 
+    #[test]
+    fn music_artwork_loads_before_any_video_thumbnail_is_requested() {
+        let sleeve = "https://lh3.googleusercontent.com/sleeve=w544-h544-l90-rj";
+        let mut requested = Vec::new();
+        let (cover, source) = fetch_preferred("song", Some(sleeve), None, |url, timeout| {
+            requested.push(url.to_string());
+            assert!(timeout <= TIMEOUT / 2);
+            Ok(Cover::solid(544, 544))
+        }).unwrap();
+        assert_eq!(requested, [sleeve]);
+        assert_eq!(source.as_deref(), Some(sleeve));
+        assert_eq!((cover.width, cover.height), (544, 544));
+    }
+
+    #[test]
+    fn missing_failed_or_invalid_music_images_fall_back_to_video_artwork() {
+        let sleeve = "https://lh3.googleusercontent.com/sleeve";
+        for mode in 0..3 {
+            let mut requested = Vec::new();
+            let (_, source) = fetch_preferred("song", (mode != 0).then_some(sleeve), None, |address, _| {
+                requested.push(address.to_string());
+                if address == sleeve {
+                    if mode == 1 { bail!("Music image returned 404"); }
+                    return decode(b"an invalid image body", MAX_EDGE);
+                }
+                Ok(Cover::solid(720, 720))
+            }).unwrap();
+            assert!(source.is_none(), "Discord must use the video fallback too");
+            assert_eq!(requested.last(), Some(&url("song", "maxresdefault")));
+            assert_eq!(requested.len(), if mode == 0 { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn superseded_music_requests_do_not_start_a_video_fallback() {
+        use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+        let generation = Arc::new(AtomicU64::new(0));
+        let cancel = super::super::http::Cancellation::capture(generation.clone());
+        let mut requests = 0;
+        let result = fetch_preferred("song", Some("https://example.com/sleeve"), Some(&cancel), |_, _| {
+            requests += 1;
+            generation.fetch_add(1, Ordering::SeqCst);
+            bail!("request cancelled")
+        });
+        assert!(result.is_err());
+        assert_eq!(requests, 1);
+    }
+
     /// Exercises the whole live path -- URL shape, TLS, decode, downscale --
     /// against i.ytimg.com. Ignored by default so the suite stays runnable
     /// offline; run it with `cargo test -- --ignored` after touching any of it.
     #[test]
     #[ignore = "requires network access"]
     fn fetches_a_real_thumbnail() {
-        let cover = fetch_cancellable("dQw4w9WgXcQ", None).expect("thumbnail should fetch and decode");
+        let (cover, _) = fetch_cancellable("dQw4w9WgXcQ", None, None).expect("thumbnail should fetch and decode");
         // Exact dimensions depend on how much padding this particular upload
         // arrives with, so assert the invariants instead. The lower bound is
         // the point of the ladder: anything under 720 on the long edge means a

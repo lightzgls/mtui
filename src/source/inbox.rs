@@ -35,7 +35,7 @@ impl Inbox {
         if shutdown { pending.clear(); }
         if let Request::Watch { video_id } = &request {
             pending.retain(|work| match &work.request {
-                Request::Lyrics { video_id: old, .. } | Request::Related { video_id: old, .. }
+                Request::Lyrics { video_id: old, .. } | Request::Romaji { video_id: old, .. } | Request::Related { video_id: old, .. }
                     | Request::Comments { video_id: old } => old == video_id,
                 _ => true,
             });
@@ -89,6 +89,7 @@ fn operation(request: &Request) -> u8 {
     match request {
         Request::Watch { .. } => 1,
         Request::Lyrics { .. } => 2,
+        Request::Romaji { .. } => 6,
         Request::Related { .. } => 3,
         Request::Comments { .. } => 4,
         Request::MoreQueue { .. } | Request::SeedQueue { .. } => 5,
@@ -101,14 +102,28 @@ fn operation(request: &Request) -> u8 {
 mod tests {
     use super::*;
     #[test]
+    fn track_changes_cancel_romaji_and_remove_stale_pending_reads() {
+        let inbox = Inbox::new(Kind::Panels);
+        let request = |id: &str| Request::Romaji { video_id: id.into(),
+            query: super::super::lrclib::Query::new("Artist", "Song", None, None).unwrap(), original: None };
+        inbox.send(request("a")).unwrap();
+        let running = inbox.recv().unwrap();
+        inbox.send(request("a")).unwrap();
+        inbox.send(Request::Watch { video_id: "b".into() }).unwrap();
+        assert!(!running.cancel.unwrap().active());
+        assert!(matches!(inbox.try_recv().unwrap().request, Request::Watch { video_id } if video_id == "b"));
+        assert!(inbox.try_recv().is_none());
+    }
+
+    #[test]
     fn newer_browsing_supersedes_pending_and_running_reads() {
         let inbox = Inbox::new(Kind::Browse);
-        inbox.send(Request::Cover{id:"old".into()}).unwrap();
+        inbox.send(Request::Cover{id:"old".into(), artwork_url:None}).unwrap();
         let running = inbox.recv().unwrap();
-        for n in 0..100 { inbox.send(Request::Cover{id:n.to_string()}).unwrap(); }
+        for n in 0..100 { inbox.send(Request::Cover{id:n.to_string(), artwork_url:None}).unwrap(); }
         assert!(!running.cancel.unwrap().active());
         assert_eq!(inbox.pending.lock().unwrap().len(),1);
-        assert!(matches!(inbox.recv().unwrap().request,Request::Cover{id} if id=="99"));
+        assert!(matches!(inbox.recv().unwrap().request,Request::Cover{id,..} if id=="99"));
     }
     #[test]
     fn track_changes_cancel_panels_without_losing_radio_continuations() {

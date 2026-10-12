@@ -133,7 +133,7 @@ fn start(instance: &instance::Instance) -> Result<()> {
 
     let startup_tray = if keep_tray {
         Tray::spawn().ok().and_then(|mut tray| {
-            tray.show("MTUI is starting ...", settings.icon_theme)
+            tray.show("MTUI is starting ...", false)
                 .ok()?;
             Some(tray)
         })
@@ -282,7 +282,9 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
                     Event::Mouse(event) => match event.kind {
                         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                             let up = event.kind == MouseEventKind::ScrollUp;
-                            if mouse.over_volume(event.column, event.row) {
+                            if app.precision_volume && mouse.over_cover(event.column, event.row) {
+                                app.handle_mouse_action(app::MouseAction::AdjustPrecisionVolume(up))?;
+                            } else if mouse.over_volume(event.column, event.row) {
                                 app.handle_mouse_action(app::MouseAction::AdjustVolume(up))?;
                             } else { app.handle_mouse_scroll(!up)?; }
                         }
@@ -570,8 +572,8 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
                 app.status = format!("could not create the tray icon: {err:#}");
                 if let Err(save) = (config::Settings {
                     start_in_tray: false,
-                    tray_click_stops: app.tray_click_stops,
-                    icon_theme: app.icon_theme(),
+                    tray_click_pauses: app.tray_click_pauses,
+                    precision_volume: app.precision_volume,
                     cover_style: app.cover_style(),
                     image_renderer: app.image_renderer(),
                     volume: app.snapshot().volume,
@@ -594,7 +596,7 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
     let Some(icon) = tray.as_mut() else {
         return;
     };
-    if let Err(err) = icon.show(&app.tray_tip(), app.icon_theme()) {
+    if let Err(err) = icon.show(&app.tray_tip(), app.tray_playing()) {
         diagnostics::error("tray", &format!("could not show icon: {err:#}"));
         app.start_in_tray = false;
         app.status = format!("could not show the tray icon: {err:#}");
@@ -602,8 +604,8 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
         *tray = None;
         if let Err(save) = (config::Settings {
             start_in_tray: false,
-            tray_click_stops: app.tray_click_stops,
-            icon_theme: app.icon_theme(),
+            tray_click_pauses: app.tray_click_pauses,
+            precision_volume: app.precision_volume,
             cover_style: app.cover_style(),
             image_renderer: app.image_renderer(),
             volume: app.snapshot().volume,
@@ -618,7 +620,7 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
     }
     if let Some(command) = icon.next_command(Duration::ZERO)
         && command != tray::TrayCommand::Show
-        && (command != tray::TrayCommand::Click || app.tray_click_stops)
+        && (command != tray::TrayCommand::Click || app.tray_click_pauses)
     {
         app.handle_tray(command);
     }
@@ -654,7 +656,7 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
         };
     }
     let icon = tray.as_mut().expect("the tray was created above");
-    if let Err(err) = icon.show(&app.tray_tip(), app.icon_theme()) {
+    if let Err(err) = icon.show(&app.tray_tip(), app.tray_playing()) {
         diagnostics::error("tray", &format!("could not enter background: {err:#}"));
         app.status = format!("{err:#}");
         if console::closed() {
@@ -667,7 +669,7 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
     // Said on the terminal that is about to be given up, since it is the last
     // thing this window will ever show and the icon is small.
     if let Ok(mut out) = console::output() {
-        let click_action = if app.tray_click_stops { "stop playback" } else { "bring this back" };
+        let click_action = if app.tray_click_pauses { "pause or resume playback" } else { "bring this back" };
         let _ = writeln!(
             out,
             "MTUI is running in the background. Its icon is in the notification area, \
@@ -683,6 +685,7 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
         return Ok(());
     }
 
+    let mut refresh_after_command = false;
     while !app.should_quit && !app.wants_foreground {
         if instance.take_activation() {
             app.wants_foreground = true;
@@ -699,16 +702,20 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
         // Not `tick_page`: lyrics and comments are panels of a page nobody can
         // see, and fetching them here would spend a request per track on
         // something that is thrown away when the track changes.
-        if let Err(err) = icon.show(&app.tray_tip(), app.icon_theme()) {
+        if let Err(err) = icon.show(&app.tray_tip(), app.tray_playing()) {
             diagnostics::error("tray", &format!("background icon lost: {err:#}"));
             app.status = format!("the tray icon was lost: {err:#}");
             app.wants_foreground = true;
             continue;
         }
 
-        let tick = if app.awaiting() { BUSY_TICK } else { IDLE_TICK };
+        // Give the audio worker's pause/resume acknowledgement a quick refresh
+        // instead of waiting half a second before starting the icon transition.
+        let tick = if app.awaiting() || refresh_after_command { BUSY_TICK } else { IDLE_TICK };
+        refresh_after_command = false;
         if let Some(command) = icon.next_command(tick) {
             app.handle_tray(command);
+            refresh_after_command = true;
         }
     }
 

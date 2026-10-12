@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">MTUI quiet tray icon</title>
+  <desc id="desc">Four silver segments form a flat strip on the same charcoal square, indicating paused or stopped playback.</desc>
+  <rect x="16" y="16" width="480" height="480" rx="128" fill="#151b23"/>
+  <path d="M118 256H138M202 256H222M286 256H306M370 256H390" fill="none" stroke="#aab5bd" stroke-width="40" stroke-linecap="round"/>
+</svg>

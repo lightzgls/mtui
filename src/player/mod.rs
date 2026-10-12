@@ -95,7 +95,7 @@ pub enum Command {
     TogglePause,
     Stop,
     Seek(Duration),
-    /// Clamped to 0.0..=2.0 by the player thread.
+    /// Clamped to 0.0..=1.0 by the player thread.
     SetVolume(f32),
     /// `None` follows the operating-system default; `Some` names a CPAL device id.
     SetOutput(Option<String>),
@@ -927,7 +927,7 @@ fn run(
 
 fn normalized_volume(volume: f32) -> f32 {
     if volume.is_finite() {
-        volume.clamp(0.0, 2.0)
+        volume.clamp(0.0, 1.0)
     } else {
         1.0
     }
@@ -1660,7 +1660,9 @@ mod tests {
     fn volume_initialization_rejects_invalid_gain() {
         assert_eq!(normalized_volume(-0.5), 0.0);
         assert_eq!(normalized_volume(0.8), 0.8);
-        assert_eq!(normalized_volume(3.0), 2.0);
+        assert_eq!(normalized_volume(1.0), 1.0);
+        assert_eq!(normalized_volume(1.63), 1.0);
+        assert_eq!(normalized_volume(3.0), 1.0);
         assert_eq!(normalized_volume(f32::INFINITY), 1.0);
     }
 

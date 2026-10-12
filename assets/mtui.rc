@@ -1,6 +1,4 @@
-// Signal stays at the lowest id so Explorer, the taskbar and alt-tab use it as
-// the executable's default. `tray.rs` selects all four by these numeric ids.
+// The mint strip icon is the default in Explorer, the taskbar and alt-tab.
+// The tray uses the quiet counterpart while playback is paused or stopped.
 1 ICON "mtui.ico"
-2 ICON "mtui-wave.ico"
-3 ICON "mtui-mono.ico"
-4 ICON "mtui-orbit.ico"
+2 ICON "mtui-quiet.ico"

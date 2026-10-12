@@ -1,5 +1,7 @@
 //! Signed-in player actions. Writes run once and success requires server evidence.
 
+pub mod browse;
+
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
@@ -37,20 +39,30 @@ fn validate_response(json: &Value) -> Result<()> {
     if let Some(error) = json.get("error").filter(|error| !error.is_null()) {
         bail!("{}", super::errors::message(400, Some(error)));
     }
-    for key in [
-        "showEngagementPanelEndpoint",
-        "showDialogCommand",
-        "modalWithTitleAndButtonRenderer",
-    ] {
-        let mut dialogs = Vec::new();
-        home::collect(json, key, &mut dialogs);
-        if !dialogs.is_empty() {
-            bail!(
-                "YouTube Music requires confirmation for this action. Check the playlist in YouTube Music."
-            );
-        }
+    if requires_confirmation(json) {
+        bail!(
+            "YouTube Music requires confirmation for this action. Check the playlist in YouTube Music."
+        );
     }
     Ok(())
+}
+
+fn requires_confirmation(command: &Value) -> bool {
+    match command {
+        Value::Array(commands) => commands.iter().any(requires_confirmation),
+        Value::Object(fields) => {
+            ["showEngagementPanelEndpoint", "showDialogCommand", "modalWithTitleAndButtonRenderer"]
+                .iter().any(|key| fields.get(*key).is_some_and(|value| !value.is_null()))
+                // Only follow commands the response executes. Playlist headers,
+                // menus and picker rows also contain dialogs behind buttons;
+                // those are available actions, not pending confirmations.
+                || ["actions", "onResponseReceivedActions", "onResponseReceivedCommands",
+                    "onResponseReceivedEndpoints", "commands", "commandExecutorCommand",
+                    "openPopupAction", "popup"]
+                    .iter().filter_map(|key| fields.get(*key)).any(requires_confirmation)
+        },
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -386,6 +398,59 @@ mod tests {
     }
 
     #[test]
+    fn inactive_playlist_menu_dialogs_do_not_block_save_verification() {
+        let page = json!({"contents":{"twoColumnBrowseResultsRenderer":{
+            "tabs":[{"tabRenderer":{"content":{"sectionListRenderer":{"contents":[
+                {"musicEditablePlaylistDetailHeaderRenderer":{"header":{"musicResponsiveHeaderRenderer":{
+                    "buttons":[{"menuRenderer":{"items":[{"menuNavigationItemRenderer":{
+                        "navigationEndpoint":{"showDialogCommand":{"dialog":{"confirmDialogRenderer":{}}}}
+                    }}]}}]
+                }}}},
+                {"musicPlaylistShelfRenderer":{"contents":[{"musicResponsiveListItemRenderer":{
+                    "playlistItemData":{"videoId":"v"}
+                }}]}}
+            ]}}}}]}}});
+        let mut writes = 0;
+        save_with("v", "p", |endpoint, _| match endpoint {
+            "playlist/get_add_to_playlist" => Ok(json!({"playlistAddToOptionRenderer":{
+                "playlistId":"p", "title":{"simpleText":"Playlist"}
+            }})),
+            "browse/edit_playlist" => {
+                writes += 1;
+                let result = json!({"actions":[{"showDialogCommand":{"dialog":{
+                    "confirmDialogRenderer":{}
+                }}}]});
+                validate_response(&result)?;
+                Ok(result)
+            },
+            "browse" => { validate_response(&page)?; Ok(page.clone()) },
+            _ => panic!("unexpected request"),
+        }).expect("an inactive menu dialog must not prevent membership confirmation");
+        assert_eq!(writes, 1, "a duplicate confirmation must not retry the save");
+    }
+
+    #[test]
+    fn confirmation_checks_follow_executed_commands_and_ignore_available_actions() {
+        for command in [
+            json!({"showEngagementPanelEndpoint":{}}),
+            json!({"showDialogCommand":{"dialog":{}}}),
+            json!({"openPopupAction":{"popup":{"modalWithTitleAndButtonRenderer":{}}}}),
+        ] {
+            for key in ["actions", "onResponseReceivedActions", "onResponseReceivedCommands", "onResponseReceivedEndpoints"] {
+                let response = json!({key:[{"commandExecutorCommand":{"commands":[command.clone()]}}]});
+                assert!(validate_response(&response).is_err(), "executed confirmation under {key}");
+            }
+        }
+        let response = json!({"actions":[{"openPopupAction":{"popup":{"addToPlaylistRenderer":{
+            "playlists":[{"playlistAddToOptionRenderer":{"playlistId":"p", "title":{"simpleText":"Playlist"},
+                "serviceEndpoint":{"showDialogCommand":{"dialog":{"modalWithTitleAndButtonRenderer":{}}}}
+            }}]
+        }}}}]});
+        validate_response(&response).expect("playlist picker actions have not been executed");
+        assert_eq!(parse_playlists(&response).len(), 1);
+    }
+
+    #[test]
     fn modern_status_only_acknowledgements_do_not_report_a_false_failure() {
         let mut writes = 0;
         save_with("v", "p", |endpoint, _| {
@@ -451,5 +516,11 @@ mod tests {
             "Current Like state: {:?}",
             rating(&http, id).expect("Like state should load")
         );
+        let cookies = session().unwrap();
+        if let Some(playlist) = choices.iter().find(|p| p.id != "LM" && p.id != "VLLM") {
+            let playlist_id = playlist.id.strip_prefix("VL").unwrap_or(&playlist.id);
+            post(&http, &cookies, "browse", json!({"browseId":format!("VL{playlist_id}")}))
+                .expect("playlist page should not require confirmation");
+        }
     }
 }

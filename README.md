@@ -60,6 +60,7 @@ https://github.com/user-attachments/assets/27cdd7f8-daf9-4ccc-b736-d903014b5be1
 - Lyrics, including synced lyrics when available, plus comments and related music.
 - Solid colors drawn from the cover, pixel or ASCII artwork, and keyboard and mouse navigation.
 - Optional Discord Rich Presence and Windows tray controls. Reopening MTUI restores the running session.
+- A single mint strip app icon, with a tray animation that reflects playing, paused, and stopped states.
 
 ## Install
 
@@ -121,6 +122,7 @@ a JSON summary under `target/test-runs/` and leaves live/account tests ignored.
 - [Lavalink YouTube Source](https://github.com/lavalink-devs/youtube-source) — a reference for playback reliability research.
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) — stream extraction fallback and PO-token support.
 - [LRCLIB](https://lrclib.net/) — community lyrics and synchronized timing fallback.
+- [AMLL TTML DB](https://github.com/amll-dev/amll-ttml-db) — community-reviewed Japanese romaji, requested from its public API when selected.
 - [Ratatui](https://ratatui.rs/) and [Crossterm](https://github.com/crossterm-rs/crossterm) — the terminal interface; [Rodio](https://github.com/RustAudio/rodio) and [Symphonia](https://github.com/pdeljanov/Symphonia) — native audio playback and decoding.
 - [Tokio](https://tokio.rs/), [Reqwest](https://github.com/seanmonstar/reqwest), [wry](https://github.com/tauri-apps/wry), and [tao](https://github.com/tauri-apps/tao) — background work, networking, and native sign-in.
 - [Best-README-Template](https://github.com/othneildrew/Best-README-Template) — the initial documentation structure.

@@ -163,7 +163,7 @@ pub(super) fn artwork(frame: &mut Frame, area: Rect, key: &str, url: Option<Stri
     render_tile(frame, art, key, area, &mut tiles.images);
 }
 
-fn song_row(
+pub(super) fn song_row(
     frame: &mut Frame,
     area: Rect,
     track: &Track,

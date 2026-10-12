@@ -331,57 +331,19 @@ impl CoverStyle {
     }
 }
 
-/// Artwork used for MTUI's runtime-owned icons.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum IconTheme {
-    #[default]
-    Signal,
-    Wave,
-    Orbit,
-    Mono,
-}
-
-impl IconTheme {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Signal => "Signal",
-            Self::Wave => "Wave",
-            Self::Orbit => "Orbit",
-            Self::Mono => "Mono",
-        }
-    }
-
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Signal => Self::Wave,
-            Self::Wave => Self::Orbit,
-            Self::Orbit => Self::Mono,
-            Self::Mono => Self::Signal,
-        }
-    }
-
-    pub const fn previous(self) -> Self {
-        match self {
-            Self::Signal => Self::Mono,
-            Self::Wave => Self::Signal,
-            Self::Orbit => Self::Wave,
-            Self::Mono => Self::Orbit,
-        }
-    }
-}
-
 /// Preferences changed from MTUI's Settings panel or the playback controls.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub start_in_tray: bool,
-    /// Left-clicking the tray icon stops playback instead of opening MTUI.
-    pub tray_click_stops: bool,
-    pub icon_theme: IconTheme,
+    /// Left-clicking the tray icon toggles pause instead of opening MTUI.
+    #[serde(alias = "tray_click_stops")]
+    pub tray_click_pauses: bool,
+    /// Wheel over the current song's cover adjusts volume in 1% steps.
+    pub precision_volume: bool,
     pub cover_style: CoverStyle,
     pub image_renderer: ImageRenderer,
-    /// Player gain, where `1.0` is 100% and `2.0` is the supported maximum.
+    /// Player volume, from `0.0` (muted) to `1.0` (100%).
     pub volume: f32,
     /// Stable CPAL device id. `None` follows the operating-system default.
     pub output_device: Option<String>,
@@ -391,8 +353,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             start_in_tray: false,
-            tray_click_stops: false,
-            icon_theme: IconTheme::default(),
+            tray_click_pauses: false,
+            precision_volume: false,
             cover_style: CoverStyle::default(),
             image_renderer: ImageRenderer::default(),
             volume: 1.0,
@@ -426,7 +388,7 @@ impl Settings {
 
 fn normalize_volume(volume: f32) -> f32 {
     if volume.is_finite() {
-        volume.clamp(0.0, 2.0)
+        volume.clamp(0.0, 1.0)
     } else {
         1.0
     }
@@ -568,8 +530,8 @@ mod tests {
         assert!(!Settings::default().start_in_tray);
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert!(!settings.start_in_tray);
-        assert!(!settings.tray_click_stops);
-        assert_eq!(settings.icon_theme, IconTheme::Signal);
+        assert!(!settings.tray_click_pauses);
+        assert!(!settings.precision_volume);
         assert_eq!(settings.cover_style, CoverStyle::Pixel);
         assert_eq!(settings.image_renderer, ImageRenderer::Automatic);
         assert_eq!(settings.volume, 1.0);
@@ -577,8 +539,8 @@ mod tests {
 
         let legacy: Settings = serde_json::from_str(r#"{"start_in_tray":true}"#).unwrap();
         assert!(legacy.start_in_tray);
-        assert!(!legacy.tray_click_stops);
-        assert_eq!(legacy.icon_theme, IconTheme::Signal);
+        assert!(!legacy.tray_click_pauses);
+        assert!(!legacy.precision_volume);
         assert_eq!(legacy.cover_style, CoverStyle::Pixel);
         assert_eq!(legacy.image_renderer, ImageRenderer::Automatic);
         assert_eq!(legacy.volume, 1.0);
@@ -589,18 +551,20 @@ mod tests {
     fn the_tray_preference_round_trips() {
         let body = serde_json::to_string(&Settings {
             start_in_tray: true,
-            tray_click_stops: true,
-            icon_theme: IconTheme::Wave,
+            tray_click_pauses: true,
+            precision_volume: true,
             cover_style: CoverStyle::ColoredAscii,
             image_renderer: ImageRenderer::Kitty,
             volume: 0.65,
             output_device: Some("Wasapi:test-output".to_string()),
         })
         .unwrap();
+        assert!(body.contains("tray_click_pauses"));
+        assert!(!body.contains("tray_click_stops"));
         let settings: Settings = serde_json::from_str(&body).unwrap();
         assert!(settings.start_in_tray);
-        assert!(settings.tray_click_stops);
-        assert_eq!(settings.icon_theme, IconTheme::Wave);
+        assert!(settings.tray_click_pauses);
+        assert!(settings.precision_volume);
         assert_eq!(settings.cover_style, CoverStyle::ColoredAscii);
         assert_eq!(settings.image_renderer, ImageRenderer::Kitty);
         assert_eq!(settings.volume, 0.65);
@@ -611,10 +575,18 @@ mod tests {
     }
 
     #[test]
+    fn the_old_tray_click_setting_keeps_pause_controls_enabled() {
+        let settings: Settings = serde_json::from_str(r#"{"tray_click_stops":true}"#).unwrap();
+        assert!(settings.tray_click_pauses);
+    }
+
+    #[test]
     fn volume_is_kept_inside_the_players_supported_range() {
         assert_eq!(normalize_volume(-1.0), 0.0);
         assert_eq!(normalize_volume(0.75), 0.75);
-        assert_eq!(normalize_volume(3.0), 2.0);
+        assert_eq!(normalize_volume(1.0), 1.0);
+        assert_eq!(normalize_volume(1.63), 1.0);
+        assert_eq!(normalize_volume(3.0), 1.0);
         assert_eq!(normalize_volume(f32::NAN), 1.0);
     }
 
@@ -642,12 +614,17 @@ mod tests {
     }
 
     #[test]
-    fn icon_themes_cycle_and_use_stable_config_names() {
-        assert_eq!(IconTheme::Signal.next(), IconTheme::Wave);
-        assert_eq!(IconTheme::Signal.previous(), IconTheme::Mono);
-        assert_eq!(IconTheme::Wave.next(), IconTheme::Orbit);
-        assert_eq!(IconTheme::Orbit.next(), IconTheme::Mono);
-        assert_eq!(IconTheme::Mono.next(), IconTheme::Signal);
-        assert_eq!(serde_json::to_string(&IconTheme::Wave).unwrap(), "\"wave\"");
+    fn retired_icon_preferences_preserve_other_settings_and_are_not_saved() {
+        for theme in ["signal", "wave", "orbit", "mono", "future-icon"] {
+            let body = format!(
+                r#"{{"icon_theme":"{theme}","start_in_tray":true,"volume":0.65,"tray_click_stops":true,"output_device":"Wasapi:test-output"}}"#
+            );
+            let settings: Settings = serde_json::from_str(&body).unwrap();
+            assert!(settings.start_in_tray);
+            assert!(settings.tray_click_pauses);
+            assert_eq!(settings.volume, 0.65);
+            assert_eq!(settings.output_device.as_deref(), Some("Wasapi:test-output"));
+            assert!(!serde_json::to_string(&settings).unwrap().contains("icon_theme"));
+        }
     }
 }

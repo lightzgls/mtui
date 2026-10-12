@@ -21,6 +21,7 @@ pub mod search;
 pub mod journal;
 pub mod library;
 pub mod lrclib;
+pub mod amll;
 pub mod sapisid;
 pub mod stats;
 pub(crate) mod listening;

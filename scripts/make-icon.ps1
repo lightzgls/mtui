@@ -3,13 +3,12 @@
     Builds MTUI's preview PNG and multi-size Windows icons.
 
 .DESCRIPTION
-    Draws four original MTUI marks at 512px, then creates every Windows icon
-    size from those masters. Signal combines an open terminal
-    prompt with an audio meter; Wave is an oscilloscope trace; Mono is a quiet
-    monochrome Signal. Orbit adds a circular music cue without using YouTube's
-    red concentric disc or play-button silhouette.
-
-    assets/mtui-icon.svg is the portable vector version of the same artwork.
+    Draws playing and quiet versions of MTUI's mint strip icon at 512px, then
+    creates Windows icons at 16 through 256px. The four rounded strips settle
+    into a flat strip when playback pauses or stops. The quiet icon uses a
+    -quiet filename suffix.
+    assets/mtui-icon.svg and assets/mtui-icon-quiet.svg are portable vectors.
+    assets/previews/tray-icons.png compares both states at real tray sizes.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts/make-icon.ps1
@@ -18,9 +17,7 @@
 param(
     [string]$Canvas,
     [string]$Output,
-    [string]$WaveOutput,
-    [string]$MonoOutput,
-    [string]$OrbitOutput
+    [string]$Preview
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,16 +26,12 @@ Add-Type -AssemblyName System.Drawing
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $Canvas) { $Canvas = Join-Path $root 'canvas.png' }
 if (-not $Output) { $Output = Join-Path $root 'assets\mtui.ico' }
-if (-not $WaveOutput) { $WaveOutput = Join-Path $root 'assets\mtui-wave.ico' }
-if (-not $MonoOutput) { $MonoOutput = Join-Path $root 'assets\mtui-mono.ico' }
-if (-not $OrbitOutput) { $OrbitOutput = Join-Path $root 'assets\mtui-orbit.ico' }
+if (-not $Preview) { $Preview = Join-Path $root 'assets\previews\tray-icons.png' }
 
 $canvasDir = Split-Path -Parent $Canvas
 $outDir = Split-Path -Parent $Output
-$waveOutDir = Split-Path -Parent $WaveOutput
-$monoOutDir = Split-Path -Parent $MonoOutput
-$orbitOutDir = Split-Path -Parent $OrbitOutput
-foreach ($dir in @($canvasDir, $outDir, $waveOutDir, $monoOutDir, $orbitOutDir)) {
+$previewDir = Split-Path -Parent $Preview
+foreach ($dir in @($canvasDir, $outDir, $previewDir)) {
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Path $dir | Out-Null
     }
@@ -55,36 +48,23 @@ using System.Runtime.InteropServices;
 
 public static class MtuiIcon
 {
-    static readonly int[] Sizes = { 16, 24, 32, 48, 64, 128, 256 };
+    static readonly int[] Sizes = { 16, 20, 24, 32, 40, 48, 64, 128, 256 };
     const int MasterSize = 512;
     const int PngFrom = 128;
 
-    public static void Build(
-        string canvasPath,
-        string signalPath,
-        string wavePath,
-        string monoPath,
-        string orbitPath)
+    public static void Build(string canvasPath, string outputPath, string previewPath)
     {
-        using (Bitmap signal = DrawArt(0))
+        using (Bitmap playing = DrawArt(true))
+        using (Bitmap quiet = DrawArt(false))
         {
-            signal.Save(canvasPath, ImageFormat.Png);
-            BuildIcon(signal, signalPath);
+            playing.Save(canvasPath, ImageFormat.Png);
+            BuildIcon(playing, outputPath);
+            string quietPath = Path.Combine(Path.GetDirectoryName(outputPath),
+                Path.GetFileNameWithoutExtension(outputPath) + "-quiet.ico");
+            BuildIcon(quiet, quietPath);
         }
-        using (Bitmap wave = DrawArt(1))
-        {
-            BuildIcon(wave, wavePath);
-        }
-        using (Bitmap mono = DrawArt(2))
-        {
-            BuildIcon(mono, monoPath);
-        }
-        using (Bitmap orbit = DrawArt(3))
-        {
-            BuildIcon(orbit, orbitPath);
-        }
+        DrawPreview(previewPath);
     }
-
     static void BuildIcon(Bitmap art, string path)
     {
         List<int> dims = new List<int>();
@@ -100,7 +80,7 @@ public static class MtuiIcon
         WriteIcon(path, dims, images);
     }
 
-    static Bitmap DrawArt(int style)
+    static Bitmap DrawArt(bool playing)
     {
         Bitmap art = new Bitmap(MasterSize, MasterSize, PixelFormat.Format32bppArgb);
         using (Graphics g = Graphics.FromImage(art))
@@ -110,109 +90,84 @@ public static class MtuiIcon
             g.CompositingQuality = CompositingQuality.HighQuality;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
 
-            if (style == 3)
-            {
-                DrawTile(g, Color.FromArgb(255, 7, 24, 33), Color.FromArgb(255, 22, 71, 91));
-                DrawOrbit(g);
-            }
-            else if (style == 1)
-            {
-                DrawTile(g, Color.FromArgb(255, 17, 13, 31), Color.FromArgb(255, 58, 47, 88));
-                DrawWave(g);
-            }
-            else if (style == 2)
-            {
-                DrawTile(g, Color.FromArgb(255, 11, 13, 16), Color.FromArgb(255, 48, 54, 61));
-                DrawSignal(g, Color.FromArgb(255, 241, 245, 249), Color.FromArgb(255, 148, 163, 184));
-            }
-            else
-            {
-                DrawTile(g, Color.FromArgb(255, 11, 16, 32), Color.FromArgb(255, 36, 49, 74));
-                DrawSignal(g, Color.FromArgb(255, 73, 215, 242), Color.FromArgb(255, 101, 245, 181));
-            }
+            DrawFlatTile(g);
+            DrawSignal(g, Color.FromArgb(255, 141, 239, 193), playing);
         }
         return art;
     }
 
-    static void DrawTile(Graphics g, Color background, Color edge)
+    static void DrawFlatTile(Graphics g)
     {
-        using (GraphicsPath tile = RoundedRect(24, 24, 464, 464, 104))
-        using (SolidBrush brush = new SolidBrush(background))
+        using (GraphicsPath tile = RoundedRect(16, 16, 480, 480, 128))
+        using (SolidBrush brush = new SolidBrush(Color.FromArgb(255, 21, 27, 35)))
             g.FillPath(brush, tile);
-        using (GraphicsPath rim = RoundedRect(30, 30, 452, 452, 98))
-        using (Pen border = new Pen(edge, 8))
-            g.DrawPath(border, rim);
     }
 
-    static void DrawSignal(Graphics g, Color promptColor, Color meterColor)
+    static void DrawSignal(Graphics g, Color ink, bool playing)
     {
-        Point[] prompt = {
-            new Point(122, 186),
-            new Point(196, 256),
-            new Point(122, 326)
-        };
-        using (Pen promptPen = new Pen(promptColor, 44))
+        int[] xs = { 128, 212, 296, 380 };
+        int[] tops = { 212, 172, 144, 196 };
+        int[] bottoms = { 300, 340, 368, 316 };
+        using (Pen strip = new Pen(playing ? ink : Color.FromArgb(255, 170, 181, 189), 40))
         {
-            promptPen.StartCap = LineCap.Round;
-            promptPen.EndCap = LineCap.Round;
-            promptPen.LineJoin = LineJoin.Round;
-            g.DrawLines(promptPen, prompt);
-        }
-
-        int[] xs = { 250, 312, 374 };
-        int[] tops = { 216, 158, 202 };
-        int[] bottoms = { 296, 354, 310 };
-        using (Pen meter = new Pen(meterColor, 38))
-        {
-            meter.StartCap = LineCap.Round;
-            meter.EndCap = LineCap.Round;
+            strip.StartCap = LineCap.Round;
+            strip.EndCap = LineCap.Round;
             for (int i = 0; i < xs.Length; i++)
-                g.DrawLine(meter, xs[i], tops[i], xs[i], bottoms[i]);
+            {
+                if (playing) g.DrawLine(strip, xs[i], tops[i], xs[i], bottoms[i]);
+                else g.DrawLine(strip, xs[i] - 10, 256, xs[i] + 10, 256);
+            }
         }
     }
 
-    static void DrawWave(Graphics g)
+    static void DrawPreview(string path)
     {
-        Point[] points = {
-            new Point(98, 272),
-            new Point(146, 272),
-            new Point(182, 206),
-            new Point(224, 326),
-            new Point(272, 162),
-            new Point(316, 336),
-            new Point(354, 230),
-            new Point(414, 230)
-        };
-        using (Pen wave = new Pen(Color.FromArgb(255, 167, 139, 250), 34))
+        using (Bitmap preview = new Bitmap(1000, 660, PixelFormat.Format32bppArgb))
+        using (Graphics g = Graphics.FromImage(preview))
+        using (Bitmap playing = DrawArt(true))
+        using (Bitmap quiet = DrawArt(false))
+        using (Font heading = new Font("Segoe UI", 26, FontStyle.Bold))
+        using (Font label = new Font("Segoe UI", 16, FontStyle.Regular))
+        using (Font small = new Font("Segoe UI", 11, FontStyle.Regular))
+        using (SolidBrush ink = new SolidBrush(Color.FromArgb(232, 236, 239)))
+        using (SolidBrush secondary = new SolidBrush(Color.FromArgb(158, 171, 180)))
+        using (SolidBrush light = new SolidBrush(Color.FromArgb(238, 241, 244)))
+        using (SolidBrush darkInk = new SolidBrush(Color.FromArgb(63, 74, 84)))
         {
-            wave.StartCap = LineCap.Round;
-            wave.EndCap = LineCap.Round;
-            wave.LineJoin = LineJoin.Round;
-            g.DrawLines(wave, points);
-        }
-        using (SolidBrush cursor = new SolidBrush(Color.FromArgb(255, 251, 191, 36)))
-            g.FillRectangle(cursor, 376, 330, 44, 44);
-    }
-
-    static void DrawOrbit(Graphics g)
-    {
-        using (Pen orbit = new Pen(Color.FromArgb(255, 64, 207, 232), 34))
-        {
-            orbit.StartCap = LineCap.Round;
-            orbit.EndCap = LineCap.Round;
-            g.DrawArc(orbit, 106, 106, 300, 300, 28, 132);
-            g.DrawArc(orbit, 106, 106, 300, 300, 208, 132);
-        }
-
-        int[] xs = { 210, 256, 302 };
-        int[] tops = { 222, 174, 204 };
-        int[] bottoms = { 290, 338, 308 };
-        using (Pen meter = new Pen(Color.FromArgb(255, 111, 242, 190), 34))
-        {
-            meter.StartCap = LineCap.Round;
-            meter.EndCap = LineCap.Round;
-            for (int i = 0; i < xs.Length; i++)
-                g.DrawLine(meter, xs[i], tops[i], xs[i], bottoms[i]);
+            g.Clear(Color.FromArgb(13, 18, 24));
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+            g.DrawString("MTUI / Strip icon", heading, ink, 48, 30);
+            g.DrawString("Four rounded strips. Raised while playing, flat at rest.", label, secondary, 48, 88);
+            using (Bitmap activeLarge = Resize(playing, 192))
+            using (Bitmap quietLarge = Resize(quiet, 192))
+            {
+                g.DrawImageUnscaled(activeLarge, 154, 150);
+                g.DrawImageUnscaled(quietLarge, 654, 150);
+            }
+            g.DrawString("Playing", label, ink, 213, 366);
+            g.DrawString("Paused / stopped", label, ink, 665, 366);
+            g.DrawString("ACTUAL TRAY SIZES", small, secondary, 48, 426);
+            for (int row = 0; row < 2; row++)
+            {
+                int y = 466 + row * 88;
+                if (row == 1) g.FillRectangle(light, 32, y - 8, 936, 80);
+                g.DrawString(row == 0 ? "Dark taskbar" : "Light taskbar", small,
+                    row == 0 ? secondary : darkInk, 48, y + 19);
+                int[] sizes = { 16, 20, 24, 32 };
+                for (int i = 0; i < sizes.Length; i++)
+                {
+                    int size = sizes[i];
+                    for (int state = 0; state < 2; state++)
+                    {
+                        int x = 244 + i * 80 + state * 380;
+                        using (Bitmap icon = Resize(state == 0 ? playing : quiet, size))
+                            g.DrawImageUnscaled(icon, x + (32 - size) / 2, y);
+                        g.DrawString(size.ToString() + "px", small,
+                            row == 0 ? secondary : darkInk, x, y + 40);
+                    }
+                }
+            }
+            preview.Save(path, ImageFormat.Png);
         }
     }
 
@@ -331,8 +286,6 @@ public static class MtuiIcon
 
 $canvasPath = [System.IO.Path]::GetFullPath($Canvas)
 $outputPath = [System.IO.Path]::GetFullPath($Output)
-$wavePath = [System.IO.Path]::GetFullPath($WaveOutput)
-$monoPath = [System.IO.Path]::GetFullPath($MonoOutput)
-$orbitPath = [System.IO.Path]::GetFullPath($OrbitOutput)
-[MtuiIcon]::Build($canvasPath, $outputPath, $wavePath, $monoPath, $orbitPath)
-Write-Host ("wrote {0}, {1}, {2}, {3}, and {4}" -f $canvasPath, $outputPath, $wavePath, $monoPath, $orbitPath)
+$previewPath = [System.IO.Path]::GetFullPath($Preview)
+[MtuiIcon]::Build($canvasPath, $outputPath, $previewPath)
+Write-Host ("wrote playing and quiet icons, {0}, and {1}" -f $canvasPath, $previewPath)
