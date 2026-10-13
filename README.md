@@ -103,9 +103,9 @@ Click cards, links, tabs, and player controls. Artist sections have mouse paging
 
 ## Resource use
 
-![Windows Task Manager showing two MTUI processes using 27.6 MB total](assets/previews/resource-usage.png)
+![Windows Task Manager showing two MTUI processes using 25.3 MB total](assets/previews/resource-usage.png)
 
-User-provided Task Manager snapshot: **27.6 MB total across two MTUI processes**, with **0% CPU at capture**. Usage varies with playback, artwork, sign-in, and helper tools; this is one snapshot, not a long-session benchmark.
+Task Manager snapshot of MTUI v0.11.4 during playback: **25.3 MB total across two MTUI processes**, with **0.3% CPU at capture**. Usage varies with playback, artwork, sign-in, and helper tools; this is one snapshot, not a long-session benchmark.
 
 ## Development
 
