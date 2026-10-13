@@ -39,9 +39,11 @@ jobs:
       # webview2-com statically links WebView2Loader on MSVC. GNU links the DLL
       # dynamically, which would turn the release into a two-file download.
       - name: Build single-file Windows release
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --locked
 
-      - name: Verify WebView2 loader is static
+      - name: Verify Windows runtime dependencies
         shell: pwsh
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
@@ -54,6 +56,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Could not inspect mtui.exe imports" }
           if ($imports -match "WebView2Loader\.dll") {
             throw "mtui.exe still imports WebView2Loader.dll"
+          }
+          if ($imports -match '(?i)VCRUNTIME\d|MSVCP\d') {
+            throw "mtui.exe still requires a separately installed Visual C++ runtime"
           }
 
       - name: Install installer compiler
@@ -125,11 +130,39 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-linux
-          path: dist/MTUI-*
+          path: |
+            dist/MTUI-*
+            dist/install.sh
           if-no-files-found: error
 
+  linux-smoke:
+    needs: linux
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:24.04", "fedora:44", "archlinux:base", "opensuse/tumbleweed:latest"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux
+          path: dist
+      - name: Verify fresh installation and updater
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          (cd dist && sha256sum MTUI-* install.sh > SHA256SUMS)
+          docker run --rm \
+            --mount "type=bind,source=$PWD/scripts,target=/source/scripts,readonly" \
+            --mount "type=bind,source=$PWD/dist,target=/packages,readonly" \
+            "$IMAGE" bash /source/scripts/test-linux-release.sh "$version" /packages
+
   publish:
-    needs: [windows, linux]
+    needs: [windows, linux, linux-smoke]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -146,7 +179,7 @@ jobs:
 
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum MTUI-* > SHA256SUMS
+        run: sha256sum MTUI-* install.sh > SHA256SUMS
 
       - name: Publish release
         env:
@@ -163,5 +196,6 @@ jobs:
             "dist/MTUI-$version-windows-x64-portable.exe#Portable MTUI for Windows (x64)" \
             "dist/MTUI-$version-linux-x64.deb#MTUI package for Debian and Ubuntu (x64)" \
             "dist/MTUI-$version-linux-x64.tar.gz#MTUI archive for Linux (x64)" \
+            "dist/install.sh#Linux installer (Debian, Fedora, Arch, openSUSE)" \
             "dist/SHA256SUMS#SHA-256 checksums" \
             "${notes_args[@]}" --verify-tag

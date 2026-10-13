@@ -52,7 +52,7 @@ fi
 installed_size=$(du -sk "$package_root/usr" | cut -f1)
 cat > "$package_root/DEBIAN/control" <<EOF
 Package: mtui
-Version: $version
+Version: $version-1
 Architecture: amd64
 Section: sound
 Priority: optional
@@ -70,7 +70,10 @@ install -Dm755 "$build_dir/mtui-sign-in" "$portable_root/mtui-sign-in"
 install -Dm644 "$repo_root/LICENSE" "$portable_root/LICENSE"
 install -Dm644 "$repo_root/README.md" "$portable_root/README.md"
 install -Dm644 "$repo_root/docs/usage.md" "$portable_root/docs/usage.md"
+install -Dm644 "$repo_root/installer/linux/mtui.desktop" "$portable_root/mtui.desktop"
+install -Dm644 "$repo_root/assets/mtui-icon.svg" "$portable_root/mtui.svg"
 tar --owner=0 --group=0 --numeric-owner -czf "$output_dir/$bundle.tar.gz" -C "$staging" "$bundle"
+install -m644 "$repo_root/scripts/install-linux.sh" "$output_dir/install.sh"
 
 printf 'Runtime dependencies: %s\n' "$dependencies"
 stat --printf='%n: %s bytes\n' "$output_dir/$bundle.deb" "$output_dir/$bundle.tar.gz"

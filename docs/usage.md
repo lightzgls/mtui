@@ -11,9 +11,11 @@ personalized Home sign-in uses the Microsoft Edge WebView2 runtime included with
 current Windows installations.
 
 **Linux** — prebuilt x86-64 packages include both MTUI and its sign-in helper.
-The Debian/Ubuntu package installs its audio, TLS, and WebKitGTK runtime
-dependencies through APT. Rust and development packages are only needed when
-building from source. A graphical desktop is needed for the sign-in window.
+The curl installer installs missing audio, TLS, and WebKitGTK runtime libraries
+through your distribution's package manager. Rust and development packages are
+only needed when building from source. Prebuilt binaries require glibc 2.34+
+and x86-64; Alpine/musl and ARM need separate builds. A graphical desktop is
+needed for the sign-in window.
 
 **macOS** — install the Xcode command-line tools and Rust. WKWebView is provided
 by macOS.
@@ -38,7 +40,72 @@ checksum, and preserves your account data and settings. Installed copies update
 in their existing directory; portable copies replace their current executable.
 Playback stops for the restart. A failed download leaves the running app intact.
 
-**Linux (Debian/Ubuntu, x64)** — download `MTUI-<version>-linux-x64.deb` from the
+**Linux (x64, recommended)** — run without `sudo`:
+
+```sh
+curl -fsSL https://github.com/lightzgls/mtui/releases/latest/download/install.sh | bash
+```
+
+The same command detects Debian/Ubuntu (including compatible derivatives),
+Fedora, Arch/Manjaro, and openSUSE. It downloads a prebuilt archive with both
+MTUI and its sign-in helper, checks its SHA-256 against the pinned release's
+`SHA256SUMS`, and installs missing runtime libraries using APT, DNF, pacman,
+or Zypper. No repository clone, Rust toolchain, or compiler is downloaded.
+Package managers show their dependency transaction before you confirm it.
+When libraries are missing, Arch uses `pacman -Syu --needed` so refreshing the
+database does not create an unsupported partial upgrade. This may also update
+existing system packages; review the download size before confirming. No package
+manager is invoked when both executables can already load their libraries.
+
+MTUI is installed under `~/.local/lib/mtui`, with shortcuts in `~/.local/bin`
+and a terminal launcher in the application menu. Open that launcher, or run the
+command printed by the installer. It does not modify shell startup files.
+An existing unrelated `~/.local/bin/mtui` is not overwritten; move that older
+installation aside before switching. Account sessions, settings, and cached
+playback tools are kept separately and are not changed.
+
+To inspect the script first:
+
+```sh
+curl -fSL https://github.com/lightzgls/mtui/releases/latest/download/install.sh -o install.sh
+less install.sh
+bash install.sh
+```
+
+Options: `bash install.sh --version 0.11.3` pins a stable release;
+`--yes` accepts package-manager confirmations; `--skip-deps` only works when
+all runtime libraries are already available. Other glibc distributions can use
+the installer if those libraries are installed, but automatic dependency setup
+is limited to the families above. Immutable desktops with missing libraries
+must provide them on the host or use Distrobox; the installer does not change
+their base image.
+
+Open **Settings → Updates** to check for a newer stable version, then select
+**Update to v…**. On Linux the updater is distribution-independent: it verifies
+the archive, stages and checks both executables, closes the UI, replaces both,
+and restarts in the same terminal. A failed download or compatibility check
+leaves the running copy intact; failed replacement or restart restores both old
+executables. Account data and downloaded playback tools are retained. Updating
+does not silently upgrade system libraries; rerun the installer if a future
+version needs additional ones.
+
+Only writable Linux installations can self-update. For a root-owned `.deb`,
+use APT, or switch once to the curl installer for per-user updates. This Linux
+update support is included in the refreshed v0.11.3 binaries; older copies need
+one manual installation of that build first. Existing Windows v0.11.3 copies
+also need the refreshed installer or portable executable once to receive the
+new settings labels; their version number has not changed.
+
+To remove a curl installation (account data and playback tools are retained):
+
+```sh
+rm "$HOME/.local/bin/mtui" "$HOME/.local/bin/mtui-sign-in"
+rm -r "$HOME/.local/lib/mtui"
+rm "${XDG_DATA_HOME:-$HOME/.local/share}/applications/mtui.desktop"
+rm "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/mtui.svg"
+```
+
+**Linux (Debian/Ubuntu package, x64)** — download `MTUI-<version>-linux-x64.deb` from the
 [latest release](https://github.com/lightzgls/mtui/releases/latest), replace
 `<version>` with the downloaded version, and run:
 
@@ -50,9 +117,11 @@ mtui
 APT installs any missing runtime libraries, including WebKitGTK for sign-in.
 The package also adds a terminal launcher to your desktop's application menu.
 Upgrade by installing the newer `.deb` the same way, then restart MTUI.
+The refreshed v0.11.3 package has Debian revision `0.11.3-1`, which upgrades the
+initial `0.11.3` package even though the app release number is unchanged.
 Remove the program with
 `sudo apt remove mtui`; account sessions and preferences remain in your home
-directory. In-app updates are currently available on Windows only.
+directory. Root-owned packages are updated with APT rather than the in-app updater.
 
 Linux packages are available from v0.11.3. Earlier releases only have Windows
 downloads; building from source remains available below. The binaries are built
@@ -113,7 +182,7 @@ to launch or install the helper separately. Ensure `~/.local/bin` is on `PATH`.
 Linux maintainers can produce the `.deb` and `.tar.gz` packages with
 `cargo build --release --locked --bins`, then
 `bash scripts/package-linux.sh <version>`. Packaging also needs `dpkg-dev`.
-The output is written to `target/packages/`.
+The output, including the release's `install.sh`, is written to `target/packages/`.
 
 ### First-Launch Downloads
 
@@ -129,12 +198,13 @@ Download payloads measured for MTUI v0.11.3 and the playback tools available on
 
 | Fresh x86-64 machine | MTUI download | MTUI plus first-launch tools |
 |---|---|---|
-| Windows 11 | 3.3 MB installer | About 90 MB |
+| Windows 11 | 3.4 MB installer | About 90 MB |
 | Ubuntu 24.04 Desktop | 1.5 MB `.deb`, including sign-in | About 103 MB |
+| Ubuntu 24.04 Desktop, curl installer | 2.1 MB archive, including sign-in | About 104 MB |
 
 These are download sizes, not installed disk usage. The Ubuntu desktop image
 already includes the needed native libraries; other distributions or minimal
-installations may need additional runtime downloads, which APT lists before
+installations may need additional runtime downloads, which the package manager lists before
 installation. Package metadata and network overhead are excluded. Tool versions
 can change these totals. Later launches reuse the downloaded tools.
 
@@ -308,6 +378,25 @@ sign-in profile without stopping current playback.
 | `S` or `Ctrl-S` | Open grouped settings; Enter chooses a value, Left/Right cycles choices |
 | `B` | Continue in the Windows notification area |
 | `q` or `Ctrl-C` | Quit |
+
+### Settings Support
+
+Settings show a platform label on each row in wide terminals and in the selected
+setting's detail in narrower terminals. Unavailable controls are disabled.
+
+| Setting | Windows | Linux |
+|---|---|---|
+| Audio output | Yes | Yes |
+| Precision volume | Yes | Yes |
+| Cover style | Yes | Yes |
+| Artwork display | Yes, terminal-dependent | Yes, terminal-dependent |
+| Discord presence | Yes, Discord must be running | Yes, Discord must be running |
+| Keep tray icon visible | Yes | No |
+| Click tray icon to pause / resume | Yes | No |
+| Updates | Yes | Yes, writable installation |
+
+"All platforms" also includes macOS for playback, appearance, and Discord.
+In-app updates are currently Windows/Linux only; macOS updates manually.
 
 ### Windows Tray
 

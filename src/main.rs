@@ -88,6 +88,8 @@ fn main() -> Result<()> {
         if let Err(error) = &result { console::report_error(&format!("Could not finish the MTUI update: {error:#}")); }
         return result;
     }
+    #[cfg(target_os = "linux")]
+    update::cleanup_completed();
     #[cfg(windows)]
     if let Some((recover, silent)) = session::helper_request() {
         return session::run_helper(recover, silent);
@@ -119,6 +121,8 @@ fn main() -> Result<()> {
         return Err(err);
     }
     diagnostics::info("app", "clean shutdown");
+    #[cfg(target_os = "linux")]
+    update::restart_if_pending()?;
     Ok(())
 }
 

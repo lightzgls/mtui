@@ -15,6 +15,15 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  linux-installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check installer scripts
+        run: |
+          shellcheck scripts/install-linux.sh scripts/test-linux-installer.sh scripts/test-linux-release.sh scripts/package-linux.sh
+          bash scripts/test-linux-installer.sh
+
   test:
     # Every desktop, deliberately: sign-in uses the native webview on each and
     # platform-specific code must not be allowed to rot unnoticed.

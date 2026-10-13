@@ -1,15 +1,15 @@
 //! Explicit, asynchronous updates from the project's stable GitHub releases.
 use std::fs::{self, OpenOptions};
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 use std::fs::File;
 use std::io::Write;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 use anyhow::bail;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -21,10 +21,14 @@ const MAX_PACKAGE: u64 = 64 * 1024 * 1024;
 const MAX_METADATA: usize = 1024 * 1024;
 const HELPER: &str = "--mtui-update-helper";
 
+#[cfg(target_os = "linux")]
+mod linux;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 enum Kind {
     Installed,
     Portable,
+    Linux,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +160,8 @@ impl State {
                         .build()?;
                     let http = client()?;
                     if let Some(release) = release {
+                        #[cfg(target_os = "linux")]
+                        linux::check_install_directory(&executable)?;
                         let result = runtime
                             .block_on(download(&http, release, executable, kind, &sender))
                             .map_err(|error| format!("Could not download the update: {error:#}"));
@@ -213,7 +219,9 @@ impl State {
 }
 
 fn package_kind(executable: &Path) -> Kind {
-    if executable
+    if cfg!(target_os = "linux") {
+        Kind::Linux
+    } else if executable
         .parent()
         .is_some_and(|dir| dir.join("unins000.exe").is_file())
     {
@@ -256,12 +264,13 @@ fn select_release(raw: &[u8], current: &str, kind: Kind) -> Result<Option<Releas
     let name = match kind {
         Kind::Installed => format!("MTUI-{release_version}-Setup-x64.exe"),
         Kind::Portable => format!("MTUI-{release_version}-windows-x64-portable.exe"),
+        Kind::Linux => format!("MTUI-{release_version}-linux-x64.tar.gz"),
     };
     let asset = metadata
         .assets
         .into_iter()
         .find(|asset| asset.name == name)
-        .context("the Windows update is not available yet; try again shortly")?;
+        .context("the update for this platform is not available yet; try again shortly")?;
     ensure!(
         asset.state == "uploaded" && asset.size > 0 && asset.size <= MAX_PACKAGE,
         "invalid update size or upload state"
@@ -418,7 +427,7 @@ fn nonce() -> u128 {
         .as_nanos()
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 fn verify(package: &Package) -> Result<()> {
     let mut file = File::open(&package.payload)?;
     ensure!(
@@ -427,7 +436,11 @@ fn verify(package: &Package) -> Result<()> {
     );
     let mut magic = [0; 2];
     file.read_exact(&mut magic)?;
-    ensure!(&magic == b"MZ", "the update is not a Windows executable");
+    if package.kind == Kind::Linux {
+        ensure!(magic == [0x1f, 0x8b], "the update is not a gzip archive");
+    } else {
+        ensure!(&magic == b"MZ", "the update is not a Windows executable");
+    }
     let mut hash = Sha256::new();
     hash.update(magic);
     let mut buffer = [0; 64 * 1024];
@@ -471,9 +484,14 @@ pub fn prepare_restart(package: Package) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn prepare_restart(package: Package) -> Result<()> {
+    linux::prepare_restart(package)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn prepare_restart(_: Package) -> Result<()> {
-    bail!("in-app installation is available on Windows")
+    bail!("in-app installation is available on Windows and Linux")
 }
 
 pub fn helper_requested() -> bool {
@@ -550,6 +568,7 @@ pub fn run_helper() -> Result<()> {
             );
         }
         Kind::Portable => replace_portable(&package.payload, &package.executable)?,
+        Kind::Linux => anyhow::bail!("a Linux update cannot be installed on Windows"),
     }
     std::process::Command::new(&package.executable)
         .creation_flags(0x0800_0000)
@@ -560,9 +579,26 @@ pub fn run_helper() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 pub fn run_helper() -> Result<()> {
-    bail!("the Windows updater cannot run on this platform")
+    linux::run_helper()
+}
+
+#[cfg(target_os = "linux")]
+pub fn restart_if_pending() -> Result<()> {
+    linux::restart_if_pending()
+}
+
+#[cfg(target_os = "linux")]
+pub fn cleanup_completed() {
+    if let Err(error) = linux::cleanup_completed() {
+        eprintln!("Could not clean up the completed MTUI update: {error:#}");
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn run_helper() -> Result<()> {
+    bail!("the updater cannot run on this platform")
 }
 
 #[cfg(any(windows, test))]
@@ -604,6 +640,7 @@ mod tests {
         let name = match kind {
             Kind::Installed => format!("MTUI-{number}-Setup-x64.exe"),
             Kind::Portable => format!("MTUI-{number}-windows-x64-portable.exe"),
+            Kind::Linux => format!("MTUI-{number}-linux-x64.tar.gz"),
         };
         serde_json::json!({"tag_name": tag, "draft": false, "prerelease": false, "assets": [{"name": name, "state": "uploaded", "size": bytes.len(), "digest": format!("sha256:{:x}", Sha256::digest(bytes)), "browser_download_url": format!("{DOWNLOADS}{tag}/{name}")}]})
     }
@@ -632,6 +669,16 @@ mod tests {
         ] {
             assert!(version(text).is_none());
         }
+    }
+
+    #[test]
+    fn linux_updates_select_the_archive_including_sign_in_not_the_debian_package() {
+        let raw = metadata("v0.12.0", Kind::Linux, &[0x1f, 0x8b, 0]);
+        let release = select_release(&serde_json::to_vec(&raw).unwrap(), "0.11.3", Kind::Linux)
+            .unwrap().unwrap();
+        assert_eq!(release.asset.name, "MTUI-0.12.0-linux-x64.tar.gz");
+        assert!(select_release(&serde_json::to_vec(&raw).unwrap(), "0.11.3", Kind::Portable).is_err());
+        assert_eq!(package_kind(Path::new("/home/user/.local/lib/mtui/mtui")) == Kind::Linux, cfg!(target_os = "linux"));
     }
 
     #[test]

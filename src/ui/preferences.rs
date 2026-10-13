@@ -39,7 +39,7 @@ pub(super) fn draw(
         frame,
         Chrome {
             title: "Settings",
-            width: 68,
+            width: 84,
             height: 25,
             close_label: if state.return_to_menu {
                 "Back"
@@ -116,15 +116,20 @@ pub(super) fn draw(
     let selected_row = rows
         .iter()
         .find(|row| row.setting == state.selected_setting());
-    let detail = if let Some((notice, _)) = &state.notice {
+    let description = if let Some((notice, _)) = &state.notice {
         notice.as_str()
     } else if selected_row.is_some_and(|row| !row.enabled) {
-        "Available on Windows."
+        "Unavailable on this platform."
     } else {
         state.selected_setting().description()
     };
+    let detail = if state.notice.is_some() {
+        description.to_string()
+    } else {
+        format!("{}. {description}", state.selected_setting().platforms())
+    };
     let error = state.notice.as_ref().is_some_and(|(_, error)| *error);
-    let detail = bounded_wrap(detail, help.width.saturating_sub(4) as usize)
+    let detail = bounded_wrap(&detail, help.width.saturating_sub(4) as usize)
         .into_iter()
         .take(help.height.saturating_sub(1) as usize)
         .map(|line| {
@@ -179,7 +184,12 @@ fn setting_line(row: &SettingRow, selected: bool, width: usize, accent: Color) -
         ));
     }
     let room = width.saturating_sub(4);
-    let value_room = (room / 2).max(8).min(room);
+    let scope = if width >= 70 {
+        format!("  {}", padded(row.setting.platforms(), 13))
+    } else {
+        String::new()
+    };
+    let value_room = (room / 2).clamp(8, 24).min(room);
     let value = if enabled {
         format!(
             "{}{}",
@@ -190,17 +200,22 @@ fn setting_line(row: &SettingRow, selected: bool, width: usize, accent: Color) -
             if row.setting.is_toggle() { "" } else { " ›" }
         )
     } else {
-        truncate("Windows only", value_room)
+        truncate("Unavailable", value_room)
     };
-    let label_room = room.saturating_sub(display_width(&value) + 1);
+    let label_room = room.saturating_sub(
+        if scope.is_empty() { display_width(&value) } else { value_room }
+            + display_width(&scope) + 1,
+    );
     let label = truncate(row.setting.label(), label_room);
-    let gap = width.saturating_sub(2 + display_width(&label) + display_width(&value));
+    let label = if scope.is_empty() { label } else { padded(&label, label_room) };
+    let gap = width.saturating_sub(2 + display_width(&label) + display_width(&scope) + display_width(&value));
     Line::from(vec![
         Span::styled(
             truncate(prefix, width),
             base.fg(if selected { accent } else { Color::White }),
         ),
         Span::styled(label, base),
+        Span::styled(scope, base.fg(Color::DarkGray)),
         Span::styled(" ".repeat(gap), base),
         Span::styled(
             value,
@@ -405,6 +420,18 @@ mod tests {
             Some(MouseAction::IgnoreOverlay),
             "a section heading consumes clicks"
         );
+    }
+
+    #[test]
+    fn platform_support_is_visible_even_when_windows_only_rows_are_enabled() {
+        let (buf, _) = drawn(&State::default(), 100, 36);
+        let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("All platforms"));
+        assert!(text.contains("Win + Linux"));
+        assert_eq!(text.matches("Windows only").count(), 2);
+        let (buf, _) = drawn(&State { selected: Setting::Tray.index(), ..Default::default() }, 48, 24);
+        let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Windows only"), "{text}");
     }
 
     #[test]

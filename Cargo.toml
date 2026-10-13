@@ -104,6 +104,11 @@ unicode-segmentation = { version = "1.13", default-features = false }
 tao = { version = "0.36.0", features = ["rwh_06"] }
 wry = { version = "0.56.1", features = ["os-webview"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Stream the verified release archive; never unpack paths or symlinks from it.
+tar = { version = "0.4.46", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 # Test-only. `stream-download` reports every reconnect, gap re-request and
 # download failure through `tracing`, and those events are the only account of
 # why a stream died mid-track -- rodio drops a failed decoder without a word.

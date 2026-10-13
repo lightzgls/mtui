@@ -60,7 +60,7 @@ impl Setting {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Output => "System default follows the output selected in Windows.",
+            Self::Output => "System default follows your operating system's audio output.",
             Self::PrecisionVolume => "Scroll over the current song's cover to change volume by 1% per wheel step.",
             Self::Cover => "Choose detailed artwork or a cover drawn with text.",
             Self::Renderer => "Automatic detects support; Kitty needs a compatible terminal.",
@@ -76,7 +76,21 @@ impl Setting {
     }
 
     pub fn enabled(self) -> bool {
-        cfg!(windows) || !matches!(self, Self::Tray | Self::TrayClick | Self::Updates)
+        cfg!(windows) || (!self.windows_only() && (self != Self::Updates || cfg!(target_os = "linux")))
+    }
+
+    pub fn windows_only(self) -> bool {
+        matches!(self, Self::Tray | Self::TrayClick)
+    }
+
+    pub fn platforms(self) -> &'static str {
+        if self.windows_only() {
+            "Windows only"
+        } else if self == Self::Updates {
+            "Win + Linux"
+        } else {
+            "All platforms"
+        }
     }
 }
 
@@ -378,6 +392,27 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn platform_labels_match_setting_availability() {
+        for setting in Setting::ALL {
+            match setting {
+                Setting::Tray | Setting::TrayClick => {
+                    assert_eq!(setting.platforms(), "Windows only");
+                    assert_eq!(setting.enabled(), cfg!(windows));
+                }
+                Setting::Updates => {
+                    assert_eq!(setting.platforms(), "Win + Linux");
+                    assert_eq!(setting.enabled(), cfg!(any(windows, target_os = "linux")));
+                }
+                _ => {
+                    assert_eq!(setting.platforms(), "All platforms");
+                    assert!(setting.enabled());
+                }
+            }
+        }
+        assert!(!Setting::Output.description().contains("Windows"));
     }
 
     #[test]

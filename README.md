@@ -66,16 +66,15 @@ https://github.com/user-attachments/assets/27cdd7f8-daf9-4ccc-b736-d903014b5be1
 
 **Windows**: download **MTUI-<version>-Setup-x64.exe** from the [latest release](https://github.com/lightzgls/mtui/releases/latest). The Windows installer requires no administrator permission. A single portable executable is also available.
 
-**Linux (x64)**: download **MTUI-<version>-linux-x64.deb**, then install it with APT:
+**Linux (x64)**: run the installer as your normal user:
 
 ```sh
-sudo apt install ./MTUI-*-linux-x64.deb
-mtui
+curl -fsSL https://github.com/lightzgls/mtui/releases/latest/download/install.sh | bash
 ```
 
-The package includes the player and sign-in helper. APT installs missing runtime libraries automatically; no Rust, compiler, or development packages are needed. Linux packages are available from v0.11.3; earlier releases contain Windows downloads only. A `.tar.gz` archive is also available. See the [Linux installation guide](docs/usage.md#installation) for archive installation and other distributions.
+The installer detects Debian/Ubuntu, Fedora, Arch, and openSUSE, verifies the download, and installs both the player and sign-in helper. Only missing system libraries need `sudo`; no Rust or compiler is needed. MTUI is installed for your user so in-app updates need no root access. Prebuilt Linux releases require glibc 2.34+; ARM and Alpine/musl need separate builds. A `.deb` and manual archive are also available. See the [Linux installation guide](docs/usage.md#installation), including how to inspect the script before running it.
 
-On Windows v0.10.0 and later, open **Settings → Updates** to check for a new version, then select **Update to v…** to download, install, and restart. Installed and portable copies both support this flow.
+Open **Settings → Updates** to download, verify, install, and restart a newer version. This works on Windows and writable Linux installations, independently of the Linux distribution. System-managed Linux packages still use their package manager. Settings label their platform support; tray controls remain Windows-only.
 
 On first launch, MTUI downloads missing playback tools: yt-dlp, a supported JavaScript runtime, and the bgutil PO-token provider. Setup needs an internet connection. Sign-in uses Microsoft Edge WebView2 on Windows and WebKitGTK on Linux; playback runs without a browser window.
 
