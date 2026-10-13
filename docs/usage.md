@@ -8,7 +8,9 @@
 
 **Windows** — nothing to install. The executable is self-contained, and
 personalized Home sign-in uses the Microsoft Edge WebView2 runtime included with
-current Windows installations.
+current Windows installations. Official builds statically link the Visual C++
+runtime, so no separate Visual C++ redistributable is required. Older or stripped
+Windows images without WebView2 must install that runtime separately.
 
 **Linux** — prebuilt x86-64 packages include both MTUI and its sign-in helper.
 The curl installer installs missing audio, TLS, and WebKitGTK runtime libraries
@@ -72,8 +74,9 @@ less install.sh
 bash install.sh
 ```
 
-Options: `bash install.sh --version 0.11.3` pins a stable release;
-`--yes` accepts package-manager confirmations; `--skip-deps` only works when
+Options: `bash install.sh --version 0.11.4` pins a stable release;
+`--yes` accepts package-manager confirmations, including Arch system updates;
+`--skip-deps` only works when
 all runtime libraries are already available. Other glibc distributions can use
 the installer if those libraries are installed, but automatic dependency setup
 is limited to the families above. Immutable desktops with missing libraries
@@ -91,10 +94,11 @@ version needs additional ones.
 
 Only writable Linux installations can self-update. For a root-owned `.deb`,
 use APT, or switch once to the curl installer for per-user updates. This Linux
-update support is included in the refreshed v0.11.3 binaries; older copies need
-one manual installation of that build first. Existing Windows v0.11.3 copies
-also need the refreshed installer or portable executable once to receive the
-new settings labels; their version number has not changed.
+update support is included in v0.11.4 and the refreshed v0.11.3 binaries. Original
+Linux v0.11.3 copies need one manual installation with the command above first.
+Refreshed per-user Linux v0.11.3 copies can update in-app to v0.11.4. Windows
+v0.10.0 and later can update in-app, including original v0.11.3 copies; no
+equal-version reinstall is needed for this new release.
 
 To remove a curl installation (account data and playback tools are retained):
 
@@ -117,8 +121,8 @@ mtui
 APT installs any missing runtime libraries, including WebKitGTK for sign-in.
 The package also adds a terminal launcher to your desktop's application menu.
 Upgrade by installing the newer `.deb` the same way, then restart MTUI.
-The refreshed v0.11.3 package has Debian revision `0.11.3-1`, which upgrades the
-initial `0.11.3` package even though the app release number is unchanged.
+The v0.11.4 package has Debian version `0.11.4-1`, which upgrades both the
+original `0.11.3` package and its refreshed `0.11.3-1` revision.
 Remove the program with
 `sudo apt remove mtui`; account sessions and preferences remain in your home
 directory. Root-owned packages are updated with APT rather than the in-app updater.
@@ -139,8 +143,9 @@ mtui
 
 Ensure `~/.local/bin` is on `PATH`. The archive includes sign-in but does not
 install system libraries. Your distribution must provide ALSA, OpenSSL 3,
-GTK 3, and WebKitGTK 4.1 runtime libraries. On Debian/Ubuntu, prefer the `.deb`
-so APT resolves the exact dependencies for you.
+GTK 3, and WebKitGTK 4.1 runtime libraries. Prefer the curl installer for automatic
+dependency setup and per-user updates, or the `.deb` for APT-managed installation.
+Close a running copy before manually replacing its executables.
 
 Each release includes `SHA256SUMS`. To check a downloaded package or archive,
 put it beside that file and run `sha256sum --check --ignore-missing SHA256SUMS`.
@@ -164,7 +169,7 @@ sudo dnf install gcc pkgconf-pkg-config openssl-devel alsa-lib-devel webkit2gtk4
 Arch Linux:
 
 ```sh
-sudo pacman -S --needed base-devel pkgconf openssl alsa-lib webkit2gtk-4.1
+sudo pacman -Syu --needed base-devel pkgconf openssl alsa-lib webkit2gtk-4.1
 ```
 
 Clone the repository, then build and install MTUI:
@@ -183,6 +188,9 @@ Linux maintainers can produce the `.deb` and `.tar.gz` packages with
 `cargo build --release --locked --bins`, then
 `bash scripts/package-linux.sh <version>`. Packaging also needs `dpkg-dev`.
 The output, including the release's `install.sh`, is written to `target/packages/`.
+Official releases build on Ubuntu 22.04, scan both binaries for native dependencies,
+and test the packages on four distribution families before publishing. See the
+[release guide](releasing.md) for the complete build and verification process.
 
 ### First-Launch Downloads
 
@@ -193,8 +201,8 @@ copy of the GPL-3.0 `bgutil-ytdlp-pot-provider` and its production dependencies 
 YouTube's protected audio streams can play at normal quality. These automatic
 installs require network access but not administrator access.
 
-Download payloads measured for MTUI v0.11.3 and the playback tools available on
-13 October 2026:
+Approximate download payloads for MTUI v0.11.4, using first-launch playback-tool
+measurements from 13 October 2026:
 
 | Fresh x86-64 machine | MTUI download | MTUI plus first-launch tools |
 |---|---|---|
@@ -348,7 +356,7 @@ sign-in profile without stopping current playback.
 
 | Key | Action |
 |---|---|
-| `Ctrl-K` | Open the App Menu for navigation, accounts, settings, help, tray, and quit |
+| `Ctrl-K` | Open the App Menu for navigation, accounts, settings, help, quit, and Windows-only tray actions |
 | `.` | Open page and selection actions, including available artist links |
 | `Ctrl-P` | Open all six playback actions outside search entry |
 | `?` | Open keyboard help |
@@ -429,10 +437,13 @@ with the former click-to-stop preference enabled keep these controls enabled.
 | Platform | Configuration directory |
 |---|---|
 | Windows | `%APPDATA%\mtui` |
-| Linux | `$XDG_CONFIG_HOME/mtui`, or `~/.config/mtui` |
+| Linux / macOS | `$XDG_CONFIG_HOME/mtui`, or `~/.config/mtui` |
 
 Downloaded tools are kept separately under `%LOCALAPPDATA%\mtui` on Windows or
-`$XDG_CACHE_HOME/mtui` on Linux.
+`$XDG_CACHE_HOME/mtui` (default `~/.cache/mtui`) on Linux/macOS. Relative XDG
+configuration/cache paths are ignored in favor of the defaults. Program files
+and these data directories are separate; reinstalling the app does not require
+signing in or downloading all playback tools again.
 
 **Resource use.** Playback uses a fixed 1 MiB audio ring buffer and a fixed
 2 MiB packet cache for MP4 interleaving rather than downloading a whole song
@@ -479,3 +490,21 @@ appears in recent YouTube Music history. A successful telemetry HTTP response
 alone does not discard the pending report. YouTube account history must be
 enabled for writes to appear; logging out clears that account's pending reports.
 On upgrade, unverified reports from the previous 24 hours are checked and recovered.
+
+## Installation and Update Troubleshooting
+
+| Problem | Next step |
+|---|---|
+| `curl` is missing | Install curl and CA certificates through your distribution's package manager, then retry. |
+| No interactive terminal during dependency installation | Run from a terminal, or inspect the script and use `bash install.sh --yes` to accept the transaction explicitly. On Arch this also accepts proposed system updates. |
+| Existing `~/.local/bin/mtui` belongs to another installation | Close MTUI and move the old player and helper aside, then rerun the installer. Do not delete the configuration/cache directories. |
+| Missing libraries on an unrecognized distribution | Provide ALSA, OpenSSL 3, GTK 3, and WebKitGTK 4.1 runtimes with your package manager, then retry. |
+| ARM, Alpine/musl, or glibc older than 2.34 | The published x64/glibc binaries cannot run here. Use a source build with compatible dependencies; a separate prebuilt target is not currently published. |
+| Immutable Linux desktop | If runtimes are already available, a writable per-user installation can work. Otherwise provide the runtimes or install inside Distrobox; the installer does not alter the immutable base. |
+| In-app update reports a read-only installation | Use the package manager for a system-owned installation, or migrate once to the per-user curl installation. Do not launch the player with sudo. |
+| Checksum or compatibility check fails | Do not bypass verification. Retry the download; rerun the installer if additional runtime libraries are required. Keep the existing binaries together. |
+| Sign-in cannot open | Use a graphical desktop with a working display session. Linux needs the companion next to the player and WebKitGTK 4.1; Windows needs WebView2. |
+
+For bug reports, include the app version, distribution/version, architecture,
+terminal, installation method, and error text. Do not attach cookies, session
+files, or private browser profiles. See the [testing guide](testing.md).

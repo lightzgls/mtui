@@ -46,6 +46,57 @@ Nếu sandbox chặn HTTP loopback hoặc thư mục tạm, ghi nhận là lỗi
 chạy lại trong môi trường cho phép localhost. Không bỏ test để biến kết quả đỏ
 thành xanh. `--offline` chỉ áp dụng cho Cargo; test loopback vẫn dùng socket.
 
+## Kiểm tra cài đặt và cập nhật Linux
+
+Chạy ShellCheck và bộ giả lập installer trong môi trường có Bash:
+
+```sh
+shellcheck scripts/install-linux.sh scripts/test-linux-installer.sh scripts/test-linux-release.sh scripts/package-linux.sh
+bash scripts/test-linux-installer.sh
+```
+
+Bộ giả lập kiểm tra APT/DNF/pacman/Zypper, Debian trước/sau chuyển đổi time64,
+release mới nhất và bản ghim, checksum sai, download lỗi, từ chối dependency,
+file trùng với cài đặt khác, distro chưa hỗ trợ, ARM/musl và luồng `curl | bash`.
+Package manager được giả lập: không cài package, không thay đổi dữ liệu trên host.
+ShellCheck mới có thể báo SC2317 cho mock được gọi gián tiếp qua mảng command;
+chỉ bỏ qua cảnh báo tại đúng mock, không bỏ qua toàn bộ kiểm tra script.
+
+Kiểm tra release thật **chỉ trong container dùng một lần**, không chạy trực tiếp
+`scripts/test-linux-release.sh` trên desktop. Script cài runtime và app vào HOME
+trong container. Thư mục `dist` phải chứa archive, `install.sh` và `SHA256SUMS`
+của cùng phiên bản. Ví dụ:
+
+```sh
+docker run --rm \
+  --mount "type=bind,source=$PWD/scripts,target=/source/scripts,readonly" \
+  --mount "type=bind,source=$PWD/dist,target=/packages,readonly" \
+  ubuntu:24.04 bash /source/scripts/test-linux-release.sh 0.11.4 /packages
+```
+
+Ma trận release gồm Ubuntu 24.04, Fedora 44, Arch và openSUSE Tumbleweed. Kiểm
+tra dependency thật, loader của cả hai executable, launcher/icon, helper sign-in
+với argument không hợp lệ, không có Rust/compiler, và đường thay thế của updater
+thật với fixture `/bin/true`. Fixture không mở Google hoặc phát âm thanh.
+Kiểm tra thêm bằng user thường khi thay đổi quyền/path; thư viện đã có thì
+installer không được yêu cầu root hoặc gọi package manager. Trên Arch thiếu thư
+viện phải dùng `pacman -Syu`, không tạo partial upgrade bằng `pacman -Sy`.
+
+Regression updater phải bao gồm archive thiếu/trùng helper, symlink/path không
+hợp lệ, body/checksum sai, ELF không tương thích, thư mục không có quyền ghi,
+rollback cả hai executable, và giữ nguyên settings/session/cache. Desktop test
+phải xác nhận terminal vẫn nhận input sau restart. Package do root quản lý phải
+báo dùng package manager, không tự sửa `/usr/bin`. Linux v0.11.3 ban đầu cần cài
+thủ công một lần; bản refresh có thể cập nhật lên v0.11.4 trong app.
+
+CI chạy kiểm tra script riêng, Full/Clippy trên ba OS, và kiểm tra đóng gói Linux.
+Release chỉ publish sau build Windows/Linux và bốn smoke job distro. Kiểm tra
+Windows bằng `dumpbin`: không phụ thuộc `WebView2Loader.dll`, `VCRUNTIME*.dll`
+hoặc `MSVCP*.dll`; vẫn cần WebView2 của OS cho sign-in. Kiểm tra `.deb` mới nâng
+cấp được bản cũ và checksum của tất cả asset. Xem [quy trình release](releasing.md).
+Headless test pass **không xác nhận** Google login bằng GUI, audio hardware hay
+tray. Không chạy account-write/live test ngoài tài khoản và playlist test.
+
 ## Chính sách cho ca vừa chọn bài rồi click đến cuối
 
 Khi duration đã biết, giữ **vị trí seek cuối cùng của bài đang được chọn** trong
@@ -105,7 +156,8 @@ một player phải phát được bài kế tiếp; Quit phải kết thúc tro
 | Text | Tiếng Việt có dấu, dấu tổ hợp, CJK, emoji ZWJ/skin tone/flag, RTL, title dài, metadata thiếu |
 | Network | 401/403/404/416/429/500/503, DNS/TLS lỗi, offline, body đứt, Range bị bỏ qua, range sai, body nén quá lớn |
 | Storage | JSON cũ/hỏng/cắt dở, journal dòng cuối thiếu, không có quyền ghi, ổ đầy, lần save bị gián đoạn |
-| OS | Windows 10/11, desktop output + tai nghe/Bluetooth; console/terminal khác nhau; không có audio output |
+| OS | Windows 10/11, Ubuntu 24.04, Fedora 44, Arch, openSUSE Tumbleweed và macOS; terminal/display session khác nhau; desktop output + tai nghe/Bluetooth hoặc không có audio output |
+| Cài đặt | Windows installer/portable; Linux curl, archive ghi được, `.deb` do root quản lý; user thường/root; runtime đã có/thiếu; HOME có dấu cách; immutable host; x64/glibc hợp lệ và ARM/musl không hỗ trợ |
 | Session | Guest, signed in, expired, logout giữa request, retry cooldown, chỉnh clock lùi/tiến |
 
 Kích thước nhỏ ở trên là ca robustness; yêu cầu sản phẩm chưa chốt minimum
@@ -138,6 +190,9 @@ Không suy diễn một mô phỏng event đã pass thành một luồng âm tha
 ## Điều kiện đóng một đợt test
 
 - Full và Clippy pass; Stress pass với số lần/thread được ghi lại.
+- Với thay đổi installer/updater: ShellCheck, giả lập installer, smoke release trên
+  bốn distro và checksum pass; ghi riêng ca desktop chưa chạy. Đối chiếu nhãn
+  Settings: tray chỉ Windows, Updates Windows/Linux ghi được, còn lại cả hai.
 - Mọi ca P0/P1 có kết quả Pass/Fail/Blocked/Not run, cùng bằng chứng và môi trường.
 - Bug tái hiện được có regression test trước khi sửa; lưu kết quả trước/sau.
 - Keyboard-only và mouse-only hoàn thành launch → search → play → seek → queue

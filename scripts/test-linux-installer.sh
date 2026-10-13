@@ -41,16 +41,23 @@ if [[ ${1:-} == worker ]]; then
             printf 'libwebkit2gtk-4.1.so.0 => not found\n'
         fi
     }
+    # These mocks are called indirectly through the installer's command array.
+    # shellcheck disable=SC2317
     sudo() { "$@"; }
+    # shellcheck disable=SC2317
     record_package_manager() {
         printf '%s\n' "$*" >> "$HOME/actions"
         [[ $scenario != dependency-failure ]] || return 1
         if [[ $* != 'apt-get update' ]]; then touch "$HOME/dependencies"; fi
     }
+    # shellcheck disable=SC2317
     apt-get() { record_package_manager apt-get "$@"; }
     apt-cache() { [[ $scenario != old-debian ]]; }
+    # shellcheck disable=SC2317
     dnf() { record_package_manager dnf "$@"; }
+    # shellcheck disable=SC2317
     pacman() { record_package_manager pacman "$@"; }
+    # shellcheck disable=SC2317
     zypper() { record_package_manager zypper "$@"; }
     if [[ $scenario == conflict ]]; then
         mkdir -p "$HOME/.local/bin"

@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "mtui"
-version = "0.11.3"
+version = "0.11.4"
 dependencies = [
  "anyhow",
  "bytes",

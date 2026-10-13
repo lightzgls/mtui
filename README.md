@@ -2,7 +2,7 @@
 
 **Your music, in the terminal.**
 
-A lightweight YouTube Music player with cover art, lyrics, playlists, and controls you can click. Free and open source, built with Rust, primarily for Windows.
+A lightweight YouTube Music player with cover art, lyrics, playlists, and controls you can click. Free and open source, built with Rust, with prebuilt Windows and Linux downloads. macOS builds from source.
 
 **[Download for Windows](https://github.com/lightzgls/mtui/releases/latest)** · [Linux installation](docs/usage.md#installation) · [See it in action](#preview) · [Usage guide](docs/usage.md) · [Report an issue](https://github.com/lightzgls/mtui/issues)
 
@@ -74,15 +74,17 @@ curl -fsSL https://github.com/lightzgls/mtui/releases/latest/download/install.sh
 
 The installer detects Debian/Ubuntu, Fedora, Arch, and openSUSE, verifies the download, and installs both the player and sign-in helper. Only missing system libraries need `sudo`; no Rust or compiler is needed. MTUI is installed for your user so in-app updates need no root access. Prebuilt Linux releases require glibc 2.34+; ARM and Alpine/musl need separate builds. A `.deb` and manual archive are also available. See the [Linux installation guide](docs/usage.md#installation), including how to inspect the script before running it.
 
-Open **Settings → Updates** to download, verify, install, and restart a newer version. This works on Windows and writable Linux installations, independently of the Linux distribution. System-managed Linux packages still use their package manager. Settings label their platform support; tray controls remain Windows-only.
+Open **Settings → Updates** to download, verify, install, and restart a newer version. This works on Windows and writable Linux installations, independently of the Linux distribution. System-managed Linux packages still use their package manager. Settings label their platform support; tray controls remain Windows-only. See the [settings support table](docs/usage.md#settings-support) and [upgrade instructions](docs/usage.md#installation) for older Linux copies.
 
 On first launch, MTUI downloads missing playback tools: yt-dlp, a supported JavaScript runtime, and the bgutil PO-token provider. Setup needs an internet connection. Sign-in uses Microsoft Edge WebView2 on Windows and WebKitGTK on Linux; playback runs without a browser window.
+
+A fresh Windows 11 setup downloads about **90 MB** including playback tools. Ubuntu 24.04 Desktop needs about **103 MB** via `.deb` or **104 MB** via curl, including sign-in. Minimal systems and other distributions may need additional system libraries. See [download measurements and exclusions](docs/usage.md#first-launch-downloads).
 
 Search and playback work without an account. Press **M** or open **Menu → Account & Sessions** to sign in for personalized Home and radio queues, playlists, likes, and listening-history sync. YouTube account history must be enabled for history writes.
 
 Sign in once; MTUI maintains the saved session automatically, including in the tray. It renews every 48 hours and recovers early after authentication failures. Temporary failures retry quietly; a sign-in window appears only when Google requires verification.
 
-Settings and sessions live in `%APPDATA%\mtui`; downloaded tools live in `%LOCALAPPDATA%\mtui`. Upgrades preserve your data. See the [usage guide](docs/usage.md) for setup, troubleshooting, and Linux/macOS instructions.
+Settings and sessions live in `%APPDATA%\mtui` on Windows, or `$XDG_CONFIG_HOME/mtui` (default `~/.config/mtui`) on Linux/macOS. Downloaded tools are kept separately in `%LOCALAPPDATA%\mtui` or `$XDG_CACHE_HOME/mtui` (default `~/.cache/mtui`). Upgrades preserve your data. See the [usage guide](docs/usage.md) for setup and platform details.
 
 ## Controls
 
@@ -107,15 +109,15 @@ User-provided Task Manager snapshot: **27.6 MB total across two MTUI processes**
 
 ## Development
 
-Use current stable Rust and the Windows MSVC toolchain for a single-file executable.
+Use current stable Rust. Windows uses the MSVC toolchain; Linux needs the [source-build dependencies](docs/usage.md#building-from-source).
 
 ```sh
-cargo build --release --locked
+cargo build --release --locked --bins
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-Windows output: `target/release/mtui.exe`. Live network/account tests are ignored by default. Focused pull requests and bug reports are welcome.
+Windows output: `target/release/mtui.exe`. Linux/macOS output: `target/release/mtui` and `mtui-sign-in`, which must be installed together. Official Windows builds also statically link the Visual C++ runtime; see the [release guide](docs/releasing.md) for packaging and verification. Live network/account tests are ignored by default. Focused pull requests and bug reports are welcome.
 
 For isolated smoke, full, and repeated test runs, use `./scripts/test.ps1`.
 See the [testing guide](docs/testing.md). The runner keeps logs and

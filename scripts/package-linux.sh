@@ -38,6 +38,8 @@ install -Dm644 "$repo_root/assets/mtui-icon.svg" "$package_root/usr/share/icons/
 install -Dm644 "$repo_root/LICENSE" "$package_root/usr/share/doc/mtui/copyright"
 install -Dm644 "$repo_root/README.md" "$package_root/usr/share/doc/mtui/README.md"
 install -Dm644 "$repo_root/docs/usage.md" "$package_root/usr/share/doc/mtui/docs/usage.md"
+install -Dm644 "$repo_root/docs/testing.md" "$package_root/usr/share/doc/mtui/docs/testing.md"
+install -Dm644 "$repo_root/docs/releasing.md" "$package_root/usr/share/doc/mtui/docs/releasing.md"
 
 # Scan both binaries so installing the player also installs sign-in's WebKit runtime.
 mkdir -p -- "$package_root/DEBIAN"
@@ -70,6 +72,8 @@ install -Dm755 "$build_dir/mtui-sign-in" "$portable_root/mtui-sign-in"
 install -Dm644 "$repo_root/LICENSE" "$portable_root/LICENSE"
 install -Dm644 "$repo_root/README.md" "$portable_root/README.md"
 install -Dm644 "$repo_root/docs/usage.md" "$portable_root/docs/usage.md"
+install -Dm644 "$repo_root/docs/testing.md" "$portable_root/docs/testing.md"
+install -Dm644 "$repo_root/docs/releasing.md" "$portable_root/docs/releasing.md"
 install -Dm644 "$repo_root/installer/linux/mtui.desktop" "$portable_root/mtui.desktop"
 install -Dm644 "$repo_root/assets/mtui-icon.svg" "$portable_root/mtui.svg"
 tar --owner=0 --group=0 --numeric-owner -czf "$output_dir/$bundle.tar.gz" -C "$staging" "$bundle"
