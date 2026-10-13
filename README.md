@@ -4,13 +4,13 @@
 
 A lightweight YouTube Music player with cover art, lyrics, playlists, and controls you can click. Free and open source, built with Rust, primarily for Windows.
 
-**[Download for Windows](https://github.com/lightzgls/mtui/releases/latest)** · [See it in action](#preview) · [Usage guide](docs/usage.md) · [Report an issue](https://github.com/lightzgls/mtui/issues)
+**[Download for Windows](https://github.com/lightzgls/mtui/releases/latest)** · [Linux installation](docs/usage.md#installation) · [See it in action](#preview) · [Usage guide](docs/usage.md) · [Report an issue](https://github.com/lightzgls/mtui/issues)
 
 ![MTUI playing music in a terminal, with pixel cover art, a queue, and playback controls](assets/previews/now-playing.png)
 
 - **Mouse or keyboard.** Click a track, drag to seek, or use shortcuts to search and control playback.
 - **More than a track list.** Browse Home, build a queue, and follow lyrics alongside cover art that sets the player's colors.
-- **Easy to try.** Windows installer or portable executable; no Rust setup needed. Search and playback work without signing in.
+- **Easy to try.** Prebuilt Windows and Linux downloads include sign-in; no Rust setup needed. Search and playback work without signing in.
 
 First launch needs an internet connection to download playback tools. MTUI is an independent project, unaffiliated with YouTube or Google.
 
@@ -64,11 +64,20 @@ https://github.com/user-attachments/assets/27cdd7f8-daf9-4ccc-b736-d903014b5be1
 
 ## Install
 
-Download **MTUI-<version>-Setup-x64.exe** from the [latest release](https://github.com/lightzgls/mtui/releases/latest). The Windows installer requires no administrator permission. A single portable executable is also available.
+**Windows**: download **MTUI-<version>-Setup-x64.exe** from the [latest release](https://github.com/lightzgls/mtui/releases/latest). The Windows installer requires no administrator permission. A single portable executable is also available.
 
-From v0.10.0, open **Settings → Updates** to check for a new version, then select **Update to v…** to download, install, and restart. Installed and portable copies both support this flow.
+**Linux (x64)**: download **MTUI-<version>-linux-x64.deb**, then install it with APT:
 
-On first launch, MTUI downloads missing playback tools: yt-dlp, a supported JavaScript runtime, and the bgutil PO-token provider. Setup needs an internet connection. Sign-in uses Microsoft Edge WebView2; playback runs without a browser window.
+```sh
+sudo apt install ./MTUI-*-linux-x64.deb
+mtui
+```
+
+The package includes the player and sign-in helper. APT installs missing runtime libraries automatically; no Rust, compiler, or development packages are needed. Linux packages are available from v0.11.3; earlier releases contain Windows downloads only. A `.tar.gz` archive is also available. See the [Linux installation guide](docs/usage.md#installation) for archive installation and other distributions.
+
+On Windows v0.10.0 and later, open **Settings → Updates** to check for a new version, then select **Update to v…** to download, install, and restart. Installed and portable copies both support this flow.
+
+On first launch, MTUI downloads missing playback tools: yt-dlp, a supported JavaScript runtime, and the bgutil PO-token provider. Setup needs an internet connection. Sign-in uses Microsoft Edge WebView2 on Windows and WebKitGTK on Linux; playback runs without a browser window.
 
 Search and playback work without an account. Press **M** or open **Menu → Account & Sessions** to sign in for personalized Home and radio queues, playlists, likes, and listening-history sync. YouTube account history must be enabled for history writes.
 

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MTUI
+Comment=A terminal music player for YouTube Music
+Exec=mtui
+Icon=mtui
+Terminal=true
+Categories=AudioVideo;Audio;Player;
+Keywords=music;youtube;terminal;

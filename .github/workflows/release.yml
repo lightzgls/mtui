@@ -5,7 +5,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -77,18 +77,91 @@ jobs:
           }
           Copy-Item target/release/mtui.exe "dist/MTUI-$env:MTUI_VERSION-windows-x64-portable.exe"
 
-      - name: Publish release
+      - name: Save Windows packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/MTUI-*.exe
+          if-no-files-found: error
+
+  linux:
+    # Build against an older glibc so newer Ubuntu desktops can run the binaries.
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev libasound2-dev libwebkit2gtk-4.1-dev dpkg-dev
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - name: Verify release tag
         shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object { $_.name -eq "mtui" }).version
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match Cargo version $version"
+          }
+          "MTUI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Isolated tests and Clippy
+        shell: pwsh
+        run: ./scripts/test.ps1 -Suite Full -Online
+
+      - name: Build Linux player and sign-in helper
+        run: cargo build --release --locked --bins
+
+      - name: Build Linux packages
+        run: bash scripts/package-linux.sh "$MTUI_VERSION" target/release dist
+
+      - name: Save Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/MTUI-*
+          if-no-files-found: error
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect release packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum MTUI-* > SHA256SUMS
+
+      - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $notes = "docs/releases/${{ github.ref_name }}.md"
-          $notesArgs = if (Test-Path -LiteralPath $notes) {
-            @("--notes-file", $notes)
-          } else {
-            @("--generate-notes")
-          }
-          gh release create "${{ github.ref_name }}" `
-            "dist/MTUI-$env:MTUI_VERSION-Setup-x64.exe#MTUI installer for Windows (x64)" `
-            "dist/MTUI-$env:MTUI_VERSION-windows-x64-portable.exe#Portable MTUI for Windows (x64)" `
-            @notesArgs --verify-tag
+          version="${GITHUB_REF_NAME#v}"
+          notes="docs/releases/$GITHUB_REF_NAME.md"
+          notes_args=(--generate-notes)
+          if [[ -f "$notes" ]]; then
+            notes_args=(--notes-file "$notes")
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/MTUI-$version-Setup-x64.exe#MTUI installer for Windows (x64)" \
+            "dist/MTUI-$version-windows-x64-portable.exe#Portable MTUI for Windows (x64)" \
+            "dist/MTUI-$version-linux-x64.deb#MTUI package for Debian and Ubuntu (x64)" \
+            "dist/MTUI-$version-linux-x64.tar.gz#MTUI archive for Linux (x64)" \
+            "dist/SHA256SUMS#SHA-256 checksums" \
+            "${notes_args[@]}" --verify-tag

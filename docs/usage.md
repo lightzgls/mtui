@@ -10,26 +10,10 @@
 personalized Home sign-in uses the Microsoft Edge WebView2 runtime included with
 current Windows installations.
 
-**Linux** — install Rust and the native audio, TLS, and WebKitGTK development
-packages.
-
-Debian or Ubuntu:
-
-```sh
-sudo apt install build-essential pkg-config libssl-dev libasound2-dev libwebkit2gtk-4.1-dev
-```
-
-Fedora:
-
-```sh
-sudo dnf install gcc pkgconf-pkg-config openssl-devel alsa-lib-devel webkit2gtk4.1-devel
-```
-
-Arch Linux:
-
-```sh
-sudo pacman -S --needed base-devel pkgconf openssl alsa-lib webkit2gtk-4.1
-```
+**Linux** — prebuilt x86-64 packages include both MTUI and its sign-in helper.
+The Debian/Ubuntu package installs its audio, TLS, and WebKitGTK runtime
+dependencies through APT. Rust and development packages are only needed when
+building from source. A graphical desktop is needed for the sign-in window.
 
 **macOS** — install the Xcode command-line tools and Rust. WKWebView is provided
 by macOS.
@@ -54,8 +38,67 @@ checksum, and preserves your account data and settings. Installed copies update
 in their existing directory; portable copies replace their current executable.
 Playback stops for the restart. A failed download leaves the running app intact.
 
-**Linux and macOS** — clone the repository, then build and install MTUI with one
-Cargo command:
+**Linux (Debian/Ubuntu, x64)** — download `MTUI-<version>-linux-x64.deb` from the
+[latest release](https://github.com/lightzgls/mtui/releases/latest), replace
+`<version>` with the downloaded version, and run:
+
+```sh
+sudo apt install ./MTUI-<version>-linux-x64.deb
+mtui
+```
+
+APT installs any missing runtime libraries, including WebKitGTK for sign-in.
+The package also adds a terminal launcher to your desktop's application menu.
+Upgrade by installing the newer `.deb` the same way, then restart MTUI.
+Remove the program with
+`sudo apt remove mtui`; account sessions and preferences remain in your home
+directory. In-app updates are currently available on Windows only.
+
+Linux packages are available from v0.11.3. Earlier releases only have Windows
+downloads; building from source remains available below. The binaries are built
+on Ubuntu 22.04; older distributions may not provide compatible runtime libraries.
+
+**Linux archive (x64)** — download `MTUI-<version>-linux-x64.tar.gz`, then extract
+and install both executables together:
+
+```sh
+tar -xzf MTUI-<version>-linux-x64.tar.gz
+install -Dm755 MTUI-<version>-linux-x64/mtui "$HOME/.local/bin/mtui"
+install -Dm755 MTUI-<version>-linux-x64/mtui-sign-in "$HOME/.local/bin/mtui-sign-in"
+mtui
+```
+
+Ensure `~/.local/bin` is on `PATH`. The archive includes sign-in but does not
+install system libraries. Your distribution must provide ALSA, OpenSSL 3,
+GTK 3, and WebKitGTK 4.1 runtime libraries. On Debian/Ubuntu, prefer the `.deb`
+so APT resolves the exact dependencies for you.
+
+Each release includes `SHA256SUMS`. To check a downloaded package or archive,
+put it beside that file and run `sha256sum --check --ignore-missing SHA256SUMS`.
+
+### Building From Source
+
+**Linux and macOS** — install Rust first. Linux also needs development libraries.
+
+Debian or Ubuntu:
+
+```sh
+sudo apt install build-essential pkg-config libssl-dev libasound2-dev libwebkit2gtk-4.1-dev
+```
+
+Fedora:
+
+```sh
+sudo dnf install gcc pkgconf-pkg-config openssl-devel alsa-lib-devel webkit2gtk4.1-devel
+```
+
+Arch Linux:
+
+```sh
+sudo pacman -S --needed base-devel pkgconf openssl alsa-lib webkit2gtk-4.1
+```
+
+Clone the repository, then build and install MTUI:
 
 ```sh
 git clone https://github.com/lightzgls/mtui.git
@@ -67,12 +110,33 @@ mtui
 Cargo installs the player and its private sign-in helper together. You never need
 to launch or install the helper separately. Ensure `~/.local/bin` is on `PATH`.
 
+Linux maintainers can produce the `.deb` and `.tar.gz` packages with
+`cargo build --release --locked --bins`, then
+`bash scripts/package-linux.sh <version>`. Packaging also needs `dpkg-dev`.
+The output is written to `target/packages/`.
+
+### First-Launch Downloads
+
 On first run, MTUI finds `yt-dlp` on `PATH` or downloads a private copy. If
 `yt-dlp` cannot find a supported JavaScript runtime, MTUI reuses Deno, Node.js, or
 Bun from `PATH`, or installs Deno privately. MTUI also installs a pinned local
 copy of the GPL-3.0 `bgutil-ytdlp-pot-provider` and its production dependencies so
 YouTube's protected audio streams can play at normal quality. These automatic
 installs require network access but not administrator access.
+
+Download payloads measured for MTUI v0.11.3 and the playback tools available on
+13 October 2026:
+
+| Fresh x86-64 machine | MTUI download | MTUI plus first-launch tools |
+|---|---|---|
+| Windows 11 | 3.3 MB installer | About 90 MB |
+| Ubuntu 24.04 Desktop | 1.5 MB `.deb`, including sign-in | About 103 MB |
+
+These are download sizes, not installed disk usage. The Ubuntu desktop image
+already includes the needed native libraries; other distributions or minimal
+installations may need additional runtime downloads, which APT lists before
+installation. Package metadata and network overhead are excluded. Tool versions
+can change these totals. Later launches reuse the downloaded tools.
 
 
 

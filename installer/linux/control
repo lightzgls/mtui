@@ -1,0 +1,11 @@
+Source: mtui
+Section: sound
+Priority: optional
+Maintainer: Lightzgls <lightzgls@users.noreply.github.com>
+Homepage: https://github.com/lightzgls/mtui
+
+Package: mtui
+Architecture: amd64
+Depends: ${shlibs:Depends}, ca-certificates
+Description: Terminal music player for YouTube Music
+ Includes native audio playback and the YouTube Music sign-in helper.
