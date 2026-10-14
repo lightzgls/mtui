@@ -60,6 +60,7 @@ https://github.com/user-attachments/assets/27cdd7f8-daf9-4ccc-b736-d903014b5be1
 - Lyrics, including synced lyrics when available, plus comments and related music.
 - Solid colors drawn from the cover, pixel or ASCII artwork, and keyboard and mouse navigation.
 - Optional Discord Rich Presence and Windows tray controls. Reopening MTUI restores the running session.
+- Windows media controls and Linux MPRIS publish the track, artist, playback state, and timeline; desktop widgets and media keys control the same player.
 - A single mint strip app icon, with a tray animation that reflects playing, paused, and stopped states.
 
 ## Install
@@ -74,11 +75,13 @@ curl -fsSL https://github.com/lightzgls/mtui/releases/latest/download/install.sh
 
 The installer detects Debian/Ubuntu, Fedora, Arch, and openSUSE, verifies the download, and installs both the player and sign-in helper. Only missing system libraries need `sudo`; no Rust or compiler is needed. MTUI is installed for your user so in-app updates need no root access. Prebuilt Linux releases require glibc 2.34+; ARM and Alpine/musl need separate builds. A `.deb` and manual archive are also available. See the [Linux installation guide](docs/usage.md#installation), including how to inspect the script before running it.
 
+After installing, open a new terminal and type **`mtui`**. To uninstall, close MTUI and run **`mtui-uninstall`**. This removes the app and **all MTUI data**, including settings, saved sign-in sessions, history, logs, caches, and downloaded playback tools.
+
 Open **Settings → Updates** to download, verify, install, and restart a newer version. This works on Windows and writable Linux installations, independently of the Linux distribution. System-managed Linux packages still use their package manager. Settings label their platform support; tray controls remain Windows-only. See the [settings support table](docs/usage.md#settings-support) and [upgrade instructions](docs/usage.md#installation) for older Linux copies.
 
 On first launch, MTUI downloads missing playback tools: yt-dlp, a supported JavaScript runtime, and the bgutil PO-token provider. Setup needs an internet connection. Sign-in uses Microsoft Edge WebView2 on Windows and WebKitGTK on Linux; playback runs without a browser window.
 
-A fresh Windows 11 setup downloads about **90 MB** including playback tools. Ubuntu 24.04 Desktop needs about **103 MB** via `.deb` or **104 MB** via curl, including sign-in. Minimal systems and other distributions may need additional system libraries. See [download measurements and exclusions](docs/usage.md#first-launch-downloads).
+Measurements from v0.11.4: a fresh Windows 11 setup downloads about **90 MB** including playback tools. Ubuntu 24.04 Desktop needs about **103 MB** via `.deb` or **104 MB** via curl, including sign-in. Minimal systems and other distributions may need additional system libraries. See [download measurements and exclusions](docs/usage.md#first-launch-downloads).
 
 Search and playback work without an account. Press **M** or open **Menu → Account & Sessions** to sign in for personalized Home and radio queues, playlists, likes, and listening-history sync. YouTube account history must be enabled for history writes.
 

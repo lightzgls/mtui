@@ -25,6 +25,43 @@ fn track(index: usize) -> Track {
 }
 
 #[test]
+fn system_media_controls_publish_track_and_use_the_existing_queue_and_seek_paths() {
+    use crate::media::MediaCommand;
+    let (mut app, driver, _requests) = fixture();
+    assert!(app.media_info().id.is_empty());
+    app.play_track(track(0), false);
+    state(&driver, PlayState::Playing, Duration::from_secs(90));
+    assert_eq!(app.media_info().state, PlayState::Buffering);
+    assert_eq!(app.media_info().position, Duration::ZERO, "a new title must never carry the old decoder's position");
+    resolve(&mut app, 0);
+    state(&driver, PlayState::Playing, Duration::from_secs(30));
+    app.now.as_mut().unwrap().queue = (0..4).map(track).collect();
+    app.now.as_mut().unwrap().playing = Some(0);
+    let info = app.media_info();
+    assert_eq!((info.title.as_str(), info.artist.as_str()), ("Song 0", "Artist"));
+    assert_eq!(info.duration, Some(Duration::from_secs(240)));
+    assert_eq!(info.position, Duration::from_secs(30));
+    assert!(info.can_next && info.can_seek && !info.can_previous);
+    driver.commands.try_iter().for_each(drop);
+    app.handle_media(MediaCommand::Pause);
+    app.handle_media(MediaCommand::Pause);
+    app.handle_media(MediaCommand::Play);
+    app.handle_media(MediaCommand::Seek(Duration::from_secs(61)));
+    app.handle_media(MediaCommand::Seek(Duration::from_secs(999)));
+    let commands: Vec<_> = driver.commands.try_iter().collect();
+    assert!(matches!(commands.as_slice(), [Command::SetPaused(true), Command::SetPaused(true),
+        Command::SetPaused(false), Command::Seek(p), Command::SeekToEnd(end)]
+        if *p == Duration::from_secs(61) && *end == Duration::from_secs(240)), "{commands:?}");
+    app.handle_media(MediaCommand::Next);
+    assert_eq!(app.now.as_ref().unwrap().video_id, "song-1");
+    assert!(!app.media_info().can_seek);
+    app.handle_media(MediaCommand::Previous);
+    assert_eq!(app.now.as_ref().unwrap().video_id, "song-0");
+    app.stop();
+    assert!(app.media_info().id.is_empty());
+}
+
+#[test]
 fn artist_songs_and_catalogue_are_clickable_and_page_without_starting_playback() {
     for (width, height) in [(160, 42), (80, 32), (28, 24)] {
         let (mut app, driver, requests) = fixture();

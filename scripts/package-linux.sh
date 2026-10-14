@@ -6,6 +6,8 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 version=${1:?Usage: bash scripts/package-linux.sh VERSION [BUILD_DIR] [OUTPUT_DIR]}
 build_dir=${2:-"$repo_root/target/release"}
 output_dir=${3:-"$repo_root/target/packages"}
+# shellcheck source=scripts/install-linux.sh
+source "$repo_root/scripts/install-linux.sh"
 
 if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     printf 'Expected a stable release version, got: %s\n' "$version" >&2
@@ -33,6 +35,7 @@ portable_root="$staging/$bundle"
 
 install -Dm755 "$build_dir/mtui" "$package_root/usr/bin/mtui"
 install -Dm755 "$build_dir/mtui-sign-in" "$package_root/usr/bin/mtui-sign-in"
+write_uninstaller "$package_root/usr/bin/mtui-uninstall"
 install -Dm644 "$repo_root/installer/linux/mtui.desktop" "$package_root/usr/share/applications/mtui.desktop"
 install -Dm644 "$repo_root/assets/mtui-icon.svg" "$package_root/usr/share/icons/hicolor/scalable/apps/mtui.svg"
 install -Dm644 "$repo_root/LICENSE" "$package_root/usr/share/doc/mtui/copyright"
@@ -69,6 +72,8 @@ dpkg-deb --root-owner-group -Zxz --build "$package_root" "$output_dir/$bundle.de
 
 install -Dm755 "$build_dir/mtui" "$portable_root/mtui"
 install -Dm755 "$build_dir/mtui-sign-in" "$portable_root/mtui-sign-in"
+write_uninstaller "$portable_root/mtui-uninstall"
+install -Dm755 "$repo_root/scripts/install-linux.sh" "$portable_root/install.sh"
 install -Dm644 "$repo_root/LICENSE" "$portable_root/LICENSE"
 install -Dm644 "$repo_root/README.md" "$portable_root/README.md"
 install -Dm644 "$repo_root/docs/usage.md" "$portable_root/docs/usage.md"

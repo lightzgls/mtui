@@ -5573,6 +5573,53 @@ impl App {
         if self.should_quit { self.wants_foreground = false; }
     }
 
+    /// System buttons use the same player and queue commands as the UI.
+    pub fn handle_media(&mut self, command: crate::media::MediaCommand) {
+        use crate::media::MediaCommand;
+        match command {
+            MediaCommand::Play | MediaCommand::Pause if self.now.is_some() && self.pending.is_none() => {
+                let _ = self.player.send(Command::SetPaused(command == MediaCommand::Pause));
+            }
+            MediaCommand::Next => self.advance(1, false),
+            MediaCommand::Previous => self.advance(-1, false),
+            #[cfg(target_os = "linux")]
+            MediaCommand::TogglePause if self.now.is_some() && self.pending.is_none() => self.toggle_pause(),
+            #[cfg(target_os = "linux")]
+            MediaCommand::Stop => self.stop(),
+            #[cfg(target_os = "linux")]
+            MediaCommand::SetVolume(volume) => self.set_volume(volume),
+            #[cfg(target_os = "linux")]
+            MediaCommand::Quit => self.should_quit = true,
+            MediaCommand::Seek(position) if self.media_info().can_seek => {
+                let total = self.now.as_ref().and_then(|now| now.duration).unwrap();
+                let target = position.min(total);
+                let seek = if target == total { Command::SeekToEnd(target) } else { Command::Seek(target) };
+                let _ = self.player.send(seek);
+                if let Some((_, listening)) = self.listening.as_mut() { listening.seeked(); }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn media_info(&self) -> crate::media::MediaInfo {
+        let Some(now) = self.now.as_ref() else {
+            return crate::media::MediaInfo { volume: self.snapshot().volume, ..Default::default() };
+        };
+        let snapshot = self.snapshot();
+        let loading = self.pending.is_some();
+        crate::media::MediaInfo {
+            id: now.video_id.clone(), title: now.title.clone(), artist: now.artist.clone(),
+            state: if loading { PlayState::Buffering } else { snapshot.state },
+            position: if loading { Duration::ZERO } else { snapshot.position },
+            duration: now.duration,
+            can_next: now.advanced_index(1, false).is_some(),
+            can_previous: now.advanced_index(-1, false).is_some(),
+            can_seek: !loading && matches!(snapshot.state, PlayState::Playing | PlayState::Paused)
+                && now.duration.is_some_and(|duration| !duration.is_zero()),
+            volume: snapshot.volume,
+        }
+    }
+
     /// The raised strips only appear while the current track is playing.
     /// `now` clears synchronously on Stop, before the audio worker catches up.
     pub fn tray_playing(&self) -> bool {

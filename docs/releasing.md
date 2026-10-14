@@ -8,8 +8,8 @@
 |---|---|
 | `MTUI-<version>-Setup-x64.exe` | Per-user Windows installer with the player and integrated sign-in |
 | `MTUI-<version>-windows-x64-portable.exe` | The same Windows player as a single portable executable |
-| `MTUI-<version>-linux-x64.deb` | Debian/Ubuntu package with player, sign-in helper, runtime dependencies, launcher, icon, and guides |
-| `MTUI-<version>-linux-x64.tar.gz` | Linux x64 archive with both executables, launcher, icon, license, and guides |
+| `MTUI-<version>-linux-x64.deb` | Debian/Ubuntu package with player, sign-in helper, uninstall command, runtime dependencies, launcher, icon, and guides |
+| `MTUI-<version>-linux-x64.tar.gz` | Linux x64 archive with both executables, installer, uninstall command, launcher, icon, license, and guides |
 | `install.sh` | Per-user Linux installer with checksum validation and distribution-specific runtime setup |
 | `SHA256SUMS` | SHA-256 checksums for the five assets above |
 
@@ -48,7 +48,7 @@ Use current stable Rust. Windows additionally needs Visual Studio's x64 MSVC
 build tools and Inno Setup 6.7.1. From PowerShell:
 
 ```powershell
-$version = '0.11.4'
+$version = '0.11.5'
 $env:RUSTFLAGS = '-C target-feature=+crt-static'
 cargo build --release --locked
 # Use the path to your installed ISCC.exe.
@@ -65,7 +65,7 @@ On an Ubuntu 22.04 build environment with the source-build libraries and
 
 ```sh
 cargo build --release --locked --bins
-bash scripts/package-linux.sh 0.11.4 target/release dist
+bash scripts/package-linux.sh 0.11.5 target/release dist
 ```
 
 The package script scans **both** executables with `dpkg-shlibdeps`, so sign-in's
@@ -93,6 +93,13 @@ the usage guide also documents downloading and inspecting it first.
 ```sh
 shellcheck scripts/install-linux.sh scripts/test-linux-installer.sh scripts/test-linux-release.sh scripts/package-linux.sh
 bash scripts/test-linux-installer.sh
+dbus-run-session -- cargo test --locked media::mpris::tests::desktop_controllers_discover_metadata_commands_and_seek_signals -- --exact --ignored
+```
+
+On a Windows desktop, verify the native media session as well:
+
+```powershell
+cargo test --locked media::imp::tests::native_media_session_publishes_and_owns_a_persistent_top_level_window -- --exact --ignored
 ```
 
 The mocked installer tests do not install packages or change the host. The real
@@ -102,7 +109,7 @@ release smoke script **does**, and must run only inside disposable containers:
 docker run --rm \
   --mount "type=bind,source=$PWD/scripts,target=/source/scripts,readonly" \
   --mount "type=bind,source=$PWD/dist,target=/packages,readonly" \
-  ubuntu:24.04 bash /source/scripts/test-linux-release.sh 0.11.4 /packages
+  ubuntu:24.04 bash /source/scripts/test-linux-release.sh 0.11.5 /packages
 ```
 
 Repeat on `fedora:44`, `archlinux:base`, and `opensuse/tumbleweed:latest` as in

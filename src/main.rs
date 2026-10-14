@@ -22,6 +22,7 @@ mod discord;
 mod graphics;
 mod instance;
 mod kitty;
+mod media;
 mod navigation;
 mod player;
 mod session;
@@ -83,6 +84,8 @@ const BUSY_TICK: Duration = Duration::from_millis(50);
 const IDLE_TICK: Duration = Duration::from_millis(500);
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    media::set_app_id()?;
     if update::helper_requested() {
         let result = update::run_helper();
         if let Err(error) = &result { console::report_error(&format!("Could not finish the MTUI update: {error:#}")); }
@@ -164,16 +167,23 @@ fn run(settings: config::Settings, mut tray: Option<Tray>, instance: &instance::
     let player = Player::spawn(settings.volume, settings.output_device.clone())?;
     let source = SourceWorker::spawn(yt)?;
     let mut app = App::new(player, source, graphics, settings);
+    let media = match media::MediaSession::spawn() {
+        Ok(session) => Some(session),
+        Err(error) => {
+            diagnostics::error("media", &format!("could not start media controls: {error:#}"));
+            None
+        }
+    };
 
     // The two faces, alternating until something asks to quit. The terminal one
     // runs first because that is how the program is started; after that, each
     // returns when the user has asked for the other.
     loop {
-        run_foreground(&mut app, &mut tray, instance)?;
+        run_foreground(&mut app, &mut tray, &media, instance)?;
         if app.should_quit {
             break;
         }
-        run_background(&mut app, &mut tray, instance)?;
+        run_background(&mut app, &mut tray, &media, instance)?;
         if app.should_quit {
             break;
         }
@@ -187,7 +197,7 @@ fn run(settings: config::Settings, mut tray: Option<Tray>, instance: &instance::
 }
 
 /// The terminal interface. Returns when the user quits or asks to background.
-fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::Instance) -> Result<()> {
+fn run_foreground(app: &mut App, tray: &mut Option<Tray>, media: &Option<media::MediaSession>, instance: &instance::Instance) -> Result<()> {
     app.wants_foreground = false;
 
     if console::closed() {
@@ -237,6 +247,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
             app.tick_page();
             app.tick_prefetch();
             app.tick_presence();
+            sync_media(app, media);
             sync_foreground_tray(app, tray);
             #[cfg(windows)]
             foreground.terminal.backend_mut().set_canvas_color(ui::canvas_color(app.cover.as_ref()))?;
@@ -638,7 +649,7 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
 /// in the foreground, with the reason in the status bar. Backgrounding is a
 /// convenience, and half of one, with the icon missing or the console gone, is
 /// a player the user cannot reach at all.
-fn run_background(app: &mut App, tray: &mut Option<Tray>, instance: &instance::Instance) -> Result<()> {
+fn run_background(app: &mut App, tray: &mut Option<Tray>, media: &Option<media::MediaSession>, instance: &instance::Instance) -> Result<()> {
     app.wants_background = false;
 
     if tray.is_none() {
@@ -703,6 +714,7 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
         // letting go of the terminal must not freeze it on whatever was playing
         // at the time.
         app.tick_presence();
+        sync_media(app, media);
         // Not `tick_page`: lyrics and comments are panels of a page nobody can
         // see, and fetching them here would spend a request per track on
         // something that is thrown away when the track changes.
@@ -735,6 +747,13 @@ fn run_background(app: &mut App, tray: &mut Option<Tray>, instance: &instance::I
         *tray = None;
     }
     Ok(())
+}
+
+fn sync_media(app: &mut App, media: &Option<media::MediaSession>) {
+    if let Some(session) = media {
+        while let Some(command) = session.next_command() { app.handle_media(command); }
+        session.publish(app.media_info());
+    }
 }
 
 /// Paints the planned cover as terminal pixels, if it is not already on screen.

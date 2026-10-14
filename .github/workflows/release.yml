@@ -99,7 +99,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev libasound2-dev libwebkit2gtk-4.1-dev dpkg-dev
+          sudo apt-get install -y build-essential pkg-config libssl-dev libasound2-dev libdbus-1-dev libwebkit2gtk-4.1-dev dpkg-dev
 
       - name: Install Rust
         run: |

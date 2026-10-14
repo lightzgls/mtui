@@ -48,7 +48,7 @@ jobs:
       # No display or audio device is needed to build or test -- only headers.
       - name: Install Linux development libraries
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libasound2-dev libwebkit2gtk-4.1-dev dpkg-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libasound2-dev libdbus-1-dev libwebkit2gtk-4.1-dev dpkg-dev
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -67,6 +67,10 @@ jobs:
       - name: Isolated tests and Clippy
         shell: pwsh
         run: ./scripts/test.ps1 -Suite Full -Online
+
+      - name: Verify Linux desktop media controls on a private bus
+        if: matrix.os == 'ubuntu-latest'
+        run: dbus-run-session -- cargo test --locked media::mpris::tests::desktop_controllers_discover_metadata_commands_and_seek_signals -- --exact --ignored
 
       - name: Verify Linux packaging
         if: matrix.os == 'ubuntu-latest'

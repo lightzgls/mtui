@@ -60,8 +60,11 @@ existing system packages; review the download size before confirming. No package
 manager is invoked when both executables can already load their libraries.
 
 MTUI is installed under `~/.local/lib/mtui`, with shortcuts in `~/.local/bin`
-and a terminal launcher in the application menu. Open that launcher, or run the
-command printed by the installer. It does not modify shell startup files.
+and a terminal launcher in the application menu. Open a new terminal and type
+`mtui`. The installer adds a managed PATH block for Bash, Zsh, Fish, and POSIX
+login shells. It preserves existing startup-file contents and does not add
+duplicate blocks when reinstalled. To run from the terminal used for installation
+immediately, use `export PATH="$HOME/.local/bin:$PATH"` (Bash/Zsh).
 An existing unrelated `~/.local/bin/mtui` is not overwritten; move that older
 installation aside before switching. Account sessions, settings, and cached
 playback tools are kept separately and are not changed.
@@ -74,7 +77,7 @@ less install.sh
 bash install.sh
 ```
 
-Options: `bash install.sh --version 0.11.4` pins a stable release;
+Options: `bash install.sh --version 0.11.5` pins a stable release;
 `--yes` accepts package-manager confirmations, including Arch system updates;
 `--skip-deps` only works when
 all runtime libraries are already available. Other glibc distributions can use
@@ -96,18 +99,30 @@ Only writable Linux installations can self-update. For a root-owned `.deb`,
 use APT, or switch once to the curl installer for per-user updates. This Linux
 update support is included in v0.11.4 and the refreshed v0.11.3 binaries. Original
 Linux v0.11.3 copies need one manual installation with the command above first.
-Refreshed per-user Linux v0.11.3 copies can update in-app to v0.11.4. Windows
-v0.10.0 and later can update in-app, including original v0.11.3 copies; no
-equal-version reinstall is needed for this new release.
+Refreshed per-user Linux v0.11.3 copies and v0.11.4 copies can update in-app to
+newer stable versions. Windows v0.10.0 and later can also update in-app,
+including original v0.11.3 copies.
 
-To remove a curl installation (account data and playback tools are retained):
+When updating an older Linux installation through Settings, run the installer
+once to add the new `mtui-uninstall` command and terminal PATH configuration.
+The in-app updater replaces the player and sign-in binaries; the installer sets
+up these additional terminal commands.
+
+To uninstall, close MTUI and run:
 
 ```sh
-rm "$HOME/.local/bin/mtui" "$HOME/.local/bin/mtui-sign-in"
-rm -r "$HOME/.local/lib/mtui"
-rm "${XDG_DATA_HOME:-$HOME/.local/share}/applications/mtui.desktop"
-rm "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/mtui.svg"
+mtui-uninstall
 ```
+
+This removes **all local MTUI data**: settings, saved account sessions and browser
+profiles, listening history, logs, update downloads, caches, and downloaded
+playback tools. It removes MTUI's launchers and its managed shell PATH blocks,
+while preserving other shell settings and other applications' data. Custom XDG
+directories recorded at installation and the current/default XDG locations are
+included. Independently installed system tools and shared system libraries are
+managed by their package manager. User/archive/source installations use the same
+offline command on every distribution. Native packages are removed through APT,
+DNF, pacman, Zypper, RPM, or APK as applicable, and may need `sudo`.
 
 **Linux (Debian/Ubuntu package, x64)** — download `MTUI-<version>-linux-x64.deb` from the
 [latest release](https://github.com/lightzgls/mtui/releases/latest), replace
@@ -121,11 +136,11 @@ mtui
 APT installs any missing runtime libraries, including WebKitGTK for sign-in.
 The package also adds a terminal launcher to your desktop's application menu.
 Upgrade by installing the newer `.deb` the same way, then restart MTUI.
-The v0.11.4 package has Debian version `0.11.4-1`, which upgrades both the
-original `0.11.3` package and its refreshed `0.11.3-1` revision.
-Remove the program with
-`sudo apt remove mtui`; account sessions and preferences remain in your home
-directory. Root-owned packages are updated with APT rather than the in-app updater.
+The v0.11.5 package has Debian version `0.11.5-1`, which upgrades earlier
+MTUI packages.
+Run `mtui-uninstall` to remove the package and all local MTUI data. Using
+`sudo apt remove mtui` alone removes the package while leaving user data.
+Root-owned packages are updated with APT rather than the in-app updater.
 
 Linux packages are available from v0.11.3. Earlier releases only have Windows
 downloads; building from source remains available below. The binaries are built
@@ -136,16 +151,17 @@ and install both executables together:
 
 ```sh
 tar -xzf MTUI-<version>-linux-x64.tar.gz
-install -Dm755 MTUI-<version>-linux-x64/mtui "$HOME/.local/bin/mtui"
-install -Dm755 MTUI-<version>-linux-x64/mtui-sign-in "$HOME/.local/bin/mtui-sign-in"
+bash MTUI-<version>-linux-x64/install.sh --bundle MTUI-<version>-linux-x64
 mtui
 ```
 
-Ensure `~/.local/bin` is on `PATH`. The archive includes sign-in but does not
-install system libraries. Your distribution must provide ALSA, OpenSSL 3,
-GTK 3, and WebKitGTK 4.1 runtime libraries. Prefer the curl installer for automatic
-dependency setup and per-user updates, or the `.deb` for APT-managed installation.
-Close a running copy before manually replacing its executables.
+The bundled installer registers both `mtui` and `mtui-uninstall` and configures
+terminal PATH. Open a new terminal after installation. Add `--skip-deps` when
+the runtime libraries are already installed; installation from the extracted
+bundle then needs no download. Missing libraries can be installed automatically
+on supported distribution families; other distributions must provide ALSA,
+OpenSSL 3, GTK 3, WebKitGTK 4.1, and D-Bus. The uninstall command is independent
+of the distribution. Verify `SHA256SUMS` before extracting an archive.
 
 Each release includes `SHA256SUMS`. To check a downloaded package or archive,
 put it beside that file and run `sha256sum --check --ignore-missing SHA256SUMS`.
@@ -157,7 +173,7 @@ put it beside that file and run `sha256sum --check --ignore-missing SHA256SUMS`.
 Debian or Ubuntu:
 
 ```sh
-sudo apt install build-essential pkg-config libssl-dev libasound2-dev libwebkit2gtk-4.1-dev
+sudo apt install build-essential pkg-config libssl-dev libasound2-dev libdbus-1-dev libwebkit2gtk-4.1-dev
 ```
 
 Fedora:
@@ -177,12 +193,20 @@ Clone the repository, then build and install MTUI:
 ```sh
 git clone https://github.com/lightzgls/mtui.git
 cd mtui
-cargo install --path . --bins --root ~/.local --locked --force
+cargo build --release --locked --bins
+# Linux:
+bash scripts/install-linux.sh --build-dir target/release --skip-deps
 mtui
 ```
 
-Cargo installs the player and its private sign-in helper together. You never need
-to launch or install the helper separately. Ensure `~/.local/bin` is on `PATH`.
+On Linux, the source installer registers `mtui` and `mtui-uninstall` together
+and configures terminal PATH for both. Open a new terminal after installation.
+Local builds are checked for runtime compatibility without imposing the prebuilt
+archive's x86-64/glibc restriction, so the same commands work on every Linux
+distribution where the source build runs. Both the player and sign-in helper are
+installed together. macOS users can use
+`cargo install --path . --bins --root ~/.local --locked --force` and add
+`~/.local/bin` to PATH.
 
 Linux maintainers can produce the `.deb` and `.tar.gz` packages with
 `cargo build --release --locked --bins`, then
@@ -353,6 +377,24 @@ MTUI removes its saved session, the manual-cookie fallback, and its private
 sign-in profile without stopping current playback.
 
 ### Controls
+
+Windows publishes an MTUI media session to the system media panel, including
+title, artist, playback state, position, and duration. Play/pause, next/previous,
+and seeking use the same player as the terminal and continue to work in tray mode.
+The session belongs to a persistent MTUI window with application identity
+`io.github.lightzgls.MTUI`, so closing or reopening the console keeps it alive.
+
+Linux exposes `org.mpris.MediaPlayer2.mtui` on the desktop session D-Bus.
+Desktop media widgets and media keys can discover MTUI, read the track and
+timeline, and control play/pause, next/previous, seeking, and volume. A second
+instance gets a separate MPRIS name. A desktop session bus is needed; playback
+still works in environments without one. For example, with `playerctl` installed:
+
+```sh
+playerctl --player=mtui metadata
+playerctl --player=mtui play-pause
+playerctl --player=mtui position 60
+```
 
 | Key | Action |
 |---|---|

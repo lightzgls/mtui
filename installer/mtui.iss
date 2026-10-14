@@ -40,9 +40,9 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "..\target\release\mtui.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\MTUI"; Filename: "{app}\mtui.exe"; WorkingDir: "{app}"; Comment: "A terminal music player for YouTube Music"
+Name: "{group}\MTUI"; Filename: "{app}\mtui.exe"; WorkingDir: "{app}"; Comment: "A terminal music player for YouTube Music"; AppUserModelID: "io.github.lightzgls.MTUI"
 Name: "{group}\Uninstall MTUI"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\MTUI"; Filename: "{app}\mtui.exe"; WorkingDir: "{app}"; Comment: "A terminal music player for YouTube Music"; Tasks: desktopicon
+Name: "{autodesktop}\MTUI"; Filename: "{app}\mtui.exe"; WorkingDir: "{app}"; Comment: "A terminal music player for YouTube Music"; Tasks: desktopicon; AppUserModelID: "io.github.lightzgls.MTUI"
 
 ; Register the stable installed executable without changing the user's PATH.
 ; Windows resolves this key for Start/Run and ShellExecute calls.

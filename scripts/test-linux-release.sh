@@ -22,6 +22,7 @@ if "$HOME/.local/lib/mtui/mtui-sign-in" --invalid >"$root/helper.log" 2>&1; then
 grep 'unknown sign-in helper argument' "$root/helper.log"
 test -f "$HOME/.local/share/applications/mtui.desktop"
 test -f "$HOME/.local/share/icons/hicolor/scalable/apps/mtui.svg"
+test -x "$HOME/.local/bin/mtui-uninstall"
 for compiler in cargo rustc gcc; do
     if command -v "$compiler"; then printf 'Unexpected compiler: %s\n' "$compiler"; exit 1; fi
 done

@@ -115,6 +115,9 @@ pub enum Command {
         why: String,
     },
     TogglePause,
+    /// An explicit system Play/Pause request must be idempotent even when
+    /// several requests arrive before the worker publishes its next snapshot.
+    SetPaused(bool),
     Stop,
     Seek(Duration),
     /// The progress bar endpoint is explicit: no unread audio is needed to finish.
@@ -778,6 +781,12 @@ fn run(
                     } else {
                         player.pause();
                         state = set_state(&snapshot, PlayState::Paused);
+                    }
+                }
+                Command::SetPaused(paused) => {
+                    if track.is_some() {
+                        if paused { player.pause(); } else { player.play(); }
+                        state = set_state(&snapshot, if paused { PlayState::Paused } else { PlayState::Playing });
                     }
                 }
                 Command::Stop => {

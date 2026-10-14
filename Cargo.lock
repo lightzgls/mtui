@@ -626,6 +626,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbus-crossroads"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64bff0bd181fba667660276c6b7ebdc50cff37ce593e7adf9e734f89c8f444e8"
+dependencies = [
+ "dbus",
+]
+
+[[package]]
 name = "deltae"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1954,11 +1963,13 @@ dependencies = [
 
 [[package]]
 name = "mtui"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "anyhow",
  "bytes",
  "crossterm",
+ "dbus",
+ "dbus-crossroads",
  "flate2",
  "form_urlencoded",
  "futures-util",
@@ -1978,6 +1989,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "unicode-width",
+ "windows 0.62.2",
  "wry",
  "zip",
 ]

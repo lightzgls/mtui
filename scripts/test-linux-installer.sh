@@ -8,6 +8,7 @@ if [[ ${1:-} == worker ]]; then
     scenario=$2
     manager_name=$3
     export HOME="$TEST_ROOT/home $scenario-$manager_name"
+    unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME ZDOTDIR
     mkdir -p -- "$HOME"
     # shellcheck source=scripts/install-linux.sh
     source "$installer"
@@ -15,6 +16,7 @@ if [[ ${1:-} == worker ]]; then
     getconf() { printf '%s\n' "${TEST_LIBC:-glibc 2.34}"; }
     detect_distribution() { distribution="Test $manager_name"; manager=$manager_name; }
     curl() {
+        [[ $scenario != bundle && $scenario != source* ]] || return 22
         local output='' url=''
         while (( $# )); do
             case $1 in
@@ -35,7 +37,7 @@ if [[ ${1:-} == worker ]]; then
         fi
     }
     ldd() {
-        if [[ $scenario == ready || -f $HOME/dependencies ]]; then
+        if [[ $scenario == ready || $scenario == uninstall || $scenario == package-uninstall || $scenario == reinstall || $scenario == custom-xdg || $scenario == bundle || $scenario == source* || -f $HOME/dependencies ]]; then
             printf 'libc.so.6 => /lib/libc.so.6\n'
         else
             printf 'libwebkit2gtk-4.1.so.0 => not found\n'
@@ -50,7 +52,7 @@ if [[ ${1:-} == worker ]]; then
         [[ $scenario != dependency-failure ]] || return 1
         if [[ $* != 'apt-get update' ]]; then touch "$HOME/dependencies"; fi
     }
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2032
     apt-get() { record_package_manager apt-get "$@"; }
     apt-cache() { [[ $scenario != old-debian ]]; }
     # shellcheck disable=SC2317
@@ -63,10 +65,82 @@ if [[ ${1:-} == worker ]]; then
         mkdir -p "$HOME/.local/bin"
         printf 'existing installation\n' > "$HOME/.local/bin/mtui"
     fi
+    printf 'export MTUI_UNRELATED_SHELL_SETTING=kept\n' > "$HOME/.bashrc"
+    printf '# user profile\n' > "$HOME/.profile"
+    printf '# user bash login\n' > "$HOME/.bash_profile"
+    if [[ $scenario == custom-xdg ]]; then
+        export XDG_CONFIG_HOME="$HOME/custom config" XDG_DATA_HOME="$HOME/custom data"
+        export XDG_CACHE_HOME="$HOME/custom cache" XDG_STATE_HOME="$HOME/custom state"
+        export ZDOTDIR="$HOME/custom zsh"
+    fi
     options=(--yes)
-    [[ $scenario != latest ]] && options+=(--version 0.11.3)
+    case $scenario in
+        latest) ;;
+        bundle) options+=(--bundle "$TEST_ROOT/MTUI-0.11.3-linux-x64") ;;
+        source*) options+=(--build-dir "$TEST_ROOT/MTUI-0.11.3-linux-x64") ;;
+        *) options+=(--version 0.11.3) ;;
+    esac
     [[ $scenario != skip ]] || options+=(--skip-deps)
     main "${options[@]}"
+    if [[ $scenario == reinstall ]]; then
+        main "${options[@]}"
+        [[ $(grep -Fxc '# >>> MTUI PATH >>>' "$HOME/.bashrc") == 1 ]]
+        [[ $(grep -Fxc '# >>> MTUI PATH >>>' "$HOME/.bash_profile") == 1 ]]
+    fi
+    # A clean shell which reads its new startup file resolves the terminal command.
+    # PATH is deliberately empty of the installed user's ~/.local/bin beforehand.
+    env PATH=/usr/bin:/bin bash --noprofile --rcfile "$HOME/.bashrc" -ic 'command -v mtui; command -v mtui-uninstall' > "$HOME/path-check" 2>/dev/null
+    grep -Fx "$HOME/.local/bin/mtui" "$HOME/path-check" >/dev/null
+    grep -Fx "$HOME/.local/bin/mtui-uninstall" "$HOME/path-check" >/dev/null
+    if [[ $scenario == uninstall || $scenario == package-uninstall || $scenario == custom-xdg ]]; then
+        while IFS= read -r directory; do
+            mkdir -p -- "$directory"
+            printf 'MTUI data\n' > "$directory/data"
+        done < "$HOME/.local/lib/mtui/.data-dirs"
+        mkdir -p -- "$HOME/.config/unrelated-app" "$HOME/.cache/unrelated-app"
+        printf 'keep me\n' > "$HOME/.config/unrelated-app/settings"
+        printf 'keep me\n' > "$HOME/.cache/unrelated-app/tool"
+        cp "$HOME/.local/lib/mtui/.data-dirs" "$HOME/expected-data-dirs"
+        # Current XDG values may have changed since installation.
+        unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME ZDOTDIR
+        if [[ $scenario == package-uninstall ]]; then
+            export TEST_NATIVE_MANAGER=$manager_name
+            # These are exported into the generated standalone uninstaller.
+            # shellcheck disable=SC2317
+            dpkg-query() { [[ $TEST_NATIVE_MANAGER == apt-get ]] && printf 'installed'; }
+            # shellcheck disable=SC2317,SC2032
+            apt-get() { printf 'apt-get %s\n' "$*" >> "$HOME/actions"; }
+            # shellcheck disable=SC2317
+            pacman() { if [[ $1 == -Q ]]; then [[ $TEST_NATIVE_MANAGER == pacman ]]; else printf 'pacman %s\n' "$*" >> "$HOME/actions"; fi; }
+            # shellcheck disable=SC2317
+            rpm() { if [[ $1 == -q ]]; then [[ $TEST_NATIVE_MANAGER == dnf || $TEST_NATIVE_MANAGER == zypper || $TEST_NATIVE_MANAGER == rpm ]]; else printf 'rpm %s\n' "$*" >> "$HOME/actions"; fi; }
+            # shellcheck disable=SC2317
+            dnf() { printf 'dnf %s\n' "$*" >> "$HOME/actions"; }
+            # shellcheck disable=SC2317
+            zypper() { printf 'zypper %s\n' "$*" >> "$HOME/actions"; }
+            # shellcheck disable=SC2317
+            apk() { if [[ $1 == info ]]; then [[ $TEST_NATIVE_MANAGER == apk ]]; else printf 'apk %s\n' "$*" >> "$HOME/actions"; fi; }
+            export -f dpkg-query pacman rpm apk apt-get sudo
+            case $manager_name in dnf) export -f dnf ;; zypper) export -f zypper ;; esac
+        fi
+        bash "$HOME/.local/bin/mtui-uninstall"
+        if [[ $scenario == package-uninstall ]]; then
+            case $manager_name in
+                apt-get) grep -Fx 'apt-get purge mtui' "$HOME/actions" >/dev/null ;;
+                pacman) grep -Fx 'pacman -R mtui' "$HOME/actions" >/dev/null ;;
+                rpm) grep -Fx 'rpm -e mtui' "$HOME/actions" >/dev/null ;;
+                apk) grep -Fx 'apk del mtui' "$HOME/actions" >/dev/null ;;
+                *) grep -Fx "$manager_name remove mtui" "$HOME/actions" >/dev/null ;;
+            esac
+        fi
+        [[ ! -e $HOME/.local/lib/mtui && ! -L $HOME/.local/bin/mtui && ! -L $HOME/.local/bin/mtui-uninstall ]]
+        while IFS= read -r directory; do [[ ! -e $directory ]]; done < "$HOME/expected-data-dirs"
+        grep -Fx 'keep me' "$HOME/.config/unrelated-app/settings" >/dev/null
+        grep -Fx 'keep me' "$HOME/.cache/unrelated-app/tool" >/dev/null
+        grep -Fx 'export MTUI_UNRELATED_SHELL_SETTING=kept' "$HOME/.bashrc" >/dev/null
+        [[ $(grep -Fc '# >>> MTUI PATH >>>' "$HOME/.bashrc" || true) == 0 ]]
+        if [[ $scenario != custom-xdg ]]; then [[ ! -e $HOME/.config/fish/conf.d/mtui-path.fish ]]; fi
+    fi
     exit
 fi
 
@@ -90,10 +164,10 @@ run_success() {
     local home="$TEST_ROOT/home $scenario-$manager"
     cmp "$TEST_ROOT/$bundle/mtui" "$home/.local/lib/mtui/mtui"
     cmp "$TEST_ROOT/$bundle/mtui-sign-in" "$home/.local/lib/mtui/mtui-sign-in"
-    [[ -x $home/.local/bin/mtui && -x $home/.local/bin/mtui-sign-in ]]
+    [[ -x $home/.local/bin/mtui && -x $home/.local/bin/mtui-sign-in && -x $home/.local/bin/mtui-uninstall ]]
     grep -F "Exec=\"$home/.local/lib/mtui/mtui\"" "$home/.local/share/applications/mtui.desktop" >/dev/null
-    if [[ $scenario == ready ]]; then
-        if grep -E '^(apt-get|dnf|pacman|zypper) ' "$home/actions"; then exit 1; fi
+    if [[ $scenario == ready || $scenario == reinstall || $scenario == bundle || $scenario == source* ]]; then
+        if [[ -f $home/actions ]] && grep -E '^(apt-get|dnf|pacman|zypper) ' "$home/actions"; then exit 1; fi
     else
         grep -E "^$manager " "$home/actions" >/dev/null
     fi
@@ -124,6 +198,18 @@ for manager in apt-get dnf pacman zypper; do run_success install "$manager"; don
 run_success old-debian apt-get
 run_success latest dnf
 run_success ready unknown
+run_success reinstall unknown
+run_success bundle unknown
+run_success source unknown
+TEST_ARCH=aarch64 TEST_LIBC='musl 1.2.5' run_success source-musl-arm unknown
+for scenario in uninstall custom-xdg; do
+    bash "$0" worker "$scenario" unknown > "$TEST_ROOT/output" 2>&1 || { cat "$TEST_ROOT/output"; exit 1; }
+    passed=$((passed + 1))
+done
+for manager in apt-get dnf pacman zypper rpm apk; do
+    bash "$0" worker package-uninstall "$manager" > "$TEST_ROOT/output" 2>&1 || { cat "$TEST_ROOT/output"; exit 1; }
+    passed=$((passed + 1))
+done
 run_failure skip dnf
 run_failure checksum dnf
 run_failure download-failure dnf
