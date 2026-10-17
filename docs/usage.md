@@ -77,7 +77,7 @@ less install.sh
 bash install.sh
 ```
 
-Options: `bash install.sh --version 0.11.5` pins a stable release;
+Options: `bash install.sh --version 0.11.6` pins a stable release;
 `--yes` accepts package-manager confirmations, including Arch system updates;
 `--skip-deps` only works when
 all runtime libraries are already available. Other glibc distributions can use
@@ -136,7 +136,7 @@ mtui
 APT installs any missing runtime libraries, including WebKitGTK for sign-in.
 The package also adds a terminal launcher to your desktop's application menu.
 Upgrade by installing the newer `.deb` the same way, then restart MTUI.
-The v0.11.5 package has Debian version `0.11.5-1`, which upgrades earlier
+The v0.11.6 package has Debian version `0.11.6-1`, which upgrades earlier
 MTUI packages.
 Run `mtui-uninstall` to remove the package and all local MTUI data. Using
 `sudo apt remove mtui` alone removes the package while leaving user data.
@@ -291,6 +291,14 @@ On Lyrics, click **Expand** or press `e` for a full-width reading view; `e` or
 Esc restores the artwork. Click **Follow lyrics** or press `f` to resume synced
 lyrics after scrolling, or pause following to read ahead. Expanded lyrics use
 more space and centered lines; the terminal still controls the actual font size.
+
+If a lookup returns plain lyrics or fails, MTUI retries twice while Lyrics is
+open, after 2 and 8 seconds. Existing words stay visible and switch to synced
+lyrics as soon as timings arrive; restarting the song is unnecessary. Successful
+timings for up to 16 recently viewed songs are kept in memory for the current
+session (up to 32 KiB of lyric text per song). Plain lyrics and failures are not
+cached. The panel labels untimed results **Unsynced lyrics**. Timings still
+depend on what YouTube Music or LRCLIB publishes for that recording.
 
 Queue entries have space between songs and clear title, artist, and duration
 columns. Short windows use compact rows. Click the current artist or album to

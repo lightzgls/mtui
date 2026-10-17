@@ -191,7 +191,7 @@ pub enum PlayState {
 }
 
 /// What the UI renders. Cheap to clone; replaced wholesale on each change.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     pub state: PlayState,
     pub title: String,

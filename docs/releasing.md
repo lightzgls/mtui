@@ -48,7 +48,7 @@ Use current stable Rust. Windows additionally needs Visual Studio's x64 MSVC
 build tools and Inno Setup 6.7.1. From PowerShell:
 
 ```powershell
-$version = '0.11.5'
+$version = '0.11.6'
 $env:RUSTFLAGS = '-C target-feature=+crt-static'
 cargo build --release --locked
 # Use the path to your installed ISCC.exe.
@@ -65,7 +65,7 @@ On an Ubuntu 22.04 build environment with the source-build libraries and
 
 ```sh
 cargo build --release --locked --bins
-bash scripts/package-linux.sh 0.11.5 target/release dist
+bash scripts/package-linux.sh 0.11.6 target/release dist
 ```
 
 The package script scans **both** executables with `dpkg-shlibdeps`, so sign-in's
@@ -109,7 +109,7 @@ release smoke script **does**, and must run only inside disposable containers:
 docker run --rm \
   --mount "type=bind,source=$PWD/scripts,target=/source/scripts,readonly" \
   --mount "type=bind,source=$PWD/dist,target=/packages,readonly" \
-  ubuntu:24.04 bash /source/scripts/test-linux-release.sh 0.11.5 /packages
+  ubuntu:24.04 bash /source/scripts/test-linux-release.sh 0.11.6 /packages
 ```
 
 Repeat on `fedora:44`, `archlinux:base`, and `opensuse/tumbleweed:latest` as in

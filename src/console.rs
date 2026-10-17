@@ -203,6 +203,9 @@ mod imp {
     const HANDSHAKE_ERROR: u8 = 2;
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
     const PIPE_POLL_INTERVAL: Duration = Duration::from_millis(2);
+    // Foreground input needs millisecond latency, not 500 empty pipe checks
+    // per second. Keep the short startup-handshake poll separate.
+    const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(8);
     const RECORD_LEN: usize = 18;
 
     static SESSION: OnceLock<Mutex<Option<ConsoleSession>>> = OnceLock::new();
@@ -1039,7 +1042,7 @@ mod imp {
                         if left.is_zero() {
                             return Ok(false);
                         }
-                        std::thread::sleep(left.min(PIPE_POLL_INTERVAL));
+                        std::thread::sleep(left.min(INPUT_POLL_INTERVAL));
                     }
                     PipeState::Available(available) => {
                         let take = available.min(RECORD_LEN - self.filled);

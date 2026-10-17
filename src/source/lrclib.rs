@@ -11,8 +11,8 @@
 //! failure is never an error the user sees -- the tab falls back to the block of
 //! text it would have shown anyway.
 //!
-//! Nothing here is cached. A lyrics fetch already happens once per track, and a
-//! cache of song words is a cache that only grows.
+//! The page worker retains a bounded cache of successful timings. Misses are
+//! retried by the app, so a temporary provider failure cannot stick all track.
 
 use std::time::Duration;
 
@@ -42,13 +42,9 @@ const USER_AGENT: &str = concat!(
     ")"
 );
 
-/// Results read from one search before giving up on it.
-///
-/// A search for a common title returns a great many recordings of it, and the
-/// ones past the first handful are progressively less likely to be the track
-/// playing. Taking the first with timings out of a few is a better bet than
-/// scanning all of them for one that happens to match.
-const MAX_CANDIDATES: usize = 8;
+/// Bound work even if a provider unexpectedly returns a much larger result set.
+const MAX_CANDIDATES: usize = 100;
+const TIMEOUT: Duration = Duration::from_secs(4);
 
 /// What LRCLIB needs to recognise a track.
 ///
@@ -119,8 +115,8 @@ fn exact(http: &Http, query: &Query) -> Option<Vec<TimedLine>> {
     synced(&json)
 }
 
-/// The fallback: search by artist and title and take the first result that has
-/// timings on it.
+/// Prefer the matching recording, rather than whichever synced result the
+/// service happens to put first. A live/remix title must match that version.
 fn search(http: &Http, query: &Query) -> Option<Vec<TimedLine>> {
     let params = vec![
         ("artist_name", query.artist.clone()),
@@ -128,10 +124,38 @@ fn search(http: &Http, query: &Query) -> Option<Vec<TimedLine>> {
     ];
 
     let json = get(http, SEARCH_URL, &params)?;
-    json.as_array()?
-        .iter()
-        .take(MAX_CANDIDATES)
-        .find_map(synced)
+    best_match(&json, query)
+}
+
+fn best_match(json: &Value, query: &Query) -> Option<Vec<TimedLine>> {
+    let title = normalized(&query.title);
+    let artist = normalized(&query.artist);
+    let album = query.album.as_deref().map(normalized);
+    let mut candidates: Vec<_> = json.as_array()?.iter().take(MAX_CANDIDATES).filter_map(|record| {
+        if normalized(&clean_title(record["trackName"].as_str()?)) != title
+            || normalized(&clean_artist(record["artistName"].as_str()?)) != artist
+        { return None; }
+        let difference = match query.duration {
+            Some(duration) => {
+                let candidate = record["duration"].as_f64()?;
+                if !candidate.is_finite() || candidate < 0.0 { return None; }
+                let difference = (candidate - duration.as_secs_f64()).abs();
+                if difference > 3.0 { return None; }
+                (difference * 1_000.0) as u64
+            }
+            None => 0,
+        };
+        let different_album = album.as_ref().is_some_and(|album| {
+            record["albumName"].as_str().map(normalized).as_ref() != Some(album)
+        });
+        Some(((difference, different_album), record))
+    }).collect();
+    candidates.sort_by_key(|(rank, _)| *rank);
+    candidates.into_iter().find_map(|(_, record)| synced(record))
+}
+
+fn normalized(text: &str) -> String {
+    text.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
 /// One GET, with the query string appended and a non-2xx treated as a miss.
@@ -147,13 +171,27 @@ fn get(http: &Http, url: &str, params: &[(&str, String)]) -> Option<Value> {
     let request = http
         .client()
         .get(format!("{url}?{query}"))
+        .timeout(TIMEOUT)
         .header(reqwest::header::USER_AGENT, USER_AGENT);
 
-    let (status, raw) = http.send(request).ok()?;
+    let (status, raw) = match http.send(request) {
+        Ok(response) => response,
+        Err(error) => {
+            crate::diagnostics::warn("lyrics", &format!("LRCLIB request failed: {error:#}"));
+            return None;
+        }
+    };
     if !(200..300).contains(&status) {
+        if status != 404 { crate::diagnostics::warn("lyrics", &format!("LRCLIB returned HTTP {status}")); }
         return None;
     }
-    serde_json::from_slice(&raw).ok()
+    match serde_json::from_slice(&raw) {
+        Ok(json) => Some(json),
+        Err(error) => {
+            crate::diagnostics::warn("lyrics", &format!("LRCLIB returned invalid JSON: {error}"));
+            None
+        }
+    }
 }
 
 /// The timed lines out of one LRCLIB record.
@@ -478,20 +516,35 @@ mod tests {
     }
 
     #[test]
-    fn a_search_takes_the_first_result_that_has_timings() {
-        let results = serde_json::json!([
-            { "syncedLyrics": Value::Null, "plainLyrics": "no use" },
-            { "syncedLyrics": "[00:02.00]sung line 0" },
-            { "syncedLyrics": "[00:03.00]not this one" },
-        ]);
+    fn a_search_finds_timings_past_plain_and_wrong_recordings() {
+        let query = Query::new("Artist", "Song", Some("Album"), Some(Duration::from_secs(240))).unwrap();
+        let mut records = vec![serde_json::json!({
+            "artistName": "Artist", "trackName": "Song", "duration": 270,
+            "syncedLyrics": "[00:03.00]wrong recording",
+        }); 9];
+        records.push(serde_json::json!({
+            "artistName": "Artist", "trackName": "Song", "duration": 240,
+            "syncedLyrics": null,
+        }));
+        records.push(serde_json::json!({
+            "artistName": "Artist", "trackName": "Song", "albumName": "Album", "duration": 240,
+            "syncedLyrics": "[00:02.00]matching recording",
+        }));
+        let found = best_match(&Value::Array(records), &query).unwrap();
+        assert_eq!(found[0].text, "matching recording");
+    }
 
-        let found = results
-            .as_array()
-            .unwrap()
-            .iter()
-            .take(MAX_CANDIDATES)
-            .find_map(synced)
-            .expect("the second record has timings");
-        assert_eq!(found[0].text, "sung line 0");
+    #[test]
+    fn search_prefers_duration_and_album_and_rejects_other_versions() {
+        let query = Query::new("Artist", "Song", Some("Album"), Some(Duration::from_secs(240))).unwrap();
+        let records = serde_json::json!([
+            { "artistName": "Other Artist", "trackName": "Song", "duration": 240, "syncedLyrics": "[00:01]other artist" },
+            { "artistName": "Artist", "trackName": "Song (Live)", "duration": 240, "syncedLyrics": "[00:01]live" },
+            { "artistName": "Artist", "trackName": "Song", "albumName": "Other", "duration": 240, "syncedLyrics": "[00:01]other album" },
+            { "artistName": "Artist", "trackName": "Song", "albumName": "Album", "duration": 240, "syncedLyrics": "[00:01]right" }
+        ]);
+        assert_eq!(best_match(&records, &query).unwrap()[0].text, "right");
+        let live = Query::new("Artist", "Song (Remix)", None, Some(Duration::from_secs(240))).unwrap();
+        assert!(best_match(&records, &live).is_none());
     }
 }

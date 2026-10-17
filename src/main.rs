@@ -25,6 +25,7 @@ mod kitty;
 mod media;
 mod navigation;
 mod player;
+mod refresh;
 mod session;
 #[path = "session/protocol.rs"]
 mod session_protocol;
@@ -66,8 +67,7 @@ use player::Player;
 use source::worker::SourceWorker;
 use tray::Tray;
 
-/// Redraw cadence when no input arrives. Fast enough for a smooth position
-/// clock, slow enough that an idle player is not spinning the CPU.
+/// Poll cadence without input. Actual drawing follows visible changes.
 const TICK: Duration = Duration::from_millis(200);
 
 /// Cadence while a request is outstanding. A prefetched track resolves from
@@ -225,6 +225,8 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, media: &Option<media::
     };
     let mut mouse = ui::MouseMap::default();
     let mut activation_until = None;
+    let mut refresh = refresh::Refresh::new(Instant::now());
+    let mut redraw = true;
 
     let result = (|| -> Result<()> {
         while !app.should_quit && !app.wants_background {
@@ -240,7 +242,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, media: &Option<media::
             }
             #[cfg(windows)]
             { app.graphics.cell = console::cell_size(); }
-            app.poll_source();
+            redraw |= app.poll_source();
             // Before the prefetch: a track that just ended starts the next one
             // here, and the prefetch warms the one after it.
             app.tick_playback();
@@ -249,37 +251,47 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, media: &Option<media::
             app.tick_presence();
             sync_media(app, media);
             sync_foreground_tray(app, tray);
-            #[cfg(windows)]
-            foreground.terminal.backend_mut().set_canvas_color(ui::canvas_color(app.cover.as_ref()))?;
-            foreground
-                .terminal
-                .draw(|frame| ui::render(frame, app, &mut mouse))
-                .context("could not draw the foreground")?;
-
-            // Protocol images live outside ratatui's buffer, so nothing it
-            // draws can erase them. Clear and rebuild in the same breath.
-            if app.image_needs_clearing() {
-                if app.painted_with_kitty() {
-                    for image in app.painted_images() {
-                        foreground
-                            .terminal
-                            .backend_mut()
-                            .write_all(&kitty::delete(kitty::placement_id(image)))
-                            .context("could not remove a Kitty image")?;
-                    }
-                }
-                foreground
-                    .terminal
-                    .clear()
-                    .context("could not clear the foreground")?;
-                app.invalidate_image();
+            let snapshot = app.snapshot();
+            let lyric = app.now.as_ref()
+                .filter(|now| app.view == app::View::Playing && now.tab == app::Tab::Lyrics)
+                .and_then(|now| match &now.lyrics {
+                    app::Panel::Ready(lyrics) => lyrics.singing(snapshot.position),
+                    _ => None,
+                });
+            if refresh.due(snapshot, lyric, redraw, ui::animated(), Instant::now()) {
+                redraw = false;
+                #[cfg(windows)]
+                foreground.terminal.backend_mut().set_canvas_color(ui::canvas_color(app.cover.as_ref()))?;
                 foreground
                     .terminal
                     .draw(|frame| ui::render(frame, app, &mut mouse))
-                    .context("could not redraw the foreground")?;
+                    .context("could not draw the foreground")?;
+
+                // Protocol images live outside ratatui's buffer, so nothing it
+                // draws can erase them. Clear and rebuild in the same breath.
+                if app.image_needs_clearing() {
+                    if app.painted_with_kitty() {
+                        for image in app.painted_images() {
+                            foreground
+                                .terminal
+                                .backend_mut()
+                                .write_all(&kitty::delete(kitty::placement_id(image)))
+                                .context("could not remove a Kitty image")?;
+                        }
+                    }
+                    foreground
+                        .terminal
+                        .clear()
+                        .context("could not clear the foreground")?;
+                    app.invalidate_image();
+                    foreground
+                        .terminal
+                        .draw(|frame| ui::render(frame, app, &mut mouse))
+                        .context("could not redraw the foreground")?;
+                }
+                paint_cover(app, foreground.terminal.backend_mut())
+                    .context("could not draw the cover")?;
             }
-            paint_cover(app, foreground.terminal.backend_mut())
-                .context("could not draw the cover")?;
             if console::closed() {
                 app.handle_window_loss(console::end_task_requested());
                 app.wants_foreground |= activation_until.is_some_and(|until| Instant::now() <= until);
@@ -293,9 +305,13 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, media: &Option<media::
                 .context("could not poll foreground input")?
             {
                 match event {
-                    Event::Key(key) if key.is_press() => app.handle_key(key)?,
+                    Event::Key(key) if key.is_press() => {
+                        redraw = true;
+                        app.handle_key(key)?;
+                    }
                     Event::Mouse(event) => match event.kind {
                         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                            redraw = true;
                             let up = event.kind == MouseEventKind::ScrollUp;
                             if app.precision_volume && mouse.over_cover(event.column, event.row) {
                                 app.handle_mouse_action(app::MouseAction::AdjustPrecisionVolume(up))?;
@@ -304,16 +320,19 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, media: &Option<media::
                             } else { app.handle_mouse_scroll(!up)?; }
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
+                            redraw = true;
                             if let Some(action) = mouse.action_at(event.column, event.row) {
                                 app.handle_mouse_action(action)?;
                             }
                         }
                         MouseEventKind::Drag(MouseButton::Left) => {
+                            redraw = true;
                             if let Some(action) = mouse.drag_action_at(event.column, event.row) {
                                 app.handle_mouse_action(action)?;
                             }
                         }
                         MouseEventKind::Down(MouseButton::Right) => {
+                            redraw = true;
                             if let Some(action) =
                                 mouse.context_action_at(event.column, event.row)
                             {
@@ -324,6 +343,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, media: &Option<media::
                         _ => {}
                     },
                     Event::Resize(width, height) => {
+                        redraw = true;
                         #[cfg(not(windows))]
                         let _ = (width, height);
                         #[cfg(windows)]

@@ -5,6 +5,7 @@
 //! screen are turned into widget items, so a full result set costs the same to
 //! draw as a single screenful.
 
+use std::cell::Cell;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -324,7 +325,14 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
+thread_local! {
+    static MARQUEE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn animated() -> bool { MARQUEE_ACTIVE.get() }
+
 pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
+    MARQUEE_ACTIVE.set(false);
     mouse.targets.clear();
     app.images.clear();
     frame.render_widget(
@@ -2572,7 +2580,7 @@ fn render_lyrics_controls(frame: &mut Frame, now: &NowPlaying, area: Rect, accen
     let expand_area = Rect::new(area.right() - expand_width, area.y, expand_width, 1);
     frame.render_widget(Paragraph::new(expand).style(Style::default().fg(accent).bg(shell::SURFACE)), expand_area);
     mouse.targets.push(MouseTarget::Area(expand_area, MouseAction::ToggleLyricsExpanded));
-    let follow = if timed && now.follow_lyrics { " Following · f pause " } else if timed { " Follow lyrics f " } else { " Lyrics " };
+    let follow = if timed && now.follow_lyrics { " Following · f pause " } else if timed { " Follow lyrics f " } else if matches!(now.lyrics, Panel::Ready(_)) { " Unsynced lyrics " } else { " Lyrics " };
     let follow_width = (display_width(follow) as u16).min(area.width.saturating_sub(expand_width + 1));
     let follow_area = Rect::new(area.x, area.y, follow_width, 1);
     frame.render_widget(Paragraph::new(truncate(follow, follow_width as usize)).style(Style::default().fg(if timed { Color::Gray } else { Color::DarkGray })), follow_area);
@@ -3738,6 +3746,7 @@ fn focused_text(text: &str, width: usize, focused: bool) -> String {
 
 /// A looping, Unicode-safe window over a long title.
 fn marquee(text: &str, width: usize) -> String {
+    if width > 0 && display_width(text) > width { MARQUEE_ACTIVE.set(true); }
     let tick = (MARQUEE_START
         .get_or_init(Instant::now)
         .elapsed()

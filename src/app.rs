@@ -603,6 +603,8 @@ pub struct NowPlaying {
     /// An explicit reading view; ordinary playback keeps the large artwork.
     pub lyrics_expanded: bool,
     pub lyrics: Panel<Lyrics>,
+    lyrics_attempts: u8,
+    lyrics_retry_at: Option<Instant>,
     pub comments: Panel<Comments>,
     pub related: Panel<Vec<Shelf>>,
     /// Browse ids from the watch response, held until the tab they belong to is
@@ -650,6 +652,8 @@ impl NowPlaying {
             follow_lyrics: true,
             lyrics_expanded: false,
             lyrics: Panel::Idle,
+            lyrics_attempts: 0,
+            lyrics_retry_at: None,
             comments: Panel::Idle,
             related: Panel::Idle,
             lyrics_id: None,
@@ -2348,16 +2352,19 @@ impl App {
     /// Drains rather than taking one: two threads now feed the response queue,
     /// so a cover and a resolve can land in the same frame and handling only
     /// the first would leave the other a frame stale.
-    pub fn poll_source(&mut self) {
+    pub fn poll_source(&mut self) -> bool {
+        let mut changed = false;
         self.poll_update();
         if self.volume_save.is_some_and(|(at, _)| at.elapsed() >= Duration::from_millis(250)) {
             self.flush_volume();
         }
         while let Some(response) = self.source.poll() {
+            changed = true;
             self.apply(response);
         }
         self.poll_player();
         self.tick_session();
+        changed
     }
 
     /// The same loop runs in the tray. Only the slow policy check touches disk;
@@ -2752,7 +2759,19 @@ impl App {
             Response::MoreQueue { epoch, page } => self.apply_more_queue(epoch, page),
             Response::Lyrics { video_id, lyrics } => {
                 if let Some(now) = self.for_track(&video_id) {
-                    now.lyrics = panel(lyrics);
+                    // A transient miss must neither erase words already on
+                    // screen nor downgrade timings that have already arrived.
+                    let already_synced = matches!(&now.lyrics, Panel::Ready(lyrics) if !lyrics.timed.is_empty());
+                    if !already_synced {
+                        if lyrics.is_ok() || !matches!(&now.lyrics, Panel::Ready(_)) {
+                            now.lyrics = panel(lyrics);
+                        }
+                        let synced = matches!(&now.lyrics, Panel::Ready(lyrics) if !lyrics.timed.is_empty());
+                        now.lyrics_retry_at = (!synced && now.lyrics_attempts < 3)
+                            .then(|| Instant::now() + Duration::from_secs(if now.lyrics_attempts <= 1 { 2 } else { 8 }));
+                    } else {
+                        now.lyrics_retry_at = None;
+                    }
                 }
             }
             Response::Related { video_id, related } => {
@@ -3294,8 +3313,8 @@ impl App {
     /// Fetches the panel behind the open tab, if it has not been asked for.
     ///
     /// Called on every tab switch and on every track change, so a panel is
-    /// fetched exactly when it is first looked at -- and never twice, which is
-    /// what [`Panel::is_idle`] is for.
+    /// fetched when first looked at. Incomplete lyrics can be retried without
+    /// making the user restart playback.
     fn request_tab(&mut self) {
         let Some(now) = self.now.as_mut() else {
             return;
@@ -3315,6 +3334,8 @@ impl App {
                     return;
                 }
                 now.lyrics = Panel::Loading;
+                now.lyrics_attempts += 1;
+                now.lyrics_retry_at = None;
                 Request::Lyrics {
                     video_id,
                     browse_id: now.lyrics_id.clone(),
@@ -3357,6 +3378,20 @@ impl App {
         });
         if waiting {
             self.request_tab();
+        }
+        if let Some(now) = self.now.as_mut()
+            && now.tab == Tab::Lyrics
+            && now.lyrics_retry_at.is_some_and(|at| Instant::now() >= at)
+        {
+            now.lyrics_retry_at = None;
+            now.lyrics_attempts += 1;
+            let request = Request::Lyrics {
+                video_id: now.video_id.clone(),
+                browse_id: now.lyrics_id.clone(),
+                query: now.lyrics_query(),
+            };
+            // Keep the plain lyrics visible while their upgrade is in flight.
+            let _ = self.source.send(request);
         }
     }
 
@@ -5992,6 +6027,10 @@ pub(crate) fn account_menu_items(connected: bool, signing_in: bool) -> Vec<MenuI
 #[cfg(test)]
 #[path = "app/scenarios.rs"]
 mod scenarios;
+
+#[cfg(test)]
+#[path = "app/performance.rs"]
+mod performance;
 
 #[cfg(test)]
 mod tests {

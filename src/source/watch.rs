@@ -184,7 +184,9 @@ impl Lyrics {
     /// An empty credit is treated as no credit: the panel draws the line it is
     /// given, and a blank one is a row of the song's height spent saying
     /// nothing.
-    pub(super) fn from_timed(timed: Vec<TimedLine>, source: Option<&str>) -> Self {
+    pub(super) fn from_timed(mut timed: Vec<TimedLine>, source: Option<&str>) -> Self {
+        timed.sort_by_key(|line| line.start);
+        timed.truncate(MAX_TIMED_LINES);
         Self {
             text: timed
                 .iter()
@@ -207,7 +209,7 @@ impl Lyrics {
     /// Music itself does. `None` only before the first line and for a track
     /// with no timings at all.
     pub fn singing(&self, position: Duration) -> Option<usize> {
-        self.timed.iter().rposition(|line| line.start <= position)
+        self.timed.partition_point(|line| line.start <= position).checked_sub(1)
     }
 }
 
@@ -426,16 +428,10 @@ fn timed_lyrics(json: &Value) -> Option<Lyrics> {
     let mut found = Vec::new();
     home::collect(json, "timedLyricsData", &mut found);
 
-    let timed: Vec<TimedLine> = found
-        .first()?
-        .as_array()?
-        .iter()
-        .filter_map(parse_timed_line)
-        .take(MAX_TIMED_LINES)
-        .collect();
-    if timed.is_empty() {
-        return None;
-    }
+    let timed = found.into_iter().filter_map(Value::as_array).find_map(|raw| {
+        let lines: Vec<_> = raw.iter().filter_map(parse_timed_line).take(MAX_TIMED_LINES).collect();
+        (!lines.is_empty()).then_some(lines)
+    })?;
 
     let mut sources = Vec::new();
     home::collect(json, "sourceMessage", &mut sources);
@@ -1162,6 +1158,18 @@ mod tests {
         // The block is kept alongside the lines so a caller that wants the
         // whole thing does not have to decide how to join them.
         assert_eq!(lyrics.text, "sung line 0\nsung line 1\nsung line 2");
+    }
+
+    #[test]
+    fn empty_timing_models_do_not_hide_a_later_valid_model() {
+        let json = serde_json::json!({"models": [
+            { "timedLyricsData": [] },
+            timed_response(vec![serde_json::json!(5_000), serde_json::json!(1_000)])
+        ]});
+        let lyrics = timed_lyrics(&json).unwrap();
+        assert_eq!(lyrics.timed[0].start, Duration::from_secs(1));
+        assert_eq!(lyrics.singing(Duration::from_secs(2)), Some(0));
+        assert_eq!(lyrics.singing(Duration::from_secs(6)), Some(1));
     }
 
     #[test]

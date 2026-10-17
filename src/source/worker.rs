@@ -29,6 +29,7 @@
 //! listening to. It is also the one thread that keeps a connection open between
 //! requests -- see [`cover::ArtFetcher`].
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel};
@@ -1015,6 +1016,7 @@ fn run_pages(rx: Arc<Inbox>, tx: Sender<Response>) {
     let Ok(mut http) = Http::new() else {
         return;
     };
+    let mut lyrics_cache = LyricsCache::default();
 
     while let Some(work) = rx.recv() {
         http.set_cancellation(work.cancel.clone());
@@ -1046,7 +1048,7 @@ fn run_pages(rx: Arc<Inbox>, tx: Sender<Response>) {
                 browse_id,
                 query,
             } => Response::Lyrics {
-                lyrics: lyrics(&http, browse_id.as_deref(), query.as_ref())
+                lyrics: lyrics_cache.get_or_fetch(&video_id, || lyrics(&http, browse_id.as_deref(), query.as_ref()))
                     .map_err(|e| format!("{e:#}")),
                 video_id,
             },
@@ -1077,18 +1079,38 @@ fn run_pages(rx: Arc<Inbox>, tx: Sender<Response>) {
     }
 }
 
+/// Only successful timings are retained. Plain text and transient misses must
+/// remain retryable; a small LRU keeps replay fast without unbounded growth.
+#[derive(Default)]
+struct LyricsCache(VecDeque<(String, watch::Lyrics)>);
+
+impl LyricsCache {
+    const CAPACITY: usize = 16;
+
+    fn get_or_fetch(&mut self, id: &str, fetch: impl FnOnce() -> Result<watch::Lyrics>) -> Result<watch::Lyrics> {
+        if let Some(index) = self.0.iter().position(|(key, _)| key == id) {
+            let entry = self.0.remove(index).expect("the cached entry exists");
+            let lyrics = entry.1.clone();
+            self.0.push_back(entry);
+            crate::diagnostics::info("lyrics", &format!("{id}: reused {} synced lines", lyrics.timed.len()));
+            return Ok(lyrics);
+        }
+        let lyrics = fetch()?;
+        crate::diagnostics::info("lyrics", &format!("{id}: fetched {} synced lines", lyrics.timed.len()));
+        let bytes = lyrics.text.len() + lyrics.source.as_ref().map_or(0, String::len)
+            + lyrics.timed.iter().map(|line| line.text.len()).sum::<usize>();
+        if !lyrics.timed.is_empty() && bytes <= 32 * 1024 {
+            if self.0.len() == Self::CAPACITY { self.0.pop_front(); }
+            self.0.push_back((id.to_string(), lyrics.clone()));
+        }
+        Ok(lyrics)
+    }
+}
+
 /// The best lyrics available for one track, from either of the two sources.
 ///
-/// YouTube is asked first and its words are always preferred: they are the ones
-/// matched to the recording that is actually playing. What it often does not
-/// have is *timings* -- it publishes those only for its own catalogue -- and
-/// without them the panel is a wall of text with nothing to follow. LRCLIB is
-/// asked only for what is missing, in one of two ways:
-///
-/// - YouTube gave words but no timings: keep its words, lay LRCLIB's timings
-///   over them, and say so in the credit.
-/// - YouTube has no lyrics page at all, or the fetch failed: LRCLIB is the only
-///   chance, and its own words are better than an empty tab.
+/// YouTube timings are preferred. When only LRCLIB has timings, keep its
+/// corresponding words together with them so the text and timestamps agree.
 ///
 /// Whichever way it goes, LRCLIB failing is never what the user is told about:
 /// the error surfaced is YouTube's, because that is the source the tab is
@@ -1107,16 +1129,9 @@ fn lyrics(
 
         // Words but no timings -- a cover, a live take, most of what is not in
         // YouTube's own catalogue.
-        Some(Ok(mut lyrics)) => {
+        Some(Ok(lyrics)) => {
             if let Some(timed) = query.and_then(|query| lrclib::timed(http, query)) {
-                lyrics.timed = timed;
-                // The words on screen are still YouTube's; what changed is that
-                // they now scroll. Crediting both is the honest version, and
-                // the panel has one line to say it in.
-                lyrics.source = Some(match lyrics.source {
-                    Some(source) => format!("{source} • Timings: LRCLIB"),
-                    None => "Timings: LRCLIB".to_string(),
-                });
+                return Ok(watch::Lyrics::from_timed(timed, Some("Source: LRCLIB")));
             }
             Ok(lyrics)
         }
@@ -1232,6 +1247,57 @@ fn run_art(rx: &Arc<Inbox>, tx: &Sender<Response>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "read-only live LRCLIB lookup; requires internet"]
+    fn live_drop_dead_by_starfall_returns_synced_words_and_replays_from_cache() {
+        let http = Http::new().unwrap();
+        let query = lrclib::Query::new("starfall - Topic", "drop dead", Some("lose myself"),
+            Some(std::time::Duration::from_secs(111))).unwrap();
+        let mut cache = LyricsCache::default();
+        let lyrics = cache.get_or_fetch("drop-dead-starfall", || lyrics(&http, None, Some(&query))).unwrap();
+        assert!(!lyrics.timed.is_empty(), "LRCLIB should have timings for this recording");
+        assert_eq!(lyrics.source.as_deref(), Some("Source: LRCLIB"));
+        assert_eq!(lyrics.text, lyrics.timed.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n"));
+        assert!(lyrics.timed.windows(2).all(|pair| pair[0].start <= pair[1].start));
+        println!("LRCLIB returned {} synced lines; final cue at {:?}", lyrics.timed.len(), lyrics.timed.last().unwrap().start);
+        cache.get_or_fetch("drop-dead-starfall", || panic!("replay must use the successful timings")).unwrap();
+    }
+
+    fn synced_fixture() -> watch::Lyrics {
+        watch::Lyrics::from_timed(vec![watch::TimedLine {
+            text: "timed words".into(), start: std::time::Duration::from_secs(1),
+        }], Some("Source: LRCLIB"))
+    }
+
+    #[test]
+    fn replay_reuses_synced_lyrics_but_plain_text_and_failures_can_recover() {
+        let mut cache = LyricsCache::default();
+        assert!(cache.get_or_fetch("song", || bail!("temporary network failure")).is_err());
+        let plain = watch::Lyrics { text: "plain words".into(), source: None, timed: Vec::new() };
+        assert!(cache.get_or_fetch("song", || Ok(plain)).unwrap().timed.is_empty());
+        assert!(!cache.get_or_fetch("song", || Ok(synced_fixture())).unwrap().timed.is_empty());
+        let replay = cache.get_or_fetch("song", || panic!("a replay must not need the provider")).unwrap();
+        assert_eq!(replay.text, "timed words");
+        assert_eq!(cache.0.len(), 1);
+    }
+
+    #[test]
+    fn lyrics_cache_is_bounded_and_keeps_recently_replayed_songs() {
+        let mut cache = LyricsCache::default();
+        for index in 0..LyricsCache::CAPACITY {
+            cache.get_or_fetch(&index.to_string(), || Ok(synced_fixture())).unwrap();
+        }
+        cache.get_or_fetch("0", || panic!("already cached")).unwrap();
+        cache.get_or_fetch("new", || Ok(synced_fixture())).unwrap();
+        assert_eq!(cache.0.len(), LyricsCache::CAPACITY);
+        assert!(!cache.0.iter().any(|(id, _)| id == "1"));
+        assert!(cache.0.iter().any(|(id, _)| id == "0"));
+        let mut oversized = synced_fixture();
+        oversized.text = "x".repeat(32 * 1024 + 1);
+        cache.get_or_fetch("large", || Ok(oversized)).unwrap();
+        assert!(!cache.0.iter().any(|(id, _)| id == "large"));
+    }
 
     #[test]
     fn resolver_startup_failure_is_answered_per_playback_request() {

@@ -24,6 +24,85 @@ fn track(index: usize) -> Track {
     }
 }
 
+fn open_lyrics(app: &mut App) {
+    let mut now = NowPlaying::new(&track(0));
+    now.tab = Tab::Lyrics;
+    now.watched = true;
+    now.lyrics_id = Some("lyrics-page".into());
+    app.now = Some(now);
+    app.view = View::Playing;
+    app.tick_page();
+}
+
+#[test]
+fn plain_lyrics_upgrade_to_visible_synced_lyrics_without_restarting_the_song() {
+    let (mut app, driver, requests) = fixture();
+    open_lyrics(&mut app);
+    assert!(matches!(requests.try_recv().unwrap(), Request::Lyrics { .. }));
+    app.apply(Response::Lyrics { video_id: "song-0".into(), lyrics: Ok(Lyrics {
+        text: "plain words".into(), source: None, timed: Vec::new(),
+    }) });
+    let now = app.now.as_mut().unwrap();
+    assert!(now.lyrics_retry_at.is_some());
+    now.lyrics_retry_at = Some(Instant::now());
+    app.tick_page();
+    assert!(matches!(requests.try_recv().unwrap(), Request::Lyrics { video_id, .. } if video_id == "song-0"));
+    assert!(matches!(&app.now.as_ref().unwrap().lyrics, Panel::Ready(lyrics) if lyrics.text == "plain words"));
+    app.tick_page();
+    assert!(requests.try_recv().is_err(), "only one retry may be in flight");
+
+    app.apply(Response::Lyrics { video_id: "song-0".into(), lyrics: Ok(Lyrics {
+        text: "synced words".into(), source: Some("Source: LRCLIB".into()),
+        timed: vec![crate::source::watch::TimedLine { text: "synced words".into(), start: Duration::from_secs(1) }],
+    }) });
+    assert!(app.now.as_ref().unwrap().lyrics_retry_at.is_none());
+    state(&driver, PlayState::Playing, Duration::from_secs(2));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+    let mut mouse = crate::ui::MouseMap::default();
+    terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+    let rendered: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+    assert!(rendered.contains("synced words") && rendered.contains('▌'), "{rendered}");
+    assert!(driver.commands.try_iter().next().is_none(), "upgrading lyrics must not restart audio");
+
+    app.apply(Response::Lyrics { video_id: "song-0".into(), lyrics: Err("late failure".into()) });
+    assert!(matches!(&app.now.as_ref().unwrap().lyrics, Panel::Ready(lyrics) if !lyrics.timed.is_empty()));
+}
+
+#[test]
+fn lyrics_retries_are_bounded_preserve_words_and_wait_until_the_panel_is_visible() {
+    let (mut app, _driver, requests) = fixture();
+    open_lyrics(&mut app);
+    requests.try_iter().for_each(drop);
+    app.apply(Response::Lyrics { video_id: "song-0".into(), lyrics: Err("temporary failure".into()) });
+    let now = app.now.as_mut().unwrap();
+    now.lyrics_retry_at = Some(Instant::now());
+    now.tab = Tab::UpNext;
+    app.tick_page();
+    assert!(requests.try_recv().is_err(), "hidden panels must not spend requests");
+    app.now.as_mut().unwrap().tab = Tab::Lyrics;
+    app.tick_page();
+    assert!(matches!(requests.try_recv().unwrap(), Request::Lyrics { .. }));
+    app.apply(Response::Lyrics { video_id: "song-0".into(), lyrics: Ok(Lyrics {
+        text: "plain words".into(), source: None, timed: Vec::new(),
+    }) });
+    app.now.as_mut().unwrap().lyrics_retry_at = Some(Instant::now());
+    app.tick_page();
+    assert!(matches!(requests.try_recv().unwrap(), Request::Lyrics { .. }));
+    app.apply(Response::Lyrics { video_id: "song-0".into(), lyrics: Err("still offline".into()) });
+    let now = app.now.as_ref().unwrap();
+    assert_eq!(now.lyrics_attempts, 3);
+    assert!(now.lyrics_retry_at.is_none());
+    assert!(matches!(&now.lyrics, Panel::Ready(lyrics) if lyrics.text == "plain words"));
+    for _ in 0..20 { app.tick_page(); }
+    assert!(requests.try_recv().is_err());
+    app.play_track(track(1), false);
+    requests.try_iter().for_each(drop);
+    app.apply(Response::Lyrics { video_id: "song-0".into(), lyrics: Err("obsolete".into()) });
+    app.tick_page();
+    assert!(app.now.as_ref().unwrap().lyrics_retry_at.is_none());
+    assert!(requests.try_recv().is_err(), "old responses must not retry the previous song");
+}
+
 #[test]
 fn system_media_controls_publish_track_and_use_the_existing_queue_and_seek_paths() {
     use crate::media::MediaCommand;
