@@ -11,7 +11,7 @@ use serde_json::Value;
 use super::home::{self, Shelf};
 use super::http::Http;
 use super::innertube::{flex_column, flex_runs, parse_duration};
-use super::{ArtistRef, Track, UNKNOWN_ARTIST};
+use super::{ArtistRef, BrowseEndpoint, Track, UNKNOWN_ARTIST};
 
 const MAX_TOP_SONGS: usize = 50;
 const MAX_SECTIONS: usize = 12;
@@ -24,6 +24,9 @@ pub struct ArtistPage {
     pub description: Option<String>,
     pub art: Option<String>,
     pub top_songs: Vec<ArtistSong>,
+    /// The provider's full song listing, rather than the short artist preview.
+    pub songs_endpoint: Option<BrowseEndpoint>,
+    pub songs_truncated: bool,
     pub shelves: Vec<Shelf>,
 }
 
@@ -74,6 +77,12 @@ fn parse(json: &Value, mut artist: ArtistRef) -> Result<ArtistPage> {
         description,
         art,
         top_songs,
+        songs_endpoint: song_shelf(json).and_then(|shelf| {
+            home::browse_route(&shelf["bottomEndpoint"])
+                .or_else(|| shelf.pointer("/title/runs")?.as_array()?.iter()
+                    .find_map(|run| home::browse_route(&run["navigationEndpoint"])))
+        }),
+        songs_truncated: false,
         shelves,
     })
 }
@@ -160,6 +169,13 @@ fn thumbnail_url(header: &Value) -> Option<String> {
 }
 
 fn top_songs(json: &Value) -> Vec<ArtistSong> {
+    song_shelf(json).and_then(|shelf| shelf["contents"].as_array())
+        .into_iter().flatten()
+        .filter_map(|item| parse_song(&item["musicResponsiveListItemRenderer"]))
+        .take(MAX_TOP_SONGS).collect()
+}
+
+fn song_shelf(json: &Value) -> Option<&Value> {
     let mut shelves = Vec::new();
     home::collect(json, "musicShelfRenderer", &mut shelves);
 
@@ -169,16 +185,8 @@ fn top_songs(json: &Value) -> Vec<ArtistSong> {
     named
         .into_iter()
         .chain(shelves)
-        .find_map(|shelf| {
-            let songs = shelf["contents"]
-                .as_array()?
-                .iter()
-                .filter_map(|item| parse_song(&item["musicResponsiveListItemRenderer"]))
-                .take(MAX_TOP_SONGS)
-                .collect::<Vec<_>>();
-            (!songs.is_empty()).then_some(songs)
-        })
-        .unwrap_or_default()
+        .find(|shelf| shelf["contents"].as_array().is_some_and(|items|
+            items.iter().any(|item| parse_song(&item["musicResponsiveListItemRenderer"]).is_some())))
 }
 
 fn parse_song(row: &Value) -> Option<ArtistSong> {
@@ -192,8 +200,9 @@ fn parse_song(row: &Value) -> Option<ArtistSong> {
     let duration = home::fixed_column(row, 0)
         .as_deref()
         .and_then(parse_duration);
-    let plays = flex_column(row, 2).filter(|text| parse_duration(text).is_none());
-    let album = flex_column(row, 3).filter(|text| !text.is_empty());
+    let plays = (1..row["flexColumns"].as_array()?.len())
+        .filter_map(|index| flex_column(row, index)).find(|text| home::is_play_count(text));
+    let album = home::row_album(row);
 
     Some(ArtistSong {
         track: Track {
@@ -314,6 +323,37 @@ mod tests {
     #[test]
     fn rejects_a_page_with_no_usable_content() {
         assert!(parse(&serde_json::json!({}), artist()).is_err());
+    }
+
+    #[test]
+    fn play_counts_are_not_albums_when_artist_columns_change_order() {
+        let column = |text: &str| serde_json::json!({
+            "musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":text}]}}
+        });
+        for fields in [["Requiem", "90M plays"], ["90M plays", "Requiem"]] {
+            let mut row = song_row()["musicResponsiveListItemRenderer"].clone();
+            row["flexColumns"][2] = column(fields[0]);
+            row["flexColumns"][3] = column(fields[1]);
+            let song = parse_song(&row).unwrap();
+            assert_eq!(song.track.album.as_deref(), Some("Requiem"));
+            assert_eq!(song.plays.as_deref(), Some("90M plays"));
+        }
+    }
+
+    #[test]
+    fn full_song_route_belongs_to_the_song_shelf_and_preserves_params() {
+        let json = serde_json::json!({"contents":[
+            {"musicShelfRenderer":{"title":{"runs":[{"text":"Top songs"}]},
+                "contents":[song_row()],
+                "bottomEndpoint":{"browseEndpoint":{"browseId":"VLsongs","params":"artist-order"}}}},
+            {"musicShelfRenderer":{"title":{"runs":[{"text":"Videos"}]},
+                "bottomEndpoint":{"browseEndpoint":{"browseId":"VLvideos"}}}}
+        ]});
+        let page = parse(&json, artist()).unwrap();
+        let route = page.songs_endpoint.unwrap();
+        assert_eq!(route.browse_id, "VLsongs");
+        assert_eq!(route.params.as_deref(), Some("artist-order"));
+        assert_eq!(page.top_songs.len(), 1);
     }
 
     #[test]

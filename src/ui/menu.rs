@@ -17,11 +17,15 @@ struct MenuRenderLine {
 
 pub(super) fn render(frame: &mut Frame, app: &App, mouse: &mut MouseMap) {
     if let Some(menu) = app.menu() {
+        let mut items = app.menu_items();
+        if !app.show_key_hints && menu.page != MenuPage::Help {
+            for item in &mut items { item.shortcut = None; }
+        }
         draw(
             frame,
             menu.page,
             menu.selected,
-            &app.menu_items(),
+            &items,
             ambient(app),
             mouse,
         );
@@ -109,7 +113,7 @@ pub(super) fn draw(
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            menu_footer(page, dialog.footer.width as usize),
+            if mouse.show_key_hints() || page == MenuPage::Help { menu_footer(page, dialog.footer.width as usize) } else { String::new() },
             Style::default().fg(Color::Gray),
         ))),
         dialog.footer,

@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 
 const BROWSE_URL: &str = "https://music.youtube.com/youtubei/v1/browse";
-const MAX_TRACKS: usize = 200;
+pub(crate) const MAX_TRACKS: usize = 200;
 
 #[derive(Debug, Clone, Default)]
 pub struct Details {

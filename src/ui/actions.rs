@@ -5,7 +5,7 @@ use super::{
     dialog::{self, Chrome},
     display_width, shell, truncate,
 };
-use crate::app::{App, MouseAction, NowPlaying, actions::PlaylistPicker};
+use crate::app::{App, MouseAction, NowPlaying, View, Tab, actions::PlaylistPicker};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -13,7 +13,7 @@ use ratatui::{
     widgets::{Block, Clear, Paragraph},
 };
 
-pub(super) fn bar(frame: &mut Frame, now: &NowPlaying, area: Rect, mouse: &mut MouseMap) {
+pub(super) fn bar(frame: &mut Frame, now: &NowPlaying, area: Rect, mouse: &mut MouseMap, view: Option<View>) {
     if area.height < 3 || area.width < 12 {
         return;
     }
@@ -23,9 +23,11 @@ pub(super) fn bar(frame: &mut Frame, now: &NowPlaying, area: Rect, mouse: &mut M
         Block::default().style(Style::default().bg(shell::SURFACE)),
         row,
     );
-    let menu_width = 11;
+    let menu_label = mouse.hinted_label("Actions", view.map(|_| "^P"), area.width);
+    let menu_width = menu_label.width() as u16 + 1;
     let end = row.right() - menu_width;
     let mut x = row.x;
+    let show_action_keys = mouse.show_key_hints() && view.is_some() && row.width >= 110;
     let like = if now.like_pending {
         " Updating… "
     } else if now.liked == Some(true) {
@@ -61,7 +63,18 @@ pub(super) fn bar(frame: &mut Frame, now: &NowPlaying, area: Rect, mouse: &mut M
         ),
         (" Output ".into(), MouseAction::ChooseOutput, true, false),
     ] {
-        let width = display_width(&label) as u16;
+        if display_width(&label) > usize::from(end.saturating_sub(x)) { break; }
+        let key = match action {
+            MouseAction::LikePlaying => Some("^L"),
+            MouseAction::SharePlaying => Some("^Y"),
+            MouseAction::SavePlaying => Some("^A"),
+            MouseAction::ChooseOutput => Some("^O"),
+            MouseAction::ShufflePlayback if view == Some(View::Playing) && now.tab == Tab::UpNext => Some("z"),
+            MouseAction::RepeatPlayback if view == Some(View::Playing) => Some("R"),
+            _ => None,
+        };
+        let label = mouse.hinted_label(&label, key.filter(|_| show_action_keys), end.saturating_sub(x));
+        let width = label.width() as u16;
         if x + width > end {
             break;
         }
@@ -81,7 +94,7 @@ pub(super) fn bar(frame: &mut Frame, now: &NowPlaying, area: Rect, mouse: &mut M
     }
     let rect = Rect::new(end, row.y, menu_width, 1);
     frame.render_widget(
-        Paragraph::new("Actions ^P").style(Style::default().fg(Color::Gray)),
+        Paragraph::new(menu_label).style(Style::default().fg(Color::Gray)),
         rect,
     );
     mouse
@@ -120,11 +133,11 @@ pub(super) fn share(frame: &mut Frame, url: &str, notice: Option<&str>, mouse: &
         let button = Rect::new(
             body.x + 1,
             body.y + 3,
-            13.min(body.width.saturating_sub(1)),
+            19.min(body.width.saturating_sub(1)),
             1,
         );
         frame.render_widget(
-            Paragraph::new(" Copy link ").style(
+        Paragraph::new(mouse.hinted_label(" Copy link ", Some("Enter"), button.width)).style(
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::UNDERLINED),
@@ -137,7 +150,7 @@ pub(super) fn share(frame: &mut Frame, url: &str, notice: Option<&str>, mouse: &
     }
     frame.render_widget(
         Paragraph::new(truncate(
-            notice.unwrap_or("Enter copy link · Esc close"),
+            notice.unwrap_or(if mouse.show_key_hints() { "Enter copy link · Esc close" } else { "" }),
             dialog.footer.width as usize,
         ))
         .style(Style::default().fg(Color::Gray)),
@@ -221,12 +234,12 @@ pub(super) fn playlists(
         }
     }
     let footer = dialog.footer;
-    let refresh = "Refresh r";
-    let right = display_width(refresh) as u16;
+    let refresh = mouse.hinted_label("Refresh", Some("r"), footer.width);
+    let right = refresh.width() as u16;
     let available = footer.width.saturating_sub(right + 1);
     frame.render_widget(
         Paragraph::new(truncate(
-            picker.notice.as_deref().unwrap_or("Enter save · Esc close"),
+            picker.notice.as_deref().unwrap_or(if mouse.show_key_hints() { "Enter save · Esc close" } else { "" }),
             available as usize,
         ))
         .style(Style::default().fg(Color::Gray)),
@@ -361,7 +374,7 @@ mod tests {
                         Paragraph::new("@".repeat(width as usize)),
                         Rect::new(0, 2, width, 1),
                     );
-                    bar(f, &now, f.area(), &mut mouse);
+                    bar(f, &now, f.area(), &mut mouse, Some(View::Playing));
                 })
                 .unwrap();
             assert!(

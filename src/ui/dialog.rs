@@ -56,7 +56,7 @@ pub(super) fn render(frame: &mut Frame, chrome: Chrome<'_>, mouse: &mut MouseMap
     };
     let [title, close] = Layout::horizontal([
         Constraint::Min(0),
-        Constraint::Length(if inner.width >= 16 { 7 } else { 0 }),
+        Constraint::Length(if inner.width >= 32 && mouse.show_key_hints() { 11 } else if inner.width >= 16 { 7 } else { 0 }),
     ])
     .areas(header);
     frame.render_widget(
@@ -70,10 +70,7 @@ pub(super) fn render(frame: &mut Frame, chrome: Chrome<'_>, mouse: &mut MouseMap
         title,
     );
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            chrome.close_label,
-            Style::default().fg(Color::Gray),
-        ))),
+        Paragraph::new(mouse.hinted_label(chrome.close_label, Some("Esc"), close.width)).style(Style::default().fg(Color::Gray)),
         close,
     );
     if !close.is_empty() {

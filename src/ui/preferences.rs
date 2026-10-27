@@ -40,7 +40,7 @@ pub(super) fn draw(
         Chrome {
             title: "Settings",
             width: 84,
-            height: 25,
+            height: 26,
             close_label: if state.return_to_menu {
                 "Back"
             } else {
@@ -123,7 +123,7 @@ pub(super) fn draw(
     } else {
         state.selected_setting().description()
     };
-    let detail = if state.notice.is_some() {
+    let detail = if state.notice.is_some() || state.selected_setting().platforms() == "All platforms" {
         description.to_string()
     } else {
         format!("{}. {description}", state.selected_setting().platforms())
@@ -149,7 +149,7 @@ pub(super) fn draw(
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            footer(
+            if !mouse.show_key_hints() { String::new() } else { footer(
                 if state.return_to_menu {
                     " ↑↓ Select   Enter Change   ←→ Cycle   Esc Back"
                 } else {
@@ -157,7 +157,7 @@ pub(super) fn draw(
                 },
                 " ↑↓ Enter ←→ Esc",
                 dialog.footer.width as usize,
-            ),
+            ) },
             Style::default().fg(Color::Gray),
         ))),
         dialog.footer,
@@ -184,7 +184,7 @@ fn setting_line(row: &SettingRow, selected: bool, width: usize, accent: Color) -
         ));
     }
     let room = width.saturating_sub(4);
-    let scope = if width >= 70 {
+    let scope = if width >= 70 && row.setting.platforms() != "All platforms" {
         format!("  {}", padded(row.setting.platforms(), 13))
     } else {
         String::new()
@@ -293,11 +293,11 @@ fn draw_picker(frame: &mut Frame, picker: &Picker, accent: Color, mouse: &mut Mo
     }
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            footer(
+            if !mouse.show_key_hints() { String::new() } else { footer(
                 " ↑↓ Select   Enter Apply   Esc Cancel",
                 " ↑↓ Enter Esc",
                 dialog.footer.width as usize,
-            ),
+            ) },
             Style::default().fg(Color::Gray),
         ))),
         dialog.footer,
@@ -331,6 +331,7 @@ mod tests {
                 "Off",
                 "Artwork",
                 "Automatic",
+                "On",
                 "Off",
                 "On",
                 "Off",
@@ -423,10 +424,10 @@ mod tests {
     }
 
     #[test]
-    fn platform_support_is_visible_even_when_windows_only_rows_are_enabled() {
+    fn restricted_platform_support_is_visible_without_repeating_common_scope() {
         let (buf, _) = drawn(&State::default(), 100, 36);
         let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
-        assert!(text.contains("All platforms"));
+        assert!(!text.contains("All platforms"));
         assert!(text.contains("Win + Linux"));
         assert_eq!(text.matches("Windows only").count(), 2);
         let (buf, _) = drawn(&State { selected: Setting::Tray.index(), ..Default::default() }, 48, 24);

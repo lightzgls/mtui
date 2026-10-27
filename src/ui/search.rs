@@ -12,7 +12,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut M
     .areas(area);
     frame.render_widget(
         Paragraph::new(truncate(
-            &format!("Results for “{}”", app.query),
+            &format!("Results for “{}”", app.search_results_query()),
             header.width as usize,
         ))
         .style(
@@ -25,8 +25,9 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut M
     let mut x = filters.x;
     let mut y = filters.y;
     for (index, filter) in Filter::ALL.into_iter().enumerate() {
-        let label = format!("{} {}", index + 1, filter.label());
-        let width = (display_width(&label) as u16).min(filters.width);
+        let key = (index + 1).to_string();
+        let label = mouse.hinted_label(filter.label(), Some(&key), filters.width);
+        let width = (label.width() as u16).min(filters.width);
         if x + width > filters.right() {
             x = filters.x;
             y += 1;
@@ -43,7 +44,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut M
             Style::default().fg(Color::Gray)
         };
         frame.render_widget(
-            Paragraph::new(truncate(&label, width as usize)).style(style),
+            Paragraph::new(label).style(style),
             rect,
         );
         mouse

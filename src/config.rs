@@ -341,6 +341,8 @@ pub struct Settings {
     pub tray_click_pauses: bool,
     /// Wheel over the current song's cover adjusts volume in 1% steps.
     pub precision_volume: bool,
+    /// Show keyboard shortcuts beside buttons and in contextual menus.
+    pub show_key_hints: bool,
     pub cover_style: CoverStyle,
     pub image_renderer: ImageRenderer,
     /// Player volume, from `0.0` (muted) to `1.0` (100%).
@@ -355,6 +357,7 @@ impl Default for Settings {
             start_in_tray: false,
             tray_click_pauses: false,
             precision_volume: false,
+            show_key_hints: true,
             cover_style: CoverStyle::default(),
             image_renderer: ImageRenderer::default(),
             volume: 1.0,
@@ -532,6 +535,7 @@ mod tests {
         assert!(!settings.start_in_tray);
         assert!(!settings.tray_click_pauses);
         assert!(!settings.precision_volume);
+        assert!(settings.show_key_hints);
         assert_eq!(settings.cover_style, CoverStyle::Pixel);
         assert_eq!(settings.image_renderer, ImageRenderer::Automatic);
         assert_eq!(settings.volume, 1.0);
@@ -541,6 +545,7 @@ mod tests {
         assert!(legacy.start_in_tray);
         assert!(!legacy.tray_click_pauses);
         assert!(!legacy.precision_volume);
+        assert!(legacy.show_key_hints);
         assert_eq!(legacy.cover_style, CoverStyle::Pixel);
         assert_eq!(legacy.image_renderer, ImageRenderer::Automatic);
         assert_eq!(legacy.volume, 1.0);
@@ -553,6 +558,7 @@ mod tests {
             start_in_tray: true,
             tray_click_pauses: true,
             precision_volume: true,
+            show_key_hints: false,
             cover_style: CoverStyle::ColoredAscii,
             image_renderer: ImageRenderer::Kitty,
             volume: 0.65,
@@ -565,6 +571,7 @@ mod tests {
         assert!(settings.start_in_tray);
         assert!(settings.tray_click_pauses);
         assert!(settings.precision_volume);
+        assert!(!settings.show_key_hints);
         assert_eq!(settings.cover_style, CoverStyle::ColoredAscii);
         assert_eq!(settings.image_renderer, ImageRenderer::Kitty);
         assert_eq!(settings.volume, 0.65);

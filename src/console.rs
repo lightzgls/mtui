@@ -191,6 +191,7 @@ mod imp {
     const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
     const MOUSE_WHEELED: u32 = 0x0004;
     const MOUSE_MOVED: u32 = 0x0001;
+    const DOUBLE_CLICK: u32 = 0x0002;
     const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
     const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
@@ -983,6 +984,7 @@ mod imp {
         wire: [u8; RECORD_LEN],
         filled: usize,
         high_surrogate: Option<u16>,
+        mouse_buttons: u32,
     }
 
     impl Input {
@@ -1001,6 +1003,7 @@ mod imp {
                 wire: [0; RECORD_LEN],
                 filled: 0,
                 high_surrogate: None,
+                mouse_buttons: 0,
             })
         }
 
@@ -1022,7 +1025,7 @@ mod imp {
                     }
                     continue;
                 }
-                if let Some(event) = event(record, &mut self.high_surrogate) {
+                if let Some(event) = event(record, &mut self.high_surrogate, &mut self.mouse_buttons) {
                     if let Event::Resize(width, height) = &event {
                         set_size(*width, *height);
                     }
@@ -1111,7 +1114,7 @@ mod imp {
             )
     }
 
-    fn event(record: InputRecord, high_surrogate: &mut Option<u16>) -> Option<Event> {
+    fn event(record: InputRecord, high_surrogate: &mut Option<u16>, mouse_buttons: &mut u32) -> Option<Event> {
         match record.event_type {
             KEY_EVENT => {
                 let key =
@@ -1122,7 +1125,7 @@ mod imp {
                 let mouse = unsafe {
                     std::ptr::read_unaligned(record.event.as_ptr().cast::<MouseRecord>())
                 };
-                mouse_event(mouse).map(Event::Mouse)
+                mouse_event_with_buttons(mouse, mouse_buttons).map(Event::Mouse)
             }
             WINDOW_BUFFER_SIZE_EVENT => {
                 let packed = record.event[0];
@@ -1132,9 +1135,17 @@ mod imp {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn mouse_event(record: MouseRecord) -> Option<MouseEvent> {
+        mouse_event_with_buttons(record, &mut 0)
+    }
+
+    pub(super) fn mouse_event_with_buttons(record: MouseRecord, previous_buttons: &mut u32) -> Option<MouseEvent> {
         let column = u16::try_from(record.position[0]).ok()?;
         let row = u16::try_from(record.position[1]).ok()?;
+        let previous = *previous_buttons;
+        let buttons = record.button_state & 0x7;
+        if matches!(record.event_flags, 0 | DOUBLE_CLICK) || record.event_flags == MOUSE_MOVED { *previous_buttons = buttons; }
         let kind = if record.event_flags == MOUSE_WHEELED {
             if (record.button_state >> 16) as i16 > 0 {
                 MouseEventKind::ScrollUp
@@ -1146,17 +1157,11 @@ mod imp {
             else if record.button_state & 0x0002 != 0 { MouseEventKind::Drag(MouseButton::Right) }
             else if record.button_state & 0x0004 != 0 { MouseEventKind::Drag(MouseButton::Middle) }
             else { return None; }
-        } else if record.event_flags == 0 {
-            let button = if record.button_state & 0x0001 != 0 {
-                MouseButton::Left
-            } else if record.button_state & 0x0002 != 0 {
-                MouseButton::Right
-            } else if record.button_state & 0x0004 != 0 {
-                MouseButton::Middle
-            } else {
-                return None;
-            };
-            MouseEventKind::Down(button)
+        } else if matches!(record.event_flags, 0 | DOUBLE_CLICK) {
+            let changed = previous ^ buttons;
+            let (bit, button) = [(1, MouseButton::Left), (2, MouseButton::Right), (4, MouseButton::Middle)]
+                .into_iter().find(|(bit, _)| changed & bit != 0)?;
+            if buttons & bit != 0 { MouseEventKind::Down(button) } else { MouseEventKind::Up(button) }
         } else {
             return None;
         };
@@ -1361,7 +1366,7 @@ mod tests {
 
     use super::imp::{
         InputRecord, KeyRecord, MouseRecord, decode_record, encode_record, key_event, mouse_event,
-        unicode_char,
+        unicode_char, mouse_event_with_buttons,
     };
 
     fn record(virtual_key: u16, unicode: u16, control: u32) -> KeyRecord {
@@ -1443,6 +1448,22 @@ mod tests {
     }
 
     #[test]
+    fn native_double_click_keeps_the_second_press_and_release() {
+        let mut held = 0;
+        for (flags, buttons, kind) in [
+            (0, 1, MouseEventKind::Down(MouseButton::Left)),
+            (0, 0, MouseEventKind::Up(MouseButton::Left)),
+            (2, 1, MouseEventKind::Down(MouseButton::Left)),
+            (0, 0, MouseEventKind::Up(MouseButton::Left)),
+        ] {
+            let event = mouse_event_with_buttons(MouseRecord { position: [12, 7], button_state: buttons,
+                control: 0, event_flags: flags }, &mut held);
+            assert_eq!(event.map(|event| event.kind), Some(kind));
+        }
+        assert_eq!(held, 0);
+    }
+
+    #[test]
     fn native_mouse_movement_is_ignored_and_drags_are_forwarded_for_scrubbing() {
         assert!(mouse_event(MouseRecord { position: [12, 7], button_state: 0, control: 0, event_flags: 1 }).is_none());
         for (buttons, kind) in [(1, MouseEventKind::Drag(MouseButton::Left)), (2, MouseEventKind::Drag(MouseButton::Right)), (4, MouseEventKind::Drag(MouseButton::Middle))] {
@@ -1473,6 +1494,21 @@ mod tests {
         .unwrap();
         assert_eq!(up.kind, MouseEventKind::ScrollUp);
         assert_eq!(down.kind, MouseEventKind::ScrollDown);
+    }
+
+    #[test]
+    fn native_button_release_ends_the_same_drag_that_was_pressed() {
+        for (bit, button) in [(1, MouseButton::Left), (2, MouseButton::Right), (4, MouseButton::Middle)] {
+            let mut held = 0;
+            let record = MouseRecord { position: [8, 9], button_state: bit, control: 0, event_flags: 0 };
+            assert_eq!(mouse_event_with_buttons(record, &mut held).unwrap().kind, MouseEventKind::Down(button));
+            let moved = MouseRecord { position: [8, 12], button_state: bit, control: 0, event_flags: 1 };
+            assert_eq!(mouse_event_with_buttons(moved, &mut held).unwrap().kind, MouseEventKind::Drag(button));
+            let released = MouseRecord { position: [8, 12], button_state: 0, control: 0, event_flags: 0 };
+            assert_eq!(mouse_event_with_buttons(released, &mut held).unwrap().kind, MouseEventKind::Up(button));
+            assert_eq!(held, 0);
+            assert!(mouse_event_with_buttons(released, &mut held).is_none());
+        }
     }
 
     /// Opens a real helper window, so it is kept out of automated test runs.

@@ -24,6 +24,914 @@ fn track(index: usize) -> Track {
     }
 }
 
+fn artist_preview(app: &mut App) {
+    let artist = ArtistRef { name: "Artist".into(), endpoint: BrowseEndpoint::new("UCartist") };
+    let mut view = ArtistView::loading(artist.clone());
+    view.set_page(Ok(ArtistPage {
+        artist, audience: None, description: None, art: None,
+        top_songs: (0..5).map(|i| ArtistSong { track: track(i), plays: None }).collect(),
+        songs_endpoint: Some(BrowseEndpoint::new("VLsongs")), songs_truncated: false,
+        shelves: Vec::new(),
+    }));
+    app.artist = Some(view);
+    app.view = View::Artist;
+}
+
+fn ux_preview(app: &mut App, name: &str) {
+    if std::env::var_os("MTUI_PREVIEW_DIR").is_none() { return; }
+    for (width, height) in [(120, 36), (48, 18)] {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let mut mouse = crate::ui::MouseMap::default();
+        terminal.draw(|frame| crate::ui::render(frame, app, &mut mouse)).unwrap();
+        crate::ui::preview_buffer(&format!("{name}-{width}x{height}"), terminal.backend().buffer());
+    }
+}
+
+#[test]
+fn play_all_fetches_the_full_artist_list_once_and_keeps_order_and_back_state() {
+    let (mut app, _driver, requests) = fixture();
+    artist_preview(&mut app);
+    ux_preview(&mut app, "artist-preview");
+    app.handle_mouse_action(MouseAction::MoreArtistSongs).unwrap();
+    app.handle_mouse_action(MouseAction::PlayArtistSongs).unwrap();
+    let request_id = match requests.try_recv().unwrap() {
+        Request::ArtistSongs { request_id, endpoint, .. } => { assert_eq!(endpoint.browse_id, "VLsongs"); request_id }
+        _ => panic!("expected the full artist list"),
+    };
+    assert!(requests.try_recv().is_err());
+    app.apply(Response::ArtistSongs { request_id, browse_id: "UCartist".into(), page: Box::new(Ok(
+        crate::source::collection::Page { details: Default::default(), tracks: (0..80).map(track).collect() }
+    )) });
+    assert_eq!(app.view, View::Playing);
+    assert_eq!(app.now.as_ref().unwrap().queue.len(), 80);
+    ux_preview(&mut app, "artist-play-all");
+    for index in 0..80 {
+        assert_eq!(app.now.as_ref().unwrap().video_id, format!("song-{index}"));
+        assert!(app.now.as_ref().unwrap().finite_queue);
+        requests.try_iter().for_each(drop);
+        app.top_up_queue();
+        assert!(requests.try_recv().is_err(), "a finite artist list must not start radio");
+        if index < 79 { app.advance(1, false); }
+    }
+    app.handle_mouse_action(MouseAction::GoBack).unwrap();
+    assert_eq!(app.view, View::Artist);
+    let view = app.artist.as_ref().unwrap();
+    assert!(view.songs_expanded);
+    assert_eq!(view.content().unwrap().top_songs.len(), 80);
+    assert!(view.songs_request.is_none());
+    ux_preview(&mut app, "artist-expanded");
+}
+
+#[test]
+fn artist_more_failure_preserves_the_preview_and_late_answers_cannot_change_a_new_page() {
+    let (mut app, _driver, requests) = fixture();
+    artist_preview(&mut app);
+    app.more_artist_songs(false);
+    let request_id = match requests.try_recv().unwrap() { Request::ArtistSongs { request_id, .. } => request_id, _ => unreachable!() };
+    app.apply(Response::ArtistSongs { request_id, browse_id: "UCartist".into(), page: Box::new(Err("offline".into())) });
+    assert_eq!(app.artist.as_ref().unwrap().content().unwrap().top_songs.len(), 5);
+    assert!(app.artist.as_ref().unwrap().songs_error.is_some());
+    app.more_artist_songs(true);
+    let retry_id = match requests.try_recv().unwrap() { Request::ArtistSongs { request_id, .. } => request_id, _ => unreachable!() };
+    assert_ne!(request_id, retry_id);
+    app.go_home();
+    let before = app.status.clone();
+    app.apply(Response::ArtistSongs { request_id: retry_id, browse_id: "UCartist".into(), page: Box::new(Ok(
+        crate::source::collection::Page { details: Default::default(), tracks: vec![track(10)] }
+    )) });
+    assert_eq!(app.view, View::Home);
+    assert_eq!(app.status, before);
+    assert!(app.now.is_none());
+}
+
+#[test]
+fn adding_to_a_finite_artist_queue_keeps_its_original_tail_until_the_collection_limit() {
+    let mut now = NowPlaying::new(&track(0));
+    now.queue = (0..80).map(track).collect();
+    now.playing = Some(0);
+    now.finite_queue = true;
+    assert!(now.insert_user_track(track(999), false));
+    assert_eq!(now.queue.len(), 81);
+    assert!(now.queue.iter().any(|track| track.id == "song-79"));
+    for i in 1000..1300 { now.insert_user_track(track(i), true); }
+    assert_eq!(now.queue.len(), crate::source::collection::MAX_TRACKS);
+    assert_eq!(now.queue[0].id, "song-0");
+}
+
+#[test]
+fn editing_search_keeps_the_origin_visible_and_rejects_results_for_an_old_draft() {
+    let (mut app, _driver, requests) = fixture();
+    artist_preview(&mut app);
+    app.query = "bead".into();
+    app.begin_search();
+    assert_eq!(app.view, View::Artist);
+    for code in [KeyCode::Home, KeyCode::Right, KeyCode::Char('r'), KeyCode::Enter] {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
+    }
+    let request_id = match requests.try_recv().unwrap() {
+        Request::Search { request_id, query, .. } => { assert_eq!(query, "bread"); request_id }
+        _ => unreachable!(),
+    };
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)).unwrap();
+    app.apply(Response::Results { request_id, tracks: Ok(Vec::new()) });
+    assert_eq!(app.mode, Mode::Editing);
+    assert_eq!(app.view, View::Artist);
+    app.handle_mouse_action(MouseAction::GoBack).unwrap();
+    assert_eq!(app.mode, Mode::Browse);
+    assert_eq!(app.view, View::Artist);
+    assert_eq!(app.artist.as_ref().unwrap().content().unwrap().top_songs.len(), 5);
+}
+
+#[test]
+fn queue_selection_and_context_actions_do_not_start_another_song() {
+    let (mut app, driver, requests) = fixture();
+    queue(&mut app, RepeatMode::Off, 0);
+    app.view = View::Playing;
+    state(&driver, PlayState::Playing, Duration::ZERO);
+    driver.commands.try_iter().for_each(drop);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+    let mut mouse = crate::ui::MouseMap::default();
+    terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+    let select = (0..36).find_map(|y| (0..120).find_map(|x| (mouse.action_at(x,y) == Some(MouseAction::SelectPageRow(2))).then_some((x,y)))).unwrap();
+    app.handle_mouse_action(mouse.action_at(select.0,select.1).unwrap()).unwrap();
+    terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+    for (code, modifiers) in [(KeyCode::Up, KeyModifiers::ALT), (KeyCode::Char('d'), KeyModifiers::NONE)] {
+        app.handle_mouse_action(MouseAction::OpenPageActions).unwrap();
+        assert!(app.menu.is_some());
+        app.handle_key(KeyEvent::new(code, modifiers)).unwrap();
+        assert!(app.menu.is_none());
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+    }
+    assert_eq!(app.now.as_ref().unwrap().video_id, "song-0");
+    assert!(!app.now.as_ref().unwrap().queue.iter().any(|track| track.id == "song-2"));
+    assert!(driver.commands.try_iter().next().is_none());
+    assert!(!requests.try_iter().any(|request| matches!(request, Request::Resolve { .. })));
+    app.status = "Added a song to your queue".into();
+    terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+    let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+    assert!(text.contains("Added a song to your queue"));
+}
+
+#[test]
+fn moving_a_queue_song_changes_its_visible_row_instead_of_recentering_it() {
+    let (mut app, _driver, _requests) = fixture();
+    queue(&mut app, RepeatMode::Off, 0);
+    app.now.as_mut().unwrap().queue = (0..30).map(track).collect();
+    app.now.as_mut().unwrap().cursor[Tab::UpNext.index()] = 7;
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+    let mut mouse = crate::ui::MouseMap::default();
+    let row_for = |mouse: &crate::ui::MouseMap, index| (0..36).find(|y|
+        (0..120).any(|x| mouse.action_at(x,*y) == Some(MouseAction::SelectPageRow(index)))).unwrap();
+    terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+    let before = row_for(&mouse, 7);
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)).unwrap();
+    terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+    assert_eq!(app.now.as_ref().unwrap().queue[6].id, "song-7");
+    assert!(row_for(&mouse, 6) < before, "moving up must visibly move the selected song upward");
+}
+
+#[test]
+fn real_pointer_click_drag_release_and_keyboard_reorder_work_at_normal_and_short_heights() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    for (width, height) in [(120,36), (80,24), (48,18)] {
+        let (mut app, driver, requests) = fixture();
+        queue(&mut app, RepeatMode::Off, 0);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width,height)).unwrap();
+        let mut mouse = crate::ui::MouseMap::default();
+        let mut pointer = crate::pointer::Pointer::default();
+        let point = |mouse: &crate::ui::MouseMap, action| (0..height).find_map(|y|
+            (0..width).find_map(|x| (mouse.action_at(x,y) == Some(action)).then_some((x,y)))).unwrap();
+        let event = |kind, (column,row)| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+        let mut draw = |app: &mut App, mouse: &mut crate::ui::MouseMap| {
+            terminal.draw(|frame| crate::ui::render(frame, app, mouse)).unwrap();
+        };
+        draw(&mut app,&mut mouse);
+        // Navigate to a future row even when only two songs fit in the short window.
+        for _ in 0..2 { app.handle_key(KeyEvent::new(KeyCode::Down,KeyModifiers::NONE)).unwrap(); }
+        draw(&mut app,&mut mouse);
+        let title = point(&mouse,MouseAction::SelectPageRow(2));
+        pointer.handle(&mut app,&mouse,event(MouseEventKind::Down(MouseButton::Left),title)).unwrap();
+        draw(&mut app,&mut mouse);
+        pointer.handle(&mut app,&mouse,event(MouseEventKind::Up(MouseButton::Left),title)).unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Up,KeyModifiers::ALT)).unwrap();
+        assert_eq!(app.now.as_ref().unwrap().queue[1].id,"song-2");
+        app.handle_key(KeyEvent::new(KeyCode::Down,KeyModifiers::ALT)).unwrap();
+        draw(&mut app,&mut mouse);
+        assert_eq!(app.now.as_ref().unwrap().queue[2].id,"song-2");
+        app.handle_key(KeyEvent::new(KeyCode::Up,KeyModifiers::SHIFT)).unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('J'),KeyModifiers::SHIFT)).unwrap();
+        draw(&mut app,&mut mouse);
+        assert_eq!(app.now.as_ref().unwrap().queue[2].id,"song-2");
+        // Drag the selected row downward using actual rendered hit targets.
+        let source = point(&mouse,MouseAction::SelectPageRow(2));
+        pointer.handle(&mut app,&mouse,event(MouseEventKind::Down(MouseButton::Left),source)).unwrap();
+        draw(&mut app,&mut mouse);
+        pointer.handle(&mut app,&mouse,event(MouseEventKind::ScrollDown,source)).unwrap();
+        draw(&mut app,&mut mouse);
+        let destination = point(&mouse,MouseAction::SelectPageRow(3));
+        pointer.handle(&mut app,&mouse,event(MouseEventKind::Drag(MouseButton::Left),destination)).unwrap();
+        draw(&mut app,&mut mouse);
+        pointer.handle(&mut app,&mouse,event(MouseEventKind::Up(MouseButton::Left),destination)).unwrap();
+        draw(&mut app,&mut mouse);
+        assert_eq!(app.now.as_ref().unwrap().queue[3].id,"song-2");
+        let before: Vec<_> = app.now.as_ref().unwrap().queue.iter().map(|t|t.id.clone()).collect();
+        let other = point(&mouse,MouseAction::SelectPageRow(2));
+        pointer.handle(&mut app,&mouse,event(MouseEventKind::Drag(MouseButton::Left),other)).unwrap();
+        assert_eq!(app.now.as_ref().unwrap().queue.iter().map(|t|t.id.clone()).collect::<Vec<_>>(),before,
+            "a released mouse must not keep moving the old selection");
+        assert_eq!(app.now.as_ref().unwrap().video_id,"song-0");
+        assert!(driver.commands.try_iter().next().is_none());
+        assert!(!requests.try_iter().any(|request|matches!(request,Request::Resolve{..})));
+    }
+}
+
+#[test]
+fn a_long_queue_drag_preserves_other_song_order_and_rejects_stale_or_past_targets() {
+    let (mut app,_driver,_requests) = fixture();
+    queue(&mut app,RepeatMode::Off,1);
+    app.now.as_mut().unwrap().queue = (0..8).map(track).collect();
+    let (id,epoch) = app.queue_drag_identity(6).unwrap();
+    app.drag_queue_song(&id,epoch,2);
+    assert_eq!(app.now.as_ref().unwrap().queue.iter().map(|t|t.id.as_str()).collect::<Vec<_>>(),
+        ["song-0","song-1","song-6","song-2","song-3","song-4","song-5","song-7"]);
+    app.drag_queue_song(&id,epoch,0);
+    assert_eq!(app.now.as_ref().unwrap().queue[2].id,"song-6");
+    app.now.as_mut().unwrap().queue_epoch+=1;
+    app.drag_queue_song(&id,epoch,4);
+    assert_eq!(app.now.as_ref().unwrap().queue[2].id,"song-6");
+    assert_eq!(app.now.as_ref().unwrap().video_id,"song-1");
+}
+
+#[test]
+fn queue_drags_cannot_seek_and_progress_drags_cannot_reorder_the_queue() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let (mut app,driver,_requests) = fixture();
+    queue(&mut app,RepeatMode::Off,0);
+    state(&driver,PlayState::Playing,Duration::ZERO);
+    driver.commands.try_iter().for_each(drop);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120,36)).unwrap();
+    let mut mouse = crate::ui::MouseMap::default();
+    let mut pointer = crate::pointer::Pointer::default();
+    let event = |kind,(column,row)| MouseEvent { kind,column,row,modifiers:KeyModifiers::NONE };
+    terminal.draw(|frame|crate::ui::render(frame,&mut app,&mut mouse)).unwrap();
+    let source = (0..36).find_map(|y|(0..120).find_map(|x|
+        (mouse.action_at(x,y)==Some(MouseAction::SelectPageRow(2))).then_some((x,y)))).unwrap();
+    let progress = (0..36).find_map(|y|(0..120).find_map(|x|
+        matches!(mouse.action_at(x,y),Some(MouseAction::SeekTo(_))).then_some((x,y)))).unwrap();
+    pointer.handle(&mut app,&mouse,event(MouseEventKind::Down(MouseButton::Left),source)).unwrap();
+    pointer.handle(&mut app,&mouse,event(MouseEventKind::Drag(MouseButton::Left),progress)).unwrap();
+    pointer.handle(&mut app,&mouse,event(MouseEventKind::Up(MouseButton::Left),progress)).unwrap();
+    assert!(driver.commands.try_recv().is_err());
+    pointer.handle(&mut app,&mouse,event(MouseEventKind::Down(MouseButton::Left),progress)).unwrap();
+    assert!(matches!(driver.commands.try_recv().unwrap(),Command::Seek(_)));
+    pointer.handle(&mut app,&mouse,event(MouseEventKind::Up(MouseButton::Left),progress)).unwrap();
+    assert!(driver.commands.try_recv().is_err(),"releasing a seek click must not issue the same seek twice");
+    pointer.handle(&mut app,&mouse,event(MouseEventKind::Down(MouseButton::Left),progress)).unwrap();
+    assert!(matches!(driver.commands.try_recv().unwrap(),Command::Seek(_)));
+    pointer.handle(&mut app,&mouse,event(MouseEventKind::Drag(MouseButton::Left),source)).unwrap();
+    pointer.handle(&mut app,&mouse,event(MouseEventKind::Up(MouseButton::Left),source)).unwrap();
+    assert!(driver.commands.try_recv().is_err());
+    assert_eq!(app.now.as_ref().unwrap().queue.iter().map(|t|t.id.as_str()).collect::<Vec<_>>(),
+        ["song-0","song-1","song-2","song-3"]);
+}
+
+#[test]
+fn the_queue_menu_honors_its_displayed_alt_arrow_move_shortcut() {
+    let (mut app,driver,_requests) = fixture();
+    queue(&mut app,RepeatMode::Off,0);
+    app.now.as_mut().unwrap().cursor[Tab::UpNext.index()] = 2;
+    app.open_menu(MenuPage::PageActions);
+    app.handle_key(KeyEvent::new(KeyCode::Up,KeyModifiers::ALT)).unwrap();
+    assert!(app.menu.is_none());
+    assert_eq!(app.now.as_ref().unwrap().queue[1].id,"song-2");
+    assert!(driver.commands.try_recv().is_err());
+}
+
+fn song_card(index: usize) -> Card {
+    Card { title: format!("Song {index}"), subtitle: "Song • Artist".into(), art: None,
+        duration: Some(Duration::from_secs(240)), artist_ref: None,
+        target: Target::Play { video_id: format!("song-{index}") } }
+}
+
+#[test]
+fn inline_artist_links_open_the_named_artist_and_back_restores_the_scrolled_origin() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use crate::source::library::browse::{Category, Item};
+    use ratatui::style::Modifier;
+    for surface in ["playlist", "library songs", "library albums", "related"] {
+        for (width, height) in [(120, 36), (80, 24), (48, 24)] {
+            let (mut app, driver, requests) = fixture();
+            queue(&mut app, RepeatMode::Off, 0);
+            state(&driver, PlayState::Playing, Duration::from_secs(35));
+            let artist = ArtistRef { name: "Artist Nine".into(), endpoint: BrowseEndpoint::new("UCnine") };
+            let linked_track = |index| Track { uploader: artist.name.clone(),
+                artist_ref: (index == 24).then(|| artist.clone()), album: Some("Evening Album".into()), ..track(index) };
+            let linked_card = |index| Card { subtitle: format!("Song • {} • Evening Album", artist.name),
+                artist_ref: (index == 24).then(|| artist.clone()), ..song_card(index) };
+            let (origin, link_action, row_action, context_action) = match surface {
+                "playlist" => {
+                    app.view = View::Tracks;
+                    app.browsing = Some("Evening Playlist".into());
+                    app.results = (0..30).map(linked_track).collect();
+                    app.selected = 24;
+                    app.offset = 24;
+                    (View::Tracks, MouseAction::OpenTrackArtist(24), MouseAction::PlayTrack(24), MouseAction::SelectTrack(24))
+                }
+                "library songs" | "library albums" => {
+                    app.view = View::Library;
+                    app.library.connected = true;
+                    app.library.category = if surface == "library songs" { Category::Songs } else { Category::Albums };
+                    let collection = app.library.collection_mut();
+                    collection.loaded = true;
+                    collection.selected = 24;
+                    collection.offset = 24;
+                    collection.items = (0..30).map(|index| {
+                        let mut card = linked_card(index);
+                        let track = if surface == "library songs" { Some(linked_track(index)) } else {
+                            card.subtitle = format!("Album • {}", artist.name);
+                            card.target = Target::Open { endpoint: BrowseEndpoint::new(format!("MPRE{index}")) };
+                            None
+                        };
+                        Item { card, track, available: true }
+                    }).collect();
+                    (View::Library, MouseAction::OpenLibraryArtist(24), MouseAction::OpenLibraryItem(24), MouseAction::SelectLibraryItem(24))
+                }
+                "related" => {
+                    let now = app.now.as_mut().unwrap();
+                    now.tab = Tab::Related;
+                    now.related = Panel::Ready(vec![Shelf { title: "Related songs".into(), cards: (0..30).map(linked_card).collect() }]);
+                    now.cursor[Tab::Related.index()] = 25;
+                    (View::Playing, MouseAction::OpenRelatedArtist(25), MouseAction::OpenPageRow(25), MouseAction::SelectPageRow(25))
+                }
+                _ => unreachable!(),
+            };
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let mut mouse = crate::ui::MouseMap::default();
+            terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+            let point = |action| (0..height).find_map(|y| (0..width).find_map(|x|
+                (mouse.action_at(x, y) == Some(action)).then_some((x, y))))
+                .unwrap_or_else(|| panic!("missing {action:?} on {surface} at {width}x{height}"));
+            let link = point(link_action);
+            let title = point(row_action);
+            let buffer = terminal.backend().buffer();
+            for (offset, glyph) in artist.name.chars().enumerate() {
+                let x = link.0 + offset as u16;
+                assert_eq!(buffer[(x, link.1)].symbol(), glyph.to_string());
+                assert!(buffer[(x, link.1)].modifier.contains(Modifier::UNDERLINED));
+                assert_eq!(mouse.action_at(x, link.1), Some(link_action));
+                assert_eq!(mouse.context_action_at(x, link.1), Some(context_action));
+            }
+            assert_ne!(mouse.action_at(link.0 + artist.name.len() as u16, link.1), Some(link_action));
+            assert!(!buffer[(link.0, link.1 - 1)].modifier.contains(Modifier::UNDERLINED));
+            let offset = if origin == View::Library { app.library.collection().offset } else { app.offset };
+            let queue_before: Vec<_> = app.now.as_ref().unwrap().queue.iter().map(|track| track.id.clone()).collect();
+            requests.try_iter().for_each(drop);
+            driver.commands.try_iter().for_each(drop);
+            let mut pointer = crate::pointer::Pointer::default();
+            let event = |kind, (column, row)| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+            // Crossing a link during a song drag must not follow it. Album
+            // titles retain their existing single-click navigation behavior.
+            if surface != "library albums" {
+                pointer.handle(&mut app, &mouse, event(MouseEventKind::Down(MouseButton::Left), title)).unwrap();
+                pointer.handle(&mut app, &mouse, event(MouseEventKind::Drag(MouseButton::Left), link)).unwrap();
+                pointer.handle(&mut app, &mouse, event(MouseEventKind::Up(MouseButton::Left), link)).unwrap();
+            }
+            assert_eq!(app.view, origin);
+            assert!(requests.try_recv().is_err());
+            // Right-click keeps the song/album menu, including on linked text.
+            pointer.handle(&mut app, &mouse, event(MouseEventKind::Down(MouseButton::Right), link)).unwrap();
+            assert!(app.menu.is_some());
+            assert_eq!(app.view, origin);
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+            pointer.handle(&mut app, &mouse, event(MouseEventKind::Down(MouseButton::Left), link)).unwrap();
+            pointer.handle(&mut app, &mouse, event(MouseEventKind::Up(MouseButton::Left), link)).unwrap();
+            assert_eq!(app.view, View::Artist);
+            let request_id = match requests.try_recv().unwrap() {
+                Request::OpenArtist { request_id, artist: requested } => { assert_eq!(requested, artist); request_id }
+                _ => panic!("expected the linked artist route"),
+            };
+            assert!(requests.try_recv().is_err());
+            app.handle_mouse_action(MouseAction::GoBack).unwrap();
+            assert_eq!(app.view, origin);
+            match origin {
+                View::Tracks => { assert_eq!(app.selected, 24); assert_eq!(app.offset, offset); assert_eq!(app.browsing.as_deref(), Some("Evening Playlist")); }
+                View::Library => { assert_eq!(app.library.collection().selected, 24); assert_eq!(app.library.collection().offset, offset); }
+                View::Playing => { assert_eq!(app.now.as_ref().unwrap().tab, Tab::Related); assert_eq!(app.now.as_ref().unwrap().cursor(), 25); }
+                _ => unreachable!(),
+            }
+            let status = app.status.clone();
+            app.apply(Response::Artist { request_id, browse_id: "UCnine".into(), page: Box::new(Err("late failure".into())) });
+            assert_eq!(app.view, origin);
+            assert_eq!(app.status, status);
+            assert!(driver.commands.try_recv().is_err());
+            assert_eq!(app.now.as_ref().unwrap().video_id, "song-0");
+            assert_eq!(app.now.as_ref().unwrap().queue.iter().map(|track| track.id.clone()).collect::<Vec<_>>(), queue_before);
+        }
+    }
+}
+
+#[test]
+fn inline_artist_links_require_visible_metadata_and_a_real_route() {
+    for (width, height, name) in [(120, 36, "unlinked"), (48, 24, "Artist ".repeat(30).as_str()), (48, 12, "Artist")] {
+        let (mut app, driver, requests) = fixture();
+        let mut song = track(9);
+        song.uploader = name.into();
+        song.artist_ref = (name != "unlinked").then(|| ArtistRef { name: name.into(), endpoint: BrowseEndpoint::new("UCnine") });
+        app.browsing = Some("Playlist".into());
+        app.results = vec![song];
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let mut mouse = crate::ui::MouseMap::default();
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        assert!(!(0..height).any(|y| (0..width).any(|x| matches!(mouse.action_at(x, y), Some(MouseAction::OpenTrackArtist(_))))));
+        for action in [MouseAction::OpenTrackArtist(usize::MAX), MouseAction::OpenLibraryArtist(0), MouseAction::OpenRelatedArtist(1)] {
+            app.handle_mouse_action(action).unwrap();
+        }
+        assert_eq!(app.view, View::Tracks);
+        assert!(driver.commands.try_recv().is_err());
+        assert!(!requests.try_iter().any(|request| matches!(request, Request::OpenArtist { .. } | Request::Resolve { .. })));
+    }
+}
+
+#[test]
+fn loaded_pages_and_playback_keep_identity_in_one_place_and_preserve_failure_feedback() {
+    let (mut app, driver, requests) = fixture();
+    app.play_track(track(0), false);
+    resolve(&mut app, 0);
+    assert!(app.status.is_empty());
+    state(&driver, PlayState::Playing, Duration::from_secs(35));
+    app.now.as_mut().unwrap().tab = Tab::Lyrics;
+    app.now.as_mut().unwrap().lyrics = Panel::Empty("No lyrics available".into());
+    app.cover = Some(Cover::solid(32, 32));
+    for view in [View::Playing, View::Home] {
+        app.view = view;
+        for (width, height) in [(120, 36), (48, 24)] {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let mut mouse = crate::ui::MouseMap::default();
+            terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+            let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+            assert_eq!(text.matches("Song 0").count(), 1, "{view:?} at {width}x{height}");
+            assert!(!text.contains("NOW PLAYING"));
+            assert!(!text.contains("playing Song 0"));
+        }
+    }
+    app.view = View::Playing;
+    for (playback, label) in [(PlayState::Paused, "PAUSED"), (PlayState::Buffering, "LOADING…")] {
+        state(&driver, playback, Duration::from_secs(35));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut Default::default())).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains(label), "{label} must remain visible");
+    }
+    artist_preview(&mut app);
+    let page = app.artist.as_ref().unwrap().content().unwrap().clone();
+    app.view = View::Home;
+    app.open_artist(page.artist.clone());
+    let request_id = app.pending_page_request.unwrap().0;
+    app.apply(Response::Artist { request_id, browse_id: "UCartist".into(), page: Box::new(Ok(page)) });
+    assert!(app.status.is_empty(), "the artist page already shows its songs and shelves");
+    app.reload_artist();
+    let request_id = app.pending_page_request.unwrap().0;
+    app.apply(Response::Artist { request_id, browse_id: "UCartist".into(), page: Box::new(Err("Artist lookup failed".into())) });
+    assert!(app.status.contains("Artist lookup failed"));
+    app.go_back();
+    app.play_track(track(1), false);
+    app.apply(Response::Resolved { id: "song-1".into(), title: "Song 1".into(), stream: Err("Audio connection failed".into()) });
+    assert!(app.status.contains("network interrupted playback"));
+    assert!(app.status.contains("r retry"));
+    requests.try_iter().for_each(drop);
+    ux_preview(&mut app, "clean-feedback");
+}
+
+#[test]
+fn key_hints_change_labels_without_hiding_controls_or_disabling_shortcuts() {
+    for show in [true, false] {
+        let (mut app, driver, requests) = fixture();
+        queue(&mut app, RepeatMode::Off, 0);
+        app.show_key_hints = show;
+        app.now.as_mut().unwrap().queue_title = "Evening Mix".into();
+        app.now.as_mut().unwrap().cursor[Tab::UpNext.index()] = 2;
+        app.cover = Some(Cover::solid(32, 32));
+        state(&driver, PlayState::Playing, Duration::from_secs(35));
+        for (width, height) in [(160, 42), (120, 36), (80, 24), (48, 18)] {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let mut mouse = crate::ui::MouseMap::default();
+            terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+            let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+            assert!(!text.contains("3 up next"));
+            assert!(!text.contains("up next · Repeat"));
+            if width >= 120 {
+                for key in ["Space", "^L", "^Y", "^A", "^O", "^P"] {
+                    assert_eq!(text.contains(key), show, "{key} at {width}x{height}");
+                }
+            }
+            assert!(!text.contains(" Up "));
+            assert!(!text.contains(" Down "));
+            assert!(!text.contains(" Remove "));
+            assert!((0..height).any(|y| (0..width).any(|x| mouse.action_at(x, y) == Some(MouseAction::OpenPlayerActions))),
+                "missing player actions at {width}x{height}");
+        }
+        ux_preview(&mut app, if show { "key-hints-on" } else { "key-hints-off" });
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)).unwrap();
+        assert_eq!(app.now.as_ref().unwrap().queue[1].id, "song-2");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)).unwrap();
+        assert!(matches!(app.overlay, Overlay::Share { .. }));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        app.open_menu(MenuPage::Root);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+        let mut mouse = crate::ui::MouseMap::default();
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert_eq!(text.contains("Ctrl+S"), show);
+        app.open_menu(MenuPage::Help);
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Enter"), "Help must remain a complete keyboard reference");
+        app.menu = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)).unwrap();
+        assert!(matches!(app.overlay, Overlay::Settings));
+        assert_eq!(app.preferences().selected_setting(), preferences::Setting::Output);
+        app.preferences.picker = None;
+        app.preferences.selected = preferences::Setting::KeyHints.index();
+        ux_preview(&mut app, if show { "settings-key-hints-on" } else { "settings-key-hints-off" });
+        assert!(driver.commands.try_recv().is_err());
+        assert!(!requests.try_iter().any(|request| matches!(request, Request::Resolve { .. })));
+    }
+}
+
+#[test]
+fn player_button_shortcuts_leave_search_text_entry_and_modals_in_control() {
+    let (mut app, driver, requests) = fixture();
+    queue(&mut app, RepeatMode::Off, 0);
+    app.begin_search();
+    app.query = "unchanged draft".into();
+    app.query_cursor = app.query.len();
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)).unwrap();
+    assert_eq!(app.query_cursor, 0);
+    assert_eq!(app.mode, Mode::Editing);
+    assert!(!app.overlay.is_open());
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)).unwrap();
+    assert!(!app.overlay.is_open());
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+    app.handle_mouse_action(MouseAction::SharePlaying).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)).unwrap();
+    assert!(matches!(app.overlay, Overlay::Share { .. }), "a modal keeps keyboard ownership");
+    assert!(driver.commands.try_recv().is_err());
+    assert!(requests.try_recv().is_err());
+}
+
+#[test]
+fn song_clicks_select_then_double_click_enter_or_context_menu_works_across_pages() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    for activation in ["double-click", "Enter", "context menu"] {
+        for view in [View::Home, View::Tracks, View::Artist, View::Library, View::Playing] {
+            let (mut app, driver, requests) = fixture();
+            queue(&mut app, RepeatMode::Off, 0);
+            let action = match view {
+                View::Home => {
+                    app.home = vec![Shelf { title: "Songs".into(), cards: vec![song_card(9)] }];
+                    MouseAction::OpenHomeCard { shelf: 0, card: 0 }
+                }
+                View::Tracks => {
+                    app.results = vec![track(9)];
+                    app.browsing = Some("Playlist".into());
+                    MouseAction::PlayTrack(0)
+                }
+                View::Artist => {
+                    artist_preview(&mut app);
+                    if let Panel::Ready(page) = &mut app.artist.as_mut().unwrap().page {
+                        page.top_songs = vec![ArtistSong { track: track(9), plays: None }];
+                    }
+                    MouseAction::OpenArtistSong(0)
+                }
+                View::Library => {
+                    app.library.connected = true;
+                    app.library.collection_mut().items = vec![crate::source::library::browse::Item {
+                        card: song_card(9), track: Some(track(9)), available: true,
+                    }];
+                    MouseAction::OpenLibraryItem(0)
+                }
+                View::Playing => {
+                    let now = app.now.as_mut().unwrap();
+                    now.tab = Tab::Related;
+                    now.related = Panel::Ready(vec![Shelf { title: "Related".into(), cards: vec![song_card(9)] }]);
+                    MouseAction::OpenPageRow(1)
+                }
+            };
+            app.view = view;
+            if activation == "Enter" {
+                app.begin_search();
+                app.query.push_str("unfinished draft");
+            }
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+            let mut mouse = crate::ui::MouseMap::default();
+            terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+            let (column, row) = (0..36).find_map(|y| (0..120).find_map(|x|
+                (mouse.action_at(x, y) == Some(action)).then_some((x, y)))).unwrap();
+            let mut pointer = crate::pointer::Pointer::default();
+            let start = Instant::now();
+            for (ms, kind) in [(0, MouseEventKind::Down(MouseButton::Left)), (40, MouseEventKind::Up(MouseButton::Left))] {
+                pointer.handle_at(&mut app, &mouse, MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE },
+                    start + Duration::from_millis(ms)).unwrap();
+            }
+            assert_eq!(app.view, view, "a single song click must keep its page open");
+            assert_eq!(app.mode, Mode::Browse, "clicking a song moves focus out of text entry");
+            assert_eq!(app.selected_queue_track().unwrap().id, "song-9");
+            assert_eq!(app.now.as_ref().unwrap().video_id, "song-0");
+            assert!(driver.commands.try_recv().is_err());
+            assert!(!requests.try_iter().any(|request| matches!(request, Request::Resolve { .. })));
+            terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+            if activation == "context menu" {
+                pointer.handle_at(&mut app, &mouse, MouseEvent { kind: MouseEventKind::Down(MouseButton::Right),
+                    column, row, modifiers: KeyModifiers::NONE }, start + Duration::from_millis(120)).unwrap();
+                assert!(app.menu.is_some());
+                assert_eq!(app.selected_queue_track().unwrap().id, "song-9");
+                assert_eq!(app.now.as_ref().unwrap().video_id, "song-0");
+                assert!(driver.commands.try_recv().is_err());
+                assert!(!requests.try_iter().any(|request| matches!(request, Request::Resolve { .. })));
+            } else {
+                if activation == "Enter" {
+                    pointer.cancel();
+                    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+                } else {
+                    for (ms, kind) in [(120, MouseEventKind::Down(MouseButton::Left)), (160, MouseEventKind::Up(MouseButton::Left))] {
+                        pointer.handle_at(&mut app, &mouse, MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE },
+                            start + Duration::from_millis(ms)).unwrap();
+                    }
+                }
+                assert_eq!(app.view, View::Playing);
+                assert_eq!(app.now.as_ref().unwrap().video_id, "song-9");
+                assert_eq!(requests.try_iter().filter(|request| matches!(request, Request::Resolve { id, .. } if id == "song-9")).count(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn mixed_search_artist_song_cards_and_queue_titles_share_double_click_playback() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use crate::source::search::{Filter, Item};
+    for surface in ["search", "artist shelf", "queue"] {
+        let (mut app, _driver, requests) = fixture();
+        queue(&mut app, RepeatMode::Off, 0);
+        let action = match surface {
+            "search" => {
+                app.view = View::Tracks;
+                app.query = "evening".into();
+                let mut album = song_card(20);
+                album.target = Target::Open { endpoint: BrowseEndpoint::new("MPREalbum") };
+                app.search_items = vec![
+                    Item { kind: Filter::Albums, card: album, track: None },
+                    Item { kind: Filter::Songs, card: song_card(9), track: Some(track(9)) },
+                ];
+                app.results = vec![track(9)];
+                MouseAction::PlayTrack(1)
+            }
+            "artist shelf" => {
+                artist_preview(&mut app);
+                if let Panel::Ready(page) = &mut app.artist.as_mut().unwrap().page {
+                    page.top_songs.clear();
+                    page.shelves = vec![Shelf { title: "Songs".into(), cards: vec![song_card(9)] }];
+                }
+                MouseAction::OpenArtistCard { shelf: 0, card: 0 }
+            }
+            "queue" => {
+                let now = app.now.as_mut().unwrap();
+                now.queue[2] = track(9);
+                now.cursor[Tab::UpNext.index()] = 2;
+                MouseAction::SelectPageRow(2)
+            }
+            _ => unreachable!(),
+        };
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+        let mut mouse = crate::ui::MouseMap::default();
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        let (column, row) = (0..36).find_map(|y| (0..120).find_map(|x|
+            (mouse.action_at(x, y) == Some(action)).then_some((x, y)))).unwrap();
+        let mut pointer = crate::pointer::Pointer::default();
+        let start = Instant::now();
+        for ms in [0, 120, 240] {
+            for (delay, kind) in [(0, MouseEventKind::Down(MouseButton::Left)), (30, MouseEventKind::Up(MouseButton::Left))] {
+                pointer.handle_at(&mut app, &mouse, MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE },
+                    start + Duration::from_millis(ms + delay)).unwrap();
+            }
+            if ms == 0 {
+                assert_eq!(app.now.as_ref().unwrap().video_id, "song-0");
+                assert!(!requests.try_iter().any(|request| matches!(request, Request::Resolve { .. })));
+            } else if ms == 120 {
+                assert_eq!(app.now.as_ref().unwrap().video_id, "song-9", "{surface}");
+                assert_eq!(requests.try_iter().filter(|request| matches!(request, Request::Resolve { id, .. } if id == "song-9")).count(), 1);
+            } else {
+                assert!(!requests.try_iter().any(|request| matches!(request, Request::Resolve { .. })), "a third click starts a new pair");
+            }
+            terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn drags_timeouts_page_changes_and_replaced_songs_cannot_complete_an_old_double_click() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    for scenario in ["timeout", "different row", "replacement", "page change", "cancel", "drag", "context menu"] {
+        let (mut app, driver, requests) = fixture();
+        queue(&mut app, RepeatMode::Off, 0);
+        app.view = View::Tracks;
+        app.browsing = Some("Playlist".into());
+        app.results = vec![track(9), track(10)];
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+        let mut mouse = crate::ui::MouseMap::default();
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        let point = |index| (0..36).find_map(|y| (0..120).find_map(|x|
+            (mouse.action_at(x, y) == Some(MouseAction::PlayTrack(index))).then_some((x, y)))).unwrap();
+        let first = point(0);
+        let other = point(1);
+        let mut pointer = crate::pointer::Pointer::default();
+        let start = Instant::now();
+        let event = |kind, (column, row)| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+        pointer.handle_at(&mut app, &mouse, event(MouseEventKind::Down(MouseButton::Left), first), start).unwrap();
+        if scenario == "drag" {
+            pointer.handle_at(&mut app, &mouse, event(MouseEventKind::Drag(MouseButton::Left), other), start + Duration::from_millis(20)).unwrap();
+        }
+        pointer.handle_at(&mut app, &mouse, event(MouseEventKind::Up(MouseButton::Left), first), start + Duration::from_millis(40)).unwrap();
+        match scenario {
+            "replacement" => app.results[0] = track(11),
+            "page change" => { app.begin_page_request(PageRequestKind::Browse); }
+            "cancel" => pointer.cancel(),
+            "context menu" => {
+                pointer.handle_at(&mut app, &mouse, event(MouseEventKind::Down(MouseButton::Right), first), start + Duration::from_millis(60)).unwrap();
+                app.handle_mouse_action(MouseAction::CloseMenu).unwrap();
+            }
+            _ => {}
+        }
+        let ms = if scenario == "timeout" { 800 } else { 120 };
+        let position = if scenario == "different row" { other } else { first };
+        pointer.handle_at(&mut app, &mouse, event(MouseEventKind::Down(MouseButton::Left), position), start + Duration::from_millis(ms)).unwrap();
+        pointer.handle_at(&mut app, &mouse, event(MouseEventKind::Up(MouseButton::Left), position), start + Duration::from_millis(ms + 40)).unwrap();
+        assert_eq!(app.now.as_ref().unwrap().video_id, "song-0", "{scenario}");
+        assert!(driver.commands.try_recv().is_err(), "{scenario}");
+        assert!(!requests.try_iter().any(|request| matches!(request, Request::Resolve { .. })), "{scenario}");
+    }
+}
+
+#[test]
+fn selected_song_menus_queue_the_correct_song_on_every_browsing_page_without_interrupting_playback() {
+    use crate::source::search::{Filter, Item};
+    for view in [View::Home, View::Tracks, View::Artist, View::Library, View::Playing] {
+        for next in [true, false] {
+            let (mut app, driver, requests) = fixture();
+            queue(&mut app, RepeatMode::Off, 0);
+            match view {
+                View::Home => app.home = vec![Shelf { title: "Songs".into(), cards: vec![song_card(9)] }],
+                View::Tracks => {
+                    let mut album = song_card(20);
+                    album.target = Target::Open { endpoint: BrowseEndpoint::new("MPREalbum") };
+                    app.search_items = vec![
+                        Item { kind: Filter::Albums, card: album, track: None },
+                        Item { kind: Filter::Songs, card: song_card(9), track: Some(track(9)) },
+                    ];
+                    app.results = vec![track(9)];
+                    app.selected = 1;
+                }
+                View::Artist => {
+                    artist_preview(&mut app);
+                    if let Panel::Ready(page) = &mut app.artist.as_mut().unwrap().page {
+                        page.top_songs = vec![ArtistSong { track: track(9), plays: None }];
+                    }
+                }
+                View::Library => {
+                    app.library.connected = true;
+                    app.library.collection_mut().items = vec![crate::source::library::browse::Item {
+                        card: song_card(9), track: Some(track(9)), available: true,
+                    }];
+                }
+                View::Playing => {
+                    let now = app.now.as_mut().unwrap();
+                    now.tab = Tab::Related;
+                    now.related = Panel::Ready(vec![Shelf { title: "Related".into(), cards: vec![song_card(9)] }]);
+                    now.cursor[Tab::Related.index()] = 1;
+                }
+            }
+            app.view = view;
+            app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE)).unwrap();
+            let label = if next { "Play next" } else { "Add to queue" };
+            let selected = app.menu_items().iter().position(|item| item.label == label && item.enabled)
+                .unwrap_or_else(|| panic!("{view:?} must expose {label} for the selected song"));
+            app.handle_mouse_action(MouseAction::ActivateMenuItem(selected)).unwrap();
+            let now = app.now.as_ref().unwrap();
+            assert_eq!(now.queue[if next { 1 } else { 4 }].id, "song-9");
+            assert_eq!(now.queue.len(), 5);
+            assert_eq!(now.video_id, "song-0");
+            assert_eq!(now.playing, Some(0));
+            assert!(app.menu.is_none());
+            assert!(driver.commands.try_recv().is_err());
+            assert!(requests.try_iter().all(|request| matches!(request, Request::Prefetch { id } if next && id == "song-9")));
+        }
+    }
+}
+
+#[test]
+fn queue_actions_skip_nonplayable_and_unavailable_items_and_wait_for_an_active_queue() {
+    use crate::source::search::{Filter, Item};
+    let (mut app, driver, requests) = fixture();
+    queue(&mut app, RepeatMode::Off, 0);
+    let mut album = song_card(9);
+    album.target = Target::Open { endpoint: BrowseEndpoint::new("MPREalbum") };
+    let no_queue_actions = |app: &App| assert!(app.page_action_items().iter().all(|item|
+        !matches!(item.action, Some(MenuAction::PlaySelectionNext | MenuAction::QueueSelection))));
+    app.view = View::Tracks;
+    app.search_items = vec![Item { kind: Filter::Albums, card: album.clone(), track: None }];
+    no_queue_actions(&app);
+    artist_preview(&mut app);
+    let artist = app.artist.as_mut().unwrap();
+    artist.section = 1;
+    if let Panel::Ready(page) = &mut artist.page {
+        page.shelves = vec![Shelf { title: "Albums".into(), cards: vec![album.clone()] }];
+    }
+    no_queue_actions(&app);
+    app.view = View::Library;
+    app.library.collection_mut().items = vec![crate::source::library::browse::Item {
+        card: song_card(9), track: Some(track(9)), available: false,
+    }];
+    no_queue_actions(&app);
+    app.library.collection_mut().items[0] = crate::source::library::browse::Item { card: album.clone(), track: None, available: true };
+    no_queue_actions(&app);
+    app.view = View::Playing;
+    let now = app.now.as_mut().unwrap();
+    now.tab = Tab::Related;
+    now.related = Panel::Ready(vec![Shelf { title: "Albums".into(), cards: vec![album] }]);
+    now.cursor[Tab::Related.index()] = 0;
+    no_queue_actions(&app);
+    app.now.as_mut().unwrap().cursor[Tab::Related.index()] = 1;
+    no_queue_actions(&app);
+
+    app.view = View::Tracks;
+    app.search_items.clear();
+    app.results = vec![track(9)];
+    for loading in [true, false] {
+        if loading { app.now.as_mut().unwrap().playing = None; } else { app.now = None; }
+        app.open_menu(MenuPage::PageActions);
+        for label in ["Play next", "Add to queue"] {
+            let selected = app.menu_items().iter().position(|item| item.label == label && !item.enabled).unwrap();
+            app.handle_mouse_action(MouseAction::ActivateMenuItem(selected)).unwrap();
+            assert!(app.menu.is_some());
+        }
+    }
+    assert!(driver.commands.try_recv().is_err());
+    assert!(requests.try_recv().is_err());
+}
+
+#[test]
+fn artist_and_library_song_cards_support_the_same_queue_actions_as_track_rows() {
+    for view in [View::Artist, View::Library] {
+        let (mut app, driver, _requests) = fixture();
+        queue(&mut app, RepeatMode::Off, 0);
+        if view == View::Artist {
+            artist_preview(&mut app);
+            let artist = app.artist.as_mut().unwrap();
+            artist.section = 1;
+            if let Panel::Ready(page) = &mut artist.page {
+                page.shelves = vec![Shelf { title: "Songs".into(), cards: vec![song_card(9)] }];
+            }
+        } else {
+            app.library.collection_mut().items = vec![crate::source::library::browse::Item {
+                card: song_card(9), track: None, available: true,
+            }];
+        }
+        app.view = view;
+        app.queue_selected_track(false);
+        assert_eq!(app.now.as_ref().unwrap().queue.last().unwrap().id, "song-9");
+        assert!(driver.commands.try_recv().is_err());
+    }
+}
+
+#[test]
+fn play_next_promotes_an_existing_song_and_keeps_the_queue_cursor_on_its_song() {
+    let (mut app, driver, requests) = fixture();
+    queue(&mut app, RepeatMode::Off, 0);
+    app.now.as_mut().unwrap().cursor[Tab::UpNext.index()] = 2;
+    app.view = View::Tracks;
+    app.results = vec![track(3), track(9)];
+    app.queue_selected_track(true);
+    let now = app.now.as_ref().unwrap();
+    assert_eq!(now.queue.iter().map(|song| song.id.as_str()).collect::<Vec<_>>(),
+        ["song-0", "song-3", "song-1", "song-2"]);
+    assert_eq!(now.queue[now.cursor[Tab::UpNext.index()]].id, "song-2");
+    app.selected = 1;
+    app.queue_selected_track(true);
+    let now = app.now.as_ref().unwrap();
+    assert_eq!(now.queue[1].id, "song-9");
+    assert_eq!(now.queue[now.cursor[Tab::UpNext.index()]].id, "song-2");
+    app.queue_selected_track(false);
+    assert!(app.status.contains("already in the queue"));
+    assert_eq!(app.now.as_ref().unwrap().queue.len(), 5);
+    app.results = vec![track(0)];
+    app.selected = 0;
+    app.queue_selected_track(true);
+    assert_eq!(app.now.as_ref().unwrap().queue.len(), 5);
+    assert_eq!(app.now.as_ref().unwrap().queue[0].id, "song-0");
+    assert!(driver.commands.try_recv().is_err());
+    assert!(!requests.try_iter().any(|request| matches!(request, Request::Resolve { .. })));
+}
+
 fn open_lyrics(app: &mut App) {
     let mut now = NowPlaying::new(&track(0));
     now.tab = Tab::Lyrics;
@@ -150,6 +1058,7 @@ fn artist_songs_and_catalogue_are_clickable_and_page_without_starting_playback()
         app.artist.as_mut().unwrap().set_page(Ok(ArtistPage {
             artist, audience: None, description: None, art: None,
             top_songs: (0..20).map(|index| ArtistSong { track: track(index), plays: None }).collect(),
+            songs_endpoint: None, songs_truncated: false,
             shelves: vec![Shelf { title: "Albums".into(), cards: (0..20).map(|index| Card {
                 title: format!("Album {index}"), subtitle: "Artist".into(), art: None, duration: None, artist_ref: None,
                 target: Target::Open { endpoint: BrowseEndpoint::new(format!("MPRE{index}")) },
@@ -397,7 +1306,8 @@ fn precision_cover_volume_uses_one_percent_steps_and_accumulates_rapid_wheel_inp
 }
 
 #[test]
-fn precision_volume_only_targets_visible_current_song_artwork() {
+fn cover_clicks_toggle_playback_and_precision_wheels_only_target_visible_current_artwork() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use crate::ui::MouseMap;
     use ratatui::{Terminal, backend::TestBackend};
     for (width, height, style, full, sixel, kitty) in [
@@ -410,8 +1320,8 @@ fn precision_volume_only_targets_visible_current_song_artwork() {
         (60, 24, CoverStyle::Pixel, false, false, true),
         (60, 24, CoverStyle::Pixel, true, true, false),
     ] {
-        let (mut app, _driver, _requests) = fixture();
-        app.play_track(track(0), false);
+        let (mut app, driver, requests) = fixture();
+        queue(&mut app, RepeatMode::Off, 0);
         app.cover = Some(Cover::solid(32, 32));
         app.cover_style = style;
         app.graphics = Graphics { sixel, kitty, cell: (9, 20) };
@@ -419,21 +1329,40 @@ fn precision_volume_only_targets_visible_current_song_artwork() {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut mouse = MouseMap::default();
         terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
-        assert!((0..height).all(|y| (0..width).all(|x| !mouse.over_cover(x, y))));
-        app.precision_volume = true;
-        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
         let points: Vec<_> = (0..height).flat_map(|y| (0..width).map(move |x| (x, y)))
             .filter(|&(x, y)| mouse.over_cover(x, y)).collect();
         assert!(!points.is_empty(), "missing cover target at {width}x{height}");
+        assert!(points.iter().all(|&(x, y)| mouse.action_at(x, y) == Some(MouseAction::TogglePlayback)));
         assert!(!mouse.over_cover(0, 0), "header is not artwork");
         assert!(!mouse.over_cover(width - 1, height - 1), "footer is not artwork");
+        let (column, row) = points[points.len() / 2];
+        let event = |kind| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+        let mut pointer = crate::pointer::Pointer::default();
+        for playback in [PlayState::Playing, PlayState::Paused] {
+            state(&driver, playback, Duration::from_secs(35));
+            pointer.handle(&mut app, &mouse, event(MouseEventKind::Down(MouseButton::Left))).unwrap();
+            pointer.handle(&mut app, &mouse, event(MouseEventKind::Up(MouseButton::Left))).unwrap();
+            assert!(matches!(driver.commands.try_recv().unwrap(), Command::TogglePause));
+            assert!(driver.commands.try_recv().is_err(), "one click toggles once");
+            assert_eq!(app.now.as_ref().unwrap().video_id, "song-0");
+            assert_eq!(app.now.as_ref().unwrap().queue.len(), 4);
+        }
+        pointer.handle(&mut app, &mouse, event(MouseEventKind::ScrollDown)).unwrap();
+        assert!(driver.commands.try_recv().is_err(), "wheel leaves volume alone when precision is off");
+        app.precision_volume = true;
+        driver.snapshot.lock().unwrap().volume = 0.50;
+        pointer.handle(&mut app, &mouse, event(MouseEventKind::ScrollUp)).unwrap();
+        assert!(matches!(driver.commands.try_recv().unwrap(), Command::SetVolume(volume) if (volume - 0.51).abs() < 0.00001));
+        assert!(driver.commands.try_recv().is_err(), "wheeling the cover must not toggle playback");
+        assert!(!requests.try_iter().any(|request| matches!(request, Request::Resolve { .. })));
+        app.volume_save = None;
         app.overlay = Overlay::Settings;
         terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
         assert!(points.iter().all(|&(x, y)| !mouse.over_cover(x, y)), "settings block artwork behind them");
         app.overlay = Overlay::None;
         app.cover = None;
         terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
-        assert!(points.iter().all(|&(x, y)| !mouse.over_cover(x, y)), "missing art has no volume target");
+        assert!(points.iter().all(|&(x, y)| !mouse.over_cover(x, y)), "missing art has no cover controls");
     }
 }
 

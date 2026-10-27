@@ -86,6 +86,7 @@ pub(super) fn render(
     area: Rect,
     accent: Color,
     tiles: &mut Tiles<'_>,
+    mouse: &mut MouseMap,
 ) -> usize {
     if !matches!(now.related, Panel::Ready(_)) {
         message(frame, waiting_on(&now.related), area);
@@ -115,7 +116,9 @@ pub(super) fn render(
                 } else {
                     CardShape::Text
                 };
-                render_card(frame, card, rect, index == now.cursor(), tiles);
+                if let Some(link) = render_card_artist_link(frame, card, rect, index == now.cursor(), tiles, card.artist_ref.as_ref()) {
+                    mouse.targets.push(MouseTarget::Area(link, MouseAction::OpenRelatedArtist(index)));
+                }
             }
         }
     }

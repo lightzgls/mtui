@@ -8,7 +8,7 @@ A lightweight YouTube Music player with cover art, lyrics, playlists, and contro
 
 ![MTUI playing music in a terminal, with pixel cover art, a queue, and playback controls](assets/previews/now-playing.png)
 
-- **Mouse or keyboard.** Click a track, drag to seek, or use shortcuts to search and control playback.
+- **Mouse or keyboard.** Click to select a song, double-click or press Enter to play, and drag to seek or reorder upcoming songs.
 - **More than a track list.** Browse Home, build a queue, and follow lyrics alongside cover art that sets the player's colors.
 - **Easy to try.** Prebuilt Windows and Linux downloads include sign-in; no Rust setup needed. Search and playback work without signing in.
 
@@ -55,10 +55,12 @@ https://github.com/user-attachments/assets/27cdd7f8-daf9-4ccc-b736-d903014b5be1
 ## Features
 
 - Search songs, artists, albums, playlists, and videos; browse personalized Home and saved playlists.
+- Expand an artist's Top songs or play the full available list; follow linked artist names from playlists, Library, and Related.
 - Native AAC playback, queue management, seeking, shuffle, repeat, and audio output selection.
 - Like songs, share links, save to playlists, and sync listening history with your signed-in account.
 - Lyrics, including synced lyrics when available, plus comments and related music.
 - Solid colors drawn from the cover, pixel or ASCII artwork, and keyboard and mouse navigation.
+- Optional key hints beside controls, a shared song action menu, and a cleaner player without repeated song details or page totals.
 - Optional Discord Rich Presence and Windows tray controls. Reopening MTUI restores the running session.
 - Windows media controls and Linux MPRIS publish the track, artist, playback state, and timeline; desktop widgets and media keys control the same player.
 - A single mint strip app icon, with a tray animation that reflects playing, paused, and stopped states.

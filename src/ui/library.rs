@@ -28,8 +28,16 @@ fn button(
             })
             .bg(shell::SURFACE)
     };
+    let key = match action {
+        MouseAction::LibraryCategory(category) if !matches!(label.trim(), "<" | ">") => Some((category.index() + 1).to_string()),
+        MouseAction::OpenLikedMusic => Some("f".into()),
+        MouseAction::LibrarySort => Some("o".into()),
+        MouseAction::RefreshLibrary => Some("r".into()),
+        MouseAction::LibrarySignIn => Some("M".into()),
+        _ => None,
+    };
     frame.render_widget(
-        Paragraph::new(Span::styled(truncate(label, area.width as usize), style)),
+        Paragraph::new(button_style(mouse.hinted_label(label, key.as_deref(), area.width), style)).style(style),
         area,
     );
     if enabled {
@@ -50,8 +58,9 @@ fn categories(
     if area.width >= 72 {
         let mut x = area.x;
         for (index, category) in Category::ALL.into_iter().enumerate() {
-            let label = format!(" {} {} ", index + 1, category.label());
-            let width = display_width(&label) as u16;
+            let label = format!(" {} ", category.label());
+            let key = (index + 1).to_string();
+            let width = mouse.hinted_label(&label, Some(&key), area.width).width() as u16;
             button(
                 frame,
                 mouse,
@@ -65,13 +74,10 @@ fn categories(
             x += width + 1;
         }
     } else {
-        let label = format!("{} {}", selected.index() + 1, selected.label());
+        let key = (selected.index() + 1).to_string();
         let width = area.width.saturating_sub(8);
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                truncate(&label, width as usize),
-                highlight(accent),
-            ))
+            Paragraph::new(button_style(mouse.hinted_label(selected.label(), Some(&key), width), highlight(accent))).style(highlight(accent))
             .alignment(ratatui::layout::Alignment::Center),
             Rect::new(area.x + area.width.min(4), area.y, width, 1),
         );
@@ -151,7 +157,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut M
             frame,
             mouse,
             Rect::new(tools.x, tools.y, liked_width, 1),
-            " Liked Music [f] ",
+            " Liked Music ",
             false,
             true,
             MouseAction::OpenLikedMusic,
@@ -161,11 +167,11 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut M
         let refresh_width = tools
             .width
             .saturating_sub(liked_width)
-            .min(if tools.width >= 60 { 13 } else { 5 });
+            .min(if tools.width >= 60 { 13 } else { 9 });
         let sort_width = tools.width.saturating_sub(liked_width + refresh_width + 2);
         if has_sort && sort_width >= 5 {
             let label = if sort_width >= 18 {
-                format!(" Sort: {} [o] ", app.library.collection().sort_label)
+                format!(" Sort: {} ", app.library.collection().sort_label)
             } else {
                 "Sort".into()
             };
@@ -185,11 +191,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut M
                 frame,
                 mouse,
                 Rect::new(tools.right() - refresh_width, tools.y, refresh_width, 1),
-                if refresh_width >= 13 {
-                    " Refresh [r] "
-                } else {
-                    " [r] "
-                },
+                " Refresh ",
                 false,
                 !app.library.loading(),
                 MouseAction::RefreshLibrary,
@@ -201,7 +203,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut M
             frame,
             mouse,
             Rect::new(tools.x, tools.y, tools.width.min(15), 1),
-            " Sign in [M] ",
+            " Sign in ",
             false,
             true,
             MouseAction::LibrarySignIn,
@@ -304,7 +306,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut M
             slot_width,
             item_height,
         );
-        if songs && let Some(track) = &item.track {
+        let artist = if songs && let Some(track) = &item.track {
             browse::song_row(
                 frame,
                 item_area,
@@ -313,14 +315,18 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut M
                 selected == index,
                 &mut tiles,
                 app.graphics,
-            );
+            )
         } else {
-            render_card(frame, &item.card, item_area, selected == index, &mut tiles);
-        }
+            let artist = item.track.as_ref().and_then(|track| track.artist_ref.as_ref()).or(item.card.artist_ref.as_ref());
+            render_card_artist_link(frame, &item.card, item_area, selected == index, &mut tiles, artist)
+        };
         mouse.targets.push(MouseTarget::Area(
             item_area,
             MouseAction::OpenLibraryItem(index),
         ));
+        if let Some(link) = artist {
+            mouse.targets.push(MouseTarget::Area(link, MouseAction::OpenLibraryArtist(index)));
+        }
     }
     let collection = app.library.collection();
     let count = collection.items.len();

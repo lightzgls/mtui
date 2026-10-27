@@ -77,7 +77,7 @@ less install.sh
 bash install.sh
 ```
 
-Options: `bash install.sh --version 0.11.6` pins a stable release;
+Options: `bash install.sh --version 0.11.7` pins a stable release;
 `--yes` accepts package-manager confirmations, including Arch system updates;
 `--skip-deps` only works when
 all runtime libraries are already available. Other glibc distributions can use
@@ -136,7 +136,7 @@ mtui
 APT installs any missing runtime libraries, including WebKitGTK for sign-in.
 The package also adds a terminal launcher to your desktop's application menu.
 Upgrade by installing the newer `.deb` the same way, then restart MTUI.
-The v0.11.6 package has Debian version `0.11.6-1`, which upgrades earlier
+The v0.11.7 package has Debian version `0.11.7-1`, which upgrades earlier
 MTUI packages.
 Run `mtui-uninstall` to remove the package and all local MTUI data. Using
 `sudo apt remove mtui` alone removes the package while leaving user data.
@@ -244,7 +244,11 @@ can change these totals. Later launches reuse the downloaded tools.
 
 ## Usage
 
-The top bar provides Home, Library, Playing, search, and Menu. Home opens with large cover
+The top bar provides Back, Home, Library, Playing, search, and Menu. Back and
+`Alt-Left` follow the same history as `Esc`. Search supports cursor movement with
+Left/Right and Home/End, Delete, `Ctrl-W` to delete the previous word, and
+`Ctrl-U` to clear the query. The current page remains visible while typing;
+Esc cancels and restores it. Home opens with large cover
 cards from Listen again (or the first available collection), followed by compact
 Quick picks. Shelf headings, artwork, and song grids keep clear spacing, and
 short windows adapt to smaller complete cards. Navigation and footer controls
@@ -301,18 +305,51 @@ cached. The panel labels untimed results **Unsynced lyrics**. Timings still
 depend on what YouTube Music or LRCLIB publishes for that recording.
 
 Queue entries have space between songs and clear title, artist, and duration
-columns. Short windows use compact rows. Click the current artist or album to
+columns. Click a song title to select it, then right-click or press `.` for
+**Move up**, **Move down**, or **Remove from queue**. Double-click the title, click the play
+marker, or press Enter to play the song. The current song and past songs cannot be removed.
+Drag an upcoming song by its title onto another upcoming row to change its
+position, or select it and press `Alt-Up` / `Alt-Down` (`Shift-Up` / `Shift-Down`
+and `K` / `J` also work). The selected song moves visibly; the queue scrolls
+only when selection reaches an edge. A drag never starts playback or seeks.
+Action feedback remains visible beneath the transport during playback.
+The queue heading shows the source name; editing actions stay in the song menu.
+Short windows use compact rows. Click the current artist or album to
 open its page when YouTube Music provides that link; queue artists are clickable
 when the artist column is visible.
+Playlist and Library song rows, Library cards, and Related recommendations also
+link the artist name when its full name is visible and YouTube supplies an artist
+route. These names have a subtle underline. Clicking one opens Artist; Back
+returns to the selected item and scroll position. Right-click still opens the
+item's action menu.
+
+Routine page totals and repeated “playing” song details no longer occupy the
+status line. The player keeps one song caption, while errors and action feedback
+remain visible. Paused and loading states still appear beside the song.
 
 Artist top songs and catalogue cards are clickable, with previous/next buttons
-to reach items beyond the visible section. Related uses cover thumbnails with
+to reach items beyond the visible section. **Show more** (`e`) fetches the
+artist's full Top songs listing when YouTube supplies its route, and expands
+the section; **Show less** collapses it again. **Play all** (`a`) loads that same
+listing and plays it in provider order, including songs beyond the preview.
+This queue ends after its last song. Back restores the artist and loaded list.
+Collection loading is bounded to 200 songs and eight continuation requests;
+an interrupted or truncated listing is labeled incomplete. A failed expansion
+keeps the original preview and offers **Retry more**.
+Related uses cover thumbnails with
 titles and details underneath its section headings. Right-click selects the item
 before opening its actions.
+
+Right-click a song, or select it and press `.`, to use **Play next** or **Add to
+queue** on Home, Search, Artist, Library, and Related. These actions become
+available once the current playback queue has loaded. Play next inserts the
+song immediately after the current track, or promotes it there if already
+upcoming. Add to queue appends it once. Both keep the current song playing.
 
 The volume −/+ buttons, keyboard `-`/`+`, and mouse wheel over the volume control
 change the level in 5% steps. Clicking or dragging its bar snaps to a 5% value.
 Volume is capped at 100%. Click **vol** to mute and restore the previous level.
+Click the current song's cover artwork to pause or resume playback.
 
 Enable **Settings → Playback → Precision volume** to adjust volume by 1% per
 wheel step over the current song's cover art. Scroll up to increase and down
@@ -336,13 +373,25 @@ and Discord/tray switches under Integrations. Click a value or press Enter to
 choose it; a choice list changes nothing until you confirm. Esc cancels the
 choice list, then returns to Settings and the menu it was opened from.
 
+**Settings → Appearance → Show key hints** shows or hides the subtle shortcuts
+beside buttons, category tabs, menu actions, and the footer guide. It is on by
+default and saved across launches. Labels stay readable in smaller windows by
+dropping a whole hint before shortening a button; the keyboard reference in
+Help remains available when hints are hidden. Hidden hints do not disable keys.
+`Ctrl-L` likes the current song, `Ctrl-Y` opens Share, `Ctrl-A` saves it to a
+playlist, and `Ctrl-O` opens audio-output choices outside text entry and dialogs.
+Album and playlist pages use `a` for Play all, `z` for Shuffle, and `r` to reload.
+
 `Ctrl-K` opens the global App Menu. Outside search entry, `.` opens actions for
 the current page or selection. The terminal UI also accepts the mouse: use the
-wheel to navigate, click the search box to edit, and click visible cards, rows,
-player tabs, or queue entries to open them. Home sections also have clickable
+wheel to navigate and click the search box to edit. Across Home, album/playlist
+lists, Artist, Library, Related, and Queue, click a song once to select it;
+double-click or press Enter to play it. Right-click selects it and opens its
+menu. Album and artist links, player tabs, and explicit playback buttons open
+or act on one click. Home sections also have clickable
 `<` / `>` buttons beside their headings to browse beyond the visible songs;
-they dim at the beginning or end. Click the
-cover or caption to play or open a card. Click or drag the progress bar to
+they dim at the beginning or end. Song artwork and captions share the same
+selection and double-click behavior. Click or drag the progress bar to
 seek; the persistent player also exposes previous, play/pause, next, and volume
 controls wherever the terminal is wide enough to show them clearly. Press `m`
 or click the `vol`/`mut` label to mute or restore the previous volume. Right-click
@@ -439,8 +488,8 @@ playerctl --player=mtui position 60
 
 ### Settings Support
 
-Settings show a platform label on each row in wide terminals and in the selected
-setting's detail in narrower terminals. Unavailable controls are disabled.
+Settings show platform labels for restricted features in wide terminals and in
+the selected setting's detail in narrower terminals. Unavailable controls are disabled.
 
 | Setting | Windows | Linux |
 |---|---|---|
@@ -453,7 +502,7 @@ setting's detail in narrower terminals. Unavailable controls are disabled.
 | Click tray icon to pause / resume | Yes | No |
 | Updates | Yes | Yes, writable installation |
 
-"All platforms" also includes macOS for playback, appearance, and Discord.
+Playback, appearance, and Discord are also available on macOS.
 In-app updates are currently Windows/Linux only; macOS updates manually.
 
 ### Windows Tray

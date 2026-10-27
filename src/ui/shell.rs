@@ -139,13 +139,15 @@ pub(super) struct Header<'a> {
     pub mode: Mode,
     pub view: View,
     pub query: &'a str,
+    pub query_cursor: usize,
+    pub can_go_back: bool,
     pub accent: Color,
     pub has_player: bool,
     pub accepts_input: bool,
     pub symbols: Symbols,
 }
 
-fn header_areas(area: Rect) -> [Rect; 6] {
+fn header_areas(area: Rect, show_keys: bool) -> [Rect; 7] {
     let area = inset(area);
     let row = Rect::new(
         area.x,
@@ -153,13 +155,16 @@ fn header_areas(area: Rect) -> [Rect; 6] {
         area.width,
         area.height.min(1),
     );
-    let brand = if row.width >= 90 { 8 } else { 0 };
-    let home = if row.width >= 40 { 8 } else { 0 };
-    let library = if row.width >= 30 { 10 } else { 0 };
-    let player = if row.width >= 72 { 12 } else { 0 };
-    let menu = if row.width >= 20 { 9 } else { 0 };
+    let brand = if row.width >= 104 { 8 } else { 0 };
+    let roomy = show_keys && row.width >= 110;
+    let back = if roomy { 12 } else if row.width >= 24 { 7 } else { 0 };
+    let home = if roomy { 10 } else if row.width >= 48 { 8 } else { 0 };
+    let library = if roomy { 12 } else if row.width >= 64 { 10 } else { 0 };
+    let player = if roomy { 14 } else if row.width >= 86 { 12 } else { 0 };
+    let menu = if roomy { 11 } else if row.width >= 16 { 7 } else { 0 };
     Layout::horizontal([
         Constraint::Length(brand),
+        Constraint::Length(back),
         Constraint::Length(home),
         Constraint::Length(library),
         Constraint::Length(player),
@@ -175,7 +180,12 @@ pub(super) fn render_header(
     header: Header<'_>,
     mouse: &mut MouseMap,
 ) {
-    let [brand, home, library, player, input, menu] = header_areas(area);
+    let [brand, back, home, library, player, input, menu] = header_areas(area, mouse.show_key_hints());
+    frame.render_widget(Paragraph::new(mouse.hinted_label("< Back", Some("Esc"), back.width)).style(Style::default().fg(
+        if header.can_go_back { Color::Gray } else { Color::DarkGray })), back);
+    if !back.is_empty() && header.can_go_back {
+        mouse.targets.push(MouseTarget::Area(back, MouseAction::GoBack));
+    }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("● ", Style::default().fg(header.accent)),
@@ -219,11 +229,13 @@ pub(super) fn render_header(
                 Color::DarkGray
             })
         };
+        let key = match action {
+            MouseAction::GoHome => "H", MouseAction::OpenLibrary => "L",
+            MouseAction::OpenPlayer => "P", _ => "^K",
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                header.symbols.label(icon, label),
-                style,
-            )))
+            Paragraph::new(super::button_style(mouse.hinted_label(&header.symbols.label(icon, label),
+                (header.mode == Mode::Browse || action == MouseAction::OpenAppMenu).then_some(key), rect.width), style)).style(style)
             .alignment(Alignment::Center),
             rect,
         );
@@ -232,21 +244,23 @@ pub(super) fn render_header(
         }
     }
 
-    let prefix = if header.symbols.symbol(Icon::Search).is_empty() {
+    let prefix = if !mouse.show_key_hints() {
+        if header.symbols.symbol(Icon::Search).is_empty() { " " } else { " ⌕ " }
+    } else if header.symbols.symbol(Icon::Search).is_empty() {
         " / "
     } else {
         " ⌕ / "
     };
     let room = (input.width as usize).saturating_sub(display_width(prefix) + 2);
     let editing = header.mode == Mode::Editing;
-    let text = if header.query.is_empty() && !editing {
-        truncate("Search songs, albums, artists", room)
+    let (text, caret) = if header.query.is_empty() && !editing {
+        (truncate("Search songs, albums, artists", room), 0)
     } else if editing {
-        visible_query(header.query, room)
+        visible_query(header.query, header.query_cursor, room)
     } else {
-        truncate(header.query, room)
+        (truncate(header.query, room), 0)
     };
-    let cursor_offset = display_width(prefix) + display_width(&text);
+    let cursor_offset = display_width(prefix) + caret;
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(prefix, Style::default().fg(header.accent)),
@@ -286,20 +300,30 @@ pub(super) fn render_header(
     }
 }
 
-/// Keep the caret's end of a long query visible, without splitting a CJK glyph
+/// Keep the actual caret in a long query visible, without splitting a CJK glyph
 /// or a composed emoji as the search field narrows.
-fn visible_query(query: &str, room: usize) -> String {
+fn visible_query(query: &str, cursor: usize, room: usize) -> (String, usize) {
+    let cursor = query.grapheme_indices(true).map(|(at, _)| at).chain(std::iter::once(query.len()))
+        .take_while(|at| *at <= cursor).last().unwrap_or(0);
     let mut used = 0;
-    let mut visible = Vec::new();
-    for grapheme in query.graphemes(true).rev() {
+    let mut start = cursor;
+    for (at, grapheme) in query[..cursor].grapheme_indices(true).rev() {
         let width = display_width(grapheme);
         if used + width > room {
             break;
         }
         used += width;
-        visible.push(grapheme);
+        start = at;
     }
-    visible.into_iter().rev().collect()
+    let caret = used;
+    let mut text = String::new();
+    used = 0;
+    for grapheme in query[start..].graphemes(true) {
+        let width = display_width(grapheme);
+        if used + width > room { break; }
+        text.push_str(grapheme); used += width;
+    }
+    (text, caret)
 }
 
 #[cfg(test)]
@@ -324,6 +348,8 @@ mod tests {
                             mode: Mode::Browse,
                             view: View::Home,
                             query: "",
+                            query_cursor: 0,
+                            can_go_back: true,
                             accent: Color::Magenta,
                             has_player: true,
                             accepts_input: true,
@@ -333,8 +359,9 @@ mod tests {
                     );
                 })
                 .unwrap();
-            let [_, home, library, player, input, menu] = header_areas(Rect::new(0, 0, width, 2));
+            let [_, back, home, library, player, input, menu] = header_areas(Rect::new(0, 0, width, 2), true);
             for (rect, expected) in [
+                (back, MouseAction::GoBack),
                 (home, MouseAction::GoHome),
                 (library, MouseAction::OpenLibrary),
                 (player, MouseAction::OpenPlayer),
@@ -355,9 +382,10 @@ mod tests {
 
     #[test]
     fn editing_keeps_the_query_tail_visible_on_grapheme_boundaries() {
-        assert_eq!(visible_query("long query 日本語", 6), "日本語");
-        assert_eq!(visible_query("long query 👩‍💻", 2), "👩‍💻");
-        assert_eq!(visible_query("abc", 0), "");
+        assert_eq!(visible_query("long query 日本語", usize::MAX, 6), ("日本語".into(), 6));
+        assert_eq!(visible_query("long query 👩‍💻", usize::MAX, 2), ("👩‍💻".into(), 2));
+        assert_eq!(visible_query("abc", 0, 0), ("".into(), 0));
+        assert_eq!(visible_query("abc 日本語", 4, 6), ("abc 日".into(), 4));
     }
 
     #[test]
@@ -390,6 +418,8 @@ mod tests {
                             mode: Mode::Editing,
                             view: View::Home,
                             query: "long search 日本語 👩‍💻",
+                            query_cursor: usize::MAX,
+                            can_go_back: true,
                             accent: Color::Cyan,
                             has_player: true,
                             accepts_input: true,
@@ -399,7 +429,7 @@ mod tests {
                     )
                 })
                 .unwrap();
-            let [_, _, _, _, input, _] = header_areas(Rect::new(0, 0, width, HEADER_HEIGHT));
+            let [_, _, _, _, _, input, _] = header_areas(Rect::new(0, 0, width, HEADER_HEIGHT), true);
             if input.width > 0 {
                 let cursor = terminal.get_cursor_position().unwrap();
                 assert!(cursor.x >= input.x && cursor.x < input.right());

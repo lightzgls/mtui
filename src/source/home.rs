@@ -1144,7 +1144,7 @@ fn target(endpoint: &Value, label: &str, artist_hint: bool) -> Option<Target> {
     Some(Target::Open { endpoint: route })
 }
 
-fn browse_route(endpoint: &Value) -> Option<BrowseEndpoint> {
+pub(super) fn browse_route(endpoint: &Value) -> Option<BrowseEndpoint> {
     Some(BrowseEndpoint {
         browse_id: endpoint
             .pointer("/browseEndpoint/browseId")?
@@ -1188,9 +1188,27 @@ pub(super) fn artist_ref(runs: &Value) -> Option<ArtistRef> {
 pub(super) fn album_ref(runs: &Value) -> Option<(String, BrowseEndpoint)> {
     runs.as_array()?.iter().find_map(|run| {
         let endpoint = browse_route(&run["navigationEndpoint"])?;
-        if !endpoint.browse_id.starts_with("MPRE") { return None; }
+        let album_page = run.pointer("/navigationEndpoint/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
+            .and_then(Value::as_str) == Some("MUSIC_PAGE_TYPE_ALBUM");
+        if !endpoint.browse_id.starts_with("MPRE") && !album_page { return None; }
         Some((run["text"].as_str()?.to_owned(), endpoint))
     })
+}
+
+pub(super) fn is_play_count(text: &str) -> bool {
+    let text = text.trim().to_lowercase();
+    (text.chars().next().is_some_and(char::is_numeric) || text.starts_with("no "))
+        && ["plays", "views", "lượt phát", "lượt xem"].iter().any(|suffix| text.ends_with(suffix))
+}
+
+/// Artist and playlist listings use different column orders. Album links are
+/// authoritative; plain text is a fallback only after excluding statistics.
+pub(super) fn row_album(row: &Value) -> Option<String> {
+    let columns = row["flexColumns"].as_array()?;
+    (1..columns.len()).find_map(|index| flex_runs(row, index).and_then(album_ref).map(|(title, _)| title))
+        .or_else(|| (2..columns.len()).filter_map(|index| flex_column(row, index))
+            .find(|text| !text.trim().is_empty() && !is_play_count(text)
+                && !(text.contains(':') && parse_duration(text).is_some())))
 }
 
 /// The video id of a list row, from wherever this particular shelf put it.
@@ -1245,7 +1263,7 @@ pub(super) fn parse_row(row: &Value) -> Option<Track> {
             .as_deref()
             .and_then(parse_duration)
             .or_else(|| fields.last().copied().and_then(parse_duration)),
-        album: flex_column(row, 2).filter(|album| !album.is_empty()),
+        album: row_album(row),
         artist_ref: flex_runs(row, 1).and_then(artist_ref),
         // These rows are not the user's to remove; only a Data API listing
         // knows an id that could be.
@@ -1880,6 +1898,26 @@ mod tests {
         .expect("row should parse");
         assert_eq!(track.duration, None);
         assert_eq!(track.uploader, "Vie Channel");
+    }
+
+    #[test]
+    fn play_counts_are_not_albums_in_a_full_artist_listing() {
+        for count in ["90M plays", "169M plays", "1.4M views"] {
+            let track = parse_row(&row("song", &["Soft Spot", "keshi", count], Some("3:25"))).unwrap();
+            assert_eq!(track.album, None, "{count} is a statistic, not an album");
+        }
+    }
+
+    #[test]
+    fn canonical_album_links_win_over_column_positions_and_numeric_titles_are_kept() {
+        let mut listing = row("song", &["Title", "Artist", "90M plays", "1989"], Some("3:25"));
+        assert_eq!(parse_row(&listing).unwrap().album.as_deref(),Some("1989"));
+        listing["flexColumns"][3]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["navigationEndpoint"] =
+            serde_json::json!({"browseEndpoint":{"browseId":"MPREalbum"}});
+        assert_eq!(parse_row(&listing).unwrap().album.as_deref(),Some("1989"));
+        listing["flexColumns"][3]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["text"] =
+            Value::String("90M plays".into());
+        assert_eq!(parse_row(&listing).unwrap().album.as_deref(),Some("90M plays"),"a linked album title must not be mistaken for a statistic");
     }
 
     /// The trending shelf hides the video id under the play button drawn over

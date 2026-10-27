@@ -32,6 +32,10 @@ pub mod preferences;
 pub mod actions;
 pub(crate) mod home;
 pub(crate) mod library;
+mod artist;
+mod selection;
+pub(crate) use selection::SongClick;
+pub(crate) mod search_input;
 
 /// How much of the window the cover is allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -242,6 +246,9 @@ pub enum MouseAction {
     SelectHomeCard { shelf: usize, card: usize },
     PageHomeShelf { shelf: usize, offset: usize, columns: usize, rows: usize },
     OpenArtistSong(usize),
+    MoreArtistSongs,
+    PlayArtistSongs,
+    GoBack,
     SelectArtistSong(usize),
     OpenArtistCard { shelf: usize, card: usize },
     SelectArtistCard { shelf: usize, card: usize },
@@ -255,6 +262,9 @@ pub enum MouseAction {
     SearchFilter(crate::source::search::Filter),
     OpenPlayingArtist,
     OpenQueueArtist(usize),
+    OpenTrackArtist(usize),
+    OpenLibraryArtist(usize),
+    OpenRelatedArtist(usize),
     OpenPlayingAlbum,
     ShufflePlayback,
     RepeatPlayback,
@@ -401,6 +411,9 @@ pub struct ArtistView {
     pub card: usize,
     pub top: usize,
     pub scroll: Vec<usize>,
+    pub songs_expanded: bool,
+    pub songs_request: Option<(PageRequestId, bool)>,
+    pub songs_error: Option<String>,
 }
 
 impl ArtistView {
@@ -414,6 +427,9 @@ impl ArtistView {
             card: 0,
             top: 0,
             scroll: Vec::new(),
+            songs_expanded: false,
+            songs_request: None,
+            songs_error: None,
         }
     }
 
@@ -438,6 +454,9 @@ impl ArtistView {
         self.song_offset = 0;
         self.card = 0;
         self.top = 0;
+        self.songs_expanded = false;
+        self.songs_request = None;
+        self.songs_error = None;
     }
 
     fn has_songs(&self) -> bool {
@@ -553,6 +572,10 @@ pub struct NowPlaying {
     /// queue itself has no end -- see [`NowPlaying::continuation`] -- so this is
     /// what keeps a session left running all day from growing the heap.
     pub queue: Vec<Track>,
+    /// Explicit artist lists finish at their last song rather than starting radio.
+    pub finite_queue: bool,
+    /// Keep rows still while selecting and reordering; scroll only at an edge.
+    pub queue_offset: usize,
     /// Identifies the queue itself, as opposed to the track playing inside it.
     ///
     /// A queue outlives the page around it: advancing through a radio replaces
@@ -634,6 +657,8 @@ impl NowPlaying {
             duration: track.duration,
             queue_title: String::new(),
             queue: Vec::new(),
+            finite_queue: false,
+            queue_offset: 0,
             // Replaced along with the queue itself the moment one arrives. Zero
             // is never minted by `App`, so a page that somehow answered a page
             // with no queue cannot be applied to it.
@@ -788,7 +813,8 @@ impl NowPlaying {
             return false;
         }
 
-        let ceiling = playing + 1 + QUEUE_AHEAD;
+        let ceiling = if self.finite_queue { crate::source::collection::MAX_TRACKS }
+            else { playing + 1 + QUEUE_AHEAD };
         if self.queue.len() >= ceiling {
             self.queue.pop();
         }
@@ -831,7 +857,8 @@ impl NowPlaying {
         if moved == selected {
             return false;
         }
-        self.queue.swap(selected, moved);
+        let track = self.queue.remove(selected);
+        self.queue.insert(moved, track);
         self.cursor[Tab::UpNext.index()] = moved;
         true
     }
@@ -906,6 +933,7 @@ impl NowPlaying {
         self.playing = Some(playing - excess);
         let cursor = &mut self.cursor[Tab::UpNext.index()];
         *cursor = cursor.saturating_sub(excess);
+        self.queue_offset = self.queue_offset.saturating_sub(excess);
     }
 
     /// Appends a page of tracks, and reports how many were new.
@@ -1131,8 +1159,8 @@ enum MenuAction {
     LogOutMusic,
     OpenHomeSelection,
     StartHomeRadio,
-    PlayHomeNext,
-    QueueHomeTrack,
+    PlaySelectionNext,
+    QueueSelection,
     PlayHomeShelf,
     ShuffleHomeShelf,
     RefreshHome,
@@ -1140,6 +1168,8 @@ enum MenuAction {
     OpenArtist,
     OpenArtistSelection,
     ReloadArtist,
+    MoreArtistSongs,
+    PlayArtistSongs,
     OpenPageSelection,
     RemoveQueueSelection,
     MoveQueueSelectionUp,
@@ -1202,6 +1232,7 @@ pub enum SignIn {
 pub struct App {
     pub mode: Mode,
     pub query: String,
+    pub query_cursor: usize,
     pub results: Vec<Track>,
     pub search_items: Vec<crate::source::search::Item>,
     pub search_filter: crate::source::search::Filter,
@@ -1228,6 +1259,7 @@ pub struct App {
     /// Whether a left-click toggles pause instead of opening the terminal.
     pub tray_click_pauses: bool,
     pub precision_volume: bool,
+    pub show_key_hints: bool,
     /// Artwork selected for runtime-owned windows and the notification area.
     /// Thumbnail for the track being played, once it has arrived. Exactly one
     /// is ever held: covers are decoration, not a cache worth growing.
@@ -1477,6 +1509,8 @@ fn menu_shortcut_matches(shortcut: &str, key: KeyEvent) -> bool {
         "Space" => is_bare_character(key, ' '),
         "Ctrl+S" => is_ctrl_key(key, 's'),
         "Ctrl+C" => is_ctrl_key(key, 'c'),
+        "Alt+Up" => key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT),
+        "Alt+Down" => key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::ALT),
         _ => {
             let mut characters = shortcut.chars();
             characters.next().is_some_and(|character| {
@@ -1599,12 +1633,13 @@ impl App {
             // letters the search box would otherwise swallow.
             mode: Mode::Browse,
             query: String::new(),
+            query_cursor: 0,
             results: Vec::new(),
             search_items: Vec::new(),
             search_filter: crate::source::search::Filter::All,
             selected: 0,
             offset: 0,
-            status: "loading the home feed ...".to_string(),
+            status: String::new(),
             busy: false,
             should_quit: false,
             updater: crate::update::State::default(),
@@ -1613,6 +1648,7 @@ impl App {
             start_in_tray: settings.start_in_tray,
             tray_click_pauses: settings.tray_click_pauses,
             precision_volume: settings.precision_volume,
+            show_key_hints: settings.show_key_hints,
             cover: None,
             cover_id: None,
             graphics,
@@ -1718,26 +1754,7 @@ impl App {
     }
 
     fn live_player_status(&self) -> String {
-        let snapshot = self.snapshot();
-        if let Some(error) = snapshot.error {
-            return error;
-        }
-        let Some(now) = self.now.as_ref() else {
-            return "nothing is playing".to_string();
-        };
-        let label = if now.artist.is_empty() || now.artist == UNKNOWN_ARTIST {
-            now.title.clone()
-        } else {
-            format!("{} — {}", now.title, now.artist)
-        };
-        let state = match snapshot.state {
-            PlayState::Idle if self.pending.is_some() => "resolving",
-            PlayState::Idle => "stopped",
-            PlayState::Buffering => "loading",
-            PlayState::Playing => "playing",
-            PlayState::Paused => "paused",
-        };
-        format!("{state} {label}")
+        self.snapshot().error.or_else(|| self.playback_error.as_deref().map(playback_failure_status)).unwrap_or_default()
     }
 
     fn current_page(&self) -> Option<HistoryEntry> {
@@ -1816,6 +1833,7 @@ impl App {
             }
             HistoryEntry::Artist { artist, status } => {
                 self.artist = Some(*artist);
+                if let Some(artist) = self.artist.as_mut() { artist.songs_request = None; }
                 self.status = status;
                 self.view = View::Artist;
             }
@@ -1847,6 +1865,16 @@ impl App {
             self.mode = Mode::Browse;
             self.view = View::Home;
         }
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        self.mode == Mode::Editing || self.view != View::Home || !self.history.is_empty()
+    }
+
+    pub fn search_results_query(&self) -> &str {
+        if self.mode == Mode::Editing && let Some(HistoryEntry::Tracks(page)) = &self.search_page {
+            &page.query
+        } else { &self.query }
     }
 
     fn go_home(&mut self) {
@@ -1957,7 +1985,7 @@ impl App {
     }
 
     fn page_action_items(&self) -> Vec<MenuItem> {
-        match self.view {
+        let mut items = match self.view {
             View::Library => self.library_action_items(),
             View::Home => {
                 let selected = self.home_card();
@@ -1995,14 +2023,14 @@ impl App {
                         None,
                         queue_ready,
                         None,
-                        MenuAction::PlayHomeNext,
+                        MenuAction::PlaySelectionNext,
                     ),
                     MenuItem::action(
                         "Add to queue",
                         None,
                         queue_ready,
                         None,
-                        MenuAction::QueueHomeTrack,
+                        MenuAction::QueueSelection,
                     ),
                     MenuItem::action(
                         "Open selected artist",
@@ -2059,7 +2087,16 @@ impl App {
             }
             View::Artist => self.artist_action_items(),
             View::Playing => self.playing_action_items(),
+        };
+        if self.view != View::Home && self.selected_queue_track().is_some() {
+            let ready = self.now.as_ref().is_some_and(|now| now.playing.is_some());
+            let at = 1.min(items.len());
+            items.splice(at..at, [
+                MenuItem::action("Play next", None, ready, None, MenuAction::PlaySelectionNext),
+                MenuItem::action("Add to queue", None, ready, None, MenuAction::QueueSelection),
+            ]);
         }
+        items
     }
 
     fn artist_action_items(&self) -> Vec<MenuItem> {
@@ -2091,6 +2128,8 @@ impl App {
             Some("Artist"),
             MenuAction::OpenArtistSelection,
         )];
+        items.push(MenuItem::action("Play all top songs", Some("a"), artist.has_songs(), None, MenuAction::PlayArtistSongs));
+        items.push(MenuItem::action("Show more top songs", Some("e"), artist.has_songs(), None, MenuAction::MoreArtistSongs));
         items.push(MenuItem::action(
             "Refresh artist page",
             Some("r"),
@@ -2132,14 +2171,14 @@ impl App {
                     ),
                     MenuItem::action(
                         "Move up",
-                        Some("K"),
+                        Some("Alt+Up"),
                         can_move_up,
                         None,
                         MenuAction::MoveQueueSelectionUp,
                     ),
                     MenuItem::action(
                         "Move down",
-                        Some("J"),
+                        Some("Alt+Down"),
                         can_move_down,
                         None,
                         MenuAction::MoveQueueSelectionDown,
@@ -2296,6 +2335,7 @@ impl App {
     /// tick to notice would be most of the latency it has left.
     pub fn awaiting(&self) -> bool {
         self.busy || self.pending_page_request.is_some() || self.pending.is_some() || (self.view == View::Library && self.library.loading())
+            || (self.view == View::Artist && self.artist.as_ref().is_some_and(|artist| artist.songs_request.is_some()))
     }
 
     /// The cover to paint as pixels, if what the renderer planned is not
@@ -2403,6 +2443,7 @@ impl App {
                         start_in_tray: self.start_in_tray,
                         tray_click_pauses: self.tray_click_pauses,
                         precision_volume: self.precision_volume,
+                        show_key_hints: self.show_key_hints,
                         cover_style: self.cover_style,
                         image_renderer: self.image_renderer,
                         volume: self.snapshot().volume,
@@ -2450,7 +2491,7 @@ impl App {
         if track.id != id { return; }
         let title = track.label();
 
-        self.status = format!("reconnecting {title} ...");
+        self.status = "Reconnecting audio…".into();
         let request = Request::Resolve {
             id: id.clone(),
             title,
@@ -2466,6 +2507,10 @@ impl App {
     }
 
     fn apply(&mut self, response: Response) {
+        if let Response::ArtistSongs { request_id, browse_id, page } = response {
+            self.apply_artist_songs(request_id, &browse_id, *page);
+            return;
+        }
         let session_generation = match &response {
             Response::Library { generation, .. } => Some(*generation),
             Response::CookiesImported { generation, .. }
@@ -2559,11 +2604,7 @@ impl App {
                 if let Some(origin) = self.search_page.take() {
                     self.push_page(origin);
                 }
-                self.status = if tracks.is_empty() {
-                    "no results".to_string()
-                } else {
-                    format!("{} results", tracks.len())
-                };
+                self.status.clear();
                 self.browsing = None;
                 self.browsing_endpoint = None;
                 self.collection = None;
@@ -2694,7 +2735,7 @@ impl App {
                 self.collection = Some(page.details);
                 self.collection_error = None;
                 if self.view == View::Tracks {
-                    self.status = format!("{} tracks in {title}", tracks.len());
+                    self.status.clear();
                 }
                 self.results = tracks;
                 self.selected = 0;
@@ -2714,11 +2755,7 @@ impl App {
                 }
                 artist.set_page(*page);
                 let status = match &artist.page {
-                    Panel::Ready(page) => format!(
-                        "{} top songs and {} sections",
-                        page.top_songs.len(),
-                        page.shelves.len()
-                    ),
+                    Panel::Ready(_) => String::new(),
                     Panel::Empty(reason) => reason.clone(),
                     Panel::Idle | Panel::Loading => String::new(),
                 };
@@ -2727,6 +2764,7 @@ impl App {
                 }
                 self.selection_settled = Some(Instant::now());
             }
+            Response::ArtistSongs { .. } => unreachable!("artist songs are matched before shared page state"),
             Response::Resolved { id, title, stream } => self.apply_resolved(&id, title, stream),
             Response::Replacement { id, stream } => {
                 if self
@@ -2737,9 +2775,7 @@ impl App {
                 {
                     let command = match self.resuming.take_if(|resuming| resuming.id == id) {
                         Some(resuming) => {
-                            if let Some((track, _)) = self.listening.as_ref() {
-                                self.status = format!("playing {}", track.label());
-                            }
+                            self.status.clear();
                             Command::Resume {
                                 url: stream.url,
                                 format: stream.format,
@@ -2832,7 +2868,7 @@ impl App {
             let from = self.resuming.take().expect("just matched").from;
             let cmd = match stream {
                 Ok(stream) => {
-                    self.status = format!("playing {title}");
+                    self.status.clear();
                     Command::Resume {
                         url: stream.url,
                         format: stream.format,
@@ -2860,7 +2896,7 @@ impl App {
 
         let why = match stream {
             Ok(stream) => {
-                self.status = format!("playing {title}");
+                self.status.clear();
                 // The track resolved, so whatever run of failures preceded it
                 // is over -- the budget is for consecutive failures. Nothing
                 // automatic is in flight any more either, so a later failure
@@ -2988,6 +3024,7 @@ impl App {
                 now.playing = watch.queue.iter().position(|track| track.id == video_id);
                 now.queue_title = watch.queue_title;
                 now.queue = watch.queue;
+                now.queue_offset = 0;
                 // A different queue, so everything the old one had learned
                 // about paging itself is about somebody else's radio now.
                 now.queue_epoch = epoch;
@@ -3065,7 +3102,7 @@ impl App {
         // `advance` declines to move for the same reason. This covers the
         // empty queue before the first watch response too, which must not be
         // seeded from the journal on top of the station already on its way.
-        if now.playing.is_none() || now.repeat == RepeatMode::All {
+        if now.playing.is_none() || now.repeat == RepeatMode::All || now.finite_queue {
             return;
         }
         // Still deep enough, already asking, or given up asking.
@@ -3202,11 +3239,7 @@ impl App {
             self.player_back = self.current_page();
             self.back_to = self.view;
         }
-        self.status = if self.ready.as_deref() == Some(track.id.as_str()) {
-            format!("starting {} ...", track.label())
-        } else {
-            format!("resolving {} ...", track.label())
-        };
+        self.status = "Loading audio…".into();
 
         // Before the resolve, not after it. Resolving costs seconds, and until
         // this lands the speakers are still on the previous track while the
@@ -3246,6 +3279,8 @@ impl App {
         {
             page.queue_title = old.queue_title;
             page.queue = old.queue;
+            page.finite_queue = old.finite_queue;
+            page.queue_offset = old.queue_offset;
             page.playing = Some(index);
             page.cursor[Tab::UpNext.index()] = index;
             // Everything the queue knows about paging itself travels with it,
@@ -3277,8 +3312,7 @@ impl App {
         // flag set for the rest of the session.
         let request = Request::Resolve {
             id: track.id.clone(),
-            // The label, not the bare title: this is what the status bar shows
-            // for as long as the track plays.
+            // Keep resolver/player metadata attached to the selected track.
             title: track.label(),
             // A track the user chose. The cache is exactly what should answer
             // it when it can -- that is the difference between pressing Enter
@@ -3536,6 +3570,7 @@ impl App {
             start_in_tray: enabled,
             tray_click_pauses: self.tray_click_pauses,
             precision_volume: self.precision_volume,
+            show_key_hints: self.show_key_hints,
             cover_style: self.cover_style,
             image_renderer: self.image_renderer,
             volume: self.snapshot().volume,
@@ -3567,6 +3602,7 @@ impl App {
             start_in_tray: self.start_in_tray,
             tray_click_pauses: enabled,
             precision_volume: self.precision_volume,
+            show_key_hints: self.show_key_hints,
             cover_style: self.cover_style,
             image_renderer: self.image_renderer,
             volume: self.snapshot().volume,
@@ -3594,6 +3630,7 @@ impl App {
             start_in_tray: self.start_in_tray,
             tray_click_pauses: self.tray_click_pauses,
             precision_volume: enabled,
+            show_key_hints: self.show_key_hints,
             cover_style: self.cover_style,
             image_renderer: self.image_renderer,
             volume: self.volume_save.map_or_else(|| self.snapshot().volume, |(_, volume)| volume),
@@ -3627,6 +3664,7 @@ impl App {
             start_in_tray: self.start_in_tray,
             tray_click_pauses: self.tray_click_pauses,
             precision_volume: self.precision_volume,
+            show_key_hints: self.show_key_hints,
             cover_style: style,
             image_renderer: self.image_renderer,
             volume: self.snapshot().volume,
@@ -3659,6 +3697,7 @@ impl App {
             start_in_tray: self.start_in_tray,
             tray_click_pauses: self.tray_click_pauses,
             precision_volume: self.precision_volume,
+            show_key_hints: self.show_key_hints,
             cover_style: self.cover_style,
             image_renderer: renderer,
             volume: self.snapshot().volume,
@@ -3746,14 +3785,37 @@ impl App {
             .as_mut()
             .is_some_and(|now| now.move_selected_upcoming(delta));
         if !moved {
+            self.status = match self.now.as_ref() {
+                Some(now) if now.playing.is_none() => "The queue is still loading.".into(),
+                Some(now) if now.playing.is_some_and(|at| now.cursor() <= at) =>
+                    "Select an upcoming song to move; the playing song and history stay in place.".into(),
+                _ if delta < 0 => "This is already the first upcoming song.".into(),
+                _ => "This is already the last upcoming song.".into(),
+            };
             return;
         }
         self.prefetch_queue_next();
-        self.status = if delta < 0 {
-            "moved queue track up".to_string()
-        } else {
-            "moved queue track down".to_string()
-        };
+        if let Some(now) = &self.now {
+            let at = now.cursor[Tab::UpNext.index()];
+            self.status = format!("Moved {} to Up next #{}", now.queue[at].title,
+                at.saturating_sub(now.playing.unwrap_or(0)));
+        }
+    }
+
+    pub(crate) fn queue_drag_identity(&self, index: usize) -> Option<(String, u64)> {
+        if self.view != View::Playing || self.mode != Mode::Browse || self.overlay.is_open() || self.menu.is_some() { return None; }
+        let now = self.now.as_ref().filter(|now| now.tab == Tab::UpNext)?;
+        (index > now.playing? && index < now.queue.len()).then(|| (now.queue[index].id.clone(), now.queue_epoch))
+    }
+
+    pub(crate) fn drag_queue_song(&mut self, id: &str, epoch: u64, target: usize) {
+        let Some((_, active_epoch)) = self.queue_drag_identity(target) else { return; };
+        if active_epoch != epoch { return; }
+        let Some(now) = self.now.as_mut() else { return; };
+        let Some(from) = now.queue.iter().position(|track| track.id == id) else { return; };
+        if !now.playing.is_some_and(|playing| from > playing) || from == target { return; }
+        now.cursor[Tab::UpNext.index()] = from;
+        self.move_queue_selection(target as isize - from as isize);
     }
 
     fn clear_upcoming_queue(&mut self) {
@@ -3861,7 +3923,7 @@ impl App {
     fn report(&mut self, msg: String) {
         crate::diagnostics::error("source", &msg);
         if msg.contains('\n') {
-            self.status = "press Esc to dismiss".to_string();
+            self.status.clear();
             self.menu = None;
             self.overlay = Overlay::Message { body: msg };
         } else {
@@ -3965,7 +4027,7 @@ impl App {
         self.status = if shelves.is_empty() {
             "nothing came back from YouTube Music".to_string()
         } else {
-            "Enter to play, / to search".to_string()
+            String::new()
         };
         home::arrange(&mut shelves);
         self.home_scroll = vec![0; shelves.len()];
@@ -4228,6 +4290,13 @@ impl App {
     }
 
     fn handle_menu_key(&mut self, key: KeyEvent) -> Result<()> {
+        if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            if let Some(selected) = self.menu.as_ref().and_then(|menu| menu.shortcut_index(key)) {
+                if let Some(menu) = self.menu.as_mut() { menu.selected = selected; }
+                self.invoke_menu_item();
+            }
+            return Ok(());
+        }
         let len = self.menu_items().len();
         match key.code {
             KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
@@ -4314,14 +4383,16 @@ impl App {
             MenuAction::LogOutMusic => self.log_out_music(),
             MenuAction::OpenHomeSelection => self.open_card(),
             MenuAction::StartHomeRadio => self.start_home_radio(),
-            MenuAction::PlayHomeNext => self.queue_home_track(true),
-            MenuAction::QueueHomeTrack => self.queue_home_track(false),
+            MenuAction::PlaySelectionNext => self.queue_selected_track(true),
+            MenuAction::QueueSelection => self.queue_selected_track(false),
             MenuAction::PlayHomeShelf => self.play_home_shelf(false),
             MenuAction::ShuffleHomeShelf => self.play_home_shelf(true),
             MenuAction::RefreshHome => self.refresh_home(),
             MenuAction::PlaySelected => self.play_selected(),
             MenuAction::OpenArtist => self.open_context_artist(),
             MenuAction::OpenArtistSelection => self.open_artist_selection(),
+            MenuAction::MoreArtistSongs => self.more_artist_songs(false),
+            MenuAction::PlayArtistSongs => self.more_artist_songs(true),
             MenuAction::ReloadArtist => self.reload_artist(),
             MenuAction::OpenPageSelection => self.open_page_row(),
             MenuAction::RemoveQueueSelection => self.remove_queue_selection(),
@@ -4385,8 +4456,26 @@ impl App {
             return self.handle_overlay_key(key);
         }
 
+        if self.mode == Mode::Browse {
+            let action = if is_ctrl_key(key, 'l') { Some(MouseAction::LikePlaying) }
+                else if is_ctrl_key(key, 'y') { Some(MouseAction::SharePlaying) }
+                else if is_ctrl_key(key, 'a') { Some(MouseAction::SavePlaying) }
+                else if is_ctrl_key(key, 'o') { Some(MouseAction::ChooseOutput) }
+                else { None };
+            if let Some(action) = action {
+                if self.now.is_some() || action == MouseAction::ChooseOutput {
+                    self.menu = None;
+                    self.handle_mouse_action(action)?;
+                }
+                return Ok(());
+            }
+        }
+
         if self.menu.is_some() {
             return self.handle_menu_key(key);
+        }
+        if key.code == KeyCode::Left && key.modifiers.contains(KeyModifiers::ALT) {
+            return self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         }
 
         if self.mode == Mode::Browse && is_ctrl_key(key, 'p') {
@@ -4465,13 +4554,32 @@ impl App {
             }
             return Ok(());
         }
+        if self.mode == Mode::Editing && matches!(action,
+            MouseAction::SelectHomeCard { .. } | MouseAction::SelectTrack(_)
+                | MouseAction::SelectArtistSong(_) | MouseAction::SelectArtistCard { .. }
+                | MouseAction::SelectLibraryItem(_) | MouseAction::SelectPageRow(_))
+        {
+            self.cancel_search_request();
+            if let Some(HistoryEntry::Tracks(page)) = self.search_page.take() {
+                self.query = page.query;
+                self.query_cursor = self.query.len();
+            }
+            self.mode = Mode::Browse;
+            self.status.clear();
+        }
         match action {
+            MouseAction::GoBack => { self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?; }
+            MouseAction::MoreArtistSongs if self.view == View::Artist => self.more_artist_songs(false),
+            MouseAction::PlayArtistSongs if self.view == View::Artist => self.more_artist_songs(true),
             MouseAction::GoHome => self.go_home(),
             MouseAction::OpenLibrary => self.open_library(),
             MouseAction::LibraryCategory(category) if self.view == View::Library => self.change_library_category(category),
             MouseAction::OpenLibraryItem(index) if self.view == View::Library => self.open_library_item(index),
             MouseAction::SelectLibraryItem(index) if self.view == View::Library => {
-                if index < self.library.collection().items.len() { self.library.collection_mut().selected = index; }
+                if index < self.library.collection().items.len() {
+                    self.library.collection_mut().selected = index;
+                    self.selection_settled = Some(Instant::now());
+                }
             }
             MouseAction::PageLibrary { offset, visible } if self.view == View::Library && visible > 0 => {
                 let collection = self.library.collection_mut();
@@ -4593,6 +4701,30 @@ impl App {
                     self.open_artist(artist);
                 }
             }
+            MouseAction::OpenTrackArtist(index) if self.view == View::Tracks => {
+                if let Some(artist) = self.results.get(index).and_then(|track| track.artist_ref.clone()) {
+                    self.handle_mouse_action(MouseAction::SelectTrack(index))?;
+                    self.open_artist(artist);
+                }
+            }
+            MouseAction::OpenLibraryArtist(index) if self.view == View::Library => {
+                if let Some(artist) = self.library.collection().items.get(index).and_then(|item|
+                    item.track.as_ref().and_then(|track| track.artist_ref.clone()).or_else(|| card_artist(&item.card)))
+                {
+                    self.handle_mouse_action(MouseAction::SelectLibraryItem(index))?;
+                    self.open_artist(artist);
+                }
+            }
+            MouseAction::OpenRelatedArtist(index) if self.view == View::Playing => {
+                let artist = self.now.as_ref().filter(|now| now.tab == Tab::Related).and_then(|now|
+                    match now.related_rows().get(index) {
+                        Some(RelatedRow::Card(card)) => card_artist(card), _ => None,
+                    });
+                if let Some(artist) = artist {
+                    self.handle_mouse_action(MouseAction::SelectPageRow(index))?;
+                    self.open_artist(artist);
+                }
+            }
             MouseAction::OpenPlayingAlbum => {
                 if let Some((title, endpoint)) = self.now.as_ref().and_then(|now| now.album_route.clone()) {
                     self.open_browse(endpoint, title);
@@ -4630,6 +4762,7 @@ impl App {
             }
             MouseAction::SelectPageRow(index) if self.view == View::Playing => {
                 if let Some(now) = self.now.as_mut() {
+                    if index < now.queue.len() { self.status.clear(); }
                     *now.cursor_mut() = index;
                 }
             }
@@ -4789,33 +4922,6 @@ impl App {
         self.play_track(track, false);
     }
 
-    /// Inserts the selected song into the active queue. The queue owns the
-    /// bound and evicts only its farthest-ahead recommendation when full, so
-    /// repeated actions cannot turn a long session into a growing heap.
-    fn queue_home_track(&mut self, next: bool) {
-        let Some(track) = self.home_card().and_then(Card::track) else {
-            return;
-        };
-        let label = track.label();
-        let Some(now) = self.now.as_mut().filter(|now| now.playing.is_some()) else {
-            self.status = "wait for Up next to finish loading".to_string();
-            return;
-        };
-        if !now.insert_user_track(track.clone(), next) {
-            self.status = format!("{} is already in the queue", track.title);
-            return;
-        }
-
-        if next {
-            let _ = self.source.send(Request::Prefetch {
-                id: track.id.clone(),
-            });
-            self.status = format!("playing {label} next");
-        } else {
-            self.status = format!("added {label} to the queue");
-        }
-    }
-
     /// Plays the playable cards in the current shelf as one finite queue. The
     /// cards already hold all metadata needed here; no collection page is
     /// fetched, and the queue is capped at the same fixed ahead window as a
@@ -4853,11 +4959,7 @@ impl App {
             now.playing = Some(0);
             now.cursor[Tab::UpNext.index()] = 0;
         }
-        self.status = if shuffle {
-            format!("shuffling {title}")
-        } else {
-            format!("playing {title}")
-        };
+        self.status = if shuffle { "Shuffled shelf".into() } else { String::new() };
     }
 
     fn activate_card(&mut self, card: Card) {
@@ -4889,7 +4991,7 @@ impl App {
         self.collection_error = None;
         self.view = View::Tracks;
         self.mode = Mode::Browse;
-        self.status = format!("opening {title} ...");
+        self.status = "Loading songs…".into();
         let request_id = self.begin_page_request(PageRequestKind::Browse);
         let request = Request::OpenBrowse {
             request_id,
@@ -4909,7 +5011,7 @@ impl App {
             return;
         }
         self.push_current_page();
-        self.status = format!("opening {} ...", artist.name);
+        self.status = "Loading artist…".into();
         self.artist = Some(ArtistView::loading(artist.clone()));
         self.view = View::Artist;
         self.mode = Mode::Browse;
@@ -4932,7 +5034,7 @@ impl App {
         let Some(artist) = self.artist.as_ref().map(|page| page.requested.clone()) else {
             return;
         };
-        self.status = format!("refreshing {} ...", artist.name);
+        self.status = "Refreshing artist…".into();
         self.artist = Some(ArtistView::loading(artist.clone()));
         self.view = View::Artist;
         self.mode = Mode::Browse;
@@ -5001,6 +5103,8 @@ impl App {
             .map(|artist| (artist.section, artist.song, artist.card));
 
         match key.code {
+            KeyCode::Char('a') => self.more_artist_songs(true),
+            KeyCode::Char('e') => self.more_artist_songs(false),
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Enter => self.open_artist_selection(),
             KeyCode::Char('r') => self.reload_artist(),
@@ -5132,6 +5236,12 @@ impl App {
     fn handle_playing_key(&mut self, key: KeyEvent) -> Result<()> {
         let current_tab = self.now.as_ref().map(|now| now.tab);
         let mut tab = None;
+        if current_tab == Some(Tab::UpNext) && key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+        {
+            self.move_queue_selection(if key.code == KeyCode::Up { -1 } else { 1 });
+            return Ok(());
+        }
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
@@ -5293,12 +5403,19 @@ impl App {
             self.search_page = self.current_page();
         }
         if self.view == View::Library { self.library.suspend(); }
-        self.view = View::Tracks;
         self.mode = Mode::Editing;
-        self.status = "type to search, Enter to run".to_string();
+        self.query_cursor = self.query.len();
+        self.status.clear();
     }
 
     fn handle_editing_key(&mut self, key: KeyEvent) -> Result<()> {
+        if let Some(changed) = search_input::edit(&mut self.query, &mut self.query_cursor, key) {
+            if changed {
+                self.cancel_search_request();
+                self.status.clear();
+            }
+            return Ok(());
+        }
         match key.code {
             KeyCode::Enter => self.submit_search(),
             KeyCode::Esc => {
@@ -5309,12 +5426,7 @@ impl App {
                     self.mode = Mode::Browse;
                     self.view = self.search_origin;
                 }
-                self.status = "/ to search, H for Home".to_string();
             }
-            KeyCode::Backspace => {
-                self.query.pop();
-            }
-            KeyCode::Char(c) => self.query.push(c),
             _ => {}
         }
         Ok(())
@@ -5337,6 +5449,7 @@ impl App {
             KeyCode::Char(c @ '1'..='6') if self.browsing.is_none() => {
                 self.filter_search(crate::source::search::Filter::ALL[(c as u8 - b'1') as usize]);
             }
+            KeyCode::Char('a') if self.browsing.is_some() => self.play_collection(0, false),
             KeyCode::Char('z') if self.browsing.is_some() => self.play_collection(0, true),
             KeyCode::Char('r') if self.browsing.is_some() => self.reload_collection(),
             KeyCode::Char(' ') => self.toggle_pause(),
@@ -5390,6 +5503,8 @@ impl App {
             self.status = "enter something to search for".to_string();
             return;
         }
+        self.query = query.clone();
+        self.query_cursor = self.query.len();
         if self
             .pending_page_request
             .is_some_and(|(_, kind)| kind != PageRequestKind::Search)
@@ -5425,7 +5540,7 @@ impl App {
             );
         }
 
-        self.status = format!("searching for {query} ...");
+        self.status = "Searching…".into();
         let request_id = self.begin_page_request(PageRequestKind::Search);
         let request = Request::Search {
             request_id,
@@ -5455,7 +5570,7 @@ impl App {
     fn filter_search(&mut self, filter: crate::source::search::Filter) {
         if self.busy || self.query.trim().is_empty() { return; }
         self.search_filter = filter;
-        self.status = format!("Searching {}…", filter.label());
+        self.status = "Searching…".into();
         let request_id = self.begin_page_request(PageRequestKind::Search);
         if self.source.send(Request::Search {
             request_id, query: self.query.clone(), limit: 60.min(MAX_RESULTS), filter,
@@ -5489,7 +5604,7 @@ impl App {
         let Some(endpoint) = self.browsing_endpoint.clone() else { return; };
         let title = self.browsing.clone().unwrap_or_default();
         self.collection_error = None;
-        self.status = format!("opening {title} ...");
+        self.status = "Loading songs…".into();
         let request_id = self.begin_page_request(PageRequestKind::Browse);
         if self.source.send(Request::OpenBrowse { request_id, endpoint, title }).is_err() {
             self.cancel_page_request();
@@ -5778,6 +5893,7 @@ impl App {
         let settings = config::Settings { start_in_tray: self.start_in_tray,
             tray_click_pauses: self.tray_click_pauses,
             precision_volume: self.precision_volume,
+            show_key_hints: self.show_key_hints,
             cover_style: self.cover_style,
             image_renderer: self.image_renderer, volume, output_device: self.output_device.clone() };
         if let Err(error) = settings.save() {
@@ -5971,6 +6087,8 @@ pub(crate) fn keyboard_help_items() -> Vec<MenuItem> {
         MenuItem::help("Move selection", "j/k, Up/Down", Some("Navigation")),
         MenuItem::help("First or last item", "g/G, Home/End", None),
         MenuItem::help("Open or play", "Enter", None),
+        MenuItem::help("Select song / play song", "Click / double-click", None),
+        MenuItem::help("Song actions", "Right-click", None),
         MenuItem::help("Go back", "Esc", None),
         MenuItem::help("Search", "/ or i", Some("Pages")),
         MenuItem::help("Home", "H", None),
@@ -5978,14 +6096,21 @@ pub(crate) fn keyboard_help_items() -> Vec<MenuItem> {
         MenuItem::help("Library categories", "1–6 / Tab", None),
         MenuItem::help("Library: liked / sort", "f / o", None),
         MenuItem::help("Now Playing", "P", None),
+        MenuItem::help("Artist: play all top songs", "a", None),
+        MenuItem::help("Artist: show more / less", "e", None),
+        MenuItem::help("Album/playlist: play all / shuffle", "a / z", None),
+        MenuItem::help("Search: move cursor", "Left/Right, Home/End", None),
+        MenuItem::help("Search: delete word / clear", "Ctrl+W / Ctrl+U", None),
         MenuItem::help("Pause or resume", "Space", Some("Playback")),
         MenuItem::help("Next or previous", "n / p", None),
         MenuItem::help("Repeat off / all / one", "R", None),
         MenuItem::help("Player actions", "Ctrl+P", None),
+        MenuItem::help("Like / share current song", "Ctrl+L / Ctrl+Y", None),
+        MenuItem::help("Save song / audio output", "Ctrl+A / Ctrl+O", None),
         MenuItem::help("Lyrics: expand / restore", "e", None),
         MenuItem::help("Lyrics: pause / resume follow", "f", None),
             MenuItem::help("Queue: remove / shuffle", "d / z", None),
-            MenuItem::help("Queue: move row", "K / J", None),
+            MenuItem::help("Queue: move row", "Alt+Up/Down, K/J", None),
             MenuItem::help("Queue: clear upcoming", "C", None),
             MenuItem::help("Seek", "Left/Right", None),
         MenuItem::help("Change volume", "+ / -", None),
@@ -6325,6 +6450,8 @@ mod tests {
                 description: None,
                 art: None,
                 top_songs: vec![ArtistSong { track, plays: None }],
+                songs_endpoint: None,
+                songs_truncated: false,
                 shelves: vec![Shelf {
                     title: "Fans might also like".to_string(),
                     cards: vec![Card {
@@ -6343,6 +6470,9 @@ mod tests {
             card: 0,
             top: 0,
             scroll: vec![0],
+            songs_expanded: false,
+            songs_request: None,
+            songs_error: None,
         };
 
         assert!(view.selected_song().is_some());

@@ -132,7 +132,7 @@ fn draw(
             list.width,
             layout.row_height,
         );
-        song_row(
+        let artist = song_row(
             frame,
             row,
             track,
@@ -145,6 +145,9 @@ fn draw(
             mouse
                 .targets
                 .push(MouseTarget::Area(row, MouseAction::PlayTrack(index)));
+            if let Some(link) = artist {
+                mouse.targets.push(MouseTarget::Area(link, MouseAction::OpenTrackArtist(index)));
+            }
         }
     }
 }
@@ -171,7 +174,7 @@ pub(super) fn song_row(
     selected: bool,
     tiles: &mut Tiles<'_>,
     graphics: Graphics,
-) {
+) -> Option<Rect> {
     let bg = if selected {
         Color::from_u32(0x0025_2525)
     } else {
@@ -246,6 +249,12 @@ pub(super) fn song_row(
             1,
         ),
     );
+    if text.height < 2 { return None; }
+    let artist = track.artist_ref.as_ref()?;
+    let width = artist_prefix_width(&metadata, artist, text.width)?;
+    let link = Rect::new(text.x, text.y + 1, width, 1);
+    underline_artist(frame, link);
+    Some(link)
 }
 
 fn collection_header(
@@ -332,20 +341,22 @@ fn collection_header(
     let y = text.y + text.height.saturating_sub(2);
     let ready = !page.busy && !page.tracks.is_empty() && page.error.is_none();
     let mut x = text.x;
-    for (label, action, enabled) in [
-        (" Play ", MouseAction::PlayCollection, ready),
-        (" Shuffle ", MouseAction::ShuffleCollection, ready),
+    for (label, key, action, enabled) in [
+        (" Play ", "a", MouseAction::PlayCollection, ready),
+        (" Shuffle ", "z", MouseAction::ShuffleCollection, ready),
         (
             if page.error.is_some() {
                 " Retry "
             } else {
                 " Refresh "
             },
-            MouseAction::RetryCollection,
+            "r", MouseAction::RetryCollection,
             !page.busy,
         ),
     ] {
-        let width = display_width(label) as u16;
+        if display_width(label) > usize::from(text.right().saturating_sub(x)) { break; }
+        let label = mouse.hinted_label(label, Some(key), text.right().saturating_sub(x));
+        let width = label.width() as u16;
         if x + width > text.right() {
             break;
         }
@@ -627,6 +638,8 @@ mod tests {
                             frame,
                             header,
                             shell::Header {
+                                query_cursor: 0,
+                                can_go_back: true,
                                 mode: Mode::Browse,
                                 view: View::Tracks,
                                 query: "birds of a feather",

@@ -1,7 +1,7 @@
 //! Queue spacing and hit targets use the same visible item geometry.
 
 use super::{
-    MouseMap, MouseTarget, cell, centred_offset, display_width, focused_cell, highlight, message,
+    MouseMap, MouseTarget, cell, display_width, focused_cell, highlight, message,
     truncate,
 };
 use crate::app::{MouseAction, NowPlaying};
@@ -14,32 +14,41 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-const HEADER_HEIGHT: u16 = 3;
 const MARKER_WIDTH: usize = 3;
 const COLUMN_GAP: usize = 2;
 const ARTIST_WIDTH: usize = 14;
 const MIN_TITLE_WIDTH: usize = 16;
 
+fn header_height(area: Rect) -> u16 {
+    if area.height >= 6 && area.width >= 20 { 2 }
+    else { area.height.min(1) }
+}
+
 pub(super) struct Geometry {
     list: Rect,
     stride: u16,
     pub viewport: usize,
-    first: usize,
+    pub(super) first: usize,
 }
 
 impl Geometry {
     pub fn new(now: &NowPlaying, area: Rect) -> Self {
-        let header = HEADER_HEIGHT.min(area.height);
+        let header = header_height(area);
         let list = Rect::new(area.x, area.y + header, area.width, area.height - header);
         // Keep a blank row between songs when at least four songs fit.
         let stride = if list.height >= 8 { 2 } else { 1 };
         let viewport = list.height.div_ceil(stride) as usize;
         let cursor = now.cursor().min(now.queue.len().saturating_sub(1));
+        let mut first = now.queue_offset.min(now.queue.len().saturating_sub(viewport));
+        if viewport > 0 {
+            if cursor < first { first = cursor; }
+            else if cursor >= first + viewport { first = cursor + 1 - viewport; }
+        }
         Self {
             list,
             stride,
             viewport,
-            first: centred_offset(cursor, viewport, now.queue.len()),
+            first,
         }
     }
 
@@ -66,7 +75,8 @@ pub(super) fn register_targets(mouse: &mut MouseMap, now: &NowPlaying, area: Rec
         let row = layout.row(slot);
         mouse
             .targets
-            .push(MouseTarget::Area(row, MouseAction::OpenPageRow(index)));
+            .push(MouseTarget::Area(row, MouseAction::SelectPageRow(index)));
+        mouse.targets.push(MouseTarget::Area(Rect { width: row.width.min(MARKER_WIDTH as u16), ..row }, MouseAction::OpenPageRow(index)));
         if let Some((x, width)) = artist_region(track, row.width as usize) {
             mouse.targets.push(MouseTarget::Area(
                 Rect::new(row.x + x as u16, row.y, width as u16, 1),
@@ -83,27 +93,10 @@ pub(super) fn render(frame: &mut Frame, now: &NowPlaying, area: Rect, accent: Co
         return 0;
     }
     let width = area.width as usize;
-    let heading = vec![
-        Line::from(Span::styled(
-            " Playing from",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            format!(" {}", truncate(&now.queue_title, width.saturating_sub(1))),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        if now.repeat.label() == "off" {
-            Line::from("")
-        } else {
-            Line::from(Span::styled(
-                format!(" Repeat {}", now.repeat.label()),
-                Style::default().fg(accent),
-            ))
-        },
-    ];
     frame.render_widget(
-        Paragraph::new(heading),
-        Rect::new(area.x, area.y, area.width, HEADER_HEIGHT.min(area.height)),
+        Paragraph::new(format!(" {}", truncate(&now.queue_title, width.saturating_sub(1))))
+            .style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
+        Rect::new(area.x, area.y, area.width, area.height.min(1)),
     );
     let layout = Geometry::new(now, area);
     let cursor = now.cursor().min(now.queue.len().saturating_sub(1));
@@ -169,7 +162,7 @@ pub(super) fn line(
             Style::default().fg(colour)
         }
     };
-    let marker = if playing { crate::navigation::current().play() } else { " " };
+    let marker = if playing { crate::navigation::current().play() } else { "›" };
     let duration = track.duration_str();
     if width < MARKER_WIDTH + display_width(&duration) + COLUMN_GAP + 1 {
         return Line::from(Span::styled(

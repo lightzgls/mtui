@@ -130,7 +130,7 @@ impl App {
         } else if !self.library.collection().loaded || self.library.loading() {
             self.request_library(false);
         } else {
-            self.status = format!("Library · {}", self.library.category.label());
+            self.status.clear();
         }
     }
 
@@ -195,7 +195,7 @@ impl App {
                     append,
                     token,
                 });
-                self.status = format!("Loading Library · {}…", category.label());
+                self.status.clear();
             }
             Err(error) => {
                 self.library.pending = None;
@@ -294,7 +294,7 @@ impl App {
                     .min(collection.items.len().saturating_sub(1));
                 collection.offset = collection.offset.min(collection.selected);
                 if self.view == View::Library {
-                    self.status = format!("{} Library items loaded", collection.items.len());
+                    self.status.clear();
                 }
             }
         }
@@ -311,7 +311,7 @@ impl App {
         if !self.library.collection().loaded {
             self.request_library(false);
         } else {
-            self.status = format!("Library · {}", category.label());
+            self.status.clear();
         }
         self.selection_settled = Some(Instant::now());
     }

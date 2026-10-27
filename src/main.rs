@@ -25,6 +25,7 @@ mod kitty;
 mod media;
 mod navigation;
 mod player;
+mod pointer;
 mod refresh;
 mod session;
 #[path = "session/protocol.rs"]
@@ -44,7 +45,7 @@ use anyhow::{Context, Result};
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
 #[cfg(not(windows))]
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
-use crossterm::event::{Event, MouseButton, MouseEventKind};
+use crossterm::event::Event;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 #[cfg(not(windows))]
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -224,6 +225,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, media: &Option<media::
         Err(err) => return Err(err),
     };
     let mut mouse = ui::MouseMap::default();
+    let mut pointer = pointer::Pointer::default();
     let mut activation_until = None;
     let mut refresh = refresh::Refresh::new(Instant::now());
     let mut redraw = true;
@@ -307,43 +309,16 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, media: &Option<media::
                 match event {
                     Event::Key(key) if key.is_press() => {
                         redraw = true;
+                        pointer.cancel();
                         app.handle_key(key)?;
                     }
-                    Event::Mouse(event) => match event.kind {
-                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
-                            redraw = true;
-                            let up = event.kind == MouseEventKind::ScrollUp;
-                            if app.precision_volume && mouse.over_cover(event.column, event.row) {
-                                app.handle_mouse_action(app::MouseAction::AdjustPrecisionVolume(up))?;
-                            } else if mouse.over_volume(event.column, event.row) {
-                                app.handle_mouse_action(app::MouseAction::AdjustVolume(up))?;
-                            } else { app.handle_mouse_scroll(!up)?; }
-                        }
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            redraw = true;
-                            if let Some(action) = mouse.action_at(event.column, event.row) {
-                                app.handle_mouse_action(action)?;
-                            }
-                        }
-                        MouseEventKind::Drag(MouseButton::Left) => {
-                            redraw = true;
-                            if let Some(action) = mouse.drag_action_at(event.column, event.row) {
-                                app.handle_mouse_action(action)?;
-                            }
-                        }
-                        MouseEventKind::Down(MouseButton::Right) => {
-                            redraw = true;
-                            if let Some(action) =
-                                mouse.context_action_at(event.column, event.row)
-                            {
-                                app.handle_mouse_action(action)?;
-                            }
-                            app.handle_mouse_action(app::MouseAction::OpenPageActions)?;
-                        }
-                        _ => {}
-                    },
+                    Event::Mouse(event) => {
+                        redraw = true;
+                        pointer.handle(app, &mouse, event)?;
+                    }
                     Event::Resize(width, height) => {
                         redraw = true;
+                        pointer.cancel();
                         #[cfg(not(windows))]
                         let _ = (width, height);
                         #[cfg(windows)]
@@ -609,6 +584,7 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
                     start_in_tray: false,
                     tray_click_pauses: app.tray_click_pauses,
                     precision_volume: app.precision_volume,
+                    show_key_hints: app.show_key_hints,
                     cover_style: app.cover_style(),
                     image_renderer: app.image_renderer(),
                     volume: app.snapshot().volume,
@@ -641,6 +617,7 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
             start_in_tray: false,
             tray_click_pauses: app.tray_click_pauses,
             precision_volume: app.precision_volume,
+            show_key_hints: app.show_key_hints,
             cover_style: app.cover_style(),
             image_renderer: app.image_renderer(),
             volume: app.snapshot().volume,

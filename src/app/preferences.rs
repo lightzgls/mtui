@@ -11,6 +11,7 @@ pub enum Setting {
     PrecisionVolume,
     Cover,
     Renderer,
+    KeyHints,
     Discord,
     Tray,
     TrayClick,
@@ -18,11 +19,12 @@ pub enum Setting {
 }
 
 impl Setting {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Output,
         Self::PrecisionVolume,
         Self::Cover,
         Self::Renderer,
+        Self::KeyHints,
         Self::Discord,
         Self::Tray,
         Self::TrayClick,
@@ -39,7 +41,7 @@ impl Setting {
     pub fn section(self) -> &'static str {
         match self {
             Self::Output | Self::PrecisionVolume => "Playback",
-            Self::Cover | Self::Renderer => "Appearance",
+            Self::Cover | Self::Renderer | Self::KeyHints => "Appearance",
             Self::Discord | Self::Tray | Self::TrayClick => "Integrations",
             Self::Updates => "App",
         }
@@ -51,6 +53,7 @@ impl Setting {
             Self::PrecisionVolume => "Precision volume",
             Self::Cover => "Cover style",
             Self::Renderer => "Artwork display",
+            Self::KeyHints => "Show key hints",
             Self::Discord => "Discord presence",
             Self::Tray => "Keep tray icon visible",
             Self::TrayClick => "Click tray icon to pause / resume",
@@ -64,6 +67,7 @@ impl Setting {
             Self::PrecisionVolume => "Scroll over the current song's cover to change volume by 1% per wheel step.",
             Self::Cover => "Choose detailed artwork or a cover drawn with text.",
             Self::Renderer => "Automatic detects support; Kitty needs a compatible terminal.",
+            Self::KeyHints => "Show subtle shortcuts beside buttons and in menus. The keyboard reference remains available in Help.",
             Self::Discord => "Share your current song and playback state on Discord.",
             Self::Tray => "Keep tray controls available while the terminal is open.",
             Self::TrayClick => "Left-click pauses or resumes the same song. Right-click and choose Show the player to open MTUI.",
@@ -72,7 +76,7 @@ impl Setting {
     }
 
     pub fn is_toggle(self) -> bool {
-        matches!(self, Self::PrecisionVolume | Self::Discord | Self::Tray | Self::TrayClick)
+        matches!(self, Self::PrecisionVolume | Self::KeyHints | Self::Discord | Self::Tray | Self::TrayClick)
     }
 
     pub fn enabled(self) -> bool {
@@ -225,6 +229,7 @@ impl App {
                     Setting::PrecisionVolume => if self.precision_volume { "On" } else { "Off" }.to_string(),
                     Setting::Cover => cover_label(self.cover_style).to_string(),
                     Setting::Renderer => renderer_label(self.image_renderer).to_string(),
+                    Setting::KeyHints => if self.show_key_hints { "On" } else { "Off" }.to_string(),
                     Setting::Discord => {
                         if self.presence_enabled() { "On" } else { "Off" }.to_string()
                     }
@@ -265,7 +270,7 @@ impl App {
                 )
             })
             .collect(),
-            Setting::PrecisionVolume | Setting::Discord | Setting::Tray | Setting::TrayClick | Setting::Updates => Vec::new(),
+            Setting::PrecisionVolume | Setting::KeyHints | Setting::Discord | Setting::Tray | Setting::TrayClick | Setting::Updates => Vec::new(),
         };
         values
             .into_iter()
@@ -345,6 +350,23 @@ impl App {
             Setting::PrecisionVolume => self.toggle_precision_volume(),
             Setting::Cover => self.cycle_cover_style(forward),
             Setting::Renderer => self.cycle_image_renderer(forward),
+            Setting::KeyHints => {
+                let enabled = !self.show_key_hints;
+                let settings = crate::config::Settings {
+                    start_in_tray: self.start_in_tray, tray_click_pauses: self.tray_click_pauses,
+                    precision_volume: self.precision_volume, show_key_hints: enabled,
+                    cover_style: self.cover_style, image_renderer: self.image_renderer,
+                    volume: self.volume_save.map_or_else(|| self.snapshot().volume, |(_, volume)| volume),
+                    output_device: self.output_device.clone(),
+                };
+                match settings.save() {
+                    Ok(()) => {
+                        self.show_key_hints = enabled;
+                        self.status = if enabled { "Key hints shown" } else { "Key hints hidden" }.into();
+                    }
+                    Err(error) => self.status = format!("could not save key hints preference: {error:#}"),
+                }
+            }
             Setting::Discord => self.toggle_presence(),
             Setting::Tray => self.toggle_start_in_tray(),
             Setting::TrayClick => self.toggle_tray_click_pauses(),

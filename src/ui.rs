@@ -25,7 +25,7 @@ use crate::art::ArtCache;
 use crate::config::CoverStyle;
 use crate::graphics::Graphics;
 use crate::player::{PlayState, Snapshot};
-use crate::source::Track;
+use crate::source::{ArtistRef, Track};
 use crate::source::artist::{ArtistPage, ArtistSong};
 use crate::source::cover::Cover;
 use crate::source::home::{Card, Shelf};
@@ -103,10 +103,10 @@ const TRANSPORT_WIDTH: u16 = 12;
 
 /// Named rather than inlined into [`hint_line`] so the test that checks they
 /// fit [`HINTS_WIDTH`] measures the strings that are actually drawn.
-const HINTS_EDITING: &str = "Enter search  Esc close  ^K app menu";
-const HINTS_BROWSE: &str = "^K app menu  . actions  ? help";
-const HINTS_AWAY: &str = "P player  ^K menu  . actions";
-const HINTS_PLAYING: &str = "Tab panels  Esc back  ^K menu  . actions";
+const HINTS_EDITING: &str = "Enter search  Esc cancel";
+const HINTS_BROWSE: &str = ". song actions  ? help";
+const HINTS_AWAY: &str = ". song actions  ? help";
+const HINTS_PLAYING: &str = "Tab panels  . song actions  ? help";
 
 
 /// Floor on the sign-in panel's width. Wide enough that the footer hint reads
@@ -230,6 +230,7 @@ const MIN_SHELF_TITLE: usize = 8;
 #[derive(Default)]
 pub struct MouseMap {
     targets: Vec<MouseTarget>,
+    key_hints_hidden: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -242,7 +243,39 @@ enum MouseTarget {
     Cover(Rect),
 }
 
+fn hinted_label(label: &str, key: Option<&str>, budget: u16, show: bool) -> Line<'static> {
+    let trailing = label.len() - label.trim_end().len();
+    let body = label.trim_end();
+    let key = key.filter(|key| show
+        && display_width(body) + display_width(key) + 1 + trailing <= usize::from(budget));
+    let mut spans = vec![Span::raw(truncate(body, usize::from(budget).saturating_sub(trailing)))];
+    if let Some(key) = key {
+        spans.push(Span::styled(format!(" {key}"), Style::default().fg(Color::DarkGray)));
+    }
+    spans.push(Span::raw(" ".repeat(trailing.min(usize::from(budget)))));
+    Line::from(spans)
+}
+
+fn button_style(mut line: Line<'static>, style: Style) -> Line<'static> {
+    for span in &mut line.spans {
+        let hint = span.style.fg == Some(Color::DarkGray);
+        span.style = style.patch(span.style);
+        if hint && style.bg.is_some_and(|bg| bg != shell::SURFACE) {
+            span.style.fg = style.fg;
+            span.style = span.style.remove_modifier(Modifier::BOLD);
+        }
+    }
+    line
+}
+
 impl MouseMap {
+    pub(super) fn show_key_hints(&self) -> bool { !self.key_hints_hidden }
+
+    /// Keep shortcuts quiet and drop the whole hint before shortening a label.
+    pub(super) fn hinted_label(&self, label: &str, key: Option<&str>, budget: u16) -> Line<'static> {
+        hinted_label(label, key, budget, self.show_key_hints())
+    }
+
     pub fn over_cover(&self, column: u16, row: u16) -> bool {
         self.targets.iter().rev().find_map(|target| match *target {
             MouseTarget::Cover(area) if contains(area, column, row) => Some(true),
@@ -258,7 +291,7 @@ impl MouseMap {
         self.targets.iter().rev().find_map(|target| match *target {
             MouseTarget::Area(area, action) if contains(area, column, row) => Some(matches!(action, MouseAction::AdjustVolume(_) | MouseAction::ToggleMute)),
             MouseTarget::Volume(area) | MouseTarget::VolumeControl(area) if contains(area, column, row) => Some(true),
-            MouseTarget::Progress(area) | MouseTarget::TrackRows { area, .. } if contains(area, column, row) => Some(false),
+            MouseTarget::Progress(area) | MouseTarget::Cover(area) | MouseTarget::TrackRows { area, .. } if contains(area, column, row) => Some(false),
             _ => None,
         }).unwrap_or(false)
     }
@@ -275,6 +308,7 @@ impl MouseMap {
             MouseTarget::Volume(area) if contains(area, column, row) => {
                 Some(MouseAction::SetVolume(horizontal_position(area, column)))
             }
+            MouseTarget::Cover(area) if contains(area, column, row) => Some(MouseAction::TogglePlayback),
             _ => None,
         })
     }
@@ -284,6 +318,15 @@ impl MouseMap {
     pub fn drag_action_at(&self, column: u16, row: u16) -> Option<MouseAction> {
         self.action_at(column, row).filter(|action| {
             matches!(action, MouseAction::SeekTo(_) | MouseAction::SetVolume(_))
+        })
+    }
+
+    /// The full queue row is a drop destination, including its artist link.
+    pub fn queue_row_at(&self, column: u16, row: u16) -> Option<usize> {
+        self.targets.iter().rev().find_map(|target| match *target {
+            MouseTarget::Area(area, MouseAction::SelectPageRow(index) | MouseAction::OpenPageRow(index))
+                if contains(area, column, row) => Some(index),
+            _ => None,
         })
     }
 
@@ -304,7 +347,7 @@ impl MouseMap {
                 MouseAction::SelectTrack(first + usize::from(row.saturating_sub(area.y))),
             ),
             MouseTarget::Area(area, MouseAction::PlayTrack(index)) if contains(area, column, row) => Some(MouseAction::SelectTrack(index)),
-            MouseTarget::Area(area, MouseAction::OpenPageRow(index)) if contains(area, column, row) => Some(MouseAction::SelectPageRow(index)),
+            MouseTarget::Area(area, MouseAction::OpenPageRow(index) | MouseAction::SelectPageRow(index)) if contains(area, column, row) => Some(MouseAction::SelectPageRow(index)),
             _ => None,
         })
     }
@@ -334,6 +377,7 @@ pub fn animated() -> bool { MARQUEE_ACTIVE.get() }
 pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
     MARQUEE_ACTIVE.set(false);
     mouse.targets.clear();
+    mouse.key_hints_hidden = !app.show_key_hints;
     app.images.clear();
     frame.render_widget(
         Block::default().style(Style::default().bg(shell::BACKGROUND).fg(Color::White)),
@@ -348,6 +392,8 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
             mode: app.mode,
             view: app.view,
             query: &app.query,
+            query_cursor: app.query_cursor,
+            can_go_back: app.can_go_back(),
             accent: ambient(app),
             has_player: app.now.is_some(),
             accepts_input: app.menu().is_none() && !app.overlay.is_open(),
@@ -418,7 +464,7 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
             plan,
         });
     }
-    if app.precision_volume && !app.overlay.is_open() && app.menu().is_none()
+    if app.now.is_some() && !app.overlay.is_open() && app.menu().is_none()
         && let (Some(area), Some(cover)) = (cover_area, app.cover.as_ref())
     {
         let cell = if app.cover_style == CoverStyle::Pixel && app.protocol_images() {
@@ -913,7 +959,7 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMa
     app.want_art(wanted);
 }
 
-const ARTIST_TOP_SONG_ROWS: u16 = 6;
+const ARTIST_TOP_SONG_ROWS: u16 = 5;
 
 fn render_artist(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMap) {
     let inner = shell::inset(area);
@@ -991,12 +1037,12 @@ fn render_artist(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut Mouse
             .into_iter()
             .find(|shape| card_size(*shape).1 < content.height)
             .unwrap_or(CardShape::Text);
-        let mut layouts = artist_layouts(page, content, view.top, max_shape);
+        let mut layouts = artist_layouts(page, content, view.top, max_shape, view.songs_expanded);
         while !layouts.iter().any(|layout| layout.section == view.section)
             && view.top < view.section
         {
             view.top += 1;
-            layouts = artist_layouts(page, content, view.top, max_shape);
+            layouts = artist_layouts(page, content, view.top, max_shape, view.songs_expanded);
         }
 
         for layout in layouts {
@@ -1013,6 +1059,7 @@ fn render_artist(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut Mouse
                         accent,
                     );
                     let list = artist_song_list(layout.area);
+                    render_artist_song_actions(frame, view, layout.area, accent, mouse);
                     let visible = usize::from(list.height);
                     for index in view.song_offset..(view.song_offset + visible).min(page.top_songs.len()) {
                         mouse.targets.push(MouseTarget::Area(
@@ -1166,6 +1213,7 @@ fn artist_layouts(
     area: Rect,
     top: usize,
     max_shape: CardShape,
+    expanded: bool,
 ) -> Vec<ArtistLayout> {
     let has_songs = !page.top_songs.is_empty();
     let count = page.shelves.len() + usize::from(has_songs);
@@ -1179,8 +1227,8 @@ fn artist_layouts(
             break;
         }
         if has_songs && section == 0 {
-            let wanted = (page.top_songs.len() as u16 + 2)
-                .min(ARTIST_TOP_SONG_ROWS + 2)
+            let wanted = (page.top_songs.len() as u16 + 3)
+                .min(if expanded { u16::MAX } else { ARTIST_TOP_SONG_ROWS + 3 })
                 .min(available);
             if wanted < 2 {
                 break;
@@ -1273,7 +1321,7 @@ fn render_artist_songs(
     offset: &mut usize,
     accent: Color,
 ) {
-    let [heading, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let [heading, _, body] = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)]).areas(area);
     let list = artist_song_list(area);
     let viewport = usize::from(list.height);
     if focused && viewport > 0 {
@@ -1333,8 +1381,36 @@ fn render_artist_songs(
 }
 
 fn artist_song_list(area: Rect) -> Rect {
-    let header = if area.height >= 3 { 2 } else { area.height.min(1) };
+    let header = if area.height >= 4 { 3 } else { area.height.min(2) };
     Rect::new(area.x, area.y + header, area.width, area.height - header)
+}
+
+fn render_artist_song_actions(frame: &mut Frame, view: &crate::app::ArtistView, area: Rect, accent: Color, mouse: &mut MouseMap) {
+    if area.height < 3 { return; }
+    let Some(page) = view.content() else { return; };
+    let loading = view.songs_request.is_some();
+    let more = if loading { " Loading… " } else if view.songs_error.is_some() || page.songs_truncated { " Retry more " }
+        else if area.width < 32 { if view.songs_expanded { " Less " } else { " More " } }
+        else if view.songs_expanded { " Show less " } else { " Show more " };
+    let has_more = page.songs_endpoint.is_some() || page.top_songs.len() > ARTIST_TOP_SONG_ROWS as usize || view.songs_expanded;
+    let mut x = area.x;
+    for (label, action, enabled) in [
+        (" Play all ", MouseAction::PlayArtistSongs, !page.top_songs.is_empty() && !loading),
+        (more, MouseAction::MoreArtistSongs, has_more && !loading),
+    ] {
+        if action == MouseAction::MoreArtistSongs && !has_more { continue; }
+        let budget = if action == MouseAction::PlayArtistSongs && has_more {
+            area.width.saturating_sub(display_width(more) as u16 + 1)
+        } else { area.right().saturating_sub(x) };
+        let label = mouse.hinted_label(label, if loading { None } else if action == MouseAction::PlayArtistSongs { Some("a") } else { Some("e") }, budget);
+        let width = (label.width() as u16).min(area.right().saturating_sub(x));
+        if width == 0 { break; }
+        let rect = Rect::new(x, area.y + 1, width, 1);
+        frame.render_widget(Paragraph::new(label).style(
+            Style::default().bg(shell::SURFACE).fg(if enabled { accent } else { Color::DarkGray })), rect);
+        if enabled { mouse.targets.push(MouseTarget::Area(rect, action)); }
+        x += width + 1;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1679,6 +1755,47 @@ fn heading_line(shelf: &Shelf, cursor: ShelfCursor, width: usize) -> Line<'stati
 /// nowhere to put a picture, which is also what a card falls back to when the
 /// window is too small to give it one.
 fn render_card(frame: &mut Frame, card: &Card, area: Rect, selected: bool, tiles: &mut Tiles) {
+    let _ = draw_card(frame, card, area, selected, tiles);
+}
+
+/// Only complete, literal artist names become links; other metadata stays plain.
+fn artist_prefix_width(text: &str, artist: &ArtistRef, room: u16) -> Option<u16> {
+    let name = artist.name.trim();
+    if name.is_empty() { return None; }
+    let rest = text.strip_prefix(name)?;
+    if rest.chars().next().is_some_and(char::is_alphanumeric)
+        || (!rest.is_empty() && !text.grapheme_indices(true).any(|(at, _)| at == name.len()))
+    { return None; }
+    if !truncate(text, usize::from(room)).starts_with(name) { return None; }
+    let width = display_width(name) as u16;
+    (width > 0).then_some(width)
+}
+
+fn underline_artist(frame: &mut Frame, area: Rect) {
+    for x in area.x..area.right() {
+        frame.buffer_mut()[(x, area.y)].set_style(Style::default().add_modifier(Modifier::UNDERLINED));
+    }
+}
+
+fn render_card_artist_link(frame: &mut Frame, card: &Card, area: Rect, selected: bool, tiles: &mut Tiles, artist: Option<&ArtistRef>) -> Option<Rect> {
+    let text = draw_card(frame, card, area, selected, tiles)?;
+    let artist = artist?;
+    if text.height < 2 { return None; }
+    let room = text.width.saturating_sub(1);
+    let start = if tiles.shape == CardShape::Text {
+        let badge_width = badge_spans(card, Color::Reset).iter().map(|span| display_width(&span.content)).sum::<usize>() as u16;
+        if room <= badge_width + 3 { return None; }
+        1 + badge_width + 3
+    } else { 1 };
+    let detail = card.detail();
+    let lead = detail.split('•').next()?.trim();
+    let width = artist_prefix_width(lead, artist, text.width.saturating_sub(start))?;
+    let link = Rect::new(text.x + start, text.y + 1, width, 1);
+    underline_artist(frame, link);
+    Some(link)
+}
+
+fn draw_card(frame: &mut Frame, card: &Card, area: Rect, selected: bool, tiles: &mut Tiles) -> Option<Rect> {
     let shape = tiles.shape;
     let art_key = card.art_key().to_string();
     let picture_cols = |rows: u16| {
@@ -1733,7 +1850,7 @@ fn render_card(frame: &mut Frame, card: &Card, area: Rect, selected: bool, tiles
         area.height,
     );
     if inner.width == 0 || inner.height == 0 {
-        return;
+        return None;
     }
 
     // Where the picture goes and what is left for the words. Both shapes with a
@@ -1791,7 +1908,7 @@ fn render_card(frame: &mut Frame, card: &Card, area: Rect, selected: bool, tiles
     };
 
     if text.width == 0 || text.height == 0 {
-        return;
+        return None;
     }
     frame.render_widget(
         Paragraph::new(card_lines(
@@ -1803,6 +1920,7 @@ fn render_card(frame: &mut Frame, card: &Card, area: Rect, selected: bool, tiles
         )),
         text,
     );
+    Some(text.intersection(area))
 }
 
 /// The words on a card: its title, then what it is, then who made it.
@@ -2178,8 +2296,10 @@ fn render_hero(
 
     let label = if hero.snap.state == PlayState::Paused {
         "PAUSED"
+    } else if hero.snap.state == PlayState::Buffering {
+        "LOADING…"
     } else {
-        "NOW PLAYING"
+        ""
     };
     let width = text.width as usize;
 
@@ -2238,7 +2358,7 @@ fn render_player(
     };
     render_player_identity(frame, identity, &layout, images);
     register_player_identity_targets(mouse, now, &layout);
-    if app.precision_volume && app.cover.is_some() && !app.overlay.is_open() && app.menu().is_none()
+    if app.cover.is_some() && !app.overlay.is_open() && app.menu().is_none()
         && let Some(hero) = layout.hero
     {
         let height = hero.height.min(3);
@@ -2353,8 +2473,10 @@ fn render_track_info(
         Line::from(Span::styled(
             if snap.state == PlayState::Paused {
                 "PAUSED"
+            } else if snap.state == PlayState::Buffering {
+                "LOADING…"
             } else {
-                "NOW PLAYING"
+                ""
             },
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         )),
@@ -2540,7 +2662,7 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseM
         let total = related::render(frame, now, content, accent, &mut Tiles {
             shape: CardShape::Tile, art: &app.art, wanted: &mut wanted,
             images: use_kitty.then_some((&mut app.images, app.graphics)),
-        });
+        }, mouse);
         app.want_art(wanted);
         (total, None)
     } else { render_panel_body(frame, now, &snap, content, accent) };
@@ -2551,7 +2673,10 @@ fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseM
     // its end. Queue item geometry excludes both the heading and spacer rows.
     let selects = matches!(tab, Tab::UpNext | Tab::Related);
     let viewport = if tab == Tab::UpNext {
-        queue::Geometry::new(app.now.as_ref().expect("player panel"), content).viewport
+        let now = app.now.as_mut().expect("player panel");
+        let geometry = queue::Geometry::new(now, content);
+        now.queue_offset = geometry.first;
+        geometry.viewport
     } else {
         content.height as usize
     };
@@ -2575,15 +2700,16 @@ fn render_panel_body(
 
 fn render_lyrics_controls(frame: &mut Frame, now: &NowPlaying, area: Rect, accent: Color, mouse: &mut MouseMap) {
     let timed = matches!(&now.lyrics, Panel::Ready(lyrics) if !lyrics.timed.is_empty());
-    let expand = if now.lyrics_expanded { " Restore e " } else { " Expand e " };
-    let expand_width = (display_width(expand) as u16).min(area.width);
+    let expand = mouse.hinted_label(if now.lyrics_expanded { " Restore " } else { " Expand " }, Some("e"), area.width);
+    let expand_width = (expand.width() as u16).min(area.width);
     let expand_area = Rect::new(area.right() - expand_width, area.y, expand_width, 1);
     frame.render_widget(Paragraph::new(expand).style(Style::default().fg(accent).bg(shell::SURFACE)), expand_area);
     mouse.targets.push(MouseTarget::Area(expand_area, MouseAction::ToggleLyricsExpanded));
-    let follow = if timed && now.follow_lyrics { " Following · f pause " } else if timed { " Follow lyrics f " } else if matches!(now.lyrics, Panel::Ready(_)) { " Unsynced lyrics " } else { " Lyrics " };
-    let follow_width = (display_width(follow) as u16).min(area.width.saturating_sub(expand_width + 1));
+    let follow = if timed && now.follow_lyrics { " Following " } else if timed { " Follow lyrics " } else if matches!(now.lyrics, Panel::Ready(_)) { " Unsynced lyrics " } else { " Lyrics " };
+    let follow = mouse.hinted_label(follow, timed.then_some("f"), area.width.saturating_sub(expand_width + 1));
+    let follow_width = (follow.width() as u16).min(area.width.saturating_sub(expand_width + 1));
     let follow_area = Rect::new(area.x, area.y, follow_width, 1);
-    frame.render_widget(Paragraph::new(truncate(follow, follow_width as usize)).style(Style::default().fg(if timed { Color::Gray } else { Color::DarkGray })), follow_area);
+    frame.render_widget(Paragraph::new(follow).style(Style::default().fg(if timed { Color::Gray } else { Color::DarkGray })), follow_area);
     if timed && follow_width > 0 {
         mouse.targets.push(MouseTarget::Area(follow_area, MouseAction::ToggleLyricsFollow));
     }
@@ -2605,6 +2731,7 @@ fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Color, mouse: 
         .map(|tab| display_width(tab.label()) + 1)
         .sum::<usize>();
     let roomy = roomy_width <= area.width as usize;
+    let show_tab_keys = mouse.show_key_hints() && roomy_width + 8 <= area.width as usize;
     let tiny = compact_width > area.width as usize;
     let initials = area.width >= 12;
     let numbered_padding = if area.width >= 8 { " " } else { "" };
@@ -2624,7 +2751,9 @@ fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Color, mouse: 
         // names visible. Extremely narrow windows retain every destination as
         // its number and initial rather than silently clipping whole tabs.
         let label = if tiny {
-            if initials {
+            if !mouse.show_key_hints() {
+                tab.label().chars().next().unwrap_or('?').to_string()
+            } else if initials {
                 format!("{}{}", index + 1, tab.label().chars().next().unwrap_or('?'))
             } else {
                 (index + 1).to_string()
@@ -2634,18 +2763,21 @@ fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Color, mouse: 
         };
         let right = if roomy { " " } else { "" };
         let left = if tiny { numbered_padding } else { " " };
-        let rendered = format!("{left}{label}{right}");
-        let rendered_width = display_width(&rendered) as u16;
+        let key = (index + 1).to_string();
+        let mut rendered = mouse.hinted_label(&format!("{left}{label}{right}"),
+            show_tab_keys.then_some(key.as_str()), area.width);
+        let rendered_width = rendered.width() as u16;
         mouse.targets.push(MouseTarget::Area(
             Rect::new(x, area.y, rendered_width, area.height),
             MouseAction::OpenTab(tab),
         ));
         x = x.saturating_add(rendered_width);
-        labels.push(Span::styled(rendered, style));
+        rendered = button_style(rendered, style);
+        labels.extend(rendered.spans);
 
         // Under the letters rather than under the padding, so the rule reads as
         // belonging to the name above it rather than to the gap beside it.
-        let width = display_width(&label);
+        let width = usize::from(rendered_width).saturating_sub(left.len() + right.len());
         rule.push(Span::styled(
             format!(
                 "{left}{}{right}",
@@ -2895,7 +3027,7 @@ fn render_comments(frame: &mut Frame, now: &NowPlaying, area: Rect) -> usize {
 fn render_related(frame: &mut Frame, now: &NowPlaying, area: Rect, ambient: Color) -> usize {
     related::render(frame, now, area, ambient, &mut Tiles {
         shape: CardShape::Tile, art: &ArtCache::default(), wanted: &mut Vec::new(), images: None,
-    })
+    }, &mut MouseMap::default())
 }
 
 /// The panel's contents when it has none: what it is waiting for, or why there
@@ -3257,10 +3389,11 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, mouse: &mut MouseMap)
         PlayerStrip {
             snap: &app.snapshot(),
             track,
-            status: &app.status,
-            hint: hint_line(app),
+            status: if app.overlay.is_open() || app.menu().is_some() { "" } else { &app.status },
+            hint: if app.overlay.is_open() || app.menu().is_some() { "" } else { hint_line(app) },
             accent: ambient(app),
             show_identity,
+            keys: (app.mode == Mode::Browse).then_some(app.view),
         },
         area,
         mouse,
@@ -3268,7 +3401,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, mouse: &mut MouseMap)
     if show_identity && let Some(now) = &app.now {
         register_footer_artist(frame, now, &app.snapshot(), area, mouse);
     }
-    if let Some(now) = &app.now { actions::bar(frame, now, area, mouse); }
+    if let Some(now) = &app.now { actions::bar(frame, now, area, mouse, (app.mode == Mode::Browse).then_some(app.view)); }
 }
 
 struct PlayerStrip<'a> {
@@ -3278,6 +3411,7 @@ struct PlayerStrip<'a> {
     hint: &'a str,
     accent: Color,
     show_identity: bool,
+    keys: Option<View>,
 }
 
 fn register_footer_artist(frame: &mut Frame, now: &NowPlaying, snap: &Snapshot, area: Rect, mouse: &mut MouseMap) {
@@ -3285,7 +3419,7 @@ fn register_footer_artist(frame: &mut Frame, now: &NowPlaying, snap: &Snapshot, 
     let controls = Rect::new(area.x, area.y + 1, area.width, 1);
     let hint_width = if area.height > 2 { 0 } else { display_width(HINTS_PLAYING) as u16 };
     let centered = area.width >= 40;
-    let identity = if centered { centered_control_areas(controls)[0] }
+    let identity = if centered { centered_control_areas(controls, mouse.show_key_hints())[0] }
         else { status_control_areas(controls, true, hint_width)[0] };
     let start = if centered { 1 } else { usize::from(TRANSPORT_WIDTH) } + display_width(&now.title) + 3;
     let width = display_width(&now.artist);
@@ -3315,6 +3449,7 @@ fn render_player_strip(
         hint,
         accent,
         show_identity,
+        keys,
     } = strip;
     let (progress_area, controls_area, hint_area) = if area.height >= 2 {
         let [progress, controls, hints] = Layout::vertical([
@@ -3361,7 +3496,7 @@ fn render_player_strip(
     }
 
     if (area.width >= 40 || !show_identity) && snap.state != PlayState::Idle && snap.error.is_none() {
-        let [identity, transport, volume] = centered_control_areas(controls_area);
+        let [identity, transport, volume] = centered_control_areas(controls_area, mouse.show_key_hints());
         let title = track.map_or(snap.title.as_str(), |track| track.title);
         let artist = track.map_or("", |track| track.byline);
         let room = identity.width.saturating_sub(2) as usize;
@@ -3379,16 +3514,12 @@ fn render_player_strip(
             frame.render_widget(Paragraph::new(line), identity);
         }
         let symbol = match snap.state { PlayState::Paused => crate::navigation::current().play(), PlayState::Buffering => "~", _ => "II" };
-        frame.render_widget(Paragraph::new(transport_line(symbol,
-            highlight(accent).add_modifier(Modifier::BOLD), transport.width as usize)), transport);
-        register_transport_targets(mouse, transport);
+        render_centered_transport(frame, symbol, highlight(accent).add_modifier(Modifier::BOLD), transport, keys, mouse);
         if volume.width > 0 {
             render_volume_control(frame, snap.volume, volume);
             register_volume_targets(mouse, volume, snap.volume);
         }
-        frame.render_widget(Paragraph::new(truncate(hint, hint_area.width as usize))
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(ratatui::layout::Alignment::Right), hint_area);
+        render_feedback(frame, player_feedback(status, volume.width > 0), hint, hint_area);
         return;
     }
 
@@ -3425,19 +3556,40 @@ fn render_player_strip(
     } else {
         hints
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate(hint, hints.width as usize),
-            Style::default().fg(Color::DarkGray),
-        )))
-        .alignment(ratatui::layout::Alignment::Right),
-        hints,
-    );
+    render_feedback(frame, if snap.state == PlayState::Idle { "" } else {
+        player_feedback(status, volume.width > 0)
+    }, hint, hints);
+}
+
+/// The volume control already reports successful changes; errors still need feedback.
+fn player_feedback(status: &str, volume_visible: bool) -> &str {
+    let volume_change = matches!(status, "muted" | "muted -- press m or click mut to restore volume")
+        || status.strip_prefix("volume ").and_then(|value| value.strip_suffix('%'))
+            .and_then(|value| value.parse::<u8>().ok()).is_some_and(|value| value <= 100);
+    if volume_visible && volume_change { "" } else { status }
+}
+
+/// Feedback owns its row even while transport is active. Narrow windows keep
+/// the result of the last action; the menus still expose the shortcut list.
+fn render_feedback(frame: &mut Frame, status: &str, hint: &str, area: Rect) {
+    if area.is_empty() { return; }
+    let area = Rect { height: 1, ..area };
+    let hint_width = if status.is_empty() { area.width }
+        else if area.width >= 90 { (display_width(hint) as u16).min(area.width / 2) } else { 0 };
+    let status_width = area.width.saturating_sub(hint_width + u16::from(hint_width > 0 && !status.is_empty()) * 2);
+    frame.render_widget(Paragraph::new(truncate(status, status_width as usize))
+        .style(Style::default().fg(Color::Gray)), Rect { width: status_width, ..area });
+    if hint_width > 0 {
+        frame.render_widget(Paragraph::new(truncate(hint, hint_width as usize))
+            .style(Style::default().fg(Color::Gray)).alignment(ratatui::layout::Alignment::Right),
+            Rect::new(area.right() - hint_width, area.y, hint_width, 1));
+    }
 }
 
 /// Artwork can dominate the page while transport stays in one predictable place.
-fn centered_control_areas(area: Rect) -> [Rect; 3] {
-    let transport_width = if area.width < TRANSPORT_WIDTH { area.width.min(3) } else { TRANSPORT_WIDTH };
+fn centered_control_areas(area: Rect, show_keys: bool) -> [Rect; 3] {
+    let transport_width = if show_keys && area.width >= 110 { 33 }
+        else if area.width < TRANSPORT_WIDTH { area.width.min(3) } else { TRANSPORT_WIDTH };
     let left = area.width.saturating_sub(transport_width) / 2;
     let volume_width = if area.width >= MIN_WIDTH_WITH_STATUS_VOLUME {
         STATUS_VOLUME_WIDTH.min(area.width.saturating_sub(left + transport_width))
@@ -3452,6 +3604,27 @@ fn centered_control_areas(area: Rect) -> [Rect; 3] {
 fn centered_label(label: &str, width: usize) -> String {
     let left = width.saturating_sub(display_width(label)) / 2;
     padded(&format!("{}{label}", " ".repeat(left)), width)
+}
+
+fn render_centered_transport(frame: &mut Frame, symbol: &str, toggle_style: Style, area: Rect, keys: Option<View>, mouse: &mut MouseMap) {
+    if area.width < 33 {
+        frame.render_widget(Paragraph::new(transport_line(symbol, toggle_style, usize::from(area.width))), area);
+        register_transport_targets(mouse, area);
+        return;
+    }
+    for (index, label, key, action, style) in [
+        (0, "‹‹", (keys == Some(View::Playing)).then_some("p"), MouseAction::PreviousTrack, Style::default().fg(Color::Gray)),
+        (1, symbol, keys.map(|_| "Space"), MouseAction::TogglePlayback, toggle_style),
+        (2, "››", (keys == Some(View::Playing)).then_some("n"), MouseAction::NextTrack, Style::default().fg(Color::Gray)),
+    ] {
+        let rect = Rect::new(area.x + index * 11, area.y, 11, area.height);
+        let mut line = mouse.hinted_label(label, key, rect.width);
+        let padding = usize::from(rect.width).saturating_sub(line.width());
+        line.spans.insert(0, Span::raw(" ".repeat(padding / 2)));
+        line.spans.push(Span::raw(" ".repeat(padding - padding / 2)));
+        frame.render_widget(Paragraph::new(button_style(line, style)), rect);
+        mouse.targets.push(MouseTarget::Area(rect, action));
+    }
 }
 
 fn transport_line(symbol: &str, toggle_style: Style, width: usize) -> Line<'static> {
@@ -3550,12 +3723,13 @@ fn render_volume_control(frame: &mut Frame, volume: f32, area: Rect) {
 /// command. The shared menus carry the full command vocabulary.
 ///
 /// Mode matters as much as view: in the search box every printable key is text,
-/// so only Enter, Esc and a Ctrl chord are advertised there.
+/// so only Enter and Esc are advertised there.
 fn hint_line(app: &App) -> &'static str {
-    if app.mode == Mode::Editing {
+    if !app.show_key_hints { "" }
+    else if app.mode == Mode::Editing {
         HINTS_EDITING
     } else if app.view == View::Library {
-        "1–6 categories  f liked  o sort  r refresh"
+        ". item actions  ? help"
     } else if app.view == View::Playing {
         HINTS_PLAYING
     } else if app.now.is_some() {
@@ -3900,6 +4074,26 @@ mod tests {
         assert!(queue::artist_region(&track, 50).is_none());
     }
 
+    #[test]
+    fn inline_artist_names_require_full_visible_names_and_grapheme_boundaries() {
+        let route = |name: &str| ArtistRef { name: name.into(), endpoint: BrowseEndpoint::new("UCartist") };
+        for (text, name, room, expected) in [
+            ("Artist • Album", "Artist", 20, Some(6)),
+            ("Artist & Guest", "Artist", 10, Some(6)),
+            ("Artist", "Artist", 6, Some(6)),
+            ("Artist", "Artist", 5, None),
+            ("Artistical", "Artist", 7, None),
+            ("Someone else", "Artist", 30, None),
+            ("銀河小魚 • Album", "銀河小魚", 20, Some(8)),
+            ("銀河小魚", "銀河小魚", 7, None),
+            ("Cafe\u{301} & Guest", "Cafe\u{301}", 20, Some(4)),
+            ("Cafe\u{301} & Guest", "Cafe", 20, None),
+            ("Artist", " ", 20, None),
+        ] {
+            assert_eq!(artist_prefix_width(text, &route(name), room), expected, "{text}, {name}, {room}");
+        }
+    }
+
     /// A 16:9 cover, as every YouTube thumbnail is once shrunk.
     fn wide() -> Cover {
         Cover::solid(160, 90)
@@ -3939,6 +4133,8 @@ mod tests {
                 artist_song(None),
                 artist_song(Some(Duration::from_secs(468))),
             ],
+            songs_endpoint: None,
+            songs_truncated: false,
             shelves: vec![Shelf {
                 title: "Albums".to_string(),
                 cards: vec![album("Currents", "Album • Tame Impala")],
@@ -3976,7 +4172,7 @@ mod tests {
 
     #[test]
     fn artist_layout_keeps_top_songs_before_catalogue_shelves() {
-        let layouts = artist_layouts(&artist_page(), Rect::new(0, 0, 100, 20), 0, CardShape::Tile);
+        let layouts = artist_layouts(&artist_page(), Rect::new(0, 0, 100, 20), 0, CardShape::Tile, false);
         assert_eq!(layouts[0].kind, ArtistSection::Songs);
         assert_eq!(layouts[1].kind, ArtistSection::Shelf(0));
         assert!(layouts[0].area.y < layouts[1].area.y);
@@ -4561,7 +4757,7 @@ mod tests {
 ",
             );
 
-        assert!(text.contains("NOW PLAYING"), "{text}");
+        assert!(!text.contains("NOW PLAYING"), "{text}");
         assert!(text.contains("Feather"), "{text}");
         assert!(text.contains("Nujabes"), "{text}");
         assert!(!text.contains("1:00 / 3:00"), "progress belongs in the persistent strip: {text}");
@@ -4752,8 +4948,7 @@ mod tests {
     fn the_queue_marks_what_is_playing() {
         let rows = drawn_panel(&playing(), 44, 12);
 
-        assert!(rows[2].contains("Playing from"));
-        assert!(rows[3].contains("Let It Happen Mix"));
+        assert!(rows[2].contains("Let It Happen Mix"));
         // The marker is on the playing track and on no other row.
         let marked: Vec<&String> = rows.iter().filter(|row| row.contains(crate::navigation::current().play())).collect();
         assert_eq!(marked.len(), 1, "exactly one row plays: {rows:#?}");
@@ -4773,8 +4968,7 @@ mod tests {
         now.cursor[Tab::UpNext.index()] = now.queue.len() - 1;
         let rows = drawn_panel(&now, 44, 9);
 
-        assert!(rows[2].contains("Playing from"), "{rows:#?}");
-        assert!(rows[3].contains("Let It Happen Mix"));
+        assert!(rows[2].contains("Let It Happen Mix"), "{rows:#?}");
         assert!(
             rows.iter().any(|row| row.contains("Dust Bunny")),
             "the last row scrolled to should be visible: {rows:#?}"
@@ -4786,13 +4980,14 @@ mod tests {
     }
 
     #[test]
-    fn active_repeat_mode_is_visible_in_the_queue_heading() {
+    fn the_queue_heading_does_not_repeat_the_playback_controls() {
         let mut now = playing();
         now.repeat = RepeatMode::All;
 
         let rows = drawn_panel(&now, 44, 9);
 
-        assert!(rows[4].contains("Repeat all"), "{rows:#?}");
+        assert!(rows[2].contains("Let It Happen Mix"), "{rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains("Repeat")), "{rows:#?}");
     }
 
     #[test]
@@ -5130,6 +5325,7 @@ mod tests {
     fn clicking_the_progress_bar_maps_its_whole_width() {
         let area = Rect::new(5, 7, 11, 1);
         let mouse = MouseMap {
+            key_hints_hidden: false,
             targets: vec![MouseTarget::Progress(area)],
         };
 
@@ -5148,6 +5344,7 @@ mod tests {
     #[test]
     fn context_click_selects_the_item_under_the_pointer_without_opening_it() {
         let mouse = MouseMap {
+            key_hints_hidden: false,
             targets: vec![
                 MouseTarget::Area(
                     Rect::new(2, 1, 8, 3),
@@ -5466,9 +5663,39 @@ mod tests {
                 .to_string()
         };
         assert_eq!(row(0), "");
-        assert_eq!(row(1), "NOW PLAYING");
+        assert_eq!(row(1), "");
         assert_eq!(row(2), "Let It Happen");
         assert_eq!(row(3), "Tame Impala • Currents");
+    }
+
+    #[test]
+    fn volume_feedback_does_not_repeat_a_visible_volume_control() {
+        for (width, status, volume, visible) in [
+            (120, "volume 6%", 0.06, false),
+            (120, "muted", 0.0, false),
+            (120, "muted -- press m or click mut to restore volume", 0.0, false),
+            (48, "volume 6%", 0.06, true),
+            (48, "muted", 0.0, true),
+            (120, "could not change volume: unavailable", 0.06, true),
+            (120, "Could not save the volume setting.", 0.06, true),
+            (120, "precision volume off", 0.06, true),
+            (120, "Added a song to your queue", 0.06, true),
+        ] {
+            for show_identity in [true, false] {
+                let snap = Snapshot { state: PlayState::Playing, volume, ..Default::default() };
+                let mut terminal = Terminal::new(TestBackend::new(width, 4)).unwrap();
+                let mut mouse = MouseMap::default();
+                terminal.draw(|frame| render_player_strip(frame, PlayerStrip {
+                    snap: &snap, track: Some(MiniTrack { title: "Song", byline: "Artist", duration: None }),
+                    status, hint: "? help", accent: Color::Cyan, show_identity, keys: Some(View::Playing),
+                }, frame.area(), &mut mouse)).unwrap();
+                let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+                assert_eq!(text.contains(status), visible, "width {width}, {status}: {text}");
+                if status == "volume 6%" {
+                    assert_eq!(text.matches("6%").count(), 1, "exactly one volume readout: {text}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -5485,6 +5712,7 @@ mod tests {
     fn clicking_the_volume_bar_maps_zero_to_one_hundred_percent() {
         let area = Rect::new(20, 4, 11, 1);
         let mouse = MouseMap {
+            key_hints_hidden: false,
             targets: vec![MouseTarget::Volume(area)],
         };
 
@@ -5614,6 +5842,7 @@ mod tests {
             let [header, main, footer] = shell::regions(frame.area());
             shell::render_header(frame, header, shell::Header {
                 mode: Mode::Browse, view, query: "", accent,
+                query_cursor: 0, can_go_back: view != View::Home,
                 has_player: true, accepts_input: true, symbols: crate::navigation::Symbols::from_mask(0x15),
             }, &mut mouse);
             if view == View::Home {
@@ -5652,8 +5881,9 @@ mod tests {
                 track: Some(MiniTrack { title: &now.title, byline: &now.artist, duration: now.duration }),
                 status: "", hint: if view == View::Home { HINTS_AWAY } else { HINTS_PLAYING }, accent,
                 show_identity: view != View::Playing || !has_player_identity(&player_layout(main, now, Some(cover))),
+                keys: Some(view),
             }, footer, &mut mouse);
-            actions::bar(frame, now, footer, &mut mouse);
+            actions::bar(frame, now, footer, &mut mouse, Some(view));
             palette::apply(frame, Some(cover), None);
         }).unwrap();
         (terminal.backend().buffer().clone(), mouse)
@@ -5749,12 +5979,14 @@ mod tests {
             for (width, height) in [(48, 18), (80, 24), (100, 36), (161, 42)] {
                 let (buf, mouse) = drawn_screen(width, height, view, &now, &[], &ArtCache::default(), &cover);
                 let y = height - STATUS_HEIGHT + 1;
-                let x = (width - TRANSPORT_WIDTH) / 2 + 4;
-                let button: String = (x..x + 4).map(|col| buf[(col, y)].symbol()).collect();
-                assert_eq!(button, " II ");
-                assert!((x..x + 4).all(|col| mouse.action_at(col, y) == Some(MouseAction::TogglePlayback)));
+                let columns: Vec<_> = (0..width).filter(|&col| mouse.action_at(col, y) == Some(MouseAction::TogglePlayback)).collect();
+                let x = columns[0];
+                let end = columns.last().unwrap() + 1;
+                let button: String = (x..end).map(|col| buf[(col, y)].symbol()).collect();
+                assert_eq!(button.trim(), if columns.len() > 4 { "II Space" } else { "II" });
+                assert_eq!(columns.len(), usize::from(end - x), "the button must be contiguous");
                 assert_eq!(mouse.action_at(x - 1, y), Some(MouseAction::PreviousTrack));
-                assert_eq!(mouse.action_at(x + 4, y), Some(MouseAction::NextTrack));
+                assert_eq!(mouse.action_at(end, y), Some(MouseAction::NextTrack));
                 if view == View::Home && width >= 100 {
                     let row: String = (0..x - 4).map(|col| buf[(col, y)].symbol()).collect();
                     assert!(row.contains(&now.title), "Home lost its playing song: {row}");
@@ -5780,10 +6012,9 @@ mod tests {
                 let footer = shell::footer_content(Rect::new(0, footer_y, width, STATUS_HEIGHT));
                 assert_eq!(mouse.action_at(footer.x, footer_y), Some(MouseAction::SeekTo(0)));
                 assert_eq!(mouse.action_at(0, footer_y), None, "the outer margin must not seek");
-                let transport_x = (width - TRANSPORT_WIDTH) / 2;
-                assert_eq!(mouse.action_at(transport_x + 1, footer_y + 1), Some(MouseAction::PreviousTrack));
-                assert_eq!(mouse.action_at(transport_x + 4, footer_y + 1), Some(MouseAction::TogglePlayback));
-                assert_eq!(mouse.action_at(transport_x + 9, footer_y + 1), Some(MouseAction::NextTrack));
+                let starts: Vec<_> = [MouseAction::PreviousTrack, MouseAction::TogglePlayback, MouseAction::NextTrack]
+                    .into_iter().map(|action| (0..width).find(|&x| mouse.action_at(x, footer_y + 1) == Some(action)).unwrap()).collect();
+                assert!(starts.windows(2).all(|pair| pair[0] < pair[1]), "transport controls must remain distinct");
                 assert_eq!(mouse.action_at(width - 1, footer_y), None, "the clock must not seek");
                 assert!(!text.contains('╭') && !text.contains('┌'), "page frames returned: {text}");
             }
@@ -6568,9 +6799,9 @@ mod tests {
 
     #[test]
     fn browse_hints_route_to_the_shared_command_surfaces() {
-        assert_eq!(HINTS_BROWSE, "^K app menu  . actions  ? help");
-        assert_eq!(HINTS_AWAY, "P player  ^K menu  . actions");
-        assert_eq!(HINTS_PLAYING, "Tab panels  Esc back  ^K menu  . actions");
+        assert_eq!(HINTS_BROWSE, ". song actions  ? help");
+        assert_eq!(HINTS_AWAY, ". song actions  ? help");
+        assert_eq!(HINTS_PLAYING, "Tab panels  . song actions  ? help");
     }
 
     #[test]
@@ -6582,7 +6813,7 @@ mod tests {
             .split("  ")
             .map(|hint| hint.split_whitespace().next().unwrap_or(""))
             .collect::<Vec<_>>();
-        assert_eq!(advertised_keys, ["Enter", "Esc", "^K"]);
+        assert_eq!(advertised_keys, ["Enter", "Esc"]);
     }
 
     #[test]

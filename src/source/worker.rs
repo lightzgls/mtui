@@ -142,6 +142,11 @@ pub enum Request {
         request_id: PageRequestId,
         artist: ArtistRef,
     },
+    ArtistSongs {
+        request_id: PageRequestId,
+        artist: ArtistRef,
+        endpoint: BrowseEndpoint,
+    },
     /// The queue a track plays inside, asked for the moment it starts. This is
     /// what decides what plays when it ends, so it is the one part of the
     /// player page fetched without being asked for.
@@ -241,6 +246,11 @@ pub enum Response {
         request_id: PageRequestId,
         browse_id: String,
         page: Box<Result<ArtistPage, String>>,
+    },
+    ArtistSongs {
+        request_id: PageRequestId,
+        browse_id: String,
+        page: Box<Result<super::collection::Page, String>>,
     },
     /// A resolve finished, whichever way it went.
     ///
@@ -520,6 +530,7 @@ impl SourceWorker {
             Request::Library { .. }
             | Request::OpenBrowse { .. }
             | Request::Search { .. }
+            | Request::ArtistSongs { .. }
             | Request::OpenArtist { .. } => self
                 .metadata_tx
                 .send(req)
@@ -577,6 +588,7 @@ fn name(req: &Request) -> &'static str {
         Request::ClearReports => "ClearReports",
         Request::OpenBrowse { .. } => "OpenBrowse",
         Request::OpenArtist { .. } => "OpenArtist",
+        Request::ArtistSongs { .. } => "ArtistSongs",
         Request::Watch { .. } => "Watch",
         Request::MoreQueue { .. } => "MoreQueue",
         Request::SeedQueue { .. } => "SeedQueue",
@@ -987,6 +999,12 @@ fn run_metadata(rx: Arc<Inbox>, tx: Sender<Response>, account_generation: Arc<At
                 request_id,
                 browse_id: artist.endpoint.browse_id.clone(),
                 page: Box::new(artist::fetch(&http, artist).map_err(|error| format!("{error:#}"))),
+            }),
+            Request::ArtistSongs { request_id, artist, endpoint } => Some(Response::ArtistSongs {
+                request_id,
+                browse_id: artist.endpoint.browse_id,
+                page: Box::new(super::collection::fetch(&http, &endpoint, &format!("{} · Top songs", artist.name))
+                    .map_err(|error| format!("{error:#}"))),
             }),
             Request::Shutdown => break,
             other => {
