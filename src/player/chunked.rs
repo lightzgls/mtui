@@ -1124,7 +1124,7 @@ mod tests {
 
     #[test]
     fn full_responses_after_a_range_do_not_duplicate_audio_bytes() {
-        use crate::source::test_http::{serve, immediate};
+        use crate::source::http::test_http::{serve, immediate};
         let (url, server) = serve(vec![
             immediate(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/6\r\nContent-Length: 3\r\nConnection: close\r\n\r\nABC"),
             immediate(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nABCDEF"),
@@ -1147,7 +1147,7 @@ mod tests {
 
     #[test]
     fn interrupted_bodies_retry_the_same_range_without_splicing_partial_data() {
-        use crate::source::test_http::{serve, immediate};
+        use crate::source::http::test_http::{serve, immediate};
         for broken in [
             b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6\r\nContent-Length: 3\r\nConnection: close\r\n\r\nD".as_slice(),
             b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nD\r\n0\r\n\r\n".as_slice(),
@@ -1186,11 +1186,9 @@ mod probe {
     #[ignore = "hits the network"]
     fn probe_range_headers() {
         let url = std::env::var("MTUI_STREAM_URL").unwrap_or_else(|_| {
-            let tube = crate::source::innertube::InnerTube::new().ok();
             let yt = crate::source::youtube::YouTube::default();
-            crate::source::resolve_stream(&yt, tube.as_ref(), "dQw4w9WgXcQ")
+            crate::source::resolve_stream(&yt, "dQw4w9WgXcQ")
                 .expect("resolve failed")
-                .0
                 .url
         });
 

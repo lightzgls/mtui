@@ -5,12 +5,12 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::player::Command;
-use crate::source::watch::Watch;
+use crate::source::youtube::watch::Watch;
 use crate::source::worker::{Request, Response};
 
-use super::{App, Overlay, SignIn};
-use super::navigation::{Mode, View};
-use super::now_playing::{NowPlaying, Panel, Tab};
+use super::App;
+use crate::app::browse::navigation::{Mode, View};
+use crate::app::playback::now_playing::{NowPlaying, Panel, Tab};
 
 /// Turns a panel fetch into what the panel should show.
 ///
@@ -49,10 +49,6 @@ impl App {
 
 
     pub(super) fn apply(&mut self, response: Response) {
-        if let Response::ArtistSongs { request_id, browse_id, page } = response {
-            self.apply_artist_songs(request_id, &browse_id, *page);
-            return;
-        }
         let session_generation = match &response {
             Response::Library { generation, .. } => Some(*generation),
             Response::CookiesImported { generation, .. }
@@ -69,65 +65,12 @@ impl App {
             | Response::Artist { request_id, .. } => Some(*request_id),
             _ => None,
         };
-        // Validate before any shared status, menu or busy state is touched. A
-        // late page must be observationally silent, not merely prevented from
-        // replacing the rows after it has already closed their menu.
-        if page_request.is_some_and(|request_id| !self.accept_page_response(request_id)) {
-            return;
-        }
-
-        // A contextual menu is a snapshot of the page under it. Responses that
-        // replace that page close the menu rather than letting Enter act on a
-        // different row than the one still visible in the modal.
-        if matches!(
-            &response,
-            Response::Results { .. }
-                | Response::Home { .. }
-                | Response::Browsed { .. }
-                | Response::Artist { .. }
-        ) {
+        if let Some(request_id) = page_request {
+            if !self.accept_page_response(request_id) {
+                return;
+            }
+            // A contextual menu is a snapshot of the page being replaced.
             self.close_page_actions();
-        }
-
-        // Nothing here is something the user is waiting on, so none of it may
-        // clear the flag a search or a play set. The player page matters as
-        // much as the cover does: its panels land on their own threads, and the
-        // queue usually arrives while the resolve behind it is still running --
-        // clearing the flag there would drop the redraw cadence back to the
-        // idle one for the rest of the wait that flag exists to cover.
-        //
-        // A resolve is excluded for a different reason: a play never sets this
-        // flag in the first place -- it tracks `pending` instead, for the
-        // reason `play_track` gives -- so there is nothing here for a resolve
-        // to be clearing. What it would clear is some *other* request's flag,
-        // still in flight, and `awaiting` would then stop reporting a wait that
-        // is still going on.
-        if !matches!(
-            response,
-            Response::Rating { .. }
-                | Response::Library { .. }
-                | Response::Playlists { .. }
-                | Response::PlaylistSaved { .. }
-                | Response::Cover { .. }
-                | Response::Art { .. }
-                | Response::Results { .. }
-                | Response::Browsed { .. }
-                | Response::Artist { .. }
-                | Response::Prefetched { .. }
-                | Response::Resolved { .. }
-                | Response::Replacement { .. }
-                | Response::Watch { .. }
-                | Response::MoreQueue { .. }
-                | Response::Lyrics { .. }
-                | Response::Related { .. }
-                | Response::Comments { .. }
-                | Response::Home { .. }
-                | Response::HomeFailed { .. }
-                | Response::CookiesImported { .. }
-                | Response::MusicSignInFailed { .. }
-                | Response::SessionRenewed { .. }
-        ) {
-            self.busy = false;
         }
 
         match response {
@@ -163,99 +106,12 @@ impl App {
                 // result. Ending the edit here makes one Back restore its origin.
                 self.mode = Mode::Browse;
             }
-            Response::Home {
-                generation,
-                shelves,
-            } => {
-                if generation != self.home_generation {
-                    return;
-                }
-                self.home_attempts = self.home_attempts.saturating_sub(1);
-                self.home_pending = self.home_attempts != 0;
-                self.apply_home(shelves);
-            }
-            Response::HomeFailed { generation } => {
-                if generation != self.home_generation {
-                    return;
-                }
-                self.home_attempts = self.home_attempts.saturating_sub(1);
-                self.finish_home_attempts();
-            }
-            Response::HomeMore { generation, shelves } => {
-                if generation != self.home_generation { return; }
-                for shelf in shelves {
-                    if self.home.len() >= 24 { break; }
-                    if self.home.iter().any(|existing| existing.title == shelf.title) { continue; }
-                    self.home.push(shelf);
-                    self.home_scroll.push(0);
-                }
-            }
-            Response::CookiesImported { browser, .. } => {
-                self.clear_account_actions();
-                // The page on screen was built without a session. There is a
-                // better one available now, so it is asked for again -- this is
-                // the whole point of doing the import in the background rather
-                // than holding the first frame back behind it.
-                self.status = format!("read your YouTube session from {browser}");
-                self.music_signing_in = false;
-                self.automatic_sign_in = false;
-                self.sign_in_prompted = false;
-                self.session_renewal.succeeded();
-                if matches!(self.overlay, Overlay::SignIn(SignIn::Music { .. })) {
-                    self.overlay = Overlay::None;
-                }
-                // A valid session is the missing half of any reports queued
-                // while signed out or while the previous cookie was stale.
-                let _ = self.source.send(Request::RetryReports);
-                self.request_rating();
-                self.request_home();
-                let in_library = self.view == View::Library;
-                self.reset_library();
-                if in_library { self.open_library(); }
-            }
-            Response::SessionRenewed { result, .. } => {
-                self.music_signing_in = false;
-                match result {
-                    Ok(()) => {
-                        self.sign_in_prompted = false;
-                        self.session_renewal.succeeded();
-                        crate::diagnostics::info("auth", "saved Music session renewed automatically");
-                        let _ = self.source.send(Request::RetryReports);
-                        if self.now.as_ref().is_none_or(|now| !now.like_pending) { self.request_rating(); }
-                    }
-                    Err(crate::session::RenewalFailure::SignInRequired) => {
-                        if !self.sign_in_prompted {
-                            self.sign_in_prompted = true;
-                            self.automatic_sign_in = true;
-                            self.music_signing_in = true;
-                            self.status = "Google needs verification—finish in the sign-in window.".into();
-                            if self.source.send(Request::MusicSignIn { recover: true }).is_err() {
-                                self.music_signing_in = false;
-                                self.automatic_sign_in = false;
-                            }
-                        }
-                    }
-                    Err(crate::session::RenewalFailure::Temporary(message)) => {
-                        crate::diagnostics::warn("auth", &format!("automatic renewal deferred: {message}"));
-                    }
-                }
-            }
-            Response::MusicSignInFailed { message: msg, .. } => {
-                crate::diagnostics::error("auth", "YouTube Music sign-in failed");
-                self.music_signing_in = false;
-                if self.automatic_sign_in {
-                    self.automatic_sign_in = false;
-                    self.status = "Google sign-in was not completed; automatic recovery will keep checking.".into();
-                    return;
-                }
-                self.status = msg.clone();
-                if matches!(self.overlay, Overlay::Settings) {
-                    self.preferences.notice = Some((msg, true));
-                } else {
-                    self.menu = None;
-                    self.overlay = Overlay::SignIn(SignIn::Failed { reason: msg });
-                }
-            }
+            Response::Home { generation, shelves } => self.receive_home(generation, shelves),
+            Response::HomeFailed { generation } => self.receive_home_failure(generation),
+            Response::HomeMore { generation, shelves } => self.extend_home(generation, shelves),
+            Response::CookiesImported { browser, .. } => self.apply_session_import(browser),
+            Response::SessionRenewed { result, .. } => self.apply_session_renewal(result),
+            Response::MusicSignInFailed { message, .. } => self.apply_sign_in_failure(message),
             Response::Browsed {
                 title,
                 endpoint,
@@ -306,7 +162,9 @@ impl App {
                 }
                 self.prefetch.selection_changed(Instant::now());
             }
-            Response::ArtistSongs { .. } => unreachable!("artist songs are matched before shared page state"),
+            Response::ArtistSongs { request_id, browse_id, page } => {
+                self.apply_artist_songs(request_id, &browse_id, *page);
+            }
             Response::Resolved { id, title, stream } => self.apply_resolved(&id, title, stream),
             Response::Replacement { id, stream } => {
                 if self.playback.listening_track().is_some_and(|track| track.id == id)
@@ -362,17 +220,24 @@ impl App {
             Response::Prefetched { id, ready } => {
                 self.prefetch.apply(id, ready);
             }
-            Response::Art { key, art } => self.art.store(key, art),
-            Response::Cover { id, art, artwork_url } => {
+            Response::Art { key, art, edge } => {
+                if edge >= self.art.edge() {
+                    self.invalidate_artwork(super::ImageSource::Card(key.clone()));
+                    self.art.store(key, art);
+                }
+            }
+            Response::Cover { id, mut art, artwork_url, edge } => {
                 // Stale unless it is still the track we asked about.
-                if self.cover_id.as_deref() == Some(id.as_str()) {
+                if self.cover_id.as_deref() == Some(id.as_str()) && edge >= self.cover_edge() {
                     // The terminal may fall back to video pixels if its fetch
                     // fails. Discord keeps the native Music metadata URL and
                     // can load it independently of the terminal's image worker.
                     if artwork_url.is_some() && let Some(now) = self.for_track(&id) {
                         now.artwork_url = artwork_url;
                     }
+                    if let Some(cover) = art.as_mut() { cover.shrink(self.cover_edge()); }
                     self.cover = art;
+                    self.invalidate_artwork(super::ImageSource::Playing);
                 }
             }
         }

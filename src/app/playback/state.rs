@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::player::{Command, PlayState, Snapshot};
 use crate::source::Track;
-use crate::source::journal::PendingReport;
+use crate::source::listening::journal::PendingReport;
 use crate::source::listening::Listening;
 
 use super::MAX_AUTO_SKIPS;
@@ -62,12 +62,14 @@ impl PlaybackState {
     }
 
     /// Replace the request, recovery and listening identity together.
-    pub(in crate::app) fn begin_track(&mut self, track: &Track, automatic: bool) {
+    pub(in crate::app) fn begin_track(
+        &mut self, track: &Track, automatic: bool, report_scope: Option<String>,
+    ) {
         self.pending = Some(PendingTrack {
             id: track.id.clone(),
             seek: None,
         });
-        self.listening = Some((track.clone(), Listening::new()));
+        self.listening = Some((track.clone(), Listening::new(report_scope)));
         self.failure = None;
         self.automatic = automatic;
         self.recovery = None;
@@ -173,7 +175,7 @@ impl PlaybackState {
     ) -> Option<PendingReport> {
         let (track, listening) = self.listening.as_mut()?;
         listening.observe(snapshot.position, snapshot.state == PlayState::Playing, now);
-        (!listening.reported && listening.heard >= Duration::from_secs(30))
+        (listening.can_checkpoint() && listening.heard >= Duration::from_secs(30))
             .then(|| listening.report(&track.id))
     }
 
@@ -201,7 +203,7 @@ mod tests {
             album: None,
             artist_ref: None,
         };
-        state.begin_track(&track, false);
+        state.begin_track(&track, false, Some("fixture-session".into()));
         let snapshot = |seconds| Snapshot {
             state: PlayState::Playing,
             position: Duration::from_secs(seconds),

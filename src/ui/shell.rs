@@ -9,7 +9,7 @@ use ratatui::widgets::Paragraph;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{Mode, MouseAction, View};
-use crate::navigation::{Icon, Symbols};
+use crate::terminal::navigation::{Icon, Symbols};
 
 use super::{
     HEADER_HEIGHT, HERO_HEIGHT, INFO_HEIGHT, MIN_WIDTH_WITH_COVER, PANEL_MIN_WIDTH, STATUS_HEIGHT,
@@ -22,12 +22,15 @@ pub(super) const BACKGROUND: Color = Color::Rgb(12, 12, 12);
 pub(super) const SURFACE: Color = Color::Rgb(26, 26, 26);
 
 pub(super) fn regions(area: Rect) -> [Rect; 3] {
-    Layout::vertical([
+    let [header, content, _, status] = Layout::vertical([
         Constraint::Length(HEADER_HEIGHT),
         Constraint::Min(1),
+        // At 20 rows the split player still needs this row for its cover and byline.
+        Constraint::Length(u16::from(area.height > 20)),
         Constraint::Length(STATUS_HEIGHT),
     ])
-    .areas(area)
+    .areas(area);
+    [header, content, status]
 }
 
 pub(super) fn inset(area: Rect) -> Rect {

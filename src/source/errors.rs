@@ -13,7 +13,7 @@ pub(super) fn message(status: u16, error: Option<&Value>) -> String {
         _ => "YouTube Music rejected this request.",
     };
     let detail = error.and_then(|error| error["message"].as_str())
-        .map(crate::diagnostics::safe_message)
+        .map(crate::runtime::diagnostics::safe_message)
         .filter(|message| !message.is_empty() && !message.starts_with("[sensitive"))
         .map(|message| message.chars().take(160).collect::<String>());
     match detail {

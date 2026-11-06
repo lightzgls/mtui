@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Paragraph};
 use crate::app::{App, CoverSize, Mode, MouseAction, NowPlaying, View};
 use crate::player::{PlayState, Snapshot};
 
-use super::{actions, shell};
+use super::{modals::actions, shell};
 use super::mouse::{MouseMap, MouseTarget, button_style};
 use super::palette::{ambient, highlight};
 use super::player::{
@@ -196,7 +196,7 @@ pub(super) fn render_player_strip(
         if show_identity {
             frame.render_widget(Paragraph::new(line), identity);
         }
-        let symbol = match snap.state { PlayState::Paused => crate::navigation::current().play(), PlayState::Buffering => "~", _ => "II" };
+        let symbol = match snap.state { PlayState::Paused => crate::terminal::navigation::current().play(), PlayState::Buffering => "~", _ => "II" };
         render_centered_transport(frame, symbol, highlight(accent).add_modifier(Modifier::BOLD), transport, keys, mouse);
         if volume.width > 0 {
             render_volume_control(frame, snap.volume, volume);
@@ -463,7 +463,7 @@ pub(super) fn mini_player_line(
         PlayState::Idle => ("-", Color::DarkGray),
         PlayState::Buffering => ("~", Color::Yellow),
         PlayState::Playing => ("II", Color::Green),
-        PlayState::Paused => (crate::navigation::current().play(), Color::Yellow),
+        PlayState::Paused => (crate::terminal::navigation::current().play(), Color::Yellow),
     };
 
     if snap.state == PlayState::Idle {

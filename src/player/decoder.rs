@@ -159,7 +159,7 @@ impl AacDecoder {
             Ok(true) => true,
             result => {
                 if let Err(error) = result {
-                    crate::diagnostics::warn(
+                    crate::runtime::diagnostics::warn(
                         "decoder",
                         &format!("AAC decoding stopped: {error:#}"),
                     );

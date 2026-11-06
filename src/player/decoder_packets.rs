@@ -157,9 +157,9 @@ fn real_aac_resume_matches_the_original_audio_at_eight_seconds() {
     )
     .into_bytes();
     reply.extend_from_slice(&bytes);
-    let (url, server) = crate::source::test_http::serve(vec![
-        crate::source::test_http::immediate(&reply),
-        crate::source::test_http::immediate(&reply),
+    let (url, server) = crate::source::http::test_http::serve(vec![
+        crate::source::http::test_http::immediate(&reply),
+        crate::source::http::test_http::immediate(&reply),
     ]);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

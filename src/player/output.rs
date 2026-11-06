@@ -54,7 +54,7 @@ pub(super) fn open(id: Option<&str>) -> Result<Output> {
         .context("could not read the audio output configuration")?
         .with_error_callback(move |error| {
             if !failure.swap(true, Ordering::Relaxed) {
-                crate::diagnostics::warn(
+                crate::runtime::diagnostics::warn(
                     "player",
                     &format!("audio output disconnected or failed: {error}"),
                 );

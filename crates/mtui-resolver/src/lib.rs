@@ -16,6 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 
+pub mod sapisid;
+
 fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]
     let mut command = Command::new(program);
@@ -659,7 +661,7 @@ fn resolve_player_as(
                 .header(reqwest::header::ORIGIN, MUSIC_ORIGIN)
                 .header(
                     reqwest::header::AUTHORIZATION,
-                    sapisid_authorization(&session.sapisid, MUSIC_ORIGIN, unix_now()),
+                    sapisid::authorization(&session.sapisid, MUSIC_ORIGIN, sapisid::unix_now()),
                 );
         }
         request.send().await?.error_for_status()?.bytes().await
@@ -1005,77 +1007,6 @@ impl UrlCache {
     }
 }
 
-/// Google's `SAPISIDHASH` authorization value for one origin and moment.
-fn sapisid_authorization(sapisid: &str, origin: &str, now: u64) -> String {
-    let digest = sha1_hex(format!("{now} {sapisid} {origin}").as_bytes());
-    format!("SAPISIDHASH {now}_{digest}")
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or(0)
-}
-
-/// SHA-1, used solely by Google's cookie-signing protocol. RFC 3174.
-#[allow(unknown_lints)]
-#[allow(clippy::chunks_exact_to_as_chunks)]
-fn sha1_hex(data: &[u8]) -> String {
-    let mut state: [u32; 5] = [
-        0x6745_2301,
-        0xEFCD_AB89,
-        0x98BA_DCFE,
-        0x1032_5476,
-        0xC3D2_E1F0,
-    ];
-    let bits = (data.len() as u64).wrapping_mul(8);
-    let mut message = data.to_vec();
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bits.to_be_bytes());
-
-    for block in message.chunks_exact(64) {
-        let mut words = [0u32; 80];
-        for (index, word) in block.chunks_exact(4).enumerate() {
-            words[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for index in 16..80 {
-            words[index] =
-                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
-                    .rotate_left(1);
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e] = state;
-        for (round, word) in words.iter().enumerate() {
-            let (mix, constant) = match round {
-                0..=19 => ((b & c) | (!b & d), 0x5A82_7999),
-                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
-                _ => (b ^ c ^ d, 0xCA62_C1D6),
-            };
-            let next = a
-                .rotate_left(5)
-                .wrapping_add(mix)
-                .wrapping_add(e)
-                .wrapping_add(constant)
-                .wrapping_add(*word);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = next;
-        }
-        for (word, added) in state.iter_mut().zip([a, b, c, d, e]) {
-            *word = word.wrapping_add(added);
-        }
-    }
-
-    state.iter().map(|word| format!("{word:08x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1191,14 +1122,6 @@ mod tests {
             resolver.cache.get("track").is_some(),
             "unchanged session cleared the cache"
         );
-    }
-
-    #[test]
-    fn sapisid_signatures_match_the_known_shape() {
-        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
-        let header = sapisid_authorization("SECRET", MUSIC_ORIGIN, 1_700_000_000);
-        assert!(header.starts_with("SAPISIDHASH 1700000000_"));
-        assert_eq!(header.len(), "SAPISIDHASH 1700000000_".len() + 40);
     }
 
     #[test]

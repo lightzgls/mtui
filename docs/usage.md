@@ -77,7 +77,7 @@ less install.sh
 bash install.sh
 ```
 
-Options: `bash install.sh --version 0.11.7` pins a stable release;
+Options: `bash install.sh --version 0.11.8` pins a stable release;
 `--yes` accepts package-manager confirmations, including Arch system updates;
 `--skip-deps` only works when
 all runtime libraries are already available. Other glibc distributions can use
@@ -136,7 +136,7 @@ mtui
 APT installs any missing runtime libraries, including WebKitGTK for sign-in.
 The package also adds a terminal launcher to your desktop's application menu.
 Upgrade by installing the newer `.deb` the same way, then restart MTUI.
-The v0.11.7 package has Debian version `0.11.7-1`, which upgrades earlier
+The v0.11.8 package has Debian version `0.11.8-1`, which upgrades earlier
 MTUI packages.
 Run `mtui-uninstall` to remove the package and all local MTUI data. Using
 `sudo apt remove mtui` alone removes the package while leaving user data.
@@ -627,8 +627,12 @@ count as listening. Reports are persisted before network delivery, retried every
 seconds while open and on the next launch, and acknowledged only after the song
 appears in recent YouTube Music history. A successful telemetry HTTP response
 alone does not discard the pending report. YouTube account history must be
-enabled for writes to appear; logging out clears that account's pending reports.
-On upgrade, unverified reports from the previous 24 hours are checked and recovered.
+enabled for writes to appear. Pending reports are only delivered under the
+credentials present when the track started. A credential change or upgrade
+from a version without that binding retires older pending reports. The local
+listening journal is retained. Logout and account changes clear the current
+playback and browsing view so the next session cannot see the previous account's
+tracks.
 
 ## Installation and Update Troubleshooting
 

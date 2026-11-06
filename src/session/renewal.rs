@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{self, Import};
+use crate::runtime::config::{self, Import};
 
 pub const INTERVAL: u64 = 48 * 60 * 60;
 const CHECK_INTERVAL: Duration = Duration::from_secs(60);
@@ -49,7 +49,9 @@ impl Default for Renewal {
             .unwrap_or_default();
         Self {
             attempts,
-            next_check: Instant::now() + CHECK_INTERVAL,
+            // Check saved age on the first poll after launch. The persisted
+            // attempt cooldown still prevents repeated browser starts.
+            next_check: Instant::now(),
             expired: false,
         }
     }
@@ -117,7 +119,7 @@ impl Renewal {
             config::write_atomic(&path, &serde_json::to_vec(&self.attempts)?)
         };
         if save().is_err() {
-            crate::diagnostics::warn("auth", "could not persist automatic renewal cooldown");
+            crate::runtime::diagnostics::warn("auth", "could not persist automatic renewal cooldown");
         }
     }
 }
@@ -129,6 +131,12 @@ fn owns_profile(browser: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_checks_saved_session_age_without_waiting_a_minute() {
+        let renewal = Renewal::default();
+        assert!(renewal.next_check <= Instant::now());
+    }
 
     #[test]
     fn manual_imports_do_not_inherit_an_unrelated_browser_profile() {

@@ -2,10 +2,10 @@
 
 use std::time::Duration;
 
-use crate::discord::{Activity, Clock};
+use crate::desktop::discord::{Activity, Clock};
 use crate::player::{Command, PlayState};
 use crate::source::UNKNOWN_ARTIST;
-use crate::tray::TrayCommand;
+use crate::desktop::tray::TrayCommand;
 
 use super::App;
 
@@ -22,7 +22,7 @@ impl App {
     /// updating when the window goes away.
     ///
     /// Cheap on every tick that changes nothing, which is nearly all of them:
-    /// [`crate::discord::Presence::publish`] compares before it sends, and nothing here touches
+    /// [`crate::desktop::discord::Presence::publish`] compares before it sends, and nothing here touches
     /// a socket.
     pub fn tick_presence(&mut self) {
         let activity = self.activity();
@@ -55,7 +55,7 @@ impl App {
         // started.
         let clock = (!paused && snap.state != PlayState::Buffering).then(|| {
             let start_ms =
-                crate::discord::now_ms().saturating_sub(snap.position.as_millis() as u64);
+                crate::desktop::discord::now_ms().saturating_sub(snap.position.as_millis() as u64);
             Clock {
                 start_ms,
                 // A livestream has no length, so it gets a clock that counts up
@@ -124,8 +124,8 @@ impl App {
 
 
     /// System buttons use the same player and queue commands as the UI.
-    pub fn handle_media(&mut self, command: crate::media::MediaCommand) {
-        use crate::media::MediaCommand;
+    pub fn handle_media(&mut self, command: crate::desktop::media::MediaCommand) {
+        use crate::desktop::media::MediaCommand;
         match command {
             MediaCommand::Play | MediaCommand::Pause if self.now.is_some() && !self.playback.is_loading() => {
                 let _ = self.player.send(Command::SetPaused(command == MediaCommand::Pause));
@@ -152,13 +152,13 @@ impl App {
     }
 
 
-    pub fn media_info(&self) -> crate::media::MediaInfo {
+    pub fn media_info(&self) -> crate::desktop::media::MediaInfo {
         let Some(now) = self.now.as_ref() else {
-            return crate::media::MediaInfo { volume: self.snapshot().volume, ..Default::default() };
+            return crate::desktop::media::MediaInfo { volume: self.snapshot().volume, ..Default::default() };
         };
         let snapshot = self.snapshot();
         let loading = self.playback.is_loading();
-        crate::media::MediaInfo {
+        crate::desktop::media::MediaInfo {
             id: now.video_id.clone(), title: now.title.clone(), artist: now.artist.clone(),
             state: if loading { PlayState::Buffering } else { snapshot.state },
             position: if loading { Duration::ZERO } else { snapshot.position },

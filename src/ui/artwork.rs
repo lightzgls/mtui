@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::app::{App, CoverSize, ImageBound, ImagePlan};
-use crate::graphics::Graphics;
+use crate::terminal::graphics::Graphics;
 use crate::source::cover::Cover;
 
 use super::mouse::{MouseMap, MouseTarget};
@@ -155,7 +155,7 @@ pub(super) fn place(frame: &mut Frame, area: Rect, (cols, rows): (u16, u16), siz
 
 pub(super) fn cell_pixels() -> (u16, u16) {
     #[cfg(windows)]
-    { crate::console::cell_size() }
+    { crate::terminal::console::cell_size() }
     #[cfg(not(windows))]
     { (8, 16) }
 }

@@ -525,7 +525,7 @@ fn run(
     let mut device = match output::open(output_device.as_deref()) {
         Ok(device) => device,
         Err(selected_error) if output_device.is_some() => {
-            crate::diagnostics::warn(
+            crate::runtime::diagnostics::warn(
                 "player",
                 &format!("saved audio output is unavailable: {selected_error:#}"),
             );
@@ -842,7 +842,7 @@ fn run(
                         }
                         Err(error) => {
                             let why = format!("could not switch audio output: {error:#}");
-                            crate::diagnostics::warn("player", &why);
+                            crate::runtime::diagnostics::warn("player", &why);
                             let _ = events.send(PlayerEvent::OutputChangeFailed { why });
                         }
                     }
@@ -873,7 +873,7 @@ fn run(
             Instant::now(), active.as_deref(), failed, output::default_id,
             || output::switch(&runtime, &mut device, &mut player, &mut track, state, volume, None),
         ) {
-            crate::diagnostics::warn("player", &format!("could not follow the system default audio output; will retry: {error:#}"));
+            crate::runtime::diagnostics::warn("player", &format!("could not follow the system default audio output; will retry: {error:#}"));
         }
 
         // A download that has been refused mid-stream, asking for a signature
@@ -898,7 +898,7 @@ fn run(
                     };
                     state = set_state(&snapshot, restored);
                 }
-                Err(error) => crate::diagnostics::warn(
+                Err(error) => crate::runtime::diagnostics::warn(
                     "player",
                     &format!("armed stream replacement failed: {error:#}"),
                 ),
@@ -1250,7 +1250,7 @@ fn open_stream(
         }
     });
     let elapsed = started.elapsed().as_millis();
-    crate::diagnostics::info(
+    crate::runtime::diagnostics::info(
         "player",
         &format!(
             "stream prefetch {} in {elapsed} ms",
@@ -1270,7 +1270,7 @@ fn open_stream(
         anyhow::bail!(if link.seek_timed_out() { "seek timed out" } else { "stream opening interrupted" });
     }
     let elapsed = started.elapsed().as_millis();
-    crate::diagnostics::info(
+    crate::runtime::diagnostics::info(
         "player",
         &format!(
             "decoder initialization {} in {elapsed} ms",
@@ -1342,7 +1342,7 @@ fn update(snapshot: &Arc<Mutex<Snapshot>>, f: impl FnOnce(&mut Snapshot)) {
 }
 
 fn set_error(snapshot: &Arc<Mutex<Snapshot>>, msg: String) {
-    crate::diagnostics::error("player", &msg);
+    crate::runtime::diagnostics::error("player", &msg);
     update(snapshot, |s| {
         s.state = PlayState::Idle;
         s.error = Some(msg);

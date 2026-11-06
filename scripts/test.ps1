@@ -98,7 +98,7 @@ try {
     Invoke-CargoPhase 'ignored-inventory' ($taskBase + @('--', '--list', '--ignored'))
 
     if ($Suite -eq 'Smoke') {
-        foreach ($taskFilter in @('app::scenarios::', 'player::tests::', 'session::renewal::', 'ui::tests::')) {
+        foreach ($taskFilter in @('app::testing::scenarios::', 'player::tests::', 'session::renewal::', 'ui::tests::')) {
             $taskName = 'smoke-' + ($taskFilter -replace '::', '-').TrimEnd('-')
             Invoke-CargoPhase $taskName ($taskBase + @($taskFilter, '--', "--test-threads=$Threads"))
         }

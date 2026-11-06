@@ -4,33 +4,16 @@
 //! resolution lives in `mtui-resolver`, while the worker here decides when that
 //! potentially blocking work may run.
 
-pub mod artist;
-pub(crate) mod account;
-pub mod bootstrap;
-pub(crate) mod body;
-mod errors;
-#[cfg(test)]
-pub(crate) mod test_http;
+pub(crate) mod catalog;
 pub mod cover;
-pub mod collection;
-pub mod home;
+mod errors;
 pub mod http;
-mod inbox;
-pub mod innertube;
-pub mod search;
-pub mod journal;
-pub mod library;
-pub mod lrclib;
-pub mod sapisid;
-pub mod stats;
 pub(crate) mod listening;
-mod history;
-pub mod watch;
+pub mod lrclib;
 pub mod worker;
 pub mod youtube;
 
-#[cfg(feature = "spotify")]
-pub mod spotify;
+pub use mtui_resolver::sapisid;
 
 use std::ffi::OsStr;
 use std::process::Command;
@@ -58,9 +41,8 @@ pub(super) fn command(program: impl AsRef<OsStr>) -> Command {
 #[cfg(test)]
 pub fn resolve_stream(
     yt: &youtube::YouTube,
-    _tube: Option<&innertube::InnerTube>,
     video_id: &str,
-) -> anyhow::Result<(StreamUrl, bool)> {
+) -> anyhow::Result<StreamUrl> {
     let mut resolver = mtui_resolver::Resolver::new(yt.bin())?;
     resolver.set_js_runtime(yt.js_runtime().map(str::to_string));
     resolver.set_pot_provider(
@@ -69,14 +51,13 @@ pub fn resolve_stream(
         yt.pot_server_home().map(str::to_string)
             .or_else(|| std::env::var("MTUI_POT_SERVER_HOME").ok()),
     );
-    if let Some(cookies) = crate::config::Cookies::available()? {
+    if let Some(cookies) = crate::runtime::config::Cookies::available()? {
         resolver.set_session(Some(mtui_resolver::PlaybackSession::new(
             cookies.header().to_string(),
             cookies.sapisid().to_string(),
         )));
     }
-    let stream = resolver.resolve(mtui_resolver::ResolveRequest::new(video_id))?;
-    Ok((stream, true))
+    Ok(resolver.resolve(mtui_resolver::ResolveRequest::new(video_id))?)
 }
 
 /// Stand-in when a source cannot name the artist. Shared so that the places
@@ -162,9 +143,9 @@ mod live_quality {
     fn saved_session_resolves_a_complete_stream_quickly() {
         use std::time::{Duration, Instant};
 
-        let yt = super::bootstrap::locate().expect("yt-dlp should be available");
-        let yt = super::bootstrap::with_js_runtime(yt).expect("runtime setup should succeed");
-        let cookies = crate::config::Cookies::available()
+        let yt = super::youtube::bootstrap::locate().expect("yt-dlp should be available");
+        let yt = super::youtube::bootstrap::with_js_runtime(yt).expect("runtime setup should succeed");
+        let cookies = crate::runtime::config::Cookies::available()
             .expect("saved cookies should parse")
             .expect("no saved YouTube Music session is available");
         let mut resolver = mtui_resolver::Resolver::new(yt.bin()).expect("resolver should build");

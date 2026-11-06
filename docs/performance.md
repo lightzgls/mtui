@@ -15,10 +15,28 @@ stream storage. Background mode draws no terminal frames and does not fetch
 hidden lyrics or comments. Network/helper latency and audio decoding require
 separate measurements from rendering.
 
+## Artwork memory
+
+Cell and ASCII player covers retain at most 128×128 RGB pixels (48 KiB).
+Kitty/SIXEL player images keep up to the existing 1280-pixel edge. Card artwork
+uses a 64-pixel edge in terminal-cell mode and 256 pixels with Kitty/SIXEL;
+the existing 128-entry, 8 MiB pixel budget still applies. At 64×64, 128 card
+bitmaps occupy at most 1.5 MiB of RGB data.
+
+Switching to cells immediately shrinks cached bitmaps. Switching to real images
+keeps the small preview while fetching larger current/visible artwork. Late
+responses cannot replace a larger image with a small one or retain large pixels
+after a downgrade. Google artwork URLs with explicit dimensions request smaller
+copies in cell mode; opaque URLs are decoded/downscaled locally. Metadata URLs
+used by desktop integrations retain their original dimensions.
+
+These are pixel-storage bounds, excluding decoder/HTTP buffers, worker overhead,
+allocator retention and terminal-owned image memory; they are not process RSS.
+
 ## Reproduce the headless comparison
 
 ```powershell
-cargo test --release --offline --locked --bin mtui app::performance::compare_foreground_frame_work -- --ignored --exact --nocapture
+cargo test --release --offline --locked --bin mtui app::testing::performance::compare_foreground_frame_work -- --ignored --exact --nocapture
 ```
 
 This explicitly selected test does not run any other ignored/live tests. It

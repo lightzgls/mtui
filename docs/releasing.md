@@ -93,13 +93,13 @@ the usage guide also documents downloading and inspecting it first.
 ```sh
 shellcheck scripts/install-linux.sh scripts/test-linux-installer.sh scripts/test-linux-release.sh scripts/package-linux.sh
 bash scripts/test-linux-installer.sh
-dbus-run-session -- cargo test --locked media::mpris::tests::desktop_controllers_discover_metadata_commands_and_seek_signals -- --exact --ignored
+dbus-run-session -- cargo test --locked desktop::media::mpris::tests::desktop_controllers_discover_metadata_commands_and_seek_signals -- --exact --ignored
 ```
 
 On a Windows desktop, verify the native media session as well:
 
 ```powershell
-cargo test --locked media::imp::tests::native_media_session_publishes_and_owns_a_persistent_top_level_window -- --exact --ignored
+cargo test --locked desktop::media::imp::tests::native_media_session_publishes_and_owns_a_persistent_top_level_window -- --exact --ignored
 ```
 
 The mocked installer tests do not install packages or change the host. The real

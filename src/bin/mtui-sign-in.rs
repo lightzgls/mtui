@@ -1,9 +1,9 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
-#[path = "../session_helper.rs"]
+#[path = "../session/helper.rs"]
 mod session_helper;
 #[path = "../session/protocol.rs"]
-mod session_protocol;
+mod protocol;
 
 use std::path::PathBuf;
 

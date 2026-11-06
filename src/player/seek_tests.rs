@@ -39,7 +39,7 @@ fn playback_commands_interrupt_a_seek_without_waiting_for_the_worker() {
 fn cancelling_a_seek_releases_an_actual_stream_download_read() {
     let mut reply = b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n".to_vec();
     reply.resize(reply.len() + 32768, 1);
-    let (url, server) = crate::source::test_http::serve(vec![(reply, Duration::from_secs(2))]);
+    let (url, server) = crate::source::http::test_http::serve(vec![(reply, Duration::from_secs(2))]);
     let runtime = runtime();
     let (mut stream, link) = runtime.block_on(backend::open(&url)).unwrap();
     let (ready_tx, ready) = channel();

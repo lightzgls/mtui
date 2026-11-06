@@ -1,14 +1,14 @@
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
-use super::artist::ArtistSection;
-use super::artist::artist_header_art_width;
-use super::artist::artist_header_height;
-use super::artist::artist_layouts;
-use super::artist::artist_shelf_cursor;
-use super::artist::artist_song_columns;
-use super::artist::artist_song_line;
-use super::artist::render_artist_header;
+use super::pages::artist::ArtistSection;
+use super::pages::artist::artist_header_art_width;
+use super::pages::artist::artist_header_height;
+use super::pages::artist::artist_layouts;
+use super::pages::artist::artist_shelf_cursor;
+use super::pages::artist::artist_song_columns;
+use super::pages::artist::artist_song_line;
+use super::pages::artist::render_artist_header;
 use super::artwork::ascii_cell;
 use super::artwork::ascii_style;
 use super::artwork::fit;
@@ -31,19 +31,19 @@ use super::cards::render_shelf;
 use super::cards::section_shape;
 use super::cards::shelf_height;
 use super::cards::shelf_layouts;
-use super::comments::render_comments;
-use super::home::Hero;
-use super::home::HomeCursor;
-use super::home::plan_home;
-use super::home::render_feed;
-use super::home::render_hero;
-use super::lyrics::lyric_line;
-use super::lyrics::render_lyrics;
+use super::player::comments::render_comments;
+use super::pages::home::Hero;
+use super::pages::home::HomeCursor;
+use super::pages::home::plan_home;
+use super::pages::home::render_feed;
+use super::pages::home::render_hero;
+use super::player::lyrics::lyric_line;
+use super::player::lyrics::render_lyrics;
 use super::mouse::MouseMap;
 use super::mouse::MouseTarget;
-use super::overlays::SIGN_IN_MAX_WIDTH;
-use super::overlays::ellipsis;
-use super::overlays::render_sign_in;
+use super::modals::overlays::SIGN_IN_MAX_WIDTH;
+use super::modals::overlays::ellipsis;
+use super::modals::overlays::render_sign_in;
 use super::palette::highlight;
 use super::palette::luma;
 use super::player::PlayerIdentity;
@@ -62,12 +62,13 @@ use super::player::render_tabs;
 use super::player::render_track_info;
 use super::player::track_info_rows;
 use super::player::volume_line;
-use super::results::ALBUM_WIDTH;
-use super::results::ARTIST_WIDTH;
-use super::results::DURATION_WIDTH;
-use super::results::MIN_TITLE_WIDTH;
-use super::results::columns;
-use super::results::header_line;
+use super::player::queue;
+use super::pages::results::ALBUM_WIDTH;
+use super::pages::results::ARTIST_WIDTH;
+use super::pages::results::DURATION_WIDTH;
+use super::pages::results::MIN_TITLE_WIDTH;
+use super::pages::results::columns;
+use super::pages::results::header_line;
 use super::status::HINTS_AWAY;
 use super::status::HINTS_BROWSE;
 use super::status::HINTS_EDITING;
@@ -108,17 +109,17 @@ use crate::app::RepeatMode;
 use crate::app::SignIn;
 use crate::app::Tab;
 use crate::app::View;
-use crate::art::ArtCache;
-use crate::graphics::Graphics;
+use crate::terminal::graphics::art::ArtCache;
+use crate::terminal::graphics::Graphics;
 use crate::player::PlayState;
 use crate::player::Snapshot;
 use crate::source::Track;
-use crate::source::artist::ArtistPage;
-use crate::source::artist::ArtistSong;
+use crate::source::catalog::artist::ArtistPage;
+use crate::source::catalog::artist::ArtistSong;
 use crate::source::cover::Cover;
-use crate::source::home::Card;
-use crate::source::home::Shelf;
-use crate::source::watch::{Comment, Comments, Lyrics, TimedLine};
+use crate::source::catalog::home::Card;
+use crate::source::catalog::home::Shelf;
+use crate::source::youtube::watch::{Comment, Comments, Lyrics, TimedLine};
 use crate::source::{ArtistRef, BrowseEndpoint};
 use ratatui::buffer::CellDiffOption;
 use ratatui::layout::Constraint;
@@ -729,7 +730,7 @@ fn preview_sign_in() {
     }
 }
 
-use crate::source::home::Target;
+use crate::source::catalog::home::Target;
 
 pub(super) fn song(title: &str, subtitle: &str) -> Card {
     Card {
@@ -818,7 +819,7 @@ fn preview_home() {
             ],
         },
     ];
-    crate::app::home::arrange(&mut shelves);
+    crate::app::browse::home::arrange(&mut shelves);
     let art = stub_art(&shelves);
 
     let now = playing();
@@ -1088,7 +1089,7 @@ fn the_queue_marks_what_is_playing() {
     // The marker is on the playing track and on no other row.
     let marked: Vec<&String> = rows
         .iter()
-        .filter(|row| row.contains(crate::navigation::current().play()))
+        .filter(|row| row.contains(crate::terminal::navigation::current().play()))
         .collect();
     assert_eq!(marked.len(), 1, "exactly one row plays: {rows:#?}");
     assert!(marked[0].contains("Let It Happen"));
@@ -1716,7 +1717,7 @@ fn mini_player_distinguishes_pause_but_errors_still_win() {
     assert!(
         paused_text.starts_with(&format!(
             " ‹‹  {}   ›› ",
-            crate::navigation::current().play()
+            crate::terminal::navigation::current().play()
         )),
         "{paused_text:?}"
     );
@@ -2082,12 +2083,12 @@ fn drawn_screen(
                     can_go_back: view != View::Home,
                     has_player: true,
                     accepts_input: true,
-                    symbols: crate::navigation::Symbols::from_mask(0x15),
+                    symbols: crate::terminal::navigation::Symbols::from_mask(0x15),
                 },
                 &mut mouse,
             );
             if view == View::Home {
-                let inner = home::content_area(main);
+                let inner = pages::home::content_area(main);
                 let shape = plan_home(inner).max_shape;
                 let mut wanted = Vec::new();
                 render_feed(
@@ -2162,7 +2163,7 @@ fn drawn_screen(
                 footer,
                 &mut mouse,
             );
-            actions::bar(frame, now, footer, &mut mouse, Some(view));
+            modals::actions::bar(frame, now, footer, &mut mouse, Some(view));
             palette::apply(frame, Some(cover), None);
         })
         .unwrap();

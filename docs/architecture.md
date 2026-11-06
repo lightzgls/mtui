@@ -1,182 +1,127 @@
-# Kiến trúc và cách tổ chức code MTUI
+# MTUI Architecture and Code Organization
 
-MTUI tổ chức theo tính năng và ranh giới chạy: giao diện terminal, điều phối ứng
-dụng, audio và công việc nền. Một module có thể có nhiều file con; không cần
-tạo thêm crate chỉ để chia một file dài.
+MTUI is organized by feature and execution boundary: the terminal UI, application orchestration, audio, and background work. A module can contain multiple files; there is no need to introduce another crate just to split a long file.
 
-## Đánh giá code hiện tại
+## Assessment of the Current Code
 
-Những nền tảng tốt đã có:
+Several solid foundations are already in place:
 
-- `ui` vẽ bằng Ratatui; `app` xử lý hành động và trạng thái. Audio thuộc
-  `player`, HTTP và subprocess thuộc các worker trong `source`.
-- `Request`, `Response`, `Command` và `PlayerEvent` thể hiện giao tiếp giữa
-  các phần qua message. Request ID, queue epoch và session generation xử lý
-  response đến trễ thay vì giả định thứ tự hoàn thành.
-- Queue, lịch sử điều hướng và cache có giới hạn. Đây là những ràng buộc cần
-  giữ khi refactor một ứng dụng ưu tiên bộ nhớ thấp.
-- Scenario test dùng player/source không hoạt động để điều khiển sự kiện;
-  không cần mở audio device hay truy cập tài khoản cho mỗi test điều phối.
-- `mtui-resolver` đã có ranh giới crate riêng cho việc phân giải stream.
+- `ui` handles rendering with Ratatui; `app` handles actions and state. Audio belongs to `player`, while HTTP and subprocess work belong to workers in `source`.
+- `Request`, `Response`, `Command`, and `PlayerEvent` represent communication between components through messages. Request IDs, queue epochs, and session generations handle late responses instead of assuming that operations finish in order.
+- The queue, navigation history, and caches are bounded. These limits must be preserved when refactoring an application that prioritizes low memory usage.
+- Scenario tests use inert player/source services to control events. Each orchestration test does not need to open an audio device or access an account.
+- `mtui-resolver` already provides a separate crate boundary for stream resolution.
 
-Trước đợt tổ chức này, `app.rs` có khoảng 7.200 dòng và `ui.rs` gần 7.000 dòng,
-bao gồm cả test. Chúng gom nhiều lý do thay đổi vào cùng một file: sửa menu,
-seek, đăng nhập, điều hướng hay cách vẽ lyric đều đụng đến file trung tâm.
-Việc tách module giúp tìm và sửa đúng phần, nhưng chưa làm `App` trở thành
-các state độc lập hoàn toàn.
+Before this reorganization, `app.rs` contained approximately 7,200 lines and `ui.rs` nearly 7,000 lines, including tests. They combined many reasons for change in the same file: changes to menus, seeking, sign-in, navigation, or lyric rendering all touched a central file. Splitting the code into modules makes the relevant parts easier to find and modify, but does not yet divide `App` into fully independent state components.
 
-## Cấu trúc
+## Structure
 
 ```text
 src/
-  main.rs                 Khởi động, vòng lặp foreground/background
-  app.rs                  App, khởi tạo dịch vụ, overlay và API dùng chung
+  main.rs                  Startup and foreground/background loops
   app/
-    account.rs            Đăng nhập, gia hạn session, đăng xuất
-    actions.rs            Like, share, lưu playlist và hành động bài hát
-    artist.rs             State và thao tác trang nghệ sĩ
-    artwork.rs            State ảnh, cache và kế hoạch đặt ảnh terminal
-    desktop.rs            Tray, media controls và Discord activity
-    home.rs               Nạp feed, chọn và mở card trên Home
-    input.rs              Phân phối key/mouse thành hành động
-    library.rs            Cache, phân trang và thao tác Library
-    menu.rs               State menu, danh sách lệnh, thực thi lệnh
-    navigation.rs         Route, Back history, tương quan page request
-    now_playing.rs        State bài hiện tại và thao tác queue
-    playback.rs           Play/seek/stop, recovery, queue và listening
-    playback/state.rs     PlaybackState: chuyển trạng thái, seek chờ và listening
-    prefetch.rs           PrefetchState: debounce selection và cache knowledge
-    preferences.rs        State settings và áp dụng lựa chọn
-    responses.rs          Poll và áp dụng response từ source worker
-    search.rs             Tìm kiếm, chọn kết quả, dispatch request
-    search_input.rs       Sửa chuỗi tìm kiếm theo grapheme
-    selection.rs          Nhận diện click/chọn bài
-    tests.rs              Unit test của application state
-    scenarios.rs          Chuỗi sự kiện với dịch vụ giả lập
-    performance.rs        Probe hiệu năng được bật riêng
-  ui.rs                   Ghép các vùng của frame và kế hoạch ảnh
+    mod.rs                 App, service initialization, overlays, and shared APIs
+    account.rs             Sign-in, session renewal, and sign-out state and handling
+    artwork.rs             Artwork state, caching, and terminal image placement plans
+    browse/                Home, Library, artists, search, navigation, and track selection
+    controls/              Input, menus, settings, and track actions
+    desktop.rs             Tray, media controls, and Discord activity
+    playback/              Current track, queue, play/seek/stop, recovery, and prefetch
+      state.rs             Playback state, pending seeks, and listening
+    responses.rs           Polling and applying responses from source workers
+    testing/               Unit tests, scenarios with fake services, and performance probes
   ui/
-    actions.rs            Hàng action và dialog bài hát
-    artist.rs             Trang nghệ sĩ
-    artwork.rs            Fit, crop và vẽ ảnh pixel/ASCII
-    browse.rs             Trang album/playlist
-    cards.rs              Card dùng chung và hình học shelf
-    comments.rs           Panel bình luận
-    dialog.rs             Khung dialog dùng chung
-    home.rs               Feed và layout Home
-    library.rs            Trang Library
-    lyrics.rs             Lyric, highlight và vị trí follow
-    menu.rs               Vẽ menu
-    mouse.rs              Hit test và vị trí control liên tục
-    overlays.rs           Overlay thông báo và đăng nhập
-    paging.rs             Control phân trang
-    palette.rs            Màu từ artwork và màu chữ dễ đọc
-    player.rs             Trang Now Playing và ghép panel
-    player_split.rs       Panel Queue/Related/Comments phía trên, Lyrics phía dưới
-    preferences.rs        Vẽ settings
-    queue.rs              Hàng queue và vùng click
-    related.rs            Card nhạc liên quan
-    results.rs            Cột và viewport danh sách bài
-    search.rs             Kết quả tìm kiếm nhiều loại
-    shell.rs              Header, vùng nội dung và geometry chung
-    sidebar.rs            Cột Now Playing cố định khi duyệt nhạc
-    status.rs             Footer, mini player, transport và volume
-    text.rs               Đo, cắt, wrap và marquee chữ terminal
-    tests.rs              Test layout/render với TestBackend
-  player/                 Thread audio, decoder, output, HTTP streaming
-  source/                 Provider, parser, worker, cache và journal
-  session.rs, session/    Session và giao thức helper
-  media.rs, media/        Adapter media controls theo OS
-  tray.rs, tray/          Tray và animation
-  update.rs, update/      Cập nhật theo nền tảng
-  bin/mtui-sign-in.rs      Executable đăng nhập độc lập
-crates/mtui-resolver/      Phân giải và kiểm tra stream URL
+    mod.rs                 Frame composition and image plans
+    pages/                 Home, Search, Library, artist, album, and playlist pages
+    player/                Now Playing, sidebar, queue, lyrics, comments, and related tracks
+    modals/                Menus, settings, sign-in, notifications, and track dialogs
+    artwork.rs             Image fitting, cropping, and pixel/ASCII rendering
+    cards.rs               Shared cards and shelf geometry
+    mouse.rs               Hit testing and positioning for continuous controls
+    paging.rs              Pagination controls
+    palette.rs             Artwork-derived colors and readable text colors
+    shell.rs               Header, content area, and shared geometry
+    split.rs               Sizes of regions that can be resized by dragging
+    status.rs              Footer, mini player, transport, and volume
+    text.rs                Terminal text measurement, truncation, wrapping, and marquees
+    tests.rs               Layout/render tests with TestBackend
+  player/                  Audio thread, decoder, output, and HTTP streaming
+  source/
+    mod.rs                 Track, BrowseEndpoint, and ArtistRef types
+    catalog/               Home, artists, albums, playlists, Library, and search
+    http/                  HTTP client, response body limits, and test fixtures
+    listening/             Listening progress tracking, journal, and history submission
+    worker/                Background work coordination and request queues
+    youtube/               yt-dlp, Innertube, sign-in sessions, and now-playing data
+    cover.rs               Cover image downloading and decoding
+    errors.rs              Provider error messages
+    lrclib.rs              Lyric lookup through LRCLIB
+  session/                 Sessions, renewal, protocol, and sign-in webview
+  desktop/                 Media controls, tray, Discord, and clipboard
+  runtime/                 Configuration, diagnostics, process locking, and updates
+  terminal/                Console, input, frame pacing, and terminal graphics support
+    graphics/              Terminal capability detection, image caching, Kitty, and Sixel
+  bin/mtui-sign-in.rs       Standalone sign-in executable
+crates/mtui-resolver/       Stream URL resolution and validation
 ```
 
-`app.rs` cùng `app/` là cách khai báo module hợp lệ của Rust, tương tự
-`ui.rs` cùng `ui/`. Không cần đổi tất cả thành `mod.rs`.
+`main.rs` is the only file directly under `src/`. Each group places its module entry point in `mod.rs`, alongside the group's implementation files.
 
-## Quy tắc đặt code
+## Code Placement Rules
 
-1. Một tính năng có phần **hành vi** trong `app/<feature>.rs` và phần **vẽ**
-   trong `ui/<feature>.rs` khi cần. Cùng tên giúp tìm hai phía của một luồng.
-2. Hàm định dạng, đo chữ và hình học dùng chung nằm trong module có tên cụ
-   thể như `ui/text.rs`, `ui/cards.rs`, `ui/artwork.rs`. Tránh gom mọi thứ vào
-   `utils.rs`, `helpers.rs` hoặc một thư mục `common` không có chủ sở hữu.
-3. `app` dispatch công việc nền; provider parser và HTTP không đi vào `ui`.
-   Worker trả dữ liệu về; không trực tiếp điều khiển giao diện.
-4. Import rõ module sở hữu. Dùng `pub(super)` cho chi tiết cần chia sẻ trong
-   cùng subsystem; chỉ re-export ở `app.rs`/`ui.rs` những tên cần cho phần khác
-   hoặc API nội bộ đang được dùng. Không dùng `include!` để chia file.
-5. Test gần tính năng hoặc trong file test riêng của module. Giữ scenario
-   test xuyên tính năng ở `app/scenarios.rs`. Không đổi tên test chỉ vì di
-   chuyển file, vì runner có lọc theo module.
-6. Tạo crate riêng khi có API và dependency độc lập thực sự, nhu cầu tái sử
-   dụng hoặc ranh giới build; số dòng tự nó chưa đủ là lý do.
+1. Place **behavior** under `app/` and **rendering** under `ui/`, in the corresponding feature groups. Matching filenames make both sides of a flow easier to find, for example `app/browse/library.rs` and `ui/pages/library.rs`.
 
-## SOLID trong Rust
+2. Shared formatting, text measurement, and geometry functions belong in specifically named modules such as `ui/text.rs`, `ui/cards.rs`, and `ui/artwork.rs`. Avoid collecting everything in `utils.rs`, `helpers.rs`, or a `common` directory with no clear owner.
 
-SOLID dùng được như nguyên tắc thiết kế. Rust diễn đạt chúng bằng module,
-composition, trait và hợp đồng hành vi; không cần dựng cây class.
+3. `app` dispatches background work; provider parsers and HTTP code do not belong in `ui`. Workers return data rather than directly controlling the interface.
 
-| Nguyên tắc | Áp dụng cho MTUI |
+4. Import explicitly from the owning module. Use `pub(super)` for implementation details that need to be shared with the parent module, and restrict visibility to the subsystem for details shared between groups, for example `pub(in crate::app)`. In `app/mod.rs` and `ui/mod.rs`, re-export only names needed elsewhere or already used as part of the internal API. Do not use `include!` to split files.
+
+5. Keep tests close to the feature or in a separate test file within the module. Keep scenarios that span multiple features in `app/testing/scenarios.rs`. Update the runner's filters when test module paths change.
+
+6. Create a separate crate when there is a genuinely independent API and dependency set, a need for reuse, or a build boundary. Line count alone is not a sufficient reason.
+
+## SOLID in Rust
+
+SOLID can be applied as a set of design principles. Rust expresses them through modules, composition, traits, and behavioral contracts; there is no need to build a class hierarchy.
+
+| Principle | Application to MTUI |
 | --- | --- |
-| Single Responsibility | Tách điều hướng, menu, playback, account và render. Bước tiếp theo là thu nhỏ state mà mỗi phần có quyền sửa. |
-| Open/Closed | Dùng trait khi có nhiều implementation cần thay thế qua cùng một hợp đồng. Với tập trạng thái/lệnh hữu hạn, enum và exhaustive match vẫn phù hợp. |
-| Liskov Substitution | Implementation của cùng trait phải giữ cùng hợp đồng, kể cả lỗi, hủy và thứ tự sự kiện. Compiler kiểm tra type/signature; test vẫn phải kiểm tra hành vi. |
-| Interface Segregation | Nếu cần abstraction, chia theo năng lực như playback hoặc tìm kiếm; tránh một trait provider gồm mọi chức năng account, cover, lyric và audio. |
-| Dependency Inversion | Message giữa App và worker đã giảm phụ thuộc vào công việc nền. App hiện vẫn giữ `Player` và `SourceWorker` cụ thể; chỉ thêm port/trait khi có nhu cầu thay implementation rõ ràng. |
+| Single Responsibility | Separate navigation, menus, playback, accounts, and rendering. The next step is to reduce the amount of state each component is allowed to modify. |
+| Open/Closed | Use traits when multiple implementations need to be interchangeable under the same contract. For a finite set of states or commands, enums and exhaustive matching remain appropriate. |
+| Liskov Substitution | Implementations of the same trait must preserve the same contract, including error behavior, cancellation, and event ordering. The compiler checks types and signatures; tests must still verify behavior. |
+| Interface Segregation | When abstraction is needed, divide it by capability, such as playback or search. Avoid a single provider trait that includes every account, cover, lyric, and audio function. |
+| Dependency Inversion | Messages between App and workers already reduce coupling to background work. App still holds concrete `Player` and `SourceWorker` types; add ports or traits only when there is a clear need to replace implementations. |
 
-Trait không tự làm code sạch hơn. Một trait chỉ có một implementation và
-không có yêu cầu thay thế có thể thêm chi phí đọc mà chưa đem lại lợi ích.
-Ownership cũng không tự bảo đảm phân chia trách nhiệm đúng.
+Traits do not automatically make code cleaner. A trait with only one implementation and no requirement for substitution can add reading overhead without providing a benefit. Ownership does not automatically ensure a sound division of responsibilities either.
 
-Tham khảo chính thức: [module và privacy](https://doc.rust-lang.org/book/ch07-02-defining-modules-to-control-scope-and-privacy.html),
-[trait và hành vi dùng chung](https://doc.rust-lang.org/book/ch10-02-traits.html).
+Official references: [modules and privacy](https://doc.rust-lang.org/book/ch07-02-defining-modules-to-control-scope-and-privacy.html), [traits and shared behavior](https://doc.rust-lang.org/book/ch10-02-traits.html).
 
-## Những phần còn nên cải thiện
+## Areas for Further Improvement
 
-- `App` còn nhiều field phục vụ duyệt trang, account và settings. Phần transport
-  đã có `PlaybackState`; có thể tiếp tục gom thành `BrowseState`, `AccountState`
-  và giới hạn thao tác qua method. Giữ test stale response/seek/queue cho từng bước.
-- Renderer vẫn nhận `&mut App` để cập nhật viewport, selection và kế hoạch
-  ảnh. Tách view data chỉ đọc khỏi layout feedback sẽ làm ranh giới chặt hơn.
-- `source` còn chứa cả model dùng chung và model theo YouTube. Nếu hỗ trợ
-  thêm provider thật, cần xác định model chung và năng lực từng provider trước
-  khi tạo abstraction. Feature Spotify hiện là bản phác thảo.
-- `playback.rs` còn tương đối lớn; có thể tiếp tục tách recovery và queue
-  dispatch khi đã xác định được state sở hữu riêng. Tránh chỉ chia tiếp theo
-  số dòng mà vẫn truyền toàn bộ App qua mọi hàm.
+- `App` still has many fields for browsing, accounts, and settings. Transport and sign-in session state already have `PlaybackState` and `SessionState`. Page loading status is derived directly from the pending navigation request. Browsing data could be grouped further so that changes are restricted to methods.
+- The renderer still receives `&mut App` to update the viewport, selection, and image plans. Separating read-only view data from layout feedback would strengthen this boundary.
+- `source` still contains both shared models and YouTube-specific models. If support for another provider is actually added, identify the common models and each provider's capabilities before introducing abstractions.
+- `app/playback/mod.rs` is still relatively large. Recovery and queue dispatch could be split out further once ownership of their state is clear. Avoid splitting code solely by line count while continuing to pass the entire App into every function.
 
-## State playback và prefetch
+## Playback and Prefetch State
 
-`App` giữ hai state nội bộ với field riêng tư, độc lập với dữ liệu render trong
-`NowPlaying`:
+`App` holds two internal state components with private fields, separate from the rendering data in `NowPlaying`:
 
-- `PlaybackState` sở hữu request resolve đang chờ, deferred seek, recovery,
-  lỗi playback, cạnh EOF, ngân sách auto-skip và tiến độ listening. Seek đang
-  chờ nằm trong request của đúng bài; response khác ID không thể lấy mất seek.
-  Chọn bài mới, Stop hoặc hủy resolve loại bỏ seek cùng request đó.
-- `PrefetchState` sở hữu debounce selection, probe đang chạy và ID đã warm.
-  Response của queue và selection chỉ giải phóng probe cùng ID; một response
-  thất bại cũ không xóa kiến thức cache của bài khác.
+- `PlaybackState` owns the pending resolve request, deferred seek, recovery, playback errors, EOF edge handling, auto-skip budget, and listening progress. A pending seek belongs to the request for its specific track; a response with a different ID cannot consume it. Selecting a new track, issuing Stop, or cancelling resolution removes the seek along with its request.
+- `PrefetchState` owns selection debouncing, in-flight probes, and warmed IDs. Queue and selection responses release only the probe with the matching ID; an old failed response does not erase the known cache status of another track.
 
-State quyết định chuyển trạng thái; `App` vẫn dispatch command, gửi request và
-ghi journal. Checkpoint listening chỉ được đánh dấu đã gửi sau khi ghi durable
-outbox thành công. Canonical metadata không thay nonce hay số giây đã nghe.
-UI tiếp tục dùng `App::now`, snapshot và các API hiện có; không được sửa trực
-tiếp các cờ transport hoặc prefetch.
+State components determine transitions; `App` still dispatches commands, sends requests, and writes the journal. A listening checkpoint is marked as sent only after it has been successfully written to the durable outbox. Canonical metadata does not change the nonce or the number of seconds listened. The UI continues to use `App::now`, snapshots, and the existing APIs; it must not modify transport or prefetch flags directly.
 
-Refactor giữ chính sách playback, format lưu dữ liệu và dependency hiện có.
+The refactor preserves existing playback policies, persisted data formats, and dependencies.
 
-## Kiểm tra sau refactor
+## Post-Refactor Checks
 
 ```powershell
 ./scripts/test.ps1 -Suite Smoke
 ./scripts/test.ps1 -Suite Full
 ```
 
-Full chạy toàn workspace/all targets và Clippy với `-D warnings`, dùng profile
-dữ liệu riêng và giữ các test live/account/audio được đánh dấu ignored.
-Xem [hướng dẫn kiểm thử](testing.md) cho giới hạn của kiểm tra headless và
-cách kiểm tra audio, terminal, tray trên hệ điều hành thật.
+The Full suite runs all targets across the entire workspace and Clippy with `-D warnings`, uses an isolated data profile, and leaves the designated live/account/audio tests ignored.
+
+See the [testing guide](testing.md) for the limitations of headless checks and instructions for testing audio, terminal behavior, and the tray on a real operating system.

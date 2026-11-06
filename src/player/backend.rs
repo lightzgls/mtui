@@ -170,14 +170,12 @@ mod tests {
     }
 
     fn resolve_track(id: &str) -> crate::source::StreamUrl {
-        let tube = crate::source::innertube::InnerTube::new().ok();
         let yt = crate::source::youtube::YouTube::new(
             std::env::var("MTUI_YT_DLP").unwrap_or_else(|_| "yt-dlp".into()),
         )
         .with_js_runtime(std::env::var("MTUI_JS_RUNTIME").ok());
-        crate::source::resolve_stream(&yt, tube.as_ref(), id)
+        crate::source::resolve_stream(&yt, id)
             .expect("resolve failed")
-            .0
     }
 
     #[test]
@@ -188,7 +186,7 @@ mod tests {
 
         let id = std::env::var("MTUI_VIDEO_ID").unwrap_or_else(|_| "14OBXAjgj7U".into());
         let mut resolver = Resolver::new(std::env::var("MTUI_YT_DLP").unwrap_or_else(|_| "yt-dlp".into())).unwrap();
-        if let Some(cookies) = crate::config::Cookies::available().unwrap() {
+        if let Some(cookies) = crate::runtime::config::Cookies::available().unwrap() {
             resolver.set_session(Some(PlaybackSession::new(cookies.header(), cookies.sapisid())));
         }
         let native = resolver.resolve_fast(ResolveRequest::new(&id)).unwrap();
@@ -472,7 +470,6 @@ mod tests {
             let id = id.clone();
             let done = std::sync::Arc::clone(&finished);
             move || {
-                let tube = crate::source::innertube::InnerTube::new().ok();
                 let yt = crate::source::youtube::YouTube::default();
                 while !done.load(std::sync::atomic::Ordering::Relaxed) {
                     if link.wants_url().is_some() {
@@ -480,8 +477,8 @@ mod tests {
                         // The same cascade the worker uses, cap check and
                         // all. Answering with anything cheaper hands back a URL
                         // capped exactly like the one being recovered from.
-                        match crate::source::resolve_stream(&yt, tube.as_ref(), &id) {
-                            Ok((fresh, _whole)) => {
+                        match crate::source::resolve_stream(&yt, &id) {
+                            Ok(fresh) => {
                                 refreshes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 println!("--- fresh URL in {:.2}s", at.elapsed().as_secs_f64());
                                 link.supply_url(&fresh.url);
@@ -589,7 +586,7 @@ mod tests {
     /// "playback is slow" can be attributed to a stage instead of guessed at.
     ///
     /// Ignored by default: it needs the network. Resolves a well-known video
-    /// through the normal fast path unless `MTUI_STREAM_URL` overrides it, so
+    /// through the normal resolve cascade unless `MTUI_STREAM_URL` overrides it, so
     /// what it reports is the real end-to-end cost of pressing Enter.
     ///
     /// `cargo test --release probe -- --ignored --nocapture`
@@ -598,10 +595,10 @@ mod tests {
     fn probe_pipeline_latency() {
         let url = std::env::var("MTUI_STREAM_URL").unwrap_or_else(|_| {
             let at_resolve = Instant::now();
-            let tube = crate::source::innertube::InnerTube::new().expect("client should build");
-            let resolved = tube.resolve("dQw4w9WgXcQ").expect("resolve failed");
+            let resolved = resolve_track("dQw4w9WgXcQ");
             println!(
-                "resolve (InnerTube)   : {:.2}s",
+                "resolve ({:?}): {:.2}s",
+                resolved.source,
                 at_resolve.elapsed().as_secs_f64()
             );
             resolved.url

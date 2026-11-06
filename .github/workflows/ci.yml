@@ -70,7 +70,7 @@ jobs:
 
       - name: Verify Linux desktop media controls on a private bus
         if: matrix.os == 'ubuntu-latest'
-        run: dbus-run-session -- cargo test --locked media::mpris::tests::desktop_controllers_discover_metadata_commands_and_seek_signals -- --exact --ignored
+        run: dbus-run-session -- cargo test --locked desktop::media::mpris::tests::desktop_controllers_discover_metadata_commands_and_seek_signals -- --exact --ignored
 
       - name: Verify Linux packaging
         if: matrix.os == 'ubuntu-latest'

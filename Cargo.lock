@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "mtui"
-version = "0.11.7"
+version = "0.11.8"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1974,6 +1974,7 @@ dependencies = [
  "form_urlencoded",
  "futures-util",
  "jpeg-decoder",
+ "libc",
  "mtui-resolver",
  "ratatui",
  "reqwest",

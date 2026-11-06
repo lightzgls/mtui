@@ -9,13 +9,13 @@ use ratatui::widgets::{Block, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{CardShape, ImageBound, ImagePlan, ImageSource, PlannedImage};
-use crate::art::ArtCache;
-use crate::graphics::Graphics;
+use crate::terminal::graphics::art::ArtCache;
+use crate::terminal::graphics::Graphics;
 use crate::source::ArtistRef;
 use crate::source::cover::Cover;
-use crate::source::home::{Card, Shelf};
+use crate::source::catalog::home::{Card, Shelf};
 
-use super::{home, paging};
+use super::{pages::home, paging};
 use super::artwork::{cell_pixels, square_columns};
 use super::text::{clock, display_width, focused_text, truncate};
 
@@ -74,7 +74,7 @@ pub(super) const NO_ART: (u8, u8, u8) = (110, 110, 110);
 pub(super) const MARKER_WIDTH: usize = 2;
 
 /// Heading width defended before the position counter is granted. Same
-/// principle as [`super::results::MIN_TITLE_WIDTH`].
+/// principle as [`super::pages::results::MIN_TITLE_WIDTH`].
 pub(super) const MIN_SHELF_TITLE: usize = 8;
 
 /// One card's nominal size, borders included.
@@ -541,9 +541,9 @@ pub(super) fn badge_spans(card: &Card, accent: Color) -> Vec<Span<'static>> {
     if spans.is_empty() {
         spans.push(Span::styled(
             if card.is_playable() {
-                crate::navigation::current().label(crate::navigation::Icon::Playing, "play")
+                crate::terminal::navigation::current().label(crate::terminal::navigation::Icon::Playing, "play")
             } else {
-                crate::navigation::current().label(crate::navigation::Icon::Menu, "open")
+                crate::terminal::navigation::current().label(crate::terminal::navigation::Icon::Menu, "open")
             },
             Style::default().fg(Color::DarkGray),
         ));

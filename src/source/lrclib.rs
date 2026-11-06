@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use crate::source::UNKNOWN_ARTIST;
 use crate::source::http::Http;
-use crate::source::watch::{MAX_TIMED_LINES, TimedLine};
+use crate::source::youtube::watch::{MAX_TIMED_LINES, TimedLine};
 
 /// The exact-match endpoint: artist, title and length, answering 404 unless it
 /// holds that precise recording.
@@ -177,18 +177,18 @@ fn get(http: &Http, url: &str, params: &[(&str, String)]) -> Option<Value> {
     let (status, raw) = match http.send(request) {
         Ok(response) => response,
         Err(error) => {
-            crate::diagnostics::warn("lyrics", &format!("LRCLIB request failed: {error:#}"));
+            crate::runtime::diagnostics::warn("lyrics", &format!("LRCLIB request failed: {error:#}"));
             return None;
         }
     };
     if !(200..300).contains(&status) {
-        if status != 404 { crate::diagnostics::warn("lyrics", &format!("LRCLIB returned HTTP {status}")); }
+        if status != 404 { crate::runtime::diagnostics::warn("lyrics", &format!("LRCLIB returned HTTP {status}")); }
         return None;
     }
     match serde_json::from_slice(&raw) {
         Ok(json) => Some(json),
         Err(error) => {
-            crate::diagnostics::warn("lyrics", &format!("LRCLIB returned invalid JSON: {error}"));
+            crate::runtime::diagnostics::warn("lyrics", &format!("LRCLIB returned invalid JSON: {error}"));
             None
         }
     }
@@ -213,7 +213,9 @@ fn synced(record: &Value) -> Option<Vec<TimedLine>> {
 /// bracket syntax (`[ar:]`, `[length:]`) and are skipped by simply not parsing
 /// as a time, which needs no list of tag names to keep up to date.
 fn parse_lrc(text: &str) -> Vec<TimedLine> {
-    let mut lines: Vec<TimedLine> = Vec::new();
+    const MAX_INPUT_CUES: usize = MAX_TIMED_LINES * 4;
+    const MAX_LINE_BYTES: usize = 1024;
+    let mut lines = Vec::new();
 
     for line in text.lines() {
         let mut rest = line.trim_start();
@@ -226,26 +228,28 @@ fn parse_lrc(text: &str) -> Vec<TimedLine> {
             let Some(start) = parse_stamp(&rest[1..=end]) else {
                 break;
             };
+            if lines.len() + starts.len() == MAX_INPUT_CUES {
+                return Vec::new();
+            }
             starts.push(start);
             rest = rest[end + 2..].trim_start();
         }
 
         let text = rest.trim_end();
-        for start in starts {
-            lines.push(TimedLine {
-                text: text.to_string(),
-                start,
-            });
-        }
+        let text = &text[..text.floor_char_boundary(MAX_LINE_BYTES)];
+        lines.extend(starts.into_iter().map(|start| (start, text)));
     }
 
     // A repeated chorus writes its later stamps against the first occurrence of
     // the words, so the file is not in time order and the panel walks it in
     // order. Sorted here rather than relied upon: `Lyrics::singing` takes the
     // last line to have started, which is only the right one if they ascend.
-    lines.sort_by_key(|line| line.start);
+    lines.sort_by_key(|(start, _)| *start);
     lines.truncate(MAX_TIMED_LINES);
-    lines
+    lines.into_iter().map(|(start, text)| TimedLine {
+        start,
+        text: text.to_owned(),
+    }).collect()
 }
 
 /// `mm:ss`, `mm:ss.xx` or `mm:ss.xxx` into a duration.
@@ -269,14 +273,13 @@ fn parse_stamp(stamp: &str) -> Option<Duration> {
         digits if digits.chars().all(|c| c.is_ascii_digit()) => {
             let value: u64 = digits.parse().ok()?;
             let scale = 10u64.checked_pow(digits.len() as u32)?;
-            value * 1_000 / scale
+            value.checked_mul(1_000)? / scale
         }
         _ => return None,
     };
 
-    Some(Duration::from_millis(
-        (minutes * 60 + seconds) * 1_000 + millis,
-    ))
+    let seconds = minutes.checked_mul(60)?.checked_add(seconds)?;
+    Some(Duration::from_millis(seconds.checked_mul(1_000)?.checked_add(millis)?))
 }
 
 /// A channel name reduced to the artist LRCLIB would index.
@@ -432,6 +435,18 @@ mod tests {
             .map(|n| format!("[{:02}:{:02}.00]sung line {n}\n", n / 60, n % 60))
             .collect();
         assert_eq!(parse_lrc(&lrc).len(), MAX_TIMED_LINES);
+    }
+
+    #[test]
+    fn repeated_timestamps_and_long_text_have_independent_limits() {
+        let long = "é".repeat(2_000);
+        let within = format!("{}{long}", "[00:01]".repeat(MAX_TIMED_LINES + 1));
+        let lines = parse_lrc(&within);
+        assert_eq!(lines.len(), MAX_TIMED_LINES);
+        assert!(lines.iter().all(|line| line.text.len() <= 1024));
+        let excessive = format!("{}{long}", "[00:01]".repeat(MAX_TIMED_LINES * 4 + 1));
+        assert!(parse_lrc(&excessive).is_empty());
+        assert_eq!(parse_stamp("18446744073709551615:00"), None);
     }
 
     #[test]

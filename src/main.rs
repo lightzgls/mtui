@@ -13,29 +13,13 @@
 //! going into the background stops drawing, not playing.
 
 mod app;
-mod clipboard;
-mod art;
-mod config;
-mod console;
-mod diagnostics;
-mod discord;
-mod encoding;
-mod graphics;
-mod instance;
-mod kitty;
-mod media;
-mod navigation;
+mod desktop;
 mod player;
-mod pointer;
-mod refresh;
+mod runtime;
 mod session;
-#[path = "session/protocol.rs"]
-mod session_protocol;
-mod sixel;
 mod source;
-mod tray;
+mod terminal;
 mod ui;
-mod update;
 
 #[cfg(windows)]
 use std::io;
@@ -65,9 +49,12 @@ use ratatui::{TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
 use app::App;
+use desktop::{media, tray::{self, Tray}};
 use player::Player;
+use runtime::{config, diagnostics, instance, update};
 use source::worker::SourceWorker;
-use tray::Tray;
+use terminal::{console, graphics, pointer, refresh};
+use terminal::graphics::{kitty, sixel};
 
 /// Poll cadence without input. Actual drawing follows visible changes.
 const TICK: Duration = Duration::from_millis(200);
@@ -168,8 +155,8 @@ fn run(settings: config::Settings, mut tray: Option<Tray>, instance: &instance::
     // message instead of appearing as a blank alternate screen. On a first run
     // this is also where yt-dlp gets fetched, which prints progress -- another
     // reason it has to happen before the alternate screen is up.
-    let yt = source::bootstrap::locate().context("yt-dlp is required but could not be obtained")?;
-    let yt = source::bootstrap::with_js_runtime(yt)
+    let yt = source::youtube::bootstrap::locate().context("yt-dlp is required but could not be obtained")?;
+    let yt = source::youtube::bootstrap::with_js_runtime(yt)
         .context("the optional JavaScript runtime could not be prepared")?;
 
     // Each foreground window probes its own host before entering the alternate
@@ -217,7 +204,7 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, media: &Option<media::
         return Ok(());
     }
 
-    app.graphics = graphics::detect();
+    app.set_graphics(graphics::detect());
     app.invalidate_image();
     diagnostics::info("graphics", &format!("detected {:?}; artwork mode {}", app.graphics, app.image_renderer().label()));
 

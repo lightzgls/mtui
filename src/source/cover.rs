@@ -33,9 +33,12 @@ use jpeg_decoder::PixelFormat;
 /// square before the renderer says how large its pane is.
 ///
 /// The cost is honest and worth naming: a 720x720 cover is 1.5 MB of RGB,
-/// resident only while a track is playing and dropped the moment one stops.
-/// That is the price of a picture rather than a mosaic.
-const MAX_EDGE: u32 = 1280;
+/// resident only while a track is playing and real images are selected. Cell
+/// renderers keep at most [`CELL_EDGE`] instead, including after a mode switch.
+pub const MAX_EDGE: u32 = 1280;
+
+/// Text and half-block renderers only sample a small number of source pixels.
+pub const CELL_EDGE: u32 = 128;
 
 /// Ceiling on the response body. A 1280x720 thumbnail runs 60-90 KB; anything
 /// wildly past that is not one, and buffering it would undo the point.
@@ -75,6 +78,7 @@ const ART_CONCURRENCY: usize = 4;
 /// between them and the one size YouTube always has, so a track missing the top
 /// two lands on 480x480 rather than dropping straight to 360x360.
 const SIZES: &[&str] = &["maxresdefault", "hq720", "sddefault", "hqdefault"];
+const CELL_SIZES: &[&str] = &["hqdefault", "mqdefault"];
 
 /// A decoded, downscaled thumbnail, held as tightly packed 8-bit RGB.
 #[derive(Clone)]
@@ -257,22 +261,25 @@ fn lift((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
     (scale(r), scale(g), scale(b))
 }
 
-/// Fetches the Music sleeve first, then the largest available video thumbnail.
+/// Fetches the Music sleeve first, then a video thumbnail sized for the renderer.
 /// The returned URL is present only when the native Music artwork loaded.
 /// Video fallback pixels are used only by the player, not Discord.
 pub fn fetch_cancellable(
     video_id: &str,
     artwork_url: Option<&str>,
+    edge: u32,
     cancel: Option<&super::http::Cancellation>,
 ) -> Result<(Cover, Option<String>)> {
-    fetch_preferred(video_id, artwork_url, cancel, |url, timeout| {
-        get(url, timeout, cancel).and_then(|body| decode(&body, MAX_EDGE))
+    let sizes = if edge <= CELL_EDGE { CELL_SIZES } else { SIZES };
+    fetch_preferred(video_id, artwork_url, sizes, cancel, |url, timeout| {
+        get(&sized_art_url(url, edge), timeout, cancel).and_then(|body| decode(&body, edge))
     })
 }
 
 fn fetch_preferred(
     video_id: &str,
     artwork_url: Option<&str>,
+    sizes: &[&str],
     cancel: Option<&super::http::Cancellation>,
     mut fetch: impl FnMut(&str, Duration) -> Result<Cover>,
 ) -> Result<(Cover, Option<String>)> {
@@ -288,7 +295,7 @@ fn fetch_preferred(
         }
     }
 
-    for name in SIZES {
+    for name in sizes {
         if cancel.is_some_and(|cancel| !cancel.active()) { bail!("thumbnail request was superseded"); }
         // A missing size answers 404 in milliseconds, so the ladder normally
         // costs nothing; this only bites when the CDN is unreachable, and then
@@ -308,6 +315,33 @@ fn fetch_preferred(
 
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no thumbnail sizes are configured")))
         .with_context(|| format!("could not fetch a thumbnail for {video_id}"))
+}
+
+/// Resize only explicit Google artwork dimensions. Preserve opaque URLs and
+/// the original metadata URL, which desktop integrations use independently.
+fn sized_art_url(address: &str, edge: u32) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(address) else { return address.to_string(); };
+    let host = parsed.host_str().unwrap_or_default();
+    if !(host == "googleusercontent.com" || host.ends_with(".googleusercontent.com")
+        || host == "ggpht.com" || host.ends_with(".ggpht.com")) {
+        return address.to_string();
+    }
+    let Some((path, sizing)) = parsed.path().rsplit_once('=') else { return address.to_string(); };
+    let mut changed = false;
+    let sizing = sizing.split('-').map(|part| {
+        if let Some(axis) = part.chars().next().filter(|c| matches!(c, 'w' | 'h'))
+            && let Ok(size) = part[1..].parse::<u32>()
+            && size > edge
+        {
+            changed = true;
+            return format!("{axis}{edge}");
+        }
+        part.to_string()
+    }).collect::<Vec<_>>().join("-");
+    if !changed { return address.to_string(); }
+    let path = format!("{path}={sizing}");
+    parsed.set_path(&path);
+    parsed.to_string()
 }
 
 fn url(video_id: &str, name: &str) -> String {
@@ -361,22 +395,21 @@ impl ArtFetcher {
     /// Fetches one visible batch concurrently on the shared connection pool.
     pub fn fetch_many(
         &self,
-        requests: Vec<(String, String)>,
-        edge: u32,
-        mut receive: impl FnMut(String, Option<Cover>) -> bool,
+        requests: Vec<(String, String, u32)>,
+        mut receive: impl FnMut(String, u32, Option<Cover>) -> bool,
     ) {
         self.runtime.block_on(async {
             let mut fetches = stream::iter(requests)
-                .map(|(key, url)| async move {
-                    let art = read(&self.client, &url, ART_TIMEOUT)
+                .map(|(key, url, edge)| async move {
+                    let art = read(&self.client, &sized_art_url(&url, edge), ART_TIMEOUT)
                         .await
                         .ok()
                         .and_then(|body| decode(&body, edge).ok());
-                    (key, art)
+                    (key, edge, art)
                 })
                 .buffer_unordered(ART_CONCURRENCY);
-            while let Some((key, art)) = fetches.next().await {
-                if !receive(key, art) {
+            while let Some((key, edge, art)) = fetches.next().await {
+                if !receive(key, edge, art) {
                     break;
                 }
             }
@@ -410,7 +443,7 @@ async fn read(client: &reqwest::Client, url: &str, timeout: Duration) -> Result<
         .await?
         .error_for_status()?;
 
-    super::body::read(response, MAX_BYTES as usize).await
+    crate::source::http::body::read(response, MAX_BYTES as usize).await
         .context("thumbnail is implausibly large or incomplete")
 }
 
@@ -421,7 +454,7 @@ async fn read(client: &reqwest::Client, url: &str, timeout: Duration) -> Result<
 /// `edge` is a parameter rather than [`MAX_EDGE`] because the two callers want
 /// different pictures from the same code: the cover pane wants every pixel
 /// YouTube has, and a card tile drawn thirty pixels across wants a fraction of
-/// one -- see [`crate::art::EDGE`].
+/// one -- see [`crate::terminal::graphics::art::EDGE`].
 fn decode(jpeg: &[u8], edge: u32) -> Result<Cover> {
     let mut decoder = jpeg_decoder::Decoder::new(jpeg);
     decoder.read_info().context("thumbnail has no readable JPEG header")?;
@@ -909,7 +942,7 @@ mod tests {
     fn music_artwork_loads_before_any_video_thumbnail_is_requested() {
         let sleeve = "https://lh3.googleusercontent.com/sleeve=w544-h544-l90-rj";
         let mut requested = Vec::new();
-        let (cover, source) = fetch_preferred("song", Some(sleeve), None, |url, timeout| {
+        let (cover, source) = fetch_preferred("song", Some(sleeve), SIZES, None, |url, timeout| {
             requested.push(url.to_string());
             assert!(timeout <= TIMEOUT / 2);
             Ok(Cover::solid(544, 544))
@@ -920,11 +953,53 @@ mod tests {
     }
 
     #[test]
+    fn cell_artwork_requests_smaller_google_images_and_preserves_opaque_urls() {
+        let original = "https://lh3.googleusercontent.com/sleeve=w544-h544-l90-rj?token=keep";
+        assert_eq!(sized_art_url(original, CELL_EDGE),
+            "https://lh3.googleusercontent.com/sleeve=w128-h128-l90-rj?token=keep");
+        assert_eq!(sized_art_url(original, MAX_EDGE), original);
+        assert_eq!(sized_art_url("https://yt3.ggpht.com/sleeve=w256-h256-c-k", 64),
+            "https://yt3.ggpht.com/sleeve=w64-h64-c-k");
+        for original in [
+            "https://example.com/sleeve=w544-h544-l90-rj",
+            "https://googleusercontent.com.example.com/sleeve=w544-h544",
+            "https://lh3.googleusercontent.com/opaque",
+            "https://lh3.googleusercontent.com/sleeve=w60-h60-l90-rj",
+            "https://lh3.googleusercontent.com/sleeve=unrecognised-format",
+        ] {
+            assert_eq!(sized_art_url(original, CELL_EDGE), original);
+        }
+    }
+
+    #[test]
+    fn cell_fallback_never_requests_high_resolution_video_thumbnails() {
+        let mut requested = Vec::new();
+        let (_, source) = fetch_preferred("song", None, CELL_SIZES, None, |address, _| {
+            requested.push(address.to_string());
+            if address.ends_with("hqdefault.jpg") { bail!("missing thumbnail"); }
+            Ok(Cover::solid(CELL_EDGE, CELL_EDGE))
+        }).unwrap();
+        assert_eq!(requested, [url("song", "hqdefault"), url("song", "mqdefault")]);
+        assert!(source.is_none());
+    }
+
+    #[test]
+    fn cell_cover_releases_large_pixel_storage_and_keeps_its_accent() {
+        let mut cover = Cover::from_rgb(720, 720, [180, 40, 70].repeat(720 * 720));
+        let accent = cover.accent;
+        cover.shrink(CELL_EDGE);
+        assert_eq!((cover.width, cover.height), (CELL_EDGE, CELL_EDGE));
+        assert_eq!(cover.rgb.len(), 128 * 128 * 3);
+        assert_eq!(cover.rgb.capacity(), cover.rgb.len());
+        assert_eq!(cover.accent, accent);
+    }
+
+    #[test]
     fn missing_failed_or_invalid_music_images_fall_back_to_video_artwork() {
         let sleeve = "https://lh3.googleusercontent.com/sleeve";
         for mode in 0..3 {
             let mut requested = Vec::new();
-            let (_, source) = fetch_preferred("song", (mode != 0).then_some(sleeve), None, |address, _| {
+            let (_, source) = fetch_preferred("song", (mode != 0).then_some(sleeve), SIZES, None, |address, _| {
                 requested.push(address.to_string());
                 if address == sleeve {
                     if mode == 1 { bail!("Music image returned 404"); }
@@ -944,7 +1019,7 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let cancel = super::super::http::Cancellation::capture(generation.clone());
         let mut requests = 0;
-        let result = fetch_preferred("song", Some("https://example.com/sleeve"), Some(&cancel), |_, _| {
+        let result = fetch_preferred("song", Some("https://example.com/sleeve"), SIZES, Some(&cancel), |_, _| {
             requests += 1;
             generation.fetch_add(1, Ordering::SeqCst);
             bail!("request cancelled")
@@ -959,7 +1034,7 @@ mod tests {
     #[test]
     #[ignore = "requires network access"]
     fn fetches_a_real_thumbnail() {
-        let (cover, _) = fetch_cancellable("dQw4w9WgXcQ", None, None).expect("thumbnail should fetch and decode");
+        let (cover, _) = fetch_cancellable("dQw4w9WgXcQ", None, MAX_EDGE, None).expect("thumbnail should fetch and decode");
         // Exact dimensions depend on how much padding this particular upload
         // arrives with, so assert the invariants instead. The lower bound is
         // the point of the ladder: anything under 720 on the long edge means a

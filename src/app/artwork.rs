@@ -1,7 +1,7 @@
 //! Artwork state, sizing, and terminal image placement.
 
-use crate::config::ImageRenderer;
-use crate::source::cover::Cover;
+use crate::runtime::config::{CoverStyle, ImageRenderer};
+use crate::source::cover::{self, Cover};
 use crate::source::worker::Request;
 
 use super::App;
@@ -96,6 +96,36 @@ pub struct PlannedImage {
 
 impl App {
 
+    pub fn set_graphics(&mut self, graphics: crate::terminal::graphics::Graphics) {
+        let previous_edge = self.cover_edge();
+        self.graphics = graphics;
+        self.sync_art_resolution(previous_edge);
+    }
+
+    pub(super) fn cover_edge(&self) -> u32 {
+        if self.cover_style == CoverStyle::Pixel && self.protocol_images() {
+            cover::MAX_EDGE
+        } else {
+            cover::CELL_EDGE
+        }
+    }
+
+    pub(super) fn sync_art_resolution(&mut self, previous_cover_edge: u32) {
+        self.art.set_edge(if self.protocol_images() { crate::terminal::graphics::art::EDGE } else { crate::terminal::graphics::art::CELL_EDGE });
+        let edge = self.cover_edge();
+        if edge == previous_cover_edge { return; }
+        if let Some(cover) = self.cover.as_mut() { cover.shrink(edge); }
+        self.invalidate_artwork(ImageSource::Playing);
+        // Metadata chooses the source first. Settings must not start a video
+        // fallback while the Music watch response is still pending.
+        if (edge > previous_cover_edge || self.cover.is_none())
+            && let Some(id) = self.cover_id.clone()
+        {
+            let artwork_url = self.now.as_ref().and_then(|now| now.artwork_url.clone());
+            self.request_cover(id, artwork_url);
+        }
+    }
+
     pub fn collection_art_key(&self) -> Option<&str> {
         self.browsing_endpoint.as_ref().map(|endpoint| endpoint.browse_id.as_str())
     }
@@ -124,12 +154,12 @@ impl App {
     /// already on screen. `None` means the pixels there are correct and
     /// repainting would only cost bandwidth and flicker.
     pub fn images_to_paint(&self) -> Vec<(&Cover, &PlannedImage)> {
-        if self.painted == self.images {
+        if self.painted == self.images && self.dirty_images.is_empty() {
             return Vec::new();
         }
         self.images
             .iter()
-            .filter(|image| !self.painted.contains(image))
+            .filter(|image| !self.painted.contains(image) || self.dirty_images.contains(&image.source))
             .filter_map(|image| {
                 let art = match &image.source {
                     ImageSource::Playing => self.cover.as_ref(),
@@ -144,6 +174,7 @@ impl App {
     pub fn mark_painted(&mut self, kitty: bool) {
         self.painted.clone_from(&self.images);
         self.painted_with_kitty = kitty;
+        self.dirty_images.clear();
     }
 
 
@@ -172,6 +203,17 @@ impl App {
     pub fn invalidate_image(&mut self) {
         self.painted.clear();
         self.painted_with_kitty = false;
+        self.dirty_images.clear();
+    }
+
+    /// Repaint updated pixels without forgetting where the old image lives.
+    /// Its placement is still needed if the next frame must erase it.
+    pub(super) fn invalidate_artwork(&mut self, source: ImageSource) {
+        if self.painted.iter().any(|image| image.source == source)
+            && !self.dirty_images.contains(&source)
+        {
+            self.dirty_images.push(source);
+        }
     }
 
 
@@ -188,6 +230,7 @@ impl App {
     /// out everything already held or already asked for, so this is a no-op on
     /// all but the first frame after the view moves.
     pub fn want_art(&mut self, cards: Vec<(String, Option<String>)>) {
+        self.art.set_edge(if self.protocol_images() { crate::terminal::graphics::art::EDGE } else { crate::terminal::graphics::art::CELL_EDGE });
         self.source.visible_art(cards.iter().filter(|(_,url)|url.is_some()).map(|(key,_)|key.clone()));
         let mut urls: std::collections::HashMap<_, _> = cards.iter()
             .filter_map(|(key, url)| Some((key.clone(), url.clone()?))).collect();
@@ -195,7 +238,7 @@ impl App {
             .filter(|(_, url)| url.is_some()).map(|(key, _)| key.as_str()));
         for key in requests {
             if let Some(url) = urls.remove(&key) {
-                let _ = self.source.send(Request::Art { key, url });
+                let _ = self.source.send(Request::Art { key, url, edge: self.art.edge() });
             }
         }
     }
@@ -209,6 +252,127 @@ impl App {
     /// have reported the same dead worker.
     pub(super) fn request_cover(&mut self, id: String, artwork_url: Option<String>) {
         self.cover_id = Some(id.clone());
-        let _ = self.source.send(Request::Cover { id, artwork_url });
+        let _ = self.source.send(Request::Cover { id, artwork_url, edge: self.cover_edge() });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::graphics::Graphics;
+    use crate::source::youtube::watch::Watch;
+    use crate::source::worker::Response;
+
+    fn cover_reply(edge: u32, side: u32) -> Response {
+        Response::Cover {
+            id: "song".into(), artwork_url: None, edge,
+            art: Some(Cover::solid(side, side)),
+        }
+    }
+
+    #[test]
+    fn real_images_upgrade_current_art_and_cells_release_it_without_refetching() {
+        let (mut app, _driver, requests) = crate::app::testing::scenarios::fixture();
+        let sleeve = "https://lh3.googleusercontent.com/sleeve=w544-h544-l90-rj";
+        let mut track = app.results[0].clone();
+        track.id = "song".into();
+        app.now = Some(crate::app::NowPlaying::new(&track));
+        app.request_cover("song".into(), Some(sleeve.into()));
+        app.now.as_mut().unwrap().artwork_url = Some(sleeve.into());
+        app.apply(cover_reply(cover::CELL_EDGE, cover::CELL_EDGE));
+        let cards = vec![("card".into(), Some(sleeve.into()))];
+        app.want_art(cards.clone());
+        app.apply(Response::Art { key: "card".into(), edge: crate::terminal::graphics::art::CELL_EDGE,
+            art: Some(Cover::solid(64, 64)) });
+        requests.try_iter().for_each(drop);
+
+        app.set_graphics(Graphics { kitty: true, sixel: false, cell: (8, 16) });
+        assert!(matches!(requests.try_recv().unwrap(), Request::Cover { edge: cover::MAX_EDGE, artwork_url: Some(url), .. } if url == sleeve));
+        assert_eq!(app.cover.as_ref().unwrap().width, cover::CELL_EDGE);
+        app.want_art(cards.clone());
+        assert!(matches!(requests.try_recv().unwrap(), Request::Art { edge: crate::terminal::graphics::art::EDGE, .. }));
+        app.apply(cover_reply(cover::MAX_EDGE, 720));
+        app.apply(Response::Art { key: "card".into(), edge: crate::terminal::graphics::art::EDGE,
+            art: Some(Cover::solid(256, 256)) });
+        // A low-resolution response that was already queued must not downgrade
+        // either freshly loaded picture, or erase it on a late failure.
+        app.apply(cover_reply(cover::CELL_EDGE, 128));
+        app.apply(Response::Art { key: "card".into(), edge: crate::terminal::graphics::art::CELL_EDGE, art: None });
+        assert_eq!(app.cover.as_ref().unwrap().width, 720);
+        assert_eq!(app.art.get("card").unwrap().width, 256);
+
+        app.set_graphics(Graphics::blocks());
+        assert_eq!(app.cover.as_ref().unwrap().width, 128);
+        assert_eq!(app.art.get("card").unwrap().width, 64);
+        app.want_art(cards);
+        assert!(requests.try_recv().is_err(), "downgrades reuse existing pixels");
+        // High-resolution replies from before the downgrade are bounded too.
+        app.apply(cover_reply(cover::MAX_EDGE, 720));
+        app.apply(Response::Art { key: "card".into(), edge: crate::terminal::graphics::art::EDGE,
+            art: Some(Cover::solid(256, 256)) });
+        assert_eq!(app.cover.as_ref().unwrap().width, 128);
+        assert_eq!(app.art.get("card").unwrap().width, 64);
+        assert_eq!(app.now.as_ref().unwrap().artwork_url.as_deref(), Some(sleeve));
+    }
+
+    #[test]
+    fn artwork_resolution_follows_actual_renderer_support_and_cover_style() {
+        let (mut app, _driver, _requests) = crate::app::testing::scenarios::fixture();
+        for renderer in [ImageRenderer::Automatic, ImageRenderer::Kitty, ImageRenderer::Sixel, ImageRenderer::PixelArt] {
+            for supported in [false, true] {
+                for style in [CoverStyle::Pixel, CoverStyle::ColoredAscii] {
+                    app.image_renderer = renderer;
+                    app.cover_style = style;
+                    app.set_graphics(Graphics { kitty: supported, sixel: false, cell: (8, 16) });
+                    let real = match renderer {
+                        ImageRenderer::Automatic => supported,
+                        ImageRenderer::Kitty | ImageRenderer::Sixel => true,
+                        ImageRenderer::PixelArt => false,
+                    };
+                    assert_eq!(app.cover_edge(), if real && style == CoverStyle::Pixel { cover::MAX_EDGE } else { cover::CELL_EDGE });
+                    assert_eq!(app.art.edge(), if real { crate::terminal::graphics::art::EDGE } else { crate::terminal::graphics::art::CELL_EDGE });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn changing_renderer_waits_for_metadata_and_replaces_pending_large_fetches() {
+        let (mut app, _driver, requests) = crate::app::testing::scenarios::fixture();
+        let mut track = app.results[0].clone();
+        track.id = "song".into();
+        app.now = Some(crate::app::NowPlaying::new(&track));
+        app.set_graphics(Graphics { kitty: false, sixel: true, cell: (8, 16) });
+        assert!(requests.try_recv().is_err(), "metadata must choose the source first");
+        app.apply_watch("song", Ok(Watch::default()));
+        assert!(requests.try_iter().any(|request| matches!(request, Request::Cover { edge: cover::MAX_EDGE, .. })));
+        app.set_graphics(Graphics::blocks());
+        assert!(matches!(requests.try_recv().unwrap(), Request::Cover { edge: cover::CELL_EDGE, .. }));
+    }
+
+    #[test]
+    fn upgraded_pixels_repaint_and_downgrading_preserves_the_placement_to_erase() {
+        let (mut app, _driver, _requests) = crate::app::testing::scenarios::fixture();
+        app.request_cover("song".into(), None);
+        app.apply(cover_reply(cover::CELL_EDGE, 128));
+        app.images.push(PlannedImage {
+            source: ImageSource::Playing,
+            plan: ImagePlan { col: 0, row: 0, width: 128, height: 128, bound: ImageBound::Columns(16) },
+        });
+        app.mark_painted(true);
+        assert!(app.images_to_paint().is_empty());
+        app.apply(cover_reply(cover::CELL_EDGE, 128));
+        assert_eq!(app.images_to_paint().len(), 1);
+        assert!(!app.image_needs_clearing(), "same placement needs only new pixels");
+        app.mark_painted(true);
+        assert!(app.images_to_paint().is_empty());
+
+        app.invalidate_artwork(ImageSource::Playing);
+        app.images.clear();
+        assert!(app.image_needs_clearing(), "old protocol pixels must be erased when switching to cells");
+        assert!(app.painted_with_kitty());
+        assert_eq!(app.painted_images().len(), 1);
+        app.invalidate_image();
+        assert!(app.dirty_images.is_empty());
     }
 }
