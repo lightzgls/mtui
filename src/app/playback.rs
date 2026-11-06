@@ -428,26 +428,16 @@ impl App {
     }
 
 
-    /// Plays a track and normally opens the player page on it.
-    ///
-    /// The single path every play goes through -- a result row, a card, the
-    /// queue, or the track that follows the one that just ended -- so that
-    /// nothing can start playing without the page around it being replaced to
-    /// match.
+    /// Updates Now Playing in place, whether it is in the sidebar or expanded.
     ///
     /// `auto` marks a play the queue started rather than the user; only those
     /// are allowed to step over a track that will not resolve.
     pub(super) fn play_track(&mut self, track: Track, auto: bool) {
-        self.start_track(track, auto, false, false);
+        self.start_track(track, auto, false);
     }
 
 
-    pub(super) fn start_track(&mut self, track: Track, auto: bool, bypass_cache: bool, preserve_view: bool) {
-        // A page whose response can still replace its contents must remain live,
-        // not be cloned into Player's return slot. Queue advancement is allowed
-        // to continue behind it without changing the visible route.
-        let keep_page =
-            self.view != View::Playing && (preserve_view || auto || self.mode == Mode::Editing || self.snapshot_blocked());
+    fn start_track(&mut self, track: Track, auto: bool, bypass_cache: bool) {
         // Automatic queue advances can happen while a contextual menu is open.
         // Its actions belong to the track it was opened over, not its successor.
         self.close_page_actions();
@@ -460,11 +450,6 @@ impl App {
         // more. Left set, a recovery URL arriving for the song just left would
         // be applied to the one that replaced it.
         self.playback.begin_track(&track, auto);
-        // Only from a list; the player page is not somewhere to go back to.
-        if self.view != View::Playing && !keep_page {
-            self.player_back = self.current_page();
-            self.back_to = self.view;
-        }
         self.status = "Loading audio…".into();
 
         // Before the resolve, not after it. Resolving costs seconds, and until
@@ -523,9 +508,6 @@ impl App {
             }
         }
         self.now = Some(page);
-        if !keep_page {
-            self.view = View::Playing;
-        }
 
         // Deliberately not `busy`, which the other requests set: that flag is
         // one shared bit, and any response clears it -- including responses to
@@ -715,7 +697,7 @@ impl App {
         let Some(track) = self.playback.listening_track().cloned() else {
             return;
         };
-        self.start_track(track, false, true, true);
+        self.start_track(track, false, true);
     }
 
 
@@ -1043,9 +1025,6 @@ impl App {
             KeyCode::Char('e') if current_tab == Some(Tab::Lyrics) => self.toggle_lyrics_expanded(),
             KeyCode::Char('f') if current_tab == Some(Tab::Lyrics) => self.toggle_lyrics_follow(),
             KeyCode::Char('R') => self.cycle_repeat(),
-            KeyCode::Char('r') if self.playback_failed(&self.snapshot()) => {
-                self.retry_current_track()
-            }
             KeyCode::Char('n') => self.advance(1, false),
             KeyCode::Char('p') => self.advance(-1, false),
             KeyCode::Char(' ') => self.toggle_pause(),
@@ -1126,7 +1105,7 @@ impl App {
         match now.tab {
             Tab::UpNext => {
                 if let Some(track) = now.queue.get(now.cursor()).cloned() {
-                    self.start_track(track, false, false, self.view != View::Playing);
+                    self.play_track(track, false);
                 }
             }
             Tab::Related => {
@@ -1136,10 +1115,7 @@ impl App {
                 let Some(RelatedRow::Card(card)) = rows.get(now.cursor()) else {
                     return;
                 };
-                let card = (*card).clone();
-                if self.view != View::Playing && let Some(track) = card.track() {
-                    self.start_track(track, false, false, true);
-                } else { self.activate_card(card); }
+                self.activate_card((*card).clone());
             }
             Tab::Lyrics | Tab::Comments => {}
         }

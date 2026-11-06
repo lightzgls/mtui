@@ -47,6 +47,6 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut M
     mouse.targets.push(MouseTarget::PlayerPanel(lyrics, Tab::Lyrics));
     if !controls.is_empty() { player::render_lyrics_controls(frame, now, controls, accent, mouse); }
     if content.is_empty() { return; }
-    let (total, following) = render_lyrics(frame, now, &snap, content);
+    let (total, following) = render_lyrics(frame, now, &snap, content, content.height >= 12);
     app.clamp_panel(Tab::Lyrics, content.height as usize, total, following);
 }

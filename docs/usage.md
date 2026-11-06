@@ -275,6 +275,8 @@ Related / Comments tabs. Pausing keeps the column visible; Stop removes it
 and returns its width to the page. Click **Expand >** to open Now Playing;
 Esc returns to the previous page. Sidebar clicks and scrolling leave the
 browsing page and any unfinished search in place.
+Starting a song while browsing updates the sidebar. Open the expanded player
+with **Expand >** or `P` to keep the larger view while changing tracks.
 
 Now Playing places the cover on the left and Queue / Related / Comments above
 Lyrics on the right. Each region scrolls independently; lyrics remain visible

@@ -1021,7 +1021,7 @@ fn drawn_panel_at(now: &NowPlaying, position: Duration, width: u16, height: u16)
             render_tabs(frame, now.tab, tabs, Color::Cyan, &mut mouse);
             match now.tab {
                 Tab::UpNext => queue::render(frame, now, content, Color::Cyan),
-                Tab::Lyrics => render_lyrics(frame, now, &snap, content).0,
+                Tab::Lyrics => render_lyrics(frame, now, &snap, content, content.height >= 12).0,
                 Tab::Comments => render_comments(frame, now, content),
                 Tab::Related => render_related(frame, now, content, Color::Cyan),
             };

@@ -170,9 +170,7 @@ impl App {
         // as an address bar. Everything the page needs beyond the id -- the
         // real title, the artist, the queue -- arrives with the watch response.
         if let Some(id) = extract_video_id(&query) {
-            // `play_track` records the view it is called from as Player's back
-            // target. Search uses Tracks as its editing surface, not as that
-            // target, so restore the page the edit hid before entering Player.
+            // Restore the page the edit hid before playing the pasted track.
             self.cancel_search_request();
             if let Some(origin) = self.search_page.take() {
                 self.restore_page(origin);

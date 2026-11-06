@@ -181,6 +181,18 @@ impl App {
             return Ok(());
         }
 
+        if self.mode == Mode::Browse
+            && (is_bare_character(key, 'r') || is_bare_character(key, 'n'))
+            && self.playback_failed(&self.snapshot())
+        {
+            if key.code == KeyCode::Char('r') {
+                self.retry_current_track();
+            } else {
+                self.advance(1, false);
+            }
+            return Ok(());
+        }
+
         match self.mode {
             Mode::Editing => self.handle_editing_key(key),
             Mode::Browse => match self.view {

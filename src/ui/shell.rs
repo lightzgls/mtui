@@ -161,7 +161,7 @@ fn header_areas(area: Rect, show_keys: bool) -> [Rect; 7] {
         area.width,
         area.height.min(1),
     );
-    let brand = if row.width >= 104 { 8 } else { 0 };
+    let brand = if row.width >= 104 { 10 } else { 0 };
     let roomy = show_keys && row.width >= 110;
     let back = if roomy { 12 } else if row.width >= 24 { 7 } else { 0 };
     let home = if roomy { 10 } else if row.width >= 48 { 8 } else { 0 };
@@ -194,7 +194,7 @@ pub(super) fn render_header(
     }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("● ", Style::default().fg(header.accent)),
+            Span::styled("▂▄▆▃ ", Style::default().fg(header.accent)),
             Span::styled("MTUI", Style::default().add_modifier(Modifier::BOLD)),
         ])),
         brand,

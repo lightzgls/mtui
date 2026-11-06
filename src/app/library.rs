@@ -701,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_song_playback_keeps_metadata_and_returns_to_library() {
+    fn saved_song_playback_stays_in_library_until_player_is_opened() {
         let (mut app, _driver, _requests) = fixture();
         let track = Track {
             id: "song".into(),
@@ -724,7 +724,9 @@ mod tests {
             app.now.as_ref().unwrap().album.as_deref(),
             Some("Saved album")
         );
-        assert_eq!(app.back_to, View::Library);
+        assert_eq!(app.view, View::Library);
+        app.open_player();
+        assert_eq!(app.view, View::Playing);
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(app.view, View::Library);

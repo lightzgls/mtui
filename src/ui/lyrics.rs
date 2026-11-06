@@ -29,6 +29,7 @@ pub(super) fn render_lyrics(
     now: &NowPlaying,
     snap: &Snapshot,
     area: Rect,
+    space_lines: bool,
 ) -> (usize, Option<usize>) {
     let area = Rect::new(area.x + u16::from(area.width > 8), area.y, area.width.saturating_sub(if area.width > 8 { 2 } else { 0 }), area.height);
     let width = (area.width as usize).saturating_sub(LYRIC_GUTTER + 1);
@@ -54,7 +55,7 @@ pub(super) fn render_lyrics(
         if text.trim().is_empty() {
             lines.push((String::new(), timing, true));
         } else {
-            if area.height >= 12 && lines.last().is_some_and(|(text, _, _)| !text.is_empty()) {
+            if space_lines && lines.last().is_some_and(|(text, _, _)| !text.is_empty()) {
                 lines.push((String::new(), None, false));
             }
             lines.extend(bounded_wrap(text, width).into_iter().enumerate()

@@ -378,7 +378,12 @@ pub(super) fn render_tabbed_panel(frame: &mut Frame, app: &mut App, area: Rect, 
         }, mouse);
         app.want_art(wanted);
         (total, None)
-    } else { render_body_for_tab(frame, now, &snap, content, accent, tab) };
+    } else if tab == Tab::Lyrics {
+        let minimum_rows = if app.view == crate::app::View::Playing { 12 } else { 5 };
+        render_lyrics(frame, now, &snap, content, content.height >= minimum_rows)
+    } else {
+        render_body_for_tab(frame, now, &snap, content, accent, tab)
+    };
     // A list stops at its last row; a wall of text stops one screenful short of
     // its end. Queue item geometry excludes both the heading and spacer rows.
     let viewport = if tab == Tab::UpNext {
@@ -408,7 +413,7 @@ fn render_body_for_tab(frame: &mut Frame, now: &NowPlaying, snap: &Snapshot,
 ) -> (usize, Option<usize>) {
     match tab {
         Tab::UpNext => (queue::render(frame, now, area, accent), None),
-        Tab::Lyrics => render_lyrics(frame, now, snap, area),
+        Tab::Lyrics => render_lyrics(frame, now, snap, area, area.height >= 12),
         Tab::Comments => (render_comments(frame, now, area), None),
         Tab::Related => (render_related(frame, now, area, accent), None),
     }

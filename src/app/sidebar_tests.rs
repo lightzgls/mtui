@@ -46,6 +46,19 @@ fn event(kind: MouseEventKind, (column, row): (u16, u16)) -> MouseEvent {
 }
 
 #[test]
+fn sidebar_lyrics_have_space_between_lines_in_a_medium_window() {
+    let (mut app, _, _) = setup();
+    app.now.as_mut().unwrap().open(Tab::Lyrics);
+    let (terminal, _) = draw(&mut app, 120, 32, "sidebar-lyric-spacing");
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..32)
+        .map(|y| (0..120).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect();
+    let first = rows.iter().position(|row| row.contains("Lyric line 0")).unwrap();
+    assert!(rows[first + 2].contains("Lyric line 1"));
+}
+
+#[test]
 fn dragging_each_divider_moves_its_rendered_boundary() {
     use crate::ui::Split;
     let (mut app, _, _) = setup();

@@ -87,7 +87,7 @@ fn play_all_fetches_the_full_artist_list_once_and_keeps_order_and_back_state() {
     app.apply(Response::ArtistSongs { request_id, browse_id: "UCartist".into(), page: Box::new(Ok(
         crate::source::collection::Page { details: Default::default(), tracks: (0..80).map(track).collect() }
     )) });
-    assert_eq!(app.view, View::Playing);
+    assert_eq!(app.view, View::Artist);
     assert_eq!(app.now.as_ref().unwrap().queue.len(), 80);
     ux_preview(&mut app, "artist-play-all");
     for index in 0..80 {
@@ -98,6 +98,8 @@ fn play_all_fetches_the_full_artist_list_once_and_keeps_order_and_back_state() {
         assert!(requests.try_recv().is_err(), "a finite artist list must not start radio");
         if index < 79 { app.advance(1, false); }
     }
+    app.handle_mouse_action(MouseAction::OpenPlayer).unwrap();
+    assert_eq!(app.view, View::Playing);
     app.handle_mouse_action(MouseAction::GoBack).unwrap();
     assert_eq!(app.view, View::Artist);
     let view = app.artist.as_ref().unwrap();
@@ -683,7 +685,7 @@ fn song_clicks_select_then_double_click_enter_or_context_menu_works_across_pages
                             start + Duration::from_millis(ms)).unwrap();
                     }
                 }
-                assert_eq!(app.view, View::Playing);
+                assert_eq!(app.view, view);
                 assert_eq!(app.now.as_ref().unwrap().video_id, "song-9");
                 assert_eq!(requests.try_iter().filter(|request| matches!(request, Request::Resolve { id, .. } if id == "song-9")).count(), 1);
             }
