@@ -42,7 +42,7 @@ pub(super) fn draw(
         Chrome {
             title: "Settings",
             width: 84,
-            height: 26,
+            height: 28,
             close_label: if state.return_to_menu {
                 "Back"
             } else {
@@ -338,6 +338,7 @@ mod tests {
                 "On",
                 "Off",
                 "v0.10.0 · Check",
+                "Native console",
             ])
             .map(|(setting, value)| SettingRow {
                 setting,
@@ -432,7 +433,7 @@ mod tests {
         let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
         assert!(!text.contains("All platforms"));
         assert!(text.contains("Win + Linux"));
-        assert_eq!(text.matches("Windows only").count(), 2);
+        assert_eq!(text.matches("Windows only").count(), 3);
         let (buf, _) = drawn(&State { selected: Setting::Tray.index(), ..Default::default() }, 48, 24);
         let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains("Windows only"), "{text}");

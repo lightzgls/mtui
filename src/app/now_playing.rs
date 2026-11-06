@@ -32,11 +32,8 @@ pub(super) const QUEUE_AHEAD: usize = 65;
 /// of kilobytes.
 pub(super) const QUEUE_MEMORY: usize = 200;
 
-/// Which panel of the player page is showing.
-///
-/// One at a time rather than side by side, for the same reason the main pane
-/// switches between lists: on a terminal, width is the scarce resource, and
-/// four columns of it would leave none of them readable.
+/// The sidebar's visible tab, or the expanded player's keyboard-focused panel.
+/// Expanded playback retains a separate detail tab above the lyrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     UpNext,
@@ -190,6 +187,8 @@ pub struct NowPlaying {
     pub(super) rating_request: u64,
     pub repeat: RepeatMode,
     pub tab: Tab,
+    /// Last non-lyrics panel, retained while lyrics have keyboard focus.
+    pub detail_tab: Tab,
     /// One cursor per tab, so switching away and back returns to where the user
     /// left off. For the two list tabs this is the selected row; for lyrics and
     /// comments, which have nothing to select, it is the first visible line.
@@ -254,6 +253,7 @@ impl NowPlaying {
             rating_request: 0,
             repeat: RepeatMode::Off,
             tab: Tab::UpNext,
+            detail_tab: Tab::UpNext,
             cursor: [0; Tab::ALL.len()],
             follow_lyrics: true,
             lyrics_expanded: false,
@@ -308,14 +308,14 @@ impl NowPlaying {
     /// Only the near end is clamped here. The far end is the renderer's, which
     /// is what knows how long each panel is once it has wrapped it.
     pub(super) fn scroll(&mut self, delta: isize) {
-        self.follow_lyrics = false;
+        if self.tab == Tab::Lyrics { self.follow_lyrics = false; }
         let cursor = self.cursor_mut();
         *cursor = cursor.saturating_add_signed(delta);
     }
 
     /// [`Self::scroll`] straight to a line, for `g` and `G`.
     pub(super) fn jump(&mut self, to: usize) {
-        self.follow_lyrics = false;
+        if self.tab == Tab::Lyrics { self.follow_lyrics = false; }
         *self.cursor_mut() = to;
     }
 
@@ -331,6 +331,7 @@ impl NowPlaying {
         }
         let changed = self.tab != tab;
         self.tab = tab;
+        if tab != Tab::Lyrics { self.detail_tab = tab; }
         changed
     }
 

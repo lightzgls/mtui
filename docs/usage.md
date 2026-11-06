@@ -269,15 +269,29 @@ the sort orders supplied by YouTube Music, and `r` refreshes the collection.
 Loading failures preserve previously loaded items and offer a retry. The account
 name and playback controls remain visible while browsing.
 
-Now Playing shows artwork beside Queue, Lyrics, Related, and Comments. In a
-narrow window the track header moves above the tabs. Progress and playback
-controls stay at the bottom on every page. The cover supplies a muted solid
-background, matching surfaces, and an accent throughout the app.
+While a track is loaded, Home, Search, Library, and Artist keep a Now Playing
+column on the right with artwork, track information, and Queue / Lyrics /
+Related / Comments tabs. Pausing keeps the column visible; Stop removes it
+and returns its width to the page. Click **Expand >** to open Now Playing;
+Esc returns to the previous page. Sidebar clicks and scrolling leave the
+browsing page and any unfinished search in place.
+
+Now Playing places the cover on the left and Queue / Related / Comments above
+Lyrics on the right. Each region scrolls independently; lyrics remain visible
+while browsing the other panels. Short windows compact these regions, and
+narrow windows move the track header above them. Progress and playback controls
+stay at the bottom on every page. The cover supplies a muted solid background,
+matching surfaces, and an accent throughout the app.
+
+Drag the sidebar's left border to change its width, or the line above its tabs
+to resize the artwork. In Now Playing, drag between the cover and panels or
+along the Lyrics heading. MTUI keeps these sizes while it is running and
+limits dragging when the terminal is too small.
 
 The active page and panel are highlighted. Normal playback gives about 60% of
 the content width to the artwork, with the track title and artist directly below
-it. Playing shows the song identity once, below its cover; other pages keep it
-in the footer. Playback buttons stay centered, including on Home.
+it. Playing shows the song identity below its cover; other pages keep it in
+the sidebar. Playback buttons stay centered, including on Home.
 
 Navigation symbols need no font installation. In the native Windows console,
 MTUI checks the current font and uses supported Unicode symbols, with simpler
@@ -304,7 +318,7 @@ session (up to 32 KiB of lyric text per song). Plain lyrics and failures are not
 cached. The panel labels untimed results **Unsynced lyrics**. Timings still
 depend on what YouTube Music or LRCLIB publishes for that recording.
 
-Queue entries have space between songs and clear title, artist, and duration
+Queue entries use one row per song with clear title, artist, and duration
 columns. Click a song title to select it, then right-click or press `.` for
 **Move up**, **Move down**, or **Remove from queue**. Double-click the title, click the play
 marker, or press Enter to play the song. The current song and past songs cannot be removed.
@@ -583,13 +597,15 @@ Both SIXEL and Kitty draw the current-song cover and visible thumbnails across
 Home, search, and artist pages. Unchanged images stay on screen instead of being
 encoded on every frame. No external image viewer or encoder is required.
 
-On Windows, MTUI opens its console helper inside Windows Terminal when `wt.exe`
-is installed. This also works when the Windows default terminal is the legacy
-console. The audio player stays separate, so closing the terminal can still move
-playback to the tray. If Windows Terminal is unavailable or fails to start, MTUI
-uses its native console and automatic artwork falls back to terminal cells.
-`MTUI_TERMINAL=native` explicitly keeps the legacy window. Terminal-reported cell
-pixels are used for bitmap sizing instead of the hidden ConPTY window's font.
+On Windows, MTUI opens its native console helper by default, as in v0.11.7,
+without launching PowerShell. Choose **Settings → App → Open MTUI with** to
+choose Native console or an installed Windows Terminal, Alacritty, or WezTerm.
+MTUI checks common install folders and PATH when you open the picker. The choice
+applies the next time the player window opens. The audio player stays separate, so closing the
+terminal can still move playback to the tray. Set
+`MTUI_TERMINAL=windows-terminal` to opt into the Windows Terminal launcher when
+`wt.exe` is installed. If it is unavailable or fails to start, MTUI falls back
+to the native console. Terminal-reported cell pixels are used for bitmap sizing.
 
 To diagnose graphics without signing in, playing audio, or replacing a running
 player, run `mtui.exe --diagnose-graphics | Out-String` in PowerShell. A temporary

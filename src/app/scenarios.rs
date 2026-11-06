@@ -495,7 +495,7 @@ fn loaded_pages_and_playback_keep_identity_in_one_place_and_preserve_failure_fee
             terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
             let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
             assert_eq!(text.matches("Song 0").count(), 1, "{view:?} at {width}x{height}");
-            assert!(!text.contains("NOW PLAYING"));
+            if view == View::Playing { assert!(!text.contains("NOW PLAYING")); }
             assert!(!text.contains("playing Song 0"));
         }
     }
@@ -1010,6 +1010,7 @@ fn lyrics_retries_are_bounded_preserve_words_and_wait_until_the_panel_is_visible
     let now = app.now.as_mut().unwrap();
     now.lyrics_retry_at = Some(Instant::now());
     now.tab = Tab::UpNext;
+    app.view = View::Tracks;
     app.tick_page();
     assert!(requests.try_recv().is_err(), "hidden panels must not spend requests");
     app.now.as_mut().unwrap().tab = Tab::Lyrics;

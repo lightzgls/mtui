@@ -148,6 +148,7 @@ impl App {
                     self.output_device = id;
                     self.refresh_output_devices();
                     let settings = config::Settings {
+            terminal_host: self.terminal_host,
                         start_in_tray: self.start_in_tray,
                         tray_click_pauses: self.tray_click_pauses,
                         precision_volume: self.precision_volume,
@@ -437,16 +438,16 @@ impl App {
     /// `auto` marks a play the queue started rather than the user; only those
     /// are allowed to step over a track that will not resolve.
     pub(super) fn play_track(&mut self, track: Track, auto: bool) {
-        self.start_track(track, auto, false);
+        self.start_track(track, auto, false, false);
     }
 
 
-    pub(super) fn start_track(&mut self, track: Track, auto: bool, bypass_cache: bool) {
+    pub(super) fn start_track(&mut self, track: Track, auto: bool, bypass_cache: bool, preserve_view: bool) {
         // A page whose response can still replace its contents must remain live,
         // not be cloned into Player's return slot. Queue advancement is allowed
         // to continue behind it without changing the visible route.
         let keep_page =
-            self.view != View::Playing && (self.mode == Mode::Editing || self.snapshot_blocked());
+            self.view != View::Playing && (preserve_view || auto || self.mode == Mode::Editing || self.snapshot_blocked());
         // Automatic queue advances can happen while a contextual menu is open.
         // Its actions belong to the track it was opened over, not its successor.
         self.close_page_actions();
@@ -485,6 +486,7 @@ impl App {
         let repeat = self.now.as_ref().map_or(RepeatMode::Off, |now| now.repeat);
         let mut page = NowPlaying::new(&track);
         page.tab = tab;
+        page.detail_tab = self.now.as_ref().map_or(Tab::UpNext, |now| now.detail_tab);
         page.repeat = repeat;
         page.lyrics_expanded = self.now.as_ref().is_some_and(|now| now.lyrics_expanded);
         // The queue survives moving *within* it -- that is what makes advancing
@@ -572,12 +574,19 @@ impl App {
     /// fetched when first looked at. Incomplete lyrics can be retried without
     /// making the user restart playback.
     pub(super) fn request_tab(&mut self) {
+        if let Some((tab, detail_tab)) = self.now.as_ref().map(|now| (now.tab, now.detail_tab)) {
+            self.request_panel(if self.view == View::Playing && tab == Tab::Lyrics { detail_tab } else { tab });
+            if self.view == View::Playing { self.request_panel(Tab::Lyrics); }
+        }
+    }
+
+    fn request_panel(&mut self, tab: Tab) {
         let Some(now) = self.now.as_mut() else {
             return;
         };
         let video_id = now.video_id.clone();
 
-        let request = match now.tab {
+        let request = match tab {
             // Already in hand: the queue arrives with the watch response.
             Tab::UpNext => return,
             // Waits on the watch response rather than on the browse id it
@@ -628,16 +637,15 @@ impl App {
     /// watch response, which is a round trip behind the play. Opening either
     /// tab in that window would otherwise leave it idle forever.
     pub fn tick_page(&mut self) {
-        let waiting = self.now.as_ref().is_some_and(|now| match now.tab {
-            Tab::Lyrics => now.lyrics.is_idle() && now.watched,
-            Tab::Related => now.related.is_idle() && now.related_id.is_some(),
-            _ => false,
-        });
+        let waiting = self.now.as_ref().is_some_and(|now|
+            ((now.tab == Tab::Lyrics || self.view == View::Playing) && now.lyrics.is_idle() && now.watched)
+                || ((now.tab == Tab::Related || (self.view == View::Playing && now.tab == Tab::Lyrics && now.detail_tab == Tab::Related))
+                    && now.related.is_idle() && now.related_id.is_some()));
         if waiting {
             self.request_tab();
         }
         if let Some(now) = self.now.as_mut()
-            && now.tab == Tab::Lyrics
+            && (now.tab == Tab::Lyrics || self.view == View::Playing)
             && now.lyrics_retry_at.is_some_and(|at| Instant::now() >= at)
         {
             now.lyrics_retry_at = None;
@@ -707,7 +715,7 @@ impl App {
         let Some(track) = self.playback.listening_track().cloned() else {
             return;
         };
-        self.start_track(track, false, true);
+        self.start_track(track, false, true, true);
     }
 
 
@@ -748,7 +756,7 @@ impl App {
 
 
     pub(crate) fn queue_drag_identity(&self, index: usize) -> Option<(String, u64)> {
-        if self.view != View::Playing || self.mode != Mode::Browse || self.overlay.is_open() || self.menu.is_some() { return None; }
+        if self.mode != Mode::Browse || self.overlay.is_open() || self.menu.is_some() { return None; }
         let now = self.now.as_ref().filter(|now| now.tab == Tab::UpNext)?;
         (index > now.playing? && index < now.queue.len()).then(|| (now.queue[index].id.clone(), now.queue_epoch))
     }
@@ -1118,7 +1126,7 @@ impl App {
         match now.tab {
             Tab::UpNext => {
                 if let Some(track) = now.queue.get(now.cursor()).cloned() {
-                    self.play_track(track, false);
+                    self.start_track(track, false, false, self.view != View::Playing);
                 }
             }
             Tab::Related => {
@@ -1128,7 +1136,10 @@ impl App {
                 let Some(RelatedRow::Card(card)) = rows.get(now.cursor()) else {
                     return;
                 };
-                self.activate_card((*card).clone());
+                let card = (*card).clone();
+                if self.view != View::Playing && let Some(track) = card.track() {
+                    self.start_track(track, false, false, true);
+                } else { self.activate_card(card); }
             }
             Tab::Lyrics | Tab::Comments => {}
         }
@@ -1245,7 +1256,8 @@ impl App {
 
     pub(super) fn flush_volume(&mut self) {
         let Some((_, volume)) = self.volume_save.take() else { return; };
-        let settings = config::Settings { start_in_tray: self.start_in_tray,
+        let settings = config::Settings {
+            terminal_host: self.terminal_host, start_in_tray: self.start_in_tray,
             tray_click_pauses: self.tray_click_pauses,
             precision_volume: self.precision_volume,
             show_key_hints: self.show_key_hints,

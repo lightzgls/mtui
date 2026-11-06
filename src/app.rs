@@ -138,10 +138,12 @@ pub struct App {
     pub graphics: Graphics,
     /// How much of the window the cover gets.
     pub cover_size: CoverSize,
+    pub(crate) splits: crate::ui::Splits,
     /// Visual language used for the current song's large cover.
     pub cover_style: CoverStyle,
     /// User-selected terminal bitmap backend.
     pub image_renderer: ImageRenderer,
+    pub terminal_host: config::TerminalHost,
     /// Outputs currently advertised by the operating system.
     output_devices: Vec<OutputDevice>,
     /// Stable id of the selected output, or `None` to follow the system default.
@@ -330,8 +332,10 @@ impl App {
             cover_id: None,
             graphics,
             cover_size: CoverSize::default(),
+            splits: crate::ui::Splits::default(),
             cover_style: settings.cover_style,
             image_renderer: settings.image_renderer,
+            terminal_host: settings.terminal_host,
             output_devices,
             output_device,
             muted,
@@ -412,6 +416,10 @@ impl App {
 #[cfg(test)]
 #[path = "app/scenarios.rs"]
 mod scenarios;
+
+#[cfg(test)]
+#[path = "app/sidebar_tests.rs"]
+mod sidebar_tests;
 
 #[cfg(test)]
 #[path = "app/performance.rs"]

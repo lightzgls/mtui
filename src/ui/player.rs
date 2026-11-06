@@ -14,7 +14,7 @@ use crate::graphics::Graphics;
 use crate::player::{PlayState, Snapshot};
 use crate::source::cover::Cover;
 
-use super::{queue, related, shell};
+use super::{Split, queue, related, shell};
 use super::artwork::{cell_pixels, fit_cells};
 use super::cards::Tiles;
 use super::comments::render_comments;
@@ -47,7 +47,10 @@ pub(super) fn render_player(
         return Some(area);
     }
 
-    let layout = player_layout(area, now, app.cover.as_ref());
+    let layout = player_layout(area, now, app.cover.as_ref(), app.splits.size(Split::PlayerWidth, area.width));
+    if let Some(divider) = layout.divider {
+        mouse.targets.push(MouseTarget::Divider(divider, Split::PlayerWidth, area));
+    }
     let identity = PlayerIdentity {
         now,
         snap: app.snapshot(),
@@ -69,7 +72,7 @@ pub(super) fn render_player(
             hero.x, hero.y, (height * 2).min(hero.width), height,
         )));
     }
-    render_panel(frame, app, layout.panel, mouse);
+    super::player_split::render(frame, app, layout.panel, mouse);
     layout.art
 }
 
@@ -81,11 +84,11 @@ pub(super) struct PlayerIdentity<'a> {
 }
 
 /// Keep the cover and its caption together, even for a short landscape image.
-pub(super) fn player_layout(area: Rect, now: &NowPlaying, cover: Option<&Cover>) -> shell::PlayerAreas {
+pub(super) fn player_layout(area: Rect, now: &NowPlaying, cover: Option<&Cover>, panel_width: Option<u16>) -> shell::PlayerAreas {
     if now.tab == Tab::Lyrics && now.lyrics_expanded {
         return shell::lyrics_areas(area);
     }
-    let mut layout = shell::player_areas(area);
+    let mut layout = shell::player_areas(area, panel_width);
     if let (Some(art), Some(info), Some(cover)) = (layout.art, layout.info, cover) {
         let (cols, rows) = fit_cells(cover, (art.width, art.height), cell_pixels());
         if cols > 0 && rows > 0 {
@@ -325,6 +328,13 @@ pub(super) fn volume_bar_width(volume: f32, width: usize) -> usize {
 /// means a frame is never drawn with a cursor past the end of a panel whose
 /// length only became knowable while drawing it.
 pub(super) fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMap) {
+    let Some(tab) = app.now.as_ref().map(|now| now.tab) else { return; };
+    render_tabbed_panel(frame, app, area, mouse, tab, &Tab::ALL);
+}
+
+pub(super) fn render_tabbed_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMap,
+    tab: Tab, choices: &[Tab],
+) {
     // Both taken before the page is borrowed, since the panels need them and
     // the borrow below is what stops either being asked for down there.
     let snap = app.snapshot();
@@ -338,10 +348,10 @@ pub(super) fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: 
     let Some(now) = app.now.as_ref() else {
         return;
     };
-    let tab = now.tab;
+    mouse.targets.push(MouseTarget::PlayerPanel(area, tab));
     let [tabs, content] =
         Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
-    render_tabs(frame, tab, tabs, accent, mouse);
+    render_tab_set(frame, tab, tabs, accent, mouse, choices);
     let content = if tab == Tab::Lyrics && content.height >= 4 {
         let [controls, body] = Layout::vertical([
             Constraint::Length(2), Constraint::Min(0),
@@ -368,13 +378,9 @@ pub(super) fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: 
         }, mouse);
         app.want_art(wanted);
         (total, None)
-    } else { render_panel_body(frame, now, &snap, content, accent) };
-    if let Some(offset) = following {
-        app.follow_page(offset);
-    }
+    } else { render_body_for_tab(frame, now, &snap, content, accent, tab) };
     // A list stops at its last row; a wall of text stops one screenful short of
     // its end. Queue item geometry excludes both the heading and spacer rows.
-    let selects = matches!(tab, Tab::UpNext | Tab::Related);
     let viewport = if tab == Tab::UpNext {
         let now = app.now.as_mut().expect("player panel");
         let geometry = queue::Geometry::new(now, content);
@@ -383,9 +389,10 @@ pub(super) fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: 
     } else {
         content.height as usize
     };
-    app.clamp_page(viewport, total, selects);
+    app.clamp_panel(tab, viewport, total, following);
 }
 
+#[cfg(test)]
 pub(super) fn render_panel_body(
     frame: &mut Frame,
     now: &NowPlaying,
@@ -393,7 +400,13 @@ pub(super) fn render_panel_body(
     area: Rect,
     accent: Color,
 ) -> (usize, Option<usize>) {
-    match now.tab {
+    render_body_for_tab(frame, now, snap, area, accent, now.tab)
+}
+
+fn render_body_for_tab(frame: &mut Frame, now: &NowPlaying, snap: &Snapshot,
+    area: Rect, accent: Color, tab: Tab,
+) -> (usize, Option<usize>) {
+    match tab {
         Tab::UpNext => (queue::render(frame, now, area, accent), None),
         Tab::Lyrics => render_lyrics(frame, now, snap, area),
         Tab::Comments => (render_comments(frame, now, area), None),
@@ -408,7 +421,7 @@ pub(super) fn render_lyrics_controls(frame: &mut Frame, now: &NowPlaying, area: 
     let expand_area = Rect::new(area.right() - expand_width, area.y, expand_width, 1);
     frame.render_widget(Paragraph::new(expand).style(Style::default().fg(accent).bg(shell::SURFACE)), expand_area);
     mouse.targets.push(MouseTarget::Area(expand_area, MouseAction::ToggleLyricsExpanded));
-    let follow = if timed && now.follow_lyrics { " Following " } else if timed { " Follow lyrics " } else if matches!(now.lyrics, Panel::Ready(_)) { " Unsynced lyrics " } else { " Lyrics " };
+    let follow = if timed && now.follow_lyrics { " Following " } else if timed { " Follow lyrics " } else if matches!(now.lyrics, Panel::Ready(_)) { " Unsynced lyrics " } else { "" };
     let follow = mouse.hinted_label(follow, timed.then_some("f"), area.width.saturating_sub(expand_width + 1));
     let follow_width = (follow.width() as u16).min(area.width.saturating_sub(expand_width + 1));
     let follow_area = Rect::new(area.x, area.y, follow_width, 1);
@@ -416,20 +429,36 @@ pub(super) fn render_lyrics_controls(frame: &mut Frame, now: &NowPlaying, area: 
     if timed && follow_width > 0 {
         mouse.targets.push(MouseTarget::Area(follow_area, MouseAction::ToggleLyricsFollow));
     }
+    if let Panel::Ready(lyrics) = &now.lyrics
+        && let Some(source) = &lyrics.source
+    {
+        let x = follow_area.right();
+        let width = expand_area.x.saturating_sub(x + 1);
+        if width >= 4 {
+            let source = truncate(&format!("· {}", source.split_whitespace().collect::<Vec<_>>().join(" ")), usize::from(width));
+            frame.render_widget(Paragraph::new(source).style(Style::default().fg(Color::DarkGray)),
+                Rect::new(x, area.y, width, 1));
+        }
+    }
 }
 
 /// A subtle filled tab and an underline identify the open panel.
 ///
 /// The fill stays behind the selected name. Its separate underline reads as
 /// the edge of the panel without filling the entire bar.
+#[cfg(test)]
 pub(super) fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Color, mouse: &mut MouseMap) {
+    render_tab_set(frame, open, area, ambient, mouse, &Tab::ALL);
+}
+
+fn render_tab_set(frame: &mut Frame, open: Tab, area: Rect, ambient: Color, mouse: &mut MouseMap, choices: &[Tab]) {
     let mut labels = Vec::new();
     let mut rule = Vec::new();
-    let roomy_width = Tab::ALL
+    let roomy_width = choices
         .iter()
         .map(|tab| display_width(tab.label()) + 2)
         .sum::<usize>();
-    let compact_width = Tab::ALL
+    let compact_width = choices
         .iter()
         .map(|tab| display_width(tab.label()) + 1)
         .sum::<usize>();
@@ -440,7 +469,8 @@ pub(super) fn render_tabs(frame: &mut Frame, open: Tab, area: Rect, ambient: Col
     let numbered_padding = if area.width >= 8 { " " } else { "" };
 
     let mut x = area.x;
-    for (index, tab) in Tab::ALL.into_iter().enumerate() {
+    for &tab in choices {
+        let index = tab.index();
         let selected = tab == open;
         let style = if selected {
             Style::default()

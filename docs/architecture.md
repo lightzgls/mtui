@@ -72,12 +72,14 @@ src/
     paging.rs             Control phân trang
     palette.rs            Màu từ artwork và màu chữ dễ đọc
     player.rs             Trang Now Playing và ghép panel
+    player_split.rs       Panel Queue/Related/Comments phía trên, Lyrics phía dưới
     preferences.rs        Vẽ settings
     queue.rs              Hàng queue và vùng click
     related.rs            Card nhạc liên quan
     results.rs            Cột và viewport danh sách bài
     search.rs             Kết quả tìm kiếm nhiều loại
     shell.rs              Header, vùng nội dung và geometry chung
+    sidebar.rs            Cột Now Playing cố định khi duyệt nhạc
     status.rs             Footer, mini player, transport và volume
     text.rs               Đo, cắt, wrap và marquee chữ terminal
     tests.rs              Test layout/render với TestBackend

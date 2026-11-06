@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{NowPlaying, Panel};
+use crate::app::{NowPlaying, Panel, Tab};
 
 use super::player::{message, waiting_on};
 use super::text::{truncate, wrap};
@@ -66,7 +66,7 @@ pub(super) fn render_comments(frame: &mut Frame, now: &NowPlaying, area: Rect) -
 
     let viewport = area.height as usize;
     let total = lines.len();
-    let offset = now.cursor().min(total.saturating_sub(viewport));
+    let offset = now.cursor[Tab::Comments.index()].min(total.saturating_sub(viewport));
 
     frame.render_widget(
         Paragraph::new(

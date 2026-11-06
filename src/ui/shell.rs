@@ -79,7 +79,7 @@ pub(super) struct PlayerAreas {
 
 /// Small windows retain track identity above the tabs. Wide windows reserve
 /// the left side for artwork and the right side for all four player panels.
-pub(super) fn player_areas(area: Rect) -> PlayerAreas {
+pub(super) fn player_areas(area: Rect, requested_width: Option<u16>) -> PlayerAreas {
     if area.width < MIN_WIDTH_WITH_COVER {
         return lyrics_areas(area);
     }
@@ -90,7 +90,10 @@ pub(super) fn player_areas(area: Rect) -> PlayerAreas {
     } else {
         PANEL_MIN_WIDTH
     };
-    let panel_width = (area.width * 2 / 5).max(minimum);
+    let panel_width = requested_width.map_or_else(
+        || (area.width * 2 / 5).max(minimum),
+        |width| width.clamp(PANEL_MIN_WIDTH, area.width - 22),
+    );
     let [left, divider, panel] = Layout::horizontal([
         Constraint::Min(1),
         Constraint::Length(2),
@@ -395,7 +398,7 @@ mod tests {
     fn artwork_dominates_playback_and_only_explicit_reading_mode_hides_it() {
         for width in [100, 160, 240] {
             let area = Rect::new(3, 4, width, 40);
-            let playback = player_areas(area);
+            let playback = player_areas(area, None);
             let art = playback.art.unwrap();
             assert!(art.width > playback.panel.width);
             assert!(art.height >= 35);

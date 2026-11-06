@@ -1154,8 +1154,7 @@ fn lyrics_scroll_by_line_and_stop_a_screenful_short_of_the_end() {
     });
 
     let top = drawn_panel(&now, 44, 8);
-    assert!(top[2].contains("Musixmatch"), "{top:#?}");
-    assert!(top[4].contains("line 1"));
+    assert!(top[2].contains("line 1"), "{top:#?}");
 
     // Six lines of content in an eight-row pane, two of them tabs: the last
     // line has to stay on screen rather than scrolling past the top.
@@ -1280,7 +1279,7 @@ fn a_user_who_has_scrolled_keeps_the_view_they_scrolled_to() {
 
     let rows = drawn_panel_at(&now, Duration::from_secs(35), 70, 8);
     assert!(
-        rows[2].contains("Musixmatch"),
+        rows[2].contains("sung line 0"),
         "the panel should still be at the top: {rows:#?}"
     );
     assert!(
@@ -1310,8 +1309,7 @@ fn a_track_with_no_timings_draws_as_it_always_did() {
     // and nothing to follow: it scrolls by cursor as it did before.
     let rows = drawn_panel_at(&now, Duration::from_secs(120), 44, 8);
     assert!(marked(&rows).is_none(), "{rows:#?}");
-    assert!(rows[2].contains("Musixmatch"), "{rows:#?}");
-    assert!(rows[4].contains("line 1"), "{rows:#?}");
+    assert!(rows[2].contains("line 1"), "{rows:#?}");
 }
 
 #[test]
@@ -2106,7 +2104,7 @@ fn drawn_screen(
                     },
                 );
             } else {
-                let layout = player_layout(main, now, Some(cover));
+                let layout = player_layout(main, now, Some(cover), None);
                 render_player_identity(
                     frame,
                     PlayerIdentity {
@@ -2158,7 +2156,7 @@ fn drawn_screen(
                     },
                     accent,
                     show_identity: view != View::Playing
-                        || !has_player_identity(&player_layout(main, now, Some(cover))),
+                        || !has_player_identity(&player_layout(main, now, Some(cover), None)),
                     keys: Some(view),
                 },
                 footer,
@@ -2213,7 +2211,7 @@ fn player_caption_stays_below_the_fitted_cover_and_owns_its_links() {
         for (cols, rows) in [(32, 32), (160, 90)] {
             let cover = Cover::solid(cols, rows);
             let main = shell::regions(Rect::new(0, 0, width, height))[1];
-            let layout = player_layout(main, &now, Some(&cover));
+            let layout = player_layout(main, &now, Some(&cover), None);
             let art = layout.art.unwrap();
             let info = layout.info.unwrap();
             assert_eq!((info.x, info.width), (art.x, art.width));

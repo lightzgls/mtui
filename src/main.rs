@@ -596,6 +596,7 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
                 app.start_in_tray = false;
                 app.status = format!("could not create the tray icon: {err:#}");
                 if let Err(save) = (config::Settings {
+            terminal_host: app.terminal_host,
                     start_in_tray: false,
                     tray_click_pauses: app.tray_click_pauses,
                     precision_volume: app.precision_volume,
@@ -629,6 +630,7 @@ fn sync_foreground_tray(app: &mut App, tray: &mut Option<Tray>) {
         icon.hide();
         *tray = None;
         if let Err(save) = (config::Settings {
+            terminal_host: app.terminal_host,
             start_in_tray: false,
             tray_click_pauses: app.tray_click_pauses,
             precision_volume: app.precision_volume,

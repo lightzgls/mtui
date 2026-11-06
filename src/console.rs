@@ -245,6 +245,7 @@ mod imp {
         if let Some(sessions) = SESSION.get()
             && let Ok(slot) = sessions.lock()
             && let Some(ConsoleSession { child: HostProcess::Terminal { terminal, window, .. }, .. }) = slot.as_ref()
+            && !window.is_empty()
         {
             return Command::new(terminal).args(["-w", window, "focus-tab", "-t", "0"])
                 .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok();
@@ -424,18 +425,22 @@ mod imp {
         let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
         if event == 0 { return Err(io::Error::last_os_error().into()); }
         let close_request = unsafe { OwnedHandle::from_raw_handle(event as *mut c_void) };
-        if std::env::var("MTUI_TERMINAL").as_deref() != Ok("native")
-            && let Some(terminal) = windows_terminal()
+        let host = match std::env::var("MTUI_TERMINAL").as_deref() {
+            Ok("windows-terminal") => crate::config::TerminalHost::WindowsTerminal,
+            Ok("native") => crate::config::TerminalHost::Native,
+            _ => crate::config::Settings::load().terminal_host,
+        };
+        if let Some(terminal) = host.executable()
         {
-            match launch_terminal(&terminal, &executable, &event_name) {
+            match launch_terminal(&terminal, host, &executable, &event_name) {
                 Ok((child, input, output, (width, height))) => {
                     set_size(width, height);
                     CLOSED.store(false, Ordering::Release);
                     *slot = Some(ConsoleSession { child, input, output, close_request });
-                    crate::diagnostics::info("console", "using Windows Terminal");
+                    crate::diagnostics::info("console", &format!("using {}", host.label()));
                     return Ok(());
                 }
-                Err(err) => crate::diagnostics::warn("console", &format!("Windows Terminal launch failed; using native console: {err:#}")),
+                Err(err) => crate::diagnostics::warn("console", &format!("{} launch failed; using native console: {err:#}", host.label())),
             }
         }
         let mut child = Command::new(executable)
@@ -538,15 +543,6 @@ mod imp {
         }
     }
 
-    fn windows_terminal() -> Option<PathBuf> {
-        let alias = std::env::var_os("LOCALAPPDATA")
-            .map(|base| PathBuf::from(base).join("Microsoft/WindowsApps/wt.exe"));
-        alias.filter(|path| path.is_file()).or_else(|| {
-            std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths)
-                .map(|path| path.join("wt.exe")).find(|path| path.is_file()))
-        })
-    }
-
     fn pipe() -> Result<(File, File)> {
         let (mut read, mut write) = (0, 0);
         if unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) } == 0 {
@@ -575,7 +571,7 @@ mod imp {
         assert!(script.contains("exit 0"), "the temporary shell must close its tab on helper exit");
     }
 
-    fn launch_terminal(terminal: &Path, executable: &Path, close_name: &str) -> Result<(HostProcess, File, File, (u16, u16))> {
+    fn launch_terminal(terminal: &Path, host: crate::config::TerminalHost, executable: &Path, close_name: &str) -> Result<(HostProcess, File, File, (u16, u16))> {
         let (remote_input, output) = pipe()?;
         let (mut input, remote_output) = pipe()?;
         // Cancel before dropping the pipe handles on any startup failure. A
@@ -589,12 +585,17 @@ mod imp {
             remote_input.as_raw_handle() as isize, remote_output.as_raw_handle() as isize);
         let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
         let encoded = String::from_utf8(crate::encoding::base64(&utf16)).expect("base64 is ASCII");
-        let window = format!("mtui-{}", std::process::id());
+        let window = if host == crate::config::TerminalHost::WindowsTerminal { format!("mtui-{}", std::process::id()) } else { String::new() };
         let powershell = PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into()))
             .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-        let mut launcher = Command::new(terminal)
-            .args(["-w", &window, "new-tab", "--title", "MTUI", "--suppressApplicationTitle", "--"])
-            .arg(powershell).args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
+        let mut command = Command::new(terminal);
+        match host {
+            crate::config::TerminalHost::WindowsTerminal => { command.args(["-w", &window, "new-tab", "--title", "MTUI", "--suppressApplicationTitle", "--"]); }
+            crate::config::TerminalHost::Alacritty => { command.args(["--title", "MTUI", "-e"]); }
+            crate::config::TerminalHost::WezTerm => { command.args(["start", "--always-new-process", "--"]); }
+            crate::config::TerminalHost::Native => unreachable!("native console has its own launcher"),
+        }
+        let mut launcher = command.arg(powershell).args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
             .context("could not launch Windows Terminal")?;
         // The launcher is short-lived; the actual helper identifies itself in

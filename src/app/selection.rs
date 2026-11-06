@@ -44,11 +44,11 @@ impl App {
                 let id = item.track.as_ref().map(|track| track.id.clone()).or_else(|| item.card.track().map(|track| track.id))?;
                 (MouseAction::SelectLibraryItem(index), id)
             }
-            MouseAction::SelectPageRow(index) if self.view == View::Playing => {
+            MouseAction::SelectPageRow(index) => {
                 let now = self.now.as_ref().filter(|now| now.tab == Tab::UpNext)?;
                 (action, now.queue.get(index)?.id.clone())
             }
-            MouseAction::OpenPageRow(index) if self.view == View::Playing => {
+            MouseAction::OpenPageRow(index) => {
                 let now = self.now.as_ref().filter(|now| now.tab == Tab::Related)?;
                 let id = match now.related_rows().get(index)? {
                     RelatedRow::Card(card) => card.track()?.id,

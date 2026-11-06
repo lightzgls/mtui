@@ -21,10 +21,11 @@ pub enum Setting {
     Tray,
     TrayClick,
     Updates,
+    Terminal,
 }
 
 impl Setting {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Output,
         Self::PrecisionVolume,
         Self::Cover,
@@ -34,6 +35,7 @@ impl Setting {
         Self::Tray,
         Self::TrayClick,
         Self::Updates,
+        Self::Terminal,
     ];
 
     pub fn index(self) -> usize {
@@ -48,7 +50,7 @@ impl Setting {
             Self::Output | Self::PrecisionVolume => "Playback",
             Self::Cover | Self::Renderer | Self::KeyHints => "Appearance",
             Self::Discord | Self::Tray | Self::TrayClick => "Integrations",
-            Self::Updates => "App",
+            Self::Updates | Self::Terminal => "App",
         }
     }
 
@@ -63,6 +65,7 @@ impl Setting {
             Self::Tray => "Keep tray icon visible",
             Self::TrayClick => "Click tray icon to pause / resume",
             Self::Updates => "Updates",
+            Self::Terminal => "Open MTUI with",
         }
     }
 
@@ -77,6 +80,7 @@ impl Setting {
             Self::Tray => "Keep tray controls available while the terminal is open.",
             Self::TrayClick => "Left-click pauses or resumes the same song. Right-click and choose Show the player to open MTUI.",
             Self::Updates => "Check for new versions and install them here.",
+            Self::Terminal => "Choose the window used next time MTUI opens. Windows Terminal falls back to the native console if unavailable.",
         }
     }
 
@@ -89,7 +93,7 @@ impl Setting {
     }
 
     pub fn windows_only(self) -> bool {
-        matches!(self, Self::Tray | Self::TrayClick)
+        matches!(self, Self::Tray | Self::TrayClick | Self::Terminal)
     }
 
     pub fn platforms(self) -> &'static str {
@@ -108,6 +112,7 @@ pub enum ChoiceValue {
     Output(Option<String>),
     Cover(CoverStyle),
     Renderer(ImageRenderer),
+    Terminal(config::TerminalHost),
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +246,7 @@ impl App {
                     Setting::Tray => if self.start_in_tray { "On" } else { "Off" }.to_string(),
                     Setting::TrayClick => if self.tray_click_pauses { "On" } else { "Off" }.to_string(),
                     Setting::Updates => self.updater.label(),
+                    Setting::Terminal => self.terminal_host.label().to_string(),
                 },
             })
             .collect()
@@ -262,6 +268,8 @@ impl App {
                 .into_iter()
                 .map(|value| (cover_label(value).to_string(), ChoiceValue::Cover(value)))
                 .collect(),
+            Setting::Terminal => config::TerminalHost::available()
+                .into_iter().map(|value| (value.label().to_string(), ChoiceValue::Terminal(value))).collect(),
             Setting::Renderer => [
                 ImageRenderer::Automatic,
                 ImageRenderer::PixelArt,
@@ -285,6 +293,7 @@ impl App {
                     ChoiceValue::Output(output) => *output == self.output_device,
                     ChoiceValue::Cover(style) => *style == self.cover_style,
                     ChoiceValue::Renderer(renderer) => *renderer == self.image_renderer,
+                    ChoiceValue::Terminal(host) => *host == self.terminal_host,
                 };
                 Choice {
                     label,
@@ -293,6 +302,24 @@ impl App {
                 }
             })
             .collect()
+    }
+
+    fn set_terminal_host(&mut self, host: config::TerminalHost) {
+        let settings = config::Settings {
+            terminal_host: host, start_in_tray: self.start_in_tray,
+            tray_click_pauses: self.tray_click_pauses, precision_volume: self.precision_volume,
+            show_key_hints: self.show_key_hints, cover_style: self.cover_style,
+            image_renderer: self.image_renderer,
+            volume: self.volume_save.map_or_else(|| self.snapshot().volume, |(_, volume)| volume),
+            output_device: self.output_device.clone(),
+        };
+        match settings.save() {
+            Ok(()) => {
+                self.terminal_host = host;
+                self.status = format!("{} will be used next time the player window opens", host.label());
+            }
+            Err(error) => self.status = format!("could not save terminal preference: {error:#}"),
+        }
     }
 
     pub(super) fn handle_preferences_intent(&mut self, intent: Intent) {
@@ -342,6 +369,7 @@ impl App {
                     ChoiceValue::Output(output) => self.set_audio_output(output),
                     ChoiceValue::Cover(style) => self.set_cover_style(style),
                     ChoiceValue::Renderer(renderer) => self.set_image_renderer(renderer),
+                    ChoiceValue::Terminal(host) => self.set_terminal_host(host),
                 }
                 self.preferences.notice =
                     Some((self.status.clone(), self.status.starts_with("could not")));
@@ -356,9 +384,16 @@ impl App {
             Setting::PrecisionVolume => self.toggle_precision_volume(),
             Setting::Cover => self.cycle_cover_style(forward),
             Setting::Renderer => self.cycle_image_renderer(forward),
+            Setting::Terminal => {
+                let hosts = config::TerminalHost::available();
+                let index = hosts.iter().position(|host| *host == self.terminal_host).unwrap_or(0);
+                let next = if forward { (index + 1) % hosts.len() } else { (index + hosts.len() - 1) % hosts.len() };
+                self.set_terminal_host(hosts[next]);
+            }
             Setting::KeyHints => {
                 let enabled = !self.show_key_hints;
                 let settings = crate::config::Settings {
+            terminal_host: self.terminal_host,
                     start_in_tray: self.start_in_tray, tray_click_pauses: self.tray_click_pauses,
                     precision_volume: self.precision_volume, show_key_hints: enabled,
                     cover_style: self.cover_style, image_renderer: self.image_renderer,
@@ -494,6 +529,7 @@ impl App {
         }
         let enabled = !self.start_in_tray;
         let settings = config::Settings {
+            terminal_host: self.terminal_host,
             start_in_tray: enabled,
             tray_click_pauses: self.tray_click_pauses,
             precision_volume: self.precision_volume,
@@ -527,6 +563,7 @@ impl App {
         }
         let enabled = !self.tray_click_pauses;
         let settings = config::Settings {
+            terminal_host: self.terminal_host,
             start_in_tray: self.start_in_tray,
             tray_click_pauses: enabled,
             precision_volume: self.precision_volume,
@@ -556,6 +593,7 @@ impl App {
     pub(super) fn toggle_precision_volume(&mut self) {
         let enabled = !self.precision_volume;
         let settings = config::Settings {
+            terminal_host: self.terminal_host,
             start_in_tray: self.start_in_tray,
             tray_click_pauses: self.tray_click_pauses,
             precision_volume: enabled,
@@ -592,6 +630,7 @@ impl App {
 
     pub(super) fn set_cover_style(&mut self, style: CoverStyle) {
         let settings = config::Settings {
+            terminal_host: self.terminal_host,
             start_in_tray: self.start_in_tray,
             tray_click_pauses: self.tray_click_pauses,
             precision_volume: self.precision_volume,
@@ -627,6 +666,7 @@ impl App {
 
     pub(super) fn set_image_renderer(&mut self, renderer: ImageRenderer) {
         let settings = config::Settings {
+            terminal_host: self.terminal_host,
             start_in_tray: self.start_in_tray,
             tray_click_pauses: self.tray_click_pauses,
             precision_volume: self.precision_volume,
@@ -708,7 +748,7 @@ mod tests {
     fn platform_labels_match_setting_availability() {
         for setting in Setting::ALL {
             match setting {
-                Setting::Tray | Setting::TrayClick => {
+                Setting::Tray | Setting::TrayClick | Setting::Terminal => {
                     assert_eq!(setting.platforms(), "Windows only");
                     assert_eq!(setting.enabled(), cfg!(windows));
                 }

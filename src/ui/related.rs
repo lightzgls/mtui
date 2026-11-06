@@ -6,15 +6,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{CardShape, MouseAction, NowPlaying, Panel, RelatedRow};
+use crate::app::{CardShape, MouseAction, NowPlaying, Panel, RelatedRow, Tab};
 
 use super::cards::{Tiles, render_card_artist_link};
 use super::mouse::{MouseMap, MouseTarget};
 use super::player::{message, waiting_on};
 use super::text::truncate;
 
-#[cfg(test)]
-use crate::app::Tab;
 #[cfg(test)]
 use crate::source::home::Shelf;
 
@@ -31,7 +29,7 @@ impl Geometry {
         if rows.is_empty() || area.is_empty() {
             return Self { rows: Vec::new() };
         }
-        let cursor = now.cursor().min(rows.len() - 1);
+        let cursor = now.cursor[Tab::Related.index()].min(rows.len() - 1);
         let heading = if area.height >= 14 { 2 } else { 1 };
         let card = match area.height {
             0..=3 => 1,
@@ -136,7 +134,7 @@ pub(super) fn render(
                 } else {
                     CardShape::Text
                 };
-                if let Some(link) = render_card_artist_link(frame, card, rect, index == now.cursor(), tiles, card.artist_ref.as_ref()) {
+                if let Some(link) = render_card_artist_link(frame, card, rect, index == now.cursor[Tab::Related.index()], tiles, card.artist_ref.as_ref()) {
                     mouse.targets.push(MouseTarget::Area(link, MouseAction::OpenRelatedArtist(index)));
                 }
             }

@@ -56,11 +56,12 @@ pub(super) const HINTS_PLAYING: &str = "Tab panels  . song actions  ? help";
 pub(super) fn render_status(frame: &mut Frame, app: &App, area: Rect, mouse: &mut MouseMap) {
     frame.render_widget(Block::default().style(Style::default().bg(shell::SURFACE)), area);
     let area = shell::footer_content(area);
-    let show_identity = app.view != View::Playing || app.cover_size == CoverSize::Full
-        || app.now.as_ref().is_none_or(|now| {
+    let show_identity = if app.view != View::Playing { app.now.is_none() } else {
+        app.cover_size == CoverSize::Full || app.now.as_ref().is_none_or(|now| {
             let main = shell::regions(frame.area())[1];
-            !has_player_identity(&player_layout(main, now, app.cover.as_ref()))
-        });
+            !has_player_identity(&player_layout(main, now, app.cover.as_ref(), app.splits.size(super::Split::PlayerWidth, main.width)))
+        })
+    };
     let track = app.now.as_ref().map(|now| MiniTrack {
         title: &now.title,
         byline: &now.artist,

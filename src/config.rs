@@ -339,6 +339,7 @@ impl CoverStyle {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub terminal_host: TerminalHost,
     pub start_in_tray: bool,
     /// Left-clicking the tray icon toggles pause instead of opening MTUI.
     #[serde(alias = "tray_click_stops")]
@@ -358,6 +359,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            terminal_host: TerminalHost::Native,
             start_in_tray: false,
             tray_click_pauses: false,
             precision_volume: false,
@@ -367,6 +369,54 @@ impl Default for Settings {
             volume: 1.0,
             output_device: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TerminalHost {
+    #[default]
+    Native,
+    WindowsTerminal,
+    Alacritty,
+    WezTerm,
+}
+
+impl TerminalHost {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Native => "Native console", Self::WindowsTerminal => "Windows Terminal",
+            Self::Alacritty => "Alacritty", Self::WezTerm => "WezTerm",
+        }
+    }
+
+    pub fn available() -> Vec<Self> {
+        [Self::Native, Self::WindowsTerminal, Self::Alacritty, Self::WezTerm]
+            .into_iter().filter(|host| *host == Self::Native || host.executable().is_some()).collect()
+    }
+
+    pub fn executable(self) -> Option<PathBuf> {
+        if !cfg!(windows) || self == Self::Native { return None; }
+        let (name, relative) = match self {
+            Self::WindowsTerminal => ("wt.exe", "Microsoft/WindowsApps/wt.exe"),
+            Self::Alacritty => ("alacritty.exe", "Programs/Alacritty/alacritty.exe"),
+            Self::WezTerm => ("wezterm.exe", "Programs/WezTerm/wezterm.exe"),
+            Self::Native => return None,
+        };
+        let mut candidates = Vec::new();
+        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(base).join(relative));
+        }
+        for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(base) = std::env::var_os(key) {
+                let folder = match self { Self::Alacritty => "Alacritty", Self::WezTerm => "WezTerm", _ => "Windows Terminal" };
+                candidates.push(PathBuf::from(base).join(folder).join(name));
+            }
+        }
+        if let Some(paths) = std::env::var_os("PATH") {
+            candidates.extend(std::env::split_paths(&paths).map(|path| path.join(name)));
+        }
+        candidates.into_iter().find(|path| path.is_file())
     }
 }
 
@@ -554,11 +604,13 @@ mod tests {
         assert_eq!(legacy.image_renderer, ImageRenderer::Automatic);
         assert_eq!(legacy.volume, 1.0);
         assert_eq!(legacy.output_device, None);
+        assert_eq!(legacy.terminal_host, TerminalHost::Native);
     }
 
     #[test]
     fn the_tray_preference_round_trips() {
         let body = serde_json::to_string(&Settings {
+            terminal_host: TerminalHost::WindowsTerminal,
             start_in_tray: true,
             tray_click_pauses: true,
             precision_volume: true,
@@ -578,6 +630,7 @@ mod tests {
         assert!(!settings.show_key_hints);
         assert_eq!(settings.cover_style, CoverStyle::ColoredAscii);
         assert_eq!(settings.image_renderer, ImageRenderer::Kitty);
+        assert_eq!(settings.terminal_host, TerminalHost::WindowsTerminal);
         assert_eq!(settings.volume, 0.65);
         assert_eq!(
             settings.output_device.as_deref(),

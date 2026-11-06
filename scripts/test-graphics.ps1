@@ -13,8 +13,8 @@ $taskOldTerminal = [Environment]::GetEnvironmentVariable('MTUI_TERMINAL', 'Proce
 $taskOldGraphics = [Environment]::GetEnvironmentVariable('MTUI_GRAPHICS', 'Process')
 try {
     [Environment]::SetEnvironmentVariable('MTUI_GRAPHICS', $null, 'Process')
-    foreach ($taskMode in @('automatic', 'native')) {
-        $taskValue = if ($taskMode -eq 'native') { 'native' } else { $null }
+    foreach ($taskMode in @('windows-terminal', 'native')) {
+        $taskValue = $taskMode
         [Environment]::SetEnvironmentVariable('MTUI_TERMINAL', $taskValue, 'Process')
         $taskJson = (& $taskExe --diagnose-graphics | Out-String).Trim()
         if ($LASTEXITCODE -ne 0) { throw "Graphics probe failed for $taskMode : $taskJson" }
@@ -22,7 +22,7 @@ try {
         if ($taskResult.cell_width -le 0 -or $taskResult.cell_height -le 0) {
             throw "Invalid cell size: $taskJson"
         }
-        if ($ExpectSixel -and $taskMode -eq 'automatic' -and -not $taskResult.sixel) {
+        if ($ExpectSixel -and $taskMode -eq 'windows-terminal' -and -not $taskResult.sixel) {
             throw "Windows Terminal did not report SIXEL: $taskJson"
         }
         Write-Output "$taskMode : $taskJson"

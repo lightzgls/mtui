@@ -6,6 +6,7 @@ use crate::source::worker::{PageRequestId, Request};
 use super::{App, library};
 use super::artist::ArtistView;
 use super::playback::playback_failure_status;
+use super::now_playing::Tab;
 
 /// Exact pages retained for Back. A cap keeps nested artist browsing bounded
 /// even when someone walks through a long chain of related artists.
@@ -20,11 +21,7 @@ pub enum Mode {
     Editing,
 }
 
-/// Which list the main pane is showing.
-///
-/// Both views share the pane rather than splitting it: on a terminal the width
-/// is the scarce resource, and a permanent sidebar would cost the results their
-/// artist and album columns for something looked at once a session.
+/// Which page occupies the main pane beside the persistent current-track column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Library,
@@ -372,32 +369,17 @@ impl App {
     /// which is what keeps a selection on something; a text panel stops one
     /// screenful short of its end, because scrolling a wall of lyrics past the
     /// bottom of the pane leaves the user looking at nothing.
-    pub fn clamp_page(&mut self, viewport: usize, total: usize, selects: bool) {
+    pub fn clamp_panel(&mut self, tab: Tab, viewport: usize, total: usize, following: Option<usize>) {
         let Some(now) = self.now.as_mut() else {
             return;
         };
-        let last = if selects {
+        let last = if matches!(tab, Tab::UpNext | Tab::Related) {
             total.saturating_sub(1)
         } else {
             total.saturating_sub(viewport)
         };
-        let cursor = now.cursor_mut();
-        *cursor = (*cursor).min(last);
-    }
-
-
-    /// Puts the open panel's cursor where the panel scrolled itself to.
-    ///
-    /// Called by the renderer when the lyrics panel is following the singer,
-    /// which is the one case where something other than a key decides what is
-    /// on screen. Written back rather than kept beside the cursor so that the
-    /// moment the user takes over -- one press of `j` -- they carry on from the
-    /// line they were looking at, instead of from wherever they had scrolled to
-    /// before the follow began.
-    pub fn follow_page(&mut self, offset: usize) {
-        if let Some(now) = self.now.as_mut() {
-            *now.cursor_mut() = offset;
-        }
+        let cursor = &mut now.cursor[tab.index()];
+        *cursor = following.unwrap_or(*cursor).min(last);
     }
 
 
@@ -459,6 +441,7 @@ impl App {
             self.search_page = None;
             self.view = View::Playing;
             self.mode = Mode::Browse;
+            self.request_tab();
         } else {
             self.status = "nothing is playing".to_string();
         }

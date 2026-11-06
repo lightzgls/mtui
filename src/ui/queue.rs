@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{MouseAction, NowPlaying};
+use crate::app::{MouseAction, NowPlaying, Tab};
 use crate::source::Track;
 
 use super::mouse::{MouseMap, MouseTarget};
@@ -26,7 +26,6 @@ fn header_height(area: Rect) -> u16 {
 
 pub(super) struct Geometry {
     list: Rect,
-    stride: u16,
     pub viewport: usize,
     pub(super) first: usize,
 }
@@ -35,10 +34,8 @@ impl Geometry {
     pub fn new(now: &NowPlaying, area: Rect) -> Self {
         let header = header_height(area);
         let list = Rect::new(area.x, area.y + header, area.width, area.height - header);
-        // Keep a blank row between songs when at least four songs fit.
-        let stride = if list.height >= 8 { 2 } else { 1 };
-        let viewport = list.height.div_ceil(stride) as usize;
-        let cursor = now.cursor().min(now.queue.len().saturating_sub(1));
+        let viewport = usize::from(list.height);
+        let cursor = now.cursor[Tab::UpNext.index()].min(now.queue.len().saturating_sub(1));
         let mut first = now.queue_offset.min(now.queue.len().saturating_sub(viewport));
         if viewport > 0 {
             if cursor < first { first = cursor; }
@@ -46,7 +43,6 @@ impl Geometry {
         }
         Self {
             list,
-            stride,
             viewport,
             first,
         }
@@ -55,7 +51,7 @@ impl Geometry {
     fn row(&self, slot: usize) -> Rect {
         Rect::new(
             self.list.x,
-            self.list.y + slot as u16 * self.stride,
+            self.list.y + slot as u16,
             self.list.width,
             1,
         )
@@ -99,7 +95,7 @@ pub(super) fn render(frame: &mut Frame, now: &NowPlaying, area: Rect, accent: Co
         Rect::new(area.x, area.y, area.width, area.height.min(1)),
     );
     let layout = Geometry::new(now, area);
-    let cursor = now.cursor().min(now.queue.len().saturating_sub(1));
+    let cursor = now.cursor[Tab::UpNext.index()].min(now.queue.len().saturating_sub(1));
     for (slot, track) in now
         .queue
         .iter()
@@ -164,7 +160,7 @@ pub(super) fn line(
     };
     let marker = if playing { crate::navigation::current().play() } else { "›" };
     let duration = track.duration_str();
-    if width < MARKER_WIDTH + display_width(&duration) + COLUMN_GAP + 1 {
+    if width < MARKER_WIDTH + display_width(&duration) + COLUMN_GAP + 1 + 8 {
         return Line::from(Span::styled(
             truncate(
                 &format!(" {marker} {}", track.title),
@@ -291,13 +287,6 @@ mod tests {
                             Some(MouseAction::SelectPageRow(index))
                         );
                         assert_ne!(buffer[(x as u16, row.y)].symbol(), " ");
-                    }
-                    if geometry.stride > 1 && row.y + 1 < height {
-                        for x in 0..width {
-                            assert_eq!(buffer[(x, row.y + 1)].symbol(), " ");
-                            assert_eq!(mouse.action_at(x, row.y + 1), None);
-                            assert_eq!(mouse.context_action_at(x, row.y + 1), None);
-                        }
                     }
                 }
             }

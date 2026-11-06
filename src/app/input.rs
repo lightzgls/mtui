@@ -240,10 +240,11 @@ impl App {
             }
             return Ok(());
         }
-        if self.mode == Mode::Editing && matches!(action,
+        if self.mode == Mode::Editing && (matches!(action,
             MouseAction::SelectHomeCard { .. } | MouseAction::SelectTrack(_)
                 | MouseAction::SelectArtistSong(_) | MouseAction::SelectArtistCard { .. }
-                | MouseAction::SelectLibraryItem(_) | MouseAction::SelectPageRow(_))
+                | MouseAction::SelectLibraryItem(_))
+            || (self.view == View::Playing && matches!(action, MouseAction::SelectPageRow(_))))
         {
             self.cancel_search_request();
             if let Some(HistoryEntry::Tracks(page)) = self.search_page.take() {
@@ -401,7 +402,7 @@ impl App {
                     self.open_artist(artist);
                 }
             }
-            MouseAction::OpenRelatedArtist(index) if self.view == View::Playing => {
+            MouseAction::OpenRelatedArtist(index) => {
                 let artist = self.now.as_ref().filter(|now| now.tab == Tab::Related).and_then(|now|
                     match now.related_rows().get(index) {
                         Some(RelatedRow::Card(card)) => card_artist(card), _ => None,
@@ -429,24 +430,25 @@ impl App {
                     self.prefetch.selection_changed(Instant::now());
                 }
             }
-            MouseAction::OpenTab(tab) if self.view == View::Playing => {
+            MouseAction::OpenTab(tab) => {
                 if self.now.as_mut().is_some_and(|now| now.open(tab)) {
                     self.request_tab();
                 }
             }
-            MouseAction::ToggleLyricsExpanded if self.view == View::Playing => {
+            MouseAction::ToggleLyricsExpanded => {
+                self.open_player();
                 self.toggle_lyrics_expanded();
             }
-            MouseAction::ToggleLyricsFollow if self.view == View::Playing => {
+            MouseAction::ToggleLyricsFollow => {
                 self.toggle_lyrics_follow();
             }
-            MouseAction::OpenPageRow(index) if self.view == View::Playing => {
+            MouseAction::OpenPageRow(index) => {
                 if let Some(now) = self.now.as_mut() {
                     *now.cursor_mut() = index;
                 }
                 self.open_page_row();
             }
-            MouseAction::SelectPageRow(index) if self.view == View::Playing => {
+            MouseAction::SelectPageRow(index) => {
                 if let Some(now) = self.now.as_mut() {
                     if index < now.queue.len() { self.status.clear(); }
                     *now.cursor_mut() = index;
@@ -477,6 +479,31 @@ impl App {
         }
         let code = if down { KeyCode::Down } else { KeyCode::Up };
         self.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Focusing a visible panel preserves its independent lyric-follow setting.
+    pub fn focus_player_panel(&mut self, tab: Tab) {
+        if !self.overlay.is_open() && self.menu.is_none()
+            && let Some(now) = self.now.as_mut()
+            && now.tab != tab
+        {
+            now.tab = tab;
+            if tab != Tab::Lyrics { now.detail_tab = tab; }
+            self.request_tab();
+        }
+    }
+
+    /// A sidebar wheel never changes the browsing page or its search draft.
+    pub fn handle_player_panel_scroll(&mut self, tab: Tab, down: bool) -> Result<()> {
+        if self.overlay.is_open() || self.menu.is_some() {
+            return self.handle_mouse_scroll(down);
+        }
+        if let Some(now) = self.now.as_mut() {
+            let cursor = &mut now.cursor[tab.index()];
+            *cursor = cursor.saturating_add_signed(if down { 1 } else { -1 });
+            if tab == Tab::Lyrics { now.follow_lyrics = false; }
+        }
+        Ok(())
     }
 
 

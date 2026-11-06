@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{NowPlaying, Panel};
+use crate::app::{NowPlaying, Panel, Tab};
 use crate::player::Snapshot;
 
 use super::player::{message, waiting_on};
@@ -42,50 +42,23 @@ pub(super) fn render_lyrics(
     // line marked.
     let singing = lyrics.singing(snap.position);
 
-    // Each drawn row: its text, the timed line it was wrapped out of, and
-    // whether it is that line's first row -- which is where the mark goes, and
-    // which only the wrap done here can know. The credit and the blank line
-    // under it belong to no lyric and stay `None`, which is also what every
-    // line of an untimed track is.
-    let mut lines: Vec<(String, Option<usize>, bool)> = Vec::new();
-    if let Some(source) = &lyrics.source {
-        lines.push((source.clone(), None, false));
-        lines.push((String::new(), None, false));
-    }
-    let credit = lines.len();
-
-    if lyrics.timed.is_empty() {
-        for paragraph in lyrics.text.lines() {
-            if paragraph.trim().is_empty() {
-                lines.push((String::new(), None, false));
-            } else {
-                lines.extend(
-                    bounded_wrap(paragraph, width)
-                        .into_iter()
-                        .map(|line| (line, None, false)),
-                );
-                if now.lyrics_expanded && area.height >= 12 {
-                    lines.push((String::new(), None, false));
-                }
-            }
-        }
+    // Space separate lyric lines when there is room, while keeping wrapped
+    // lines together and preserving the source's own verse breaks.
+    let lyrics_rows: Box<dyn Iterator<Item = (&str, Option<usize>)>> = if lyrics.timed.is_empty() {
+        Box::new(lyrics.text.lines().map(|line| (line, None)))
     } else {
-        for (at, timed) in lyrics.timed.iter().enumerate() {
-            if timed.text.trim().is_empty() {
-                // A verse gap is one row, and is its own first.
-                lines.push((String::new(), Some(at), true));
-            } else {
-                lines.extend(
-                    bounded_wrap(&timed.text, width)
-                        .into_iter()
-                        .enumerate()
-                        .map(|(row, line)| (line, Some(at), row == 0)),
-                );
-                if area.height >= 12 {
-                    lines.push((String::new(), None, false));
-                    if now.lyrics_expanded { lines.push((String::new(), None, false)); }
-                }
+        Box::new(lyrics.timed.iter().enumerate().map(|(index, line)| (line.text.as_str(), Some(index))))
+    };
+    let mut lines: Vec<(String, Option<usize>, bool)> = Vec::new();
+    for (text, timing) in lyrics_rows {
+        if text.trim().is_empty() {
+            lines.push((String::new(), timing, true));
+        } else {
+            if area.height >= 12 && lines.last().is_some_and(|(text, _, _)| !text.is_empty()) {
+                lines.push((String::new(), None, false));
             }
+            lines.extend(bounded_wrap(text, width).into_iter().enumerate()
+                .map(|(row, text)| (text, timing, row == 0)));
         }
     }
 
@@ -101,15 +74,14 @@ pub(super) fn render_lyrics(
         centred_offset(first, viewport, lines.len())
     });
     let offset =
-        following.unwrap_or_else(|| now.cursor().min(lines.len().saturating_sub(viewport)));
+        following.unwrap_or_else(|| now.cursor[Tab::Lyrics.index()].min(lines.len().saturating_sub(viewport)));
 
     let drawn: Vec<Line> = lines
         .iter()
-        .enumerate()
         .skip(offset)
         .take(viewport)
-        .map(|(index, (text, from, first))| {
-            let line = lyric_line(text, index < credit, *from, singing, *first);
+        .map(|(text, from, first)| {
+            let line = lyric_line(text, false, *from, singing, *first);
             if now.lyrics_expanded { line.alignment(ratatui::layout::Alignment::Center) } else { line }
         })
         .collect();

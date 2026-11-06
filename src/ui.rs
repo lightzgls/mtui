@@ -46,12 +46,16 @@ mod overlays;
 mod paging;
 mod palette;
 mod player;
+mod player_split;
 mod preferences;
 mod queue;
 mod related;
 mod results;
 mod search;
 mod shell;
+mod sidebar;
+mod split;
+pub(crate) use split::{Split, Splits};
 mod status;
 mod text;
 
@@ -109,15 +113,17 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
         mouse,
     );
 
+    let (content_area, sidebar_area) = sidebar::areas(main_area,
+        app.now.is_some() && app.view != View::Playing, &app.splits);
     // The player page lays itself out around the cover rather than beside it,
     // so it reserves its own rect instead of going through `split_cover`.
     let cover_area = if app.view == View::Playing {
         render_player(frame, app, main_area, mouse)
     } else if app.view == View::Library {
-        library::render(frame, app, main_area, mouse);
+        library::render(frame, app, content_area, mouse);
         None
     } else {
-        let (list_area, cover_area) = split_cover(app, main_area);
+        let (list_area, cover_area) = split_cover(app, content_area);
         if let Some(area) = list_area {
             match app.view {
                 View::Home => render_home(frame, app, area, mouse),
@@ -130,6 +136,7 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
         }
         cover_area
     };
+    let sidebar_cover = sidebar_area.and_then(|area| sidebar::render(frame, app, area, main_area, mouse));
     render_status(frame, app, status_area, mouse);
 
     // Planned last so it can reach into the finished buffer and mark the cells
@@ -144,6 +151,20 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
     } else {
         app.cover_size
     };
+    render_playing_cover(frame, app, mouse, cover_area, size);
+    render_playing_cover(frame, app, mouse, sidebar_cover, CoverSize::Full);
+
+    // Over everything, including the cover pane's cells.
+    render_overlay(frame, app, mouse);
+    menu::render(frame, app, mouse);
+    palette::apply(frame, app.cover.as_ref(), if app.cover_style == CoverStyle::ColoredAscii {
+        cover_area.or(sidebar_cover)
+    } else { None });
+}
+
+fn render_playing_cover(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap,
+    cover_area: Option<ratatui::layout::Rect>, size: CoverSize,
+) {
     let image = match (cover_area, app.cover.as_ref()) {
         // Protocol image pixels are not in ratatui's buffer, so an overlay
         // drawn over them would not cover them -- the modal would appear with
@@ -180,12 +201,6 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
         register_cover_target(mouse, cover, area, size, cell);
     }
 
-    // Over everything, including the cover pane's cells.
-    render_overlay(frame, app, mouse);
-    // Menus are the final layer. Input keeps them mutually exclusive with the
-    // ordinary overlays, but drawing last preserves that invariant visually.
-    menu::render(frame, app, mouse);
-    palette::apply(frame, app.cover.as_ref(), if app.cover_style == CoverStyle::ColoredAscii { cover_area } else { None });
 }
 
 #[cfg(windows)]

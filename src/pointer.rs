@@ -28,6 +28,7 @@ enum Capture {
     Queue { id: String, epoch: u64 },
     Seek,
     Volume,
+    Divider(crate::ui::Split, ratatui::layout::Rect),
 }
 
 impl Pointer {
@@ -47,6 +48,14 @@ impl Pointer {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.capture = None;
                 self.press = None;
+                if !app.overlay.is_open() && app.menu().is_none()
+                    && let Some((split, bounds)) = mouse.divider_at(x, y)
+                {
+                    self.capture = Some(Capture::Divider(split, bounds));
+                    self.last_click = None;
+                    return Ok(());
+                }
+                if let Some(tab) = mouse.player_panel_at(x, y) { app.focus_player_panel(tab); }
                 if let Some(action) = mouse.action_at(x, y) {
                     let target = app.song_click(action);
                     let selected = target.as_ref().map_or(action, |target| target.select);
@@ -85,6 +94,13 @@ impl Pointer {
                         if matches!(event.kind, MouseEventKind::Drag(_))
                             && let Some(action @ MouseAction::SetVolume(_)) = mouse.drag_action_at(x, y) { app.handle_mouse_action(action)?; }
                     }
+                    Some(Capture::Divider(split, bounds))
+                        if matches!(event.kind, MouseEventKind::Drag(_))
+                            && !app.overlay.is_open() && app.menu().is_none() && app.now.is_some() =>
+                    {
+                        app.splits.drag(*split, *bounds, x, y);
+                    }
+                    Some(Capture::Divider(..)) => {}
                     None => {}
                 }
                 if matches!(event.kind, MouseEventKind::Up(_)) {
@@ -102,8 +118,11 @@ impl Pointer {
             }
             MouseEventKind::Down(MouseButton::Right) => {
                 self.cancel();
+                if let Some(tab) = mouse.player_panel_at(x, y) { app.focus_player_panel(tab); }
                 if let Some(action) = mouse.context_action_at(x, y) { app.handle_mouse_action(action)?; }
-                app.handle_mouse_action(MouseAction::OpenPageActions)?;
+                app.handle_mouse_action(if app.view != crate::app::View::Playing && mouse.player_panel_at(x, y).is_some() {
+                    MouseAction::OpenPlayerActions
+                } else { MouseAction::OpenPageActions })?;
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 self.press = None;
@@ -113,6 +132,8 @@ impl Pointer {
                     app.handle_mouse_action(MouseAction::AdjustPrecisionVolume(up))?;
                 } else if mouse.over_volume(x, y) {
                     app.handle_mouse_action(MouseAction::AdjustVolume(up))?;
+                } else if let Some(tab) = mouse.player_panel_at(x, y) {
+                    app.handle_player_panel_scroll(tab, !up)?;
                 } else { app.handle_mouse_scroll(!up)?; }
             }
             MouseEventKind::Down(_) | MouseEventKind::Up(_) => self.cancel(),

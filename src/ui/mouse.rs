@@ -23,6 +23,8 @@ pub(super) enum MouseTarget {
     Volume(Rect),
     VolumeControl(Rect),
     Cover(Rect),
+    PlayerPanel(Rect, crate::app::Tab),
+    Divider(Rect, super::Split, Rect),
 }
 
 pub(super) fn hinted_label(label: &str, key: Option<&str>, budget: u16, show: bool) -> Line<'static> {
@@ -51,6 +53,19 @@ pub(super) fn button_style(mut line: Line<'static>, style: Style) -> Line<'stati
 }
 
 impl MouseMap {
+    pub(crate) fn divider_at(&self, x: u16, y: u16) -> Option<(super::Split, Rect)> {
+        self.targets.iter().rev().find_map(|target| match *target {
+            MouseTarget::Divider(area, split, bounds) if contains(area, x, y) => Some((split, bounds)),
+            _ => None,
+        })
+    }
+    pub(crate) fn player_panel_at(&self, column: u16, row: u16) -> Option<crate::app::Tab> {
+        self.targets.iter().rev().find_map(|target| match *target {
+            MouseTarget::Area(area, MouseAction::IgnoreOverlay) if contains(area, column, row) => Some(None),
+            MouseTarget::PlayerPanel(area, tab) if contains(area, column, row) => Some(Some(tab)),
+            _ => None,
+        }).flatten()
+    }
     pub(super) fn show_key_hints(&self) -> bool { !self.key_hints_hidden }
 
     /// Keep shortcuts quiet and drop the whole hint before shortening a label.
