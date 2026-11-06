@@ -54,7 +54,7 @@ pub(super) fn render_player(
         cover: app.cover.as_ref(),
         accent: ambient(app),
     };
-    let images = if app.kitty_images() && !app.overlay.is_open() && app.menu().is_none() {
+    let images = if app.protocol_images() && !app.overlay.is_open() && app.menu().is_none() {
         Some((&mut app.images, app.graphics))
     } else {
         None
@@ -329,7 +329,7 @@ pub(super) fn render_panel(frame: &mut Frame, app: &mut App, area: Rect, mouse: 
     // the borrow below is what stops either being asked for down there.
     let snap = app.snapshot();
     let accent = ambient(app);
-    let use_images = app.kitty_images() && !app.overlay.is_open() && app.menu().is_none();
+    let use_images = app.protocol_images() && !app.overlay.is_open() && app.menu().is_none();
     let inner = shell::panel_inset(area);
     if inner.height < 2 {
         return;

@@ -138,8 +138,8 @@ pub(super) struct Tiles<'a> {
     /// Key and optional URL of every visible picture. Cached URL-less duplicates
     /// still keep their shared key recent; only real misses need the URL.
     pub(super) wanted: &'a mut Vec<(String, Option<String>)>,
-    /// Kitty can place many independent images in one frame. Sixel is kept to
-    /// the single player cover because it has no comparable placement IDs.
+    /// Protocol images are planned only for visible artwork. Unchanged
+    /// placements are retained so navigation does not re-encode every sleeve.
     pub(super) images: Option<(&'a mut Vec<PlannedImage>, Graphics)>,
 }
 
@@ -560,9 +560,8 @@ pub(super) fn badge_spans(card: &Card, accent: Color) -> Vec<Span<'static>> {
 /// them is not a grid. So a 16:9 video thumbnail loses its sides here and every
 /// tile is the same square.
 ///
-/// Kitty placements are used when selected; the universal fallback is made of
-/// half-blocks. Sixel remains limited to the large player cover because a
-/// screenful of separately encoded sixels would make navigation stutter.
+/// Both Kitty and SIXEL can paint these tiles. The universal fallback is made
+/// of half-blocks; protocol pixels are retained until their placement changes.
 pub(super) fn render_tile(
     frame: &mut Frame,
     art: Option<&Cover>,

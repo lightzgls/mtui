@@ -567,13 +567,35 @@ falls back to the YouTube video thumbnail.
 
 **Graphics.** MTUI detects Kitty graphics and Sixel support automatically. The
 Settings panel's **Artwork display** choice can keep automatic detection, force
-Kitty (useful when a multiplexer hides terminal capabilities), or use universal
-terminal-cell pixel art. **Cover style** separately switches the large current-song
-cover between bitmap/pixel rendering and colored ASCII. Artwork is center-cropped
+Kitty or SIXEL (useful when terminal capabilities are hidden), or use universal
+terminal-cell pixel art. Leave **Automatic** selected for safe fallback on
+terminals such as stock Alacritty that do not support bitmap graphics. Forced
+Kitty and SIXEL modes require a terminal that supports the selected protocol;
+they cannot add graphics support to the terminal itself. **Cover style**
+separately switches the large current-song cover between bitmap/pixel rendering
+and colored ASCII. Artwork is center-cropped
 to a square sleeve. `MTUI_GRAPHICS=blocks`, `MTUI_GRAPHICS=kitty`, and
 `MTUI_GRAPHICS=sixel` remain available as startup overrides for automatic
 detection. MTUI's native Windows window locks font zoom and recalculates artwork
 geometry when resized or moved between monitors with different scaling.
+
+Both SIXEL and Kitty draw the current-song cover and visible thumbnails across
+Home, search, and artist pages. Unchanged images stay on screen instead of being
+encoded on every frame. No external image viewer or encoder is required.
+
+On Windows, MTUI opens its console helper inside Windows Terminal when `wt.exe`
+is installed. This also works when the Windows default terminal is the legacy
+console. The audio player stays separate, so closing the terminal can still move
+playback to the tray. If Windows Terminal is unavailable or fails to start, MTUI
+uses its native console and automatic artwork falls back to terminal cells.
+`MTUI_TERMINAL=native` explicitly keeps the legacy window. Terminal-reported cell
+pixels are used for bitmap sizing instead of the hidden ConPTY window's font.
+
+To diagnose graphics without signing in, playing audio, or replacing a running
+player, run `mtui.exe --diagnose-graphics | Out-String` in PowerShell. A temporary
+terminal opens, queries SIXEL and cell size, prints a JSON report, and closes.
+The normal application log also records detected graphics and artwork mode each
+time its foreground window opens.
 
 **Diagnostics.** MTUI records startup, shutdown, crashes, and subsystem failures
 in `mtui.log` inside the configuration directory. The log rotates at 1 MiB and

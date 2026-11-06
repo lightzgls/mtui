@@ -76,7 +76,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut M
     let layout = regions(inner, app.browsing.is_some(), !app.results.is_empty());
     let visible = usize::from(layout.list.height / layout.row_height.max(1));
     app.clamp_scroll(visible);
-    let use_images = app.kitty_images() && !app.overlay.is_open() && app.menu().is_none();
+    let use_images = app.protocol_images() && !app.overlay.is_open() && app.menu().is_none();
     let art_key = app.collection_art_key().unwrap_or("").to_owned();
     let mut wanted = Vec::new();
     let mut images = use_images.then_some((&mut app.images, app.graphics));

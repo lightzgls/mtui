@@ -110,7 +110,8 @@ impl App {
 
 
     pub fn sixel_images(&self) -> bool {
-        self.image_renderer == ImageRenderer::Automatic && self.graphics.sixel
+        self.image_renderer == ImageRenderer::Sixel
+            || (self.image_renderer == ImageRenderer::Automatic && self.graphics.sixel)
     }
 
 

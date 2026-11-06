@@ -273,15 +273,16 @@ pub enum CoverStyle {
 
 /// How bitmap artwork is sent to the terminal.
 ///
-/// Automatic keeps the safe capability probe as the default. Kitty is an
-/// explicit escape hatch for multiplexers and terminals whose `$TERM` does not
-/// advertise the protocol, while PixelArt never emits graphics escapes.
+/// Automatic keeps the safe capability probe as the default. Kitty and Sixel
+/// are explicit overrides for compatible terminals whose capabilities are
+/// hidden, while PixelArt never emits graphics escapes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ImageRenderer {
     #[default]
     Automatic,
     Kitty,
+    Sixel,
     PixelArt,
 }
 
@@ -290,6 +291,7 @@ impl ImageRenderer {
         match self {
             Self::Automatic => "Automatic",
             Self::Kitty => "Kitty",
+            Self::Sixel => "SIXEL",
             Self::PixelArt => "Pixel art",
         }
     }
@@ -297,7 +299,8 @@ impl ImageRenderer {
     pub const fn next(self) -> Self {
         match self {
             Self::Automatic => Self::Kitty,
-            Self::Kitty => Self::PixelArt,
+            Self::Kitty => Self::Sixel,
+            Self::Sixel => Self::PixelArt,
             Self::PixelArt => Self::Automatic,
         }
     }
@@ -306,7 +309,8 @@ impl ImageRenderer {
         match self {
             Self::Automatic => Self::PixelArt,
             Self::Kitty => Self::Automatic,
-            Self::PixelArt => Self::Kitty,
+            Self::Sixel => Self::Kitty,
+            Self::PixelArt => Self::Sixel,
         }
     }
 }
@@ -611,13 +615,21 @@ mod tests {
     #[test]
     fn image_renderers_cycle_and_use_stable_config_names() {
         assert_eq!(ImageRenderer::Automatic.next(), ImageRenderer::Kitty);
-        assert_eq!(ImageRenderer::Kitty.next(), ImageRenderer::PixelArt);
+        assert_eq!(ImageRenderer::Kitty.next(), ImageRenderer::Sixel);
+        assert_eq!(ImageRenderer::Sixel.next(), ImageRenderer::PixelArt);
         assert_eq!(ImageRenderer::PixelArt.next(), ImageRenderer::Automatic);
         assert_eq!(ImageRenderer::Automatic.previous(), ImageRenderer::PixelArt);
+        assert_eq!(ImageRenderer::PixelArt.previous(), ImageRenderer::Sixel);
+        assert_eq!(ImageRenderer::Sixel.previous(), ImageRenderer::Kitty);
+        assert_eq!(ImageRenderer::Kitty.previous(), ImageRenderer::Automatic);
         assert_eq!(
             serde_json::to_string(&ImageRenderer::PixelArt).unwrap(),
             "\"pixel-art\""
         );
+        let settings: Settings = serde_json::from_str(r#"{"image_renderer":"sixel"}"#).unwrap();
+        assert_eq!(settings.image_renderer, ImageRenderer::Sixel);
+        let body = serde_json::to_string(&settings).unwrap();
+        assert!(body.contains(r#""image_renderer":"sixel""#));
     }
 
     #[test]

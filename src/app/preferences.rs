@@ -71,7 +71,7 @@ impl Setting {
             Self::Output => "System default follows your operating system's audio output.",
             Self::PrecisionVolume => "Scroll over the current song's cover to change volume by 1% per wheel step.",
             Self::Cover => "Choose detailed artwork or a cover drawn with text.",
-            Self::Renderer => "Automatic detects support; Kitty needs a compatible terminal.",
+            Self::Renderer => "Automatic detects support; Kitty and SIXEL need a compatible terminal.",
             Self::KeyHints => "Show subtle shortcuts beside buttons and in menus. The keyboard reference remains available in Help.",
             Self::Discord => "Share your current song and playback state on Discord.",
             Self::Tray => "Keep tray controls available while the terminal is open.",
@@ -266,6 +266,7 @@ impl App {
                 ImageRenderer::Automatic,
                 ImageRenderer::PixelArt,
                 ImageRenderer::Kitty,
+                ImageRenderer::Sixel,
             ]
             .into_iter()
             .map(|value| {
@@ -408,6 +409,7 @@ pub fn renderer_label(renderer: ImageRenderer) -> &'static str {
     match renderer {
         ImageRenderer::Automatic => "Automatic",
         ImageRenderer::Kitty => "Kitty images",
+        ImageRenderer::Sixel => "SIXEL images",
         ImageRenderer::PixelArt => "Terminal cells",
     }
 }

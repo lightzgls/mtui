@@ -364,6 +364,7 @@ mod tests {
                 ImageRenderer::Automatic,
                 ImageRenderer::PixelArt,
                 ImageRenderer::Kitty,
+                ImageRenderer::Sixel,
             ]
             .into_iter()
             .enumerate()
@@ -485,9 +486,10 @@ mod tests {
             text.contains("Automatic")
                 && text.contains("Terminal cells")
                 && text.contains("Kitty images")
+                && text.contains("SIXEL images")
         );
         assert_eq!(text.matches("Current").count(), 1);
-        for index in 0..3 {
+        for index in 0..4 {
             let area = mouse
                 .targets
                 .iter()

@@ -27,7 +27,7 @@ pub(super) fn render_artist(frame: &mut Frame, app: &mut App, area: Rect, mouse:
     let inner = shell::inset(area);
 
     let accent = ambient(app);
-    let use_images = app.kitty_images() && !app.overlay.is_open() && app.menu().is_none();
+    let use_images = app.protocol_images() && !app.overlay.is_open() && app.menu().is_none();
     let graphics = app.graphics;
     let art = &app.art;
     let images = &mut app.images;

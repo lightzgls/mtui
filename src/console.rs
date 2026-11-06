@@ -12,7 +12,8 @@ mod imp {
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
@@ -26,6 +27,10 @@ mod imp {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn AllocConsole() -> i32;
+        fn AttachConsole(process: u32) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, process: u32) -> isize;
+        fn TerminateProcess(process: isize, code: u32) -> i32;
+        fn CreatePipe(read: *mut isize, write: *mut isize, security: *const c_void, size: u32) -> i32;
         fn SetConsoleTitleW(title: *const u16) -> i32;
         fn GetConsoleWindow() -> isize;
         fn DuplicateHandle(
@@ -189,6 +194,7 @@ mod imp {
     const ENABLE_MOUSE_INPUT: u32 = 0x0010;
     const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
     const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
     const MOUSE_WHEELED: u32 = 0x0004;
     const MOUSE_MOVED: u32 = 0x0001;
     const DOUBLE_CLICK: u32 = 0x0002;
@@ -215,6 +221,7 @@ mod imp {
     static WINDOW: AtomicIsize = AtomicIsize::new(0);
     static CELL: AtomicU32 = AtomicU32::new((16 << 16) | 8);
     static NAVIGATION_ICONS: AtomicU32 = AtomicU32::new(0);
+    static NATIVE_HOST: AtomicBool = AtomicBool::new(true);
     static CLOSE_NOTIFICATION: AtomicIsize = AtomicIsize::new(0);
 
     pub fn navigation_icon_mask() -> u32 {
@@ -226,7 +233,22 @@ mod imp {
         (packed as u16, (packed >> 16) as u16)
     }
 
+    pub fn set_protocol_cell_size(cell: (u16, u16)) {
+        // ConPTY's Win32 font metrics describe its hidden compatibility window,
+        // not the visible Windows Terminal tab. Keep the terminal's own report.
+        if !NATIVE_HOST.load(Ordering::Acquire) && cell.0 != 0 && cell.1 != 0 {
+            CELL.store(pack(cell), Ordering::Release);
+        }
+    }
+
     pub fn focus() -> bool {
+        if let Some(sessions) = SESSION.get()
+            && let Ok(slot) = sessions.lock()
+            && let Some(ConsoleSession { child: HostProcess::Terminal { terminal, window, .. }, .. }) = slot.as_ref()
+        {
+            return Command::new(terminal).args(["-w", window, "focus-tab", "-t", "0"])
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok();
+        }
         let window = WINDOW.load(Ordering::Acquire);
         if window == 0 || closed() || unsafe { IsWindow(window) } == 0 {
             return false;
@@ -236,10 +258,49 @@ mod imp {
     }
 
     struct ConsoleSession {
-        child: Child,
-        input: ChildStdout,
-        output: ChildStdin,
+        child: HostProcess,
+        input: File,
+        output: File,
         close_request: OwnedHandle,
+    }
+
+    enum HostProcess {
+        Native(Child),
+        Terminal { process: OwnedHandle, terminal: PathBuf, window: String },
+    }
+
+    struct StartupGuard {
+        event: OwnedHandle,
+        armed: bool,
+    }
+
+    impl Drop for StartupGuard {
+        fn drop(&mut self) {
+            if self.armed { unsafe { SetEvent(self.event.as_raw_handle() as isize); } }
+        }
+    }
+
+    impl HostProcess {
+        fn alive(&mut self) -> bool {
+            match self {
+                Self::Native(child) => matches!(child.try_wait(), Ok(None)),
+                Self::Terminal { process, .. } => unsafe { WaitForSingleObject(process.as_raw_handle() as isize, 0) == 258 },
+            }
+        }
+
+        fn stop(&mut self) {
+            match self {
+                Self::Native(child) => {
+                    if matches!(child.try_wait(), Ok(None)) { let _ = child.kill(); }
+                    let _ = child.wait();
+                }
+                Self::Terminal { process, .. } => unsafe {
+                    let handle = process.as_raw_handle() as isize;
+                    if WaitForSingleObject(handle, 0) == 258 { TerminateProcess(handle, 0); }
+                    WaitForSingleObject(handle, 1000);
+                },
+            }
+        }
     }
 
     struct HostConsole {
@@ -270,14 +331,7 @@ mod imp {
     pub fn run_host() -> Result<()> {
         // AllocConsole is allowed to replace process standard handles. Keep the
         // inherited pipes alive independently before making that call.
-        let mut parent_output = File::from(duplicate_standard(STD_OUTPUT_HANDLE)?);
-        let parent_input = match duplicate_standard(STD_INPUT_HANDLE) {
-            Ok(handle) => File::from(handle),
-            Err(err) => {
-                let _ = write_handshake(&mut parent_output, Err(&err));
-                return Ok(());
-            }
-        };
+        let (parent_input, mut parent_output) = host_pipes()?;
 
         let console = match open_host_console() {
             Ok(console) => console,
@@ -355,7 +409,7 @@ mod imp {
             .lock()
             .map_err(|_| anyhow!("could not lock the console session"))?;
         if let Some(session) = slot.as_mut()
-            && session.child.try_wait()?.is_none()
+            && session.child.alive()
         {
             CLOSED.store(false, Ordering::Release);
             return Ok(());
@@ -370,6 +424,20 @@ mod imp {
         let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
         if event == 0 { return Err(io::Error::last_os_error().into()); }
         let close_request = unsafe { OwnedHandle::from_raw_handle(event as *mut c_void) };
+        if std::env::var("MTUI_TERMINAL").as_deref() != Ok("native")
+            && let Some(terminal) = windows_terminal()
+        {
+            match launch_terminal(&terminal, &executable, &event_name) {
+                Ok((child, input, output, (width, height))) => {
+                    set_size(width, height);
+                    CLOSED.store(false, Ordering::Release);
+                    *slot = Some(ConsoleSession { child, input, output, close_request });
+                    crate::diagnostics::info("console", "using Windows Terminal");
+                    return Ok(());
+                }
+                Err(err) => crate::diagnostics::warn("console", &format!("Windows Terminal launch failed; using native console: {err:#}")),
+            }
+        }
         let mut child = Command::new(executable)
             .arg(HOST_ARGUMENT)
             .arg(event_name)
@@ -378,15 +446,19 @@ mod imp {
             .stderr(Stdio::null())
             .spawn()
             .context("could not start the terminal helper")?;
-        let output = child
+        let output_pipe = child
             .stdin
             .take()
             .ok_or_else(|| anyhow!("the terminal helper has no output pipe"))?;
-        let mut input = child
+        let input_pipe = child
             .stdout
             .take()
             .ok_or_else(|| anyhow!("the terminal helper has no input pipe"))?;
 
+        let output = File::from(duplicate_raw(output_pipe.as_raw_handle() as isize)?);
+        let mut input = File::from(duplicate_raw(input_pipe.as_raw_handle() as isize)?);
+        drop((input_pipe, output_pipe));
+        let child = HostProcess::Native(child);
         let handshake = read_handshake(&mut input);
         if let Err(err) = handshake {
             stop(ConsoleSession {
@@ -397,7 +469,7 @@ mod imp {
             });
             return Err(err);
         }
-        let (width, height) = handshake.expect("the error case returned above");
+        let (width, height, _) = handshake.expect("the error case returned above");
         set_size(width, height);
         CLOSED.store(false, Ordering::Release);
         *slot = Some(ConsoleSession {
@@ -439,7 +511,7 @@ mod imp {
             return true;
         };
         let alive = match slot.as_mut() {
-            Some(session) => matches!(session.child.try_wait(), Ok(None)),
+            Some(session) => session.child.alive(),
             None => false,
         };
         if !alive {
@@ -466,6 +538,111 @@ mod imp {
         }
     }
 
+    fn windows_terminal() -> Option<PathBuf> {
+        let alias = std::env::var_os("LOCALAPPDATA")
+            .map(|base| PathBuf::from(base).join("Microsoft/WindowsApps/wt.exe"));
+        alias.filter(|path| path.is_file()).or_else(|| {
+            std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths)
+                .map(|path| path.join("wt.exe")).find(|path| path.is_file()))
+        })
+    }
+
+    fn pipe() -> Result<(File, File)> {
+        let (mut read, mut write) = (0, 0);
+        if unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) } == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(unsafe {
+            (File::from(OwnedHandle::from_raw_handle(read as *mut c_void)),
+                File::from(OwnedHandle::from_raw_handle(write as *mut c_void)))
+        })
+    }
+
+    fn terminal_script(executable: &Path, close_name: &str, parent: u32, read: isize, write: isize) -> String {
+        // EncodedCommand prevents either Windows Terminal's environment-string
+        // expansion or a shell from treating the executable path as code.
+        let literal = |value: &str| format!("'{}'", value.replace('\'', "''"));
+        format!("$ErrorActionPreference='Stop'; try {{ Start-Process -FilePath {} -ArgumentList @({}, {}, '--terminal', '{parent}', '{read}', '{write}') -NoNewWindow -Wait | Out-Null }} finally {{ exit 0 }}",
+            literal(&executable.to_string_lossy()), literal(HOST_ARGUMENT), literal(close_name))
+    }
+
+    #[test]
+    fn terminal_launch_keeps_paths_and_pipe_arguments_literal() {
+        let script = terminal_script(Path::new("C:\\Music %PATH% & !\\it's player.exe"), "Local\\MTUI-close-1", 42, 56, 78);
+        assert!(script.contains("-FilePath 'C:\\Music %PATH% & !\\it''s player.exe'"));
+        assert!(script.contains("'--terminal', '42', '56', '78'"));
+        assert!(script.contains("-NoNewWindow -Wait"));
+        assert!(script.contains("exit 0"), "the temporary shell must close its tab on helper exit");
+    }
+
+    fn launch_terminal(terminal: &Path, executable: &Path, close_name: &str) -> Result<(HostProcess, File, File, (u16, u16))> {
+        let (remote_input, output) = pipe()?;
+        let (mut input, remote_output) = pipe()?;
+        // Cancel before dropping the pipe handles on any startup failure. A
+        // delayed shell must never duplicate handle numbers that were reused
+        // by the native-console fallback in the meantime.
+        let cancel_name: Vec<u16> = format!("{close_name}-startup").encode_utf16().chain(Some(0)).collect();
+        let cancel = unsafe { CreateEventW(std::ptr::null(), 1, 0, cancel_name.as_ptr()) };
+        if cancel == 0 { return Err(io::Error::last_os_error().into()); }
+        let mut cancel = StartupGuard { event: unsafe { OwnedHandle::from_raw_handle(cancel as *mut c_void) }, armed: true };
+        let script = terminal_script(executable, close_name, std::process::id(),
+            remote_input.as_raw_handle() as isize, remote_output.as_raw_handle() as isize);
+        let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let encoded = String::from_utf8(crate::encoding::base64(&utf16)).expect("base64 is ASCII");
+        let window = format!("mtui-{}", std::process::id());
+        let powershell = PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into()))
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let mut launcher = Command::new(terminal)
+            .args(["-w", &window, "new-tab", "--title", "MTUI", "--suppressApplicationTitle", "--"])
+            .arg(powershell).args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+            .context("could not launch Windows Terminal")?;
+        // The launcher is short-lived; the actual helper identifies itself in
+        // its handshake. Never use the launcher's exit as the player lifetime.
+        let (width, height, pid) = read_handshake(&mut input)?;
+        if pid == 0 { return Err(anyhow!("the terminal helper did not identify its process")); }
+        let process = unsafe { OpenProcess(0x0010_0001 /* SYNCHRONIZE | PROCESS_TERMINATE */, 0, pid) };
+        if process == 0 { return Err(io::Error::last_os_error().into()); }
+        let process = unsafe { OwnedHandle::from_raw_handle(process as *mut c_void) };
+        cancel.armed = false;
+        drop((remote_input, remote_output));
+        let _ = launcher.try_wait();
+        Ok((HostProcess::Terminal { process, terminal: terminal.to_path_buf(), window }, input, output, (width, height)))
+    }
+
+    fn host_pipes() -> Result<(File, File)> {
+        if std::env::args().nth(3).as_deref() != Some("--terminal") {
+            return Ok((File::from(duplicate_standard(STD_INPUT_HANDLE)?),
+                File::from(duplicate_standard(STD_OUTPUT_HANDLE)?)));
+        }
+        let mut args = std::env::args().skip(4);
+        let close_name = std::env::args().nth(2).context("missing console close notification")?;
+        let cancel_name: Vec<u16> = format!("{close_name}-startup").encode_utf16().chain(Some(0)).collect();
+        let cancel = unsafe { OpenEventW(0x0010_0000 /* SYNCHRONIZE */, 0, cancel_name.as_ptr()) };
+        if cancel == 0 { return Err(anyhow!("terminal startup was cancelled")); }
+        let cancel = unsafe { OwnedHandle::from_raw_handle(cancel as *mut c_void) };
+        let cancelled = || unsafe { WaitForSingleObject(cancel.as_raw_handle() as isize, 0) != 258 };
+        if cancelled() { return Err(anyhow!("terminal startup was cancelled")); }
+        let parent: u32 = args.next().context("missing parent process")?.parse()?;
+        let read: isize = args.next().context("missing input handle")?.parse()?;
+        let write: isize = args.next().context("missing output handle")?.parse()?;
+        if parent == 0 || read <= 0 || write <= 0 { return Err(anyhow!("invalid terminal pipe handles")); }
+        let source = unsafe { OpenProcess(0x0040 /* PROCESS_DUP_HANDLE */, 0, parent) };
+        if source == 0 { return Err(io::Error::last_os_error().into()); }
+        let source = unsafe { OwnedHandle::from_raw_handle(source as *mut c_void) };
+        let duplicate = |handle| -> Result<File> {
+            let mut target = 0;
+            if unsafe { DuplicateHandle(source.as_raw_handle() as isize, handle, GetCurrentProcess(),
+                &mut target, 0, 0, DUPLICATE_SAME_ACCESS) } == 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            Ok(File::from(unsafe { OwnedHandle::from_raw_handle(target as *mut c_void) }))
+        };
+        let pipes = (duplicate(read)?, duplicate(write)?);
+        if cancelled() { return Err(anyhow!("terminal startup was cancelled")); }
+        Ok(pipes)
+    }
+
     fn stop(session: ConsoleSession) {
         let ConsoleSession {
             mut child,
@@ -475,13 +652,10 @@ mod imp {
         } = session;
         drop(input);
         drop(output);
-        if matches!(child.try_wait(), Ok(None)) {
-            let _ = child.kill();
-        }
-        let _ = child.wait();
+        child.stop();
     }
 
-    fn read_handshake(input: &mut ChildStdout) -> Result<(u16, u16)> {
+    fn read_handshake(input: &mut File) -> Result<(u16, u16, u32)> {
         let mut message = [0; HANDSHAKE_LEN];
         let mut filled = 0;
         let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
@@ -521,6 +695,7 @@ mod imp {
         }
         let width = u16::from_le_bytes([message[9], message[10]]);
         if message[8] == HANDSHAKE_READY {
+            NATIVE_HOST.store(message[35] != 0, Ordering::Release);
             WINDOW.store(i64::from_le_bytes(message[15..23].try_into().unwrap()) as isize, Ordering::Release);
             let cell = u32::from_le_bytes(message[23..27].try_into().unwrap());
             if cell as u16 != 0 && (cell >> 16) != 0 { CELL.store(cell, Ordering::Release); }
@@ -530,7 +705,7 @@ mod imp {
         let length =
             usize::from(u16::from_le_bytes([message[13], message[14]])).min(HANDSHAKE_LEN - 15);
         match message[8] {
-            HANDSHAKE_READY if width != 0 && height != 0 => Ok((width, height)),
+            HANDSHAKE_READY if width != 0 && height != 0 => Ok((width, height, u32::from_le_bytes(message[31..35].try_into().unwrap()))),
             HANDSHAKE_READY => Err(anyhow!("the terminal helper reported an invalid size")),
             HANDSHAKE_ERROR => Err(anyhow!(
                 "terminal helper setup failed: {}",
@@ -552,6 +727,8 @@ mod imp {
                 message[9..11].copy_from_slice(&width.to_le_bytes());
                 message[11..13].copy_from_slice(&height.to_le_bytes());
                 message[15..23].copy_from_slice(&(unsafe { GetConsoleWindow() } as i64).to_le_bytes());
+                message[31..35].copy_from_slice(&std::process::id().to_le_bytes());
+                message[35] = u8::from(native_geometry().is_some());
                 if let Ok(handle) = open_console("CONOUT$", GENERIC_READ) {
                     let cell = font_size(handle.as_raw_handle() as isize);
                     message[23..27].copy_from_slice(&pack(cell).to_le_bytes());
@@ -609,7 +786,9 @@ mod imp {
         // Query the native host in its actual monitor coordinate space rather
         // than DPI-virtualized pixels inherited from the launcher.
         unsafe { SetThreadDpiAwarenessContext(-4); }
-        if unsafe { AllocConsole() } == 0 {
+        let terminal = std::env::args().nth(3).as_deref() == Some("--terminal");
+        let attached = if terminal { unsafe { AttachConsole(u32::MAX) } } else { unsafe { AllocConsole() } };
+        if attached == 0 {
             return Err(anyhow!(
                 "could not allocate a console: {}",
                 io::Error::last_os_error()
@@ -633,7 +812,8 @@ mod imp {
         input_mode &= !(ENABLE_PROCESSED_INPUT
             | ENABLE_LINE_INPUT
             | ENABLE_ECHO_INPUT
-            | ENABLE_QUICK_EDIT_MODE);
+            | ENABLE_QUICK_EDIT_MODE
+            | ENABLE_VIRTUAL_TERMINAL_INPUT);
         input_mode |= ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
         if unsafe { SetConsoleMode(input_raw, input_mode) } == 0 {
             return Err(anyhow!("could not enable raw terminal input"));
@@ -1008,8 +1188,9 @@ mod imp {
         }
 
         pub fn next(&mut self, timeout: Duration) -> Result<Option<Event>> {
-            let mut wait = timeout;
+            let deadline = Instant::now() + timeout;
             loop {
+                let wait = deadline.saturating_duration_since(Instant::now());
                 if !self.read_record(wait)? {
                     return Ok(None);
                 }
@@ -1019,7 +1200,7 @@ mod imp {
                     let pixels = record.event[1];
                     if dimensions.0 != 0 && dimensions.1 != 0 && pixels as u16 != 0 && (pixels >> 16) != 0 {
                         set_size(dimensions.0, dimensions.1);
-                        CELL.store(pixels, Ordering::Release);
+                        if NATIVE_HOST.load(Ordering::Acquire) { CELL.store(pixels, Ordering::Release); }
                         NAVIGATION_ICONS.store(record.event[2], Ordering::Release);
                         return Ok(Some(Event::Resize(dimensions.0, dimensions.1)));
                     }
@@ -1031,7 +1212,6 @@ mod imp {
                     }
                     return Ok(Some(event));
                 }
-                wait = Duration::ZERO;
             }
         }
 
@@ -1077,6 +1257,25 @@ mod imp {
             self.filled = 0;
             Ok(true)
         }
+    }
+
+    #[test]
+    fn focus_records_do_not_end_the_wait_for_a_terminal_reply() {
+        let (file, mut writer) = pipe().unwrap();
+        writer.write_all(&encode_record(InputRecord { event_type: 0x0010, event: [1, 0, 0, 0] })).unwrap();
+        let reply = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            writer.write_all(&encode_record(InputRecord {
+                event_type: KEY_EVENT,
+                event: [1, 1 | (0x43 << 16), u32::from('c') << 16, 0],
+            })).unwrap();
+        });
+        let mut input = Input { file, wire: [0; RECORD_LEN], filled: 0,
+            high_surrogate: None, mouse_buttons: 0 };
+        let event = input.next(Duration::from_secs(1)).unwrap();
+        reply.join().unwrap();
+        assert!(matches!(event, Some(Event::Key(key)) if key.code == KeyCode::Char('c')),
+            "ignored focus records must not discard a delayed capability response");
     }
 
     enum PipeState {
@@ -1358,7 +1557,7 @@ pub use imp::end_task_requested;
 pub fn end_task_requested() -> bool { false }
 
 #[cfg(windows)]
-pub use imp::{cell_size, is_host, navigation_icon_mask, prepare_parent, run_host, size};
+pub use imp::{cell_size, is_host, navigation_icon_mask, prepare_parent, run_host, set_protocol_cell_size, size};
 
 #[cfg(all(test, windows))]
 mod tests {

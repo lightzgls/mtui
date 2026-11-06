@@ -134,13 +134,15 @@ fn ask() -> Option<String> {
             break;
         }
         let Some(event) = input.next(left).ok()? else {
-            break;
+            if console::closed() { break; }
+            continue;
         };
         collect_key(event, &mut reply);
         if complete(&reply) {
             break;
         }
     }
+    if let (_, Some(cell)) = parse(&reply) { console::set_protocol_cell_size(cell); }
     (!reply.is_empty()).then_some(reply)
 }
 

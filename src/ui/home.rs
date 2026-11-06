@@ -240,7 +240,7 @@ pub(super) fn render_home(frame: &mut Frame, app: &mut App, area: Rect, mouse: &
     // are on screen falls out of laying them out, and deriving it twice is two
     // chances for the pictures and the cards to disagree about what is visible.
     let mut wanted = Vec::new();
-    let tile_images = if app.kitty_images() && !app.overlay.is_open() && app.menu().is_none() {
+    let tile_images = if app.protocol_images() && !app.overlay.is_open() && app.menu().is_none() {
         Some((&mut app.images, app.graphics))
     } else {
         None

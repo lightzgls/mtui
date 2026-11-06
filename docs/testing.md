@@ -46,6 +46,20 @@ Nếu sandbox chặn HTTP loopback hoặc thư mục tạm, ghi nhận là lỗi
 chạy lại trong môi trường cho phép localhost. Không bỏ test để biến kết quả đỏ
 thành xanh. `--offline` chỉ áp dụng cho Cargo; test loopback vẫn dùng socket.
 
+## Kiểm tra graphics trên Windows
+
+Kiểm tra graphics trên Windows với bản build có sẵn:
+
+```powershell
+./scripts/test-graphics.ps1 -Exe ./target/release/mtui.exe -ExpectSixel
+```
+
+Probe mở rồi đóng các console tạm, kiểm tra đường Windows Terminal và fallback
+native. Không tạo audio device, truy cập account hoặc thay thế player đang chạy.
+`-ExpectSixel` yêu cầu Windows Terminal 1.22+ đã cài; bỏ cờ này khi chỉ kiểm tra
+fallback. Full suite kiểm tra cả focus record đến trước capability reply và bitmap
+thumbnail trên Home/search; chúng không thay thế kiểm tra hiển thị thật.
+
 ## Kiểm tra cài đặt và cập nhật Linux
 
 Chạy ShellCheck và bộ giả lập installer trong môi trường có Bash:

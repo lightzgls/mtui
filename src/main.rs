@@ -19,6 +19,7 @@ mod config;
 mod console;
 mod diagnostics;
 mod discord;
+mod encoding;
 mod graphics;
 mod instance;
 mod kitty;
@@ -109,6 +110,16 @@ fn main() -> Result<()> {
         }
         return result;
     }
+    if std::env::args().nth(1).as_deref() == Some("--diagnose-graphics") {
+        #[cfg(windows)]
+        console::prepare_parent();
+        console::attach()?;
+        let graphics = graphics::detect();
+        println!("{}", serde_json::json!({ "sixel": graphics.sixel, "kitty": graphics.kitty,
+            "cell_width": graphics.cell.0, "cell_height": graphics.cell.1 }));
+        console::detach()?;
+        return Ok(());
+    }
     let Some(instance) = instance::Instance::acquire()? else { return Ok(()); };
     #[cfg(windows)]
     console::prepare_parent();
@@ -161,9 +172,9 @@ fn run(settings: config::Settings, mut tray: Option<Tray>, instance: &instance::
     let yt = source::bootstrap::with_js_runtime(yt)
         .context("the optional JavaScript runtime could not be prepared")?;
 
-    // Asked before the alternate screen is up, so the replies cannot land in
-    // the middle of a drawn frame.
-    let graphics = graphics::detect();
+    // Each foreground window probes its own host before entering the alternate
+    // screen, including a newly created window after returning from the tray.
+    let graphics = graphics::Graphics::blocks();
 
     let player = Player::spawn(settings.volume, settings.output_device.clone())?;
     let source = SourceWorker::spawn(yt)?;
@@ -205,6 +216,10 @@ fn run_foreground(app: &mut App, tray: &mut Option<Tray>, media: &Option<media::
         app.handle_window_loss(console::end_task_requested());
         return Ok(());
     }
+
+    app.graphics = graphics::detect();
+    app.invalidate_image();
+    diagnostics::info("graphics", &format!("detected {:?}; artwork mode {}", app.graphics, app.image_renderer().label()));
 
     // Each foreground owner gets duplicate helper pipes. The graphics probe
     // has already released its copies before normal input begins.

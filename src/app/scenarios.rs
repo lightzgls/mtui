@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config;
-use crate::config::CoverStyle;
+use crate::config::{CoverStyle, ImageRenderer};
 use crate::discord::Presence;
 use crate::graphics::Graphics;
 use crate::player::{Command, PlayState, Player, PlayerEvent, Snapshot, TestDriver};
@@ -19,7 +19,7 @@ use crate::source::worker::{Request, Response, SourceWorker};
 use crate::tray::TrayCommand;
 
 use super::artist::ArtistView;
-use super::artwork::CoverSize;
+use super::artwork::{CoverSize, ImageSource};
 use super::input::{MouseAction, POINTER_SCALE};
 use super::menu::{MenuAction, MenuPage};
 use super::navigation::{Mode, PageRequestKind, View};
@@ -1328,6 +1328,108 @@ fn precision_cover_volume_uses_one_percent_steps_and_accumulates_rapid_wheel_inp
         assert!((volume - expected).abs() < 0.00001, "wheel ticks must accumulate before the audio snapshot updates");
     }
     assert_eq!(mute_transition(true, 0.0, 0.03).0, 0.03, "mute restores precision levels below 5%");
+}
+
+#[test]
+fn artwork_renderer_choices_reach_the_encoder_and_respect_modal_and_text_fallbacks() {
+    use ratatui::{Terminal, backend::TestBackend};
+    use ImageRenderer::{Automatic, Kitty, PixelArt, Sixel};
+
+    for (sixel, kitty, renderer, expected) in [
+        (false, false, Automatic, None),
+        (true, false, Automatic, Some(Sixel)),
+        (false, true, Automatic, Some(Kitty)),
+        (false, false, Sixel, Some(Sixel)),
+        (false, true, Sixel, Some(Sixel)),
+        (true, false, Kitty, Some(Kitty)),
+        (true, false, PixelArt, None),
+        (false, true, PixelArt, None),
+    ] {
+        let (mut app, _driver, _requests) = fixture();
+        queue(&mut app, RepeatMode::Off, 0);
+        app.cover = Some(Cover::from_rgb(2, 2, [180, 90, 60].repeat(4)));
+        app.cover_size = CoverSize::Full;
+        app.graphics = Graphics { sixel, kitty, cell: (8, 16) };
+        app.image_renderer = renderer;
+        let mut terminal = Terminal::new(TestBackend::new(48, 18)).unwrap();
+        let mut mouse = crate::ui::MouseMap::default();
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+
+        let mut output = Vec::new();
+        crate::paint_cover(&mut app, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.contains("\x1bPq"), expected == Some(Sixel), "{renderer:?}");
+        assert_eq!(output.contains("\x1b_Ga=T"), expected == Some(Kitty), "{renderer:?}");
+        assert_eq!(app.images.is_empty(), expected.is_none());
+        let mut unchanged = Vec::new();
+        crate::paint_cover(&mut app, &mut unchanged).unwrap();
+        assert!(unchanged.is_empty(), "unchanged covers must not be re-encoded");
+
+        terminal.backend_mut().resize(32, 12);
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        assert_eq!(app.image_needs_clearing(), expected.is_some(), "resizing must replace old placements");
+        app.invalidate_image();
+        let mut resized = Vec::new();
+        crate::paint_cover(&mut app, &mut resized).unwrap();
+        assert_eq!(resized.is_empty(), expected.is_none());
+
+        app.overlay = Overlay::Settings;
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        assert!(app.images.is_empty(), "a cover cannot show through Settings");
+        assert_eq!(app.image_needs_clearing(), expected.is_some());
+        app.invalidate_image();
+
+        app.overlay = Overlay::None;
+        app.cover_style = CoverStyle::ColoredAscii;
+        terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+        assert!(app.images.is_empty(), "colored text must override bitmap modes");
+        let mut text = Vec::new();
+        crate::paint_cover(&mut app, &mut text).unwrap();
+        assert!(text.is_empty());
+    }
+}
+
+#[test]
+fn home_and_search_use_sixel_thumbnails_and_keep_the_terminal_cell_fallback() {
+    use crate::source::search::{Filter, Item};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for view in [View::Home, View::Tracks] {
+        for renderer in [ImageRenderer::Automatic, ImageRenderer::Sixel, ImageRenderer::Kitty, ImageRenderer::PixelArt] {
+            let (mut app, _driver, _requests) = fixture();
+            let card = Card {
+                title: "Cover fixture".into(), subtitle: "Artist".into(),
+                art: Some("https://example.invalid/cover.jpg".into()),
+                duration: None, artist_ref: None,
+                target: Target::Play { video_id: "song-0".into() },
+            };
+            let key = card.art_key().to_string();
+            app.apply_home(vec![Shelf { title: "Albums for you".into(), cards: vec![card.clone()] }]);
+            app.search_items = vec![Item { card, kind: Filter::Songs, track: Some(track(0)) }];
+            app.art.want(&key);
+            app.art.store(key.clone(), Some(Cover::from_rgb(2, 2, [180, 90, 60].repeat(4))));
+            app.view = view;
+            app.graphics = Graphics { sixel: true, kitty: false, cell: (8, 16) };
+            app.image_renderer = renderer;
+            let mut terminal = Terminal::new(TestBackend::new(100, 36)).unwrap();
+            let mut mouse = crate::ui::MouseMap::default();
+            terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+            let bitmap = renderer != ImageRenderer::PixelArt;
+            assert_eq!(app.images.iter().any(|image| image.source == ImageSource::Card(key.clone())), bitmap,
+                "missing bitmap thumbnail in {view:?} with {renderer:?}");
+            let mut output = Vec::new();
+            crate::paint_cover(&mut app, &mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(output.contains("\x1bPq"), bitmap && renderer != ImageRenderer::Kitty);
+            assert_eq!(output.contains("\x1b_Ga=T"), renderer == ImageRenderer::Kitty);
+            terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+            assert!(app.images_to_paint().is_empty(), "unchanged thumbnail should stay on screen");
+            app.overlay = Overlay::Settings;
+            terminal.draw(|frame| crate::ui::render(frame, &mut app, &mut mouse)).unwrap();
+            assert!(app.images.is_empty());
+            assert_eq!(app.image_needs_clearing(), bitmap);
+        }
+    }
 }
 
 #[test]

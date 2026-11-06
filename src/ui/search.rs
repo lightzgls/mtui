@@ -86,7 +86,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut M
         return;
     }
     let accent = ambient(app);
-    let use_images = app.kitty_images() && !app.overlay.is_open() && app.menu().is_none();
+    let use_images = app.protocol_images() && !app.overlay.is_open() && app.menu().is_none();
     let mut wanted = Vec::new();
     let mut tiles = Tiles {
         shape: CardShape::Tile,
