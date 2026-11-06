@@ -14,6 +14,7 @@ use ratatui::widgets::Block;
 
 use crate::app::{App, CoverSize, ImageSource, PlannedImage, View};
 use crate::runtime::config::CoverStyle;
+#[cfg(windows)]
 use crate::source::cover::Cover;
 
 use artwork::{
