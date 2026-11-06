@@ -6,7 +6,7 @@ A lightweight YouTube Music player with cover art, lyrics, playlists, and contro
 
 **[Download for Windows](https://github.com/lightzgls/mtui/releases/latest)** · [Linux installation](docs/usage.md#installation) · [See it in action](#preview) · [Usage guide](docs/usage.md) · [Report an issue](https://github.com/lightzgls/mtui/issues)
 
-![MTUI playing music in a terminal, with pixel cover art, a queue, and playback controls](assets/previews/now-playing.png)
+![MTUI playing music in a terminal, with pixel cover art, a queue, and playback controls](assets/previews/v0.11.8/player-Queue-160x42.png)
 
 - **Mouse or keyboard.** Click to select a song, double-click or press Enter to play, and drag to seek or reorder upcoming songs.
 - **More than a track list.** Browse Home, build a queue, and follow lyrics alongside cover art that sets the player's colors.
@@ -16,6 +16,10 @@ First launch needs an internet connection to download playback tools. MTUI is an
 
 ## Preview
 
+**v0.11.8 browsing with Now Playing**
+
+![Browsing with persistent Now Playing](assets/previews/v0.11.8/persistent-Tracks-120x36.png)
+
 https://github.com/user-attachments/assets/27cdd7f8-daf9-4ccc-b736-d903014b5be1
 
 
@@ -24,7 +28,7 @@ https://github.com/user-attachments/assets/27cdd7f8-daf9-4ccc-b736-d903014b5be1
 
 **Personalized Home**
 
-![Personalized Home shelves](assets/previews/home.png)
+![Personalized Home shelves](assets/previews/v0.11.8/home-100x36.png)
 
 **Search**
 
