@@ -3,12 +3,19 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing version to rebuild without creating a release
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  MTUI_RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
 jobs:
   windows:
@@ -27,8 +34,8 @@ jobs:
         run: |
           $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
           $version = ($metadata.packages | Where-Object { $_.name -eq "mtui" }).version
-          if ("v$version" -ne "${{ github.ref_name }}") {
-            throw "Tag ${{ github.ref_name }} does not match Cargo version $version"
+          if ("v$version" -ne $env:MTUI_RELEASE_TAG) {
+            throw "Tag $env:MTUI_RELEASE_TAG does not match Cargo version $version"
           }
           "MTUI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -111,8 +118,8 @@ jobs:
         run: |
           $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
           $version = ($metadata.packages | Where-Object { $_.name -eq "mtui" }).version
-          if ("v$version" -ne "${{ github.ref_name }}") {
-            throw "Tag ${{ github.ref_name }} does not match Cargo version $version"
+          if ("v$version" -ne $env:MTUI_RELEASE_TAG) {
+            throw "Tag $env:MTUI_RELEASE_TAG does not match Cargo version $version"
           }
           "MTUI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -154,7 +161,7 @@ jobs:
         env:
           IMAGE: ${{ matrix.image }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${MTUI_RELEASE_TAG#v}"
           (cd dist && sha256sum MTUI-* install.sh > SHA256SUMS)
           docker run --rm \
             --mount "type=bind,source=$PWD/scripts,target=/source/scripts,readonly" \
@@ -162,6 +169,9 @@ jobs:
             "$IMAGE" bash /source/scripts/test-linux-release.sh "$version" /packages
 
   publish:
+    # Manual rebuilds only produce verified artifacts. Updating an existing
+    # release is a separate operation and must record the new build source.
+    if: github.event_name == 'push'
     needs: [windows, linux, linux-smoke]
     runs-on: ubuntu-22.04
     permissions:

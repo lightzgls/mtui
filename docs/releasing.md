@@ -42,6 +42,19 @@ do not move an existing release tag or silently replace binaries for an
 ordinary update. v0.11.3's same-version refresh was an exception; its notes
 record the separate build source. v0.11.4 restores tag-to-build provenance.
 
+### Rebuild an Existing Version
+
+When an existing release must explicitly be refreshed, dispatch the Release
+workflow on the reviewed source commit with `release_tag` set to that version.
+Manual runs build Windows/Linux artifacts and run the same verification gates;
+the publish job is skipped, so they cannot create a release or move its tag.
+
+After the run succeeds, download both artifacts, regenerate and verify
+`SHA256SUMS`, and verify the payloads before replacing the existing release's
+six assets. Record the source commit and workflow run in its description.
+Keep the original tag unchanged and explain that equal-version refreshes need
+manual reinstallation. Never mark a refresh complete while uploads are pending.
+
 ## Local Packaging
 
 Use current stable Rust. Windows additionally needs Visual Studio's x64 MSVC

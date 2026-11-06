@@ -227,13 +227,14 @@ fn real_pointer_click_drag_release_and_keyboard_reorder_work_at_normal_and_short
         let mut mouse = crate::ui::MouseMap::default();
         let mut pointer = crate::terminal::pointer::Pointer::default();
         let point = |mouse: &crate::ui::MouseMap, action| (0..height).find_map(|y|
-            (0..width).find_map(|x| (mouse.action_at(x,y) == Some(action)).then_some((x,y)))).unwrap();
+            (0..width).find_map(|x| (mouse.action_at(x,y) == Some(action)).then_some((x,y))))
+                .unwrap_or_else(|| panic!("missing {action:?} at {width}x{height}"));
         let event = |kind, (column,row)| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
         let mut draw = |app: &mut App, mouse: &mut crate::ui::MouseMap| {
             terminal.draw(|frame| crate::ui::render(frame, app, mouse)).unwrap();
         };
         draw(&mut app,&mut mouse);
-        // Navigate to a future row even when only two songs fit in the short window.
+        // Navigate to a future row even when only one song fits in the short window.
         for _ in 0..2 { app.handle_key(KeyEvent::new(KeyCode::Down,KeyModifiers::NONE)).unwrap(); }
         draw(&mut app,&mut mouse);
         let title = point(&mouse,MouseAction::SelectPageRow(2));
@@ -262,6 +263,9 @@ fn real_pointer_click_drag_release_and_keyboard_reorder_work_at_normal_and_short
         draw(&mut app,&mut mouse);
         assert_eq!(app.now.as_ref().unwrap().queue[3].id,"song-2");
         let before: Vec<_> = app.now.as_ref().unwrap().queue.iter().map(|t|t.id.clone()).collect();
+        // Reveal the previous row again when the short panel only fits one song.
+        pointer.handle(&mut app,&mouse,event(MouseEventKind::ScrollUp,destination)).unwrap();
+        draw(&mut app,&mut mouse);
         let other = point(&mouse,MouseAction::SelectPageRow(2));
         pointer.handle(&mut app,&mouse,event(MouseEventKind::Drag(MouseButton::Left),other)).unwrap();
         assert_eq!(app.now.as_ref().unwrap().queue.iter().map(|t|t.id.clone()).collect::<Vec<_>>(),before,

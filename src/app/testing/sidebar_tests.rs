@@ -46,6 +46,37 @@ fn event(kind: MouseEventKind, (column, row): (u16, u16)) -> MouseEvent {
 }
 
 #[test]
+fn queue_spacing_survives_scrolling_and_resizing_in_the_player_and_sidebar() {
+    let (mut app, _, _) = setup();
+    let template = app.now.as_ref().unwrap().queue[0].clone();
+    app.now.as_mut().unwrap().queue = (0..30).map(|index| Track {
+        id: format!("song-{index}"), title: format!("Song {index}"), ..template.clone()
+    }).collect();
+    for view in [View::Tracks, View::Playing] {
+        app.view = view;
+        for (width, height) in [(80, 24), (120, 36), (160, 42)] {
+            for selected in [0, 15, 29] {
+                app.now.as_mut().unwrap().cursor[Tab::UpNext.index()] = selected;
+                let (terminal, mouse) = draw(&mut app, width, height, "queue-spacing");
+                let (x, _) = locate(&mouse, width, height, MouseAction::OpenPageRow(selected));
+                let rows: Vec<_> = (0..height).filter(|&y| mouse.queue_row_at(x, y).is_some()).collect();
+                if height >= 36 {
+                    assert!(rows.len() >= 2, "too few queue rows at {width}x{height}");
+                }
+                for pair in rows.windows(2) {
+                    assert_eq!(pair[1] - pair[0], 2, "queue spacing at {width}x{height}");
+                    assert_eq!(terminal.backend().buffer()[(x, pair[0] + 1)].symbol(), " ");
+                    assert_eq!(mouse.action_at(x, pair[0] + 1), None);
+                    assert_eq!(mouse.queue_row_at(x, pair[0] + 1), None);
+                }
+                let first = mouse.queue_row_at(x, rows[0]).unwrap();
+                assert_eq!(app.now.as_ref().unwrap().queue_offset, first);
+            }
+        }
+    }
+}
+
+#[test]
 fn sidebar_lyrics_have_space_between_lines_in_a_medium_window() {
     let (mut app, _, _) = setup();
     app.now.as_mut().unwrap().open(Tab::Lyrics);

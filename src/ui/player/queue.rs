@@ -18,6 +18,8 @@ const MARKER_WIDTH: usize = 3;
 const COLUMN_GAP: usize = 2;
 const ARTIST_WIDTH: usize = 14;
 const MIN_TITLE_WIDTH: usize = 16;
+// One text row followed by one blank row in both player layouts.
+const ROW_PITCH: u16 = 2;
 
 fn header_height(area: Rect) -> u16 {
     if area.height >= 6 && area.width >= 20 { 2 }
@@ -34,7 +36,8 @@ impl Geometry {
     pub fn new(now: &NowPlaying, area: Rect) -> Self {
         let header = header_height(area);
         let list = Rect::new(area.x, area.y + header, area.width, area.height - header);
-        let viewport = usize::from(list.height);
+        // A final song can use the last line without a trailing spacer.
+        let viewport = usize::from(list.height.div_ceil(ROW_PITCH));
         let cursor = now.cursor[Tab::UpNext.index()].min(now.queue.len().saturating_sub(1));
         let mut first = now.queue_offset.min(now.queue.len().saturating_sub(viewport));
         if viewport > 0 {
@@ -51,7 +54,7 @@ impl Geometry {
     fn row(&self, slot: usize) -> Rect {
         Rect::new(
             self.list.x,
-            self.list.y + slot as u16,
+            self.list.y + slot as u16 * ROW_PITCH,
             self.list.width,
             1,
         )
@@ -255,6 +258,11 @@ mod tests {
                     })
                     .unwrap();
                 let buffer = terminal.backend().buffer();
+                assert_eq!(
+                    geometry.row(1).y - geometry.row(0).y,
+                    2,
+                    "queue items need a blank line between them"
+                );
                 assert!(
                     (0..height)
                         .any(|y| mouse.action_at(0, y) == Some(MouseAction::OpenPageRow(cursor))),
@@ -277,6 +285,15 @@ mod tests {
                         mouse.context_action_at(0, row.y),
                         Some(MouseAction::SelectPageRow(index))
                     );
+                    assert_eq!(mouse.queue_row_at(0, row.y), Some(index));
+                    if row.y + 1 < area.bottom() {
+                        for x in 0..width {
+                            assert_eq!(buffer[(x, row.y + 1)].symbol(), " ");
+                            assert_eq!(mouse.action_at(x, row.y + 1), None);
+                            assert_eq!(mouse.context_action_at(x, row.y + 1), None);
+                            assert_eq!(mouse.queue_row_at(x, row.y + 1), None);
+                        }
+                    }
                     if let Some((x, _)) = artist_region(&now.queue[index], width as usize) {
                         assert_eq!(
                             mouse.action_at(x as u16, row.y),
