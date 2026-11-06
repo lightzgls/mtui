@@ -4,7 +4,7 @@
 
 A lightweight YouTube Music player with cover art, lyrics, playlists, and controls you can click. Free and open source, built with Rust, with prebuilt Windows and Linux downloads. macOS builds from source.
 
-**[Download for Windows](https://github.com/lightzgls/mtui/releases/latest)** · [Linux installation](docs/usage.md#installation) · [See it in action](#preview) · [Usage guide](docs/usage.md) · [Report an issue](https://github.com/lightzgls/mtui/issues)
+**[Download for Windows](https://github.com/lightzgls/mtui/releases/latest)** Â· [Linux installation](docs/usage.md#installation) Â· [See it in action](#preview) Â· [Usage guide](docs/usage.md) Â· [Report an issue](https://github.com/lightzgls/mtui/issues)
 
 ![MTUI playing music in a terminal, with pixel cover art, a queue, and playback controls](assets/previews/v0.11.8/player-Queue-160x42.png)
 
@@ -16,45 +16,17 @@ First launch needs an internet connection to download playback tools. MTUI is an
 
 ## Preview
 
-**v0.11.8 browsing with Now Playing**
+**Browse while music plays**
 
 ![Browsing with persistent Now Playing](assets/previews/v0.11.8/persistent-Tracks-120x36.png)
 
-https://github.com/user-attachments/assets/27cdd7f8-daf9-4ccc-b736-d903014b5be1
+**Home**
 
+![Home shelves](assets/previews/v0.11.8/home-100x36.png)
 
-<details>
-<summary>More screenshots</summary>
+**Queue and lyrics**
 
-**Personalized Home**
-
-![Personalized Home shelves](assets/previews/v0.11.8/home-100x36.png)
-
-**Search**
-
-![Search results for songs, artists, albums, playlists, and videos](assets/previews/search.png)
-
-**Lyrics**
-
-![Lyrics beside the current cover](assets/previews/lyrics.png)
-
-**Artist**
-
-![Artist page with songs, albums, and videos](assets/previews/artist.png)
-
-**Album**
-
-![Album track list](assets/previews/album.png)
-
-**Playlist**
-
-![Playlist details and track list](assets/previews/playlist.png)
-
-**Settings**
-
-![Playback, appearance, and integration settings](assets/previews/settings.png)
-
-</details>
+![Now Playing with queue and lyrics](assets/previews/v0.11.8/player-Queue-160x42.png)
 
 ## Features
 
@@ -83,13 +55,13 @@ The installer detects Debian/Ubuntu, Fedora, Arch, and openSUSE, verifies the do
 
 After installing, open a new terminal and type **`mtui`**. To uninstall, close MTUI and run **`mtui-uninstall`**. This removes the app and **all MTUI data**, including settings, saved sign-in sessions, history, logs, caches, and downloaded playback tools.
 
-Open **Settings → Updates** to download, verify, install, and restart a newer version. This works on Windows and writable Linux installations, independently of the Linux distribution. System-managed Linux packages still use their package manager. Settings label their platform support; tray controls remain Windows-only. See the [settings support table](docs/usage.md#settings-support) and [upgrade instructions](docs/usage.md#installation) for older Linux copies.
+Open **Settings â†’ Updates** to download, verify, install, and restart a newer version. This works on Windows and writable Linux installations, independently of the Linux distribution. System-managed Linux packages still use their package manager. Settings label their platform support; tray controls remain Windows-only. See the [settings support table](docs/usage.md#settings-support) and [upgrade instructions](docs/usage.md#installation) for older Linux copies.
 
 On first launch, MTUI downloads missing playback tools: yt-dlp, a supported JavaScript runtime, and the bgutil PO-token provider. Setup needs an internet connection. Sign-in uses Microsoft Edge WebView2 on Windows and WebKitGTK on Linux; playback runs without a browser window.
 
 Measurements from v0.11.4: a fresh Windows 11 setup downloads about **90 MB** including playback tools. Ubuntu 24.04 Desktop needs about **103 MB** via `.deb` or **104 MB** via curl, including sign-in. Minimal systems and other distributions may need additional system libraries. See [download measurements and exclusions](docs/usage.md#first-launch-downloads).
 
-Search and playback work without an account. Press **M** or open **Menu → Account & Sessions** to sign in for personalized Home and radio queues, playlists, likes, and listening-history sync. YouTube account history must be enabled for history writes.
+Search and playback work without an account. Press **M** or open **Menu â†’ Account & Sessions** to sign in for personalized Home and radio queues, playlists, likes, and listening-history sync. YouTube account history must be enabled for history writes.
 
 Sign in once; MTUI maintains the saved session automatically, including in the tray. It renews every 48 hours and recovers early after authentication failures. Temporary failures retry quietly; a sign-in window appears only when Google requires verification.
 
@@ -103,12 +75,12 @@ Settings and sessions live in `%APPDATA%\mtui` on Windows, or `$XDG_CONFIG_HOME/
 | Arrows / `hjkl`, `Enter` | Navigate and open or play |
 | `Space`, `n` / `p` | Pause/resume, next/previous track |
 | `+` / `-`, `m` | Volume in 5% steps, mute |
-| `Tab` / `1`–`4` | Queue, Lyrics, Related, Comments |
+| `Tab` / `1`â€“`4` | Queue, Lyrics, Related, Comments |
 | `Ctrl-K`, `Ctrl-P` | App menu, playback actions |
 | `S`, `?` | Settings, full keyboard help |
 | `Esc`, `q` | Back, quit |
 
-Click cards, links, tabs, and player controls. Artist sections have mouse paging, and Related shows artwork cards. Drag the progress bar to seek; use the volume −/+ buttons or wheel over volume for 5% steps. Closing the Windows window continues playback in the tray. **End task**, **Menu → Quit**, and the tray's Quit command exit the player.
+Click cards, links, tabs, and player controls. Artist sections have mouse paging, and Related shows artwork cards. Drag the progress bar to seek; use the volume âˆ’/+ buttons or wheel over volume for 5% steps. Closing the Windows window continues playback in the tray. **End task**, **Menu â†’ Quit**, and the tray's Quit command exit the player.
 
 ## Resource use
 
@@ -139,14 +111,14 @@ the source layout, and refactoring conventions.
 
 [Pear Desktop](https://github.com/pear-devs/pear-desktop) was the main inspiration for MTUI's listening experience. Thank you to the Pear Desktop team, and to the maintainers and contributors whose work supports this project:
 
-- [YouTube Music](https://music.youtube.com/) and [Spotify](https://open.spotify.com/) — references for browsing, navigation, and player layout.
-- [ytmusicapi](https://github.com/sigma67/ytmusicapi) and [YouTube.js](https://github.com/LuanRT/YouTube.js) — implementation references for YouTube Music requests, account actions, and playlist parsing.
-- [Lavalink YouTube Source](https://github.com/lavalink-devs/youtube-source) — a reference for playback reliability research.
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) — stream extraction fallback and PO-token support.
-- [LRCLIB](https://lrclib.net/) — community lyrics and synchronized timing fallback.
-- [Ratatui](https://ratatui.rs/) and [Crossterm](https://github.com/crossterm-rs/crossterm) — the terminal interface; [Rodio](https://github.com/RustAudio/rodio) and [Symphonia](https://github.com/pdeljanov/Symphonia) — native audio playback and decoding.
-- [Tokio](https://tokio.rs/), [Reqwest](https://github.com/seanmonstar/reqwest), [wry](https://github.com/tauri-apps/wry), and [tao](https://github.com/tauri-apps/tao) — background work, networking, and native sign-in.
-- [Best-README-Template](https://github.com/othneildrew/Best-README-Template) — the initial documentation structure.
+- [YouTube Music](https://music.youtube.com/) and [Spotify](https://open.spotify.com/) â€” references for browsing, navigation, and player layout.
+- [ytmusicapi](https://github.com/sigma67/ytmusicapi) and [YouTube.js](https://github.com/LuanRT/YouTube.js) â€” implementation references for YouTube Music requests, account actions, and playlist parsing.
+- [Lavalink YouTube Source](https://github.com/lavalink-devs/youtube-source) â€” a reference for playback reliability research.
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) â€” stream extraction fallback and PO-token support.
+- [LRCLIB](https://lrclib.net/) â€” community lyrics and synchronized timing fallback.
+- [Ratatui](https://ratatui.rs/) and [Crossterm](https://github.com/crossterm-rs/crossterm) â€” the terminal interface; [Rodio](https://github.com/RustAudio/rodio) and [Symphonia](https://github.com/pdeljanov/Symphonia) â€” native audio playback and decoding.
+- [Tokio](https://tokio.rs/), [Reqwest](https://github.com/seanmonstar/reqwest), [wry](https://github.com/tauri-apps/wry), and [tao](https://github.com/tauri-apps/tao) â€” background work, networking, and native sign-in.
+- [Best-README-Template](https://github.com/othneildrew/Best-README-Template) â€” the initial documentation structure.
 
 ## License
 
