@@ -1,17 +1,18 @@
 //! Player actions share one row; smaller windows retain a single Actions menu.
 
-use super::{
-    MouseMap, MouseTarget, ambient, centred_offset,
-    dialog::{self, Chrome},
-    display_width, shell, truncate,
-};
-use crate::app::{App, MouseAction, NowPlaying, View, Tab, actions::PlaylistPicker};
-use ratatui::{
-    Frame,
-    layout::Rect,
-    style::{Color, Modifier, Style},
-    widgets::{Block, Clear, Paragraph},
-};
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{Block, Clear, Paragraph};
+
+use crate::app::{App, MouseAction, NowPlaying, Tab, View};
+use crate::app::actions::PlaylistPicker;
+
+use super::{dialog, shell};
+use super::dialog::Chrome;
+use super::mouse::{MouseMap, MouseTarget};
+use super::palette::ambient;
+use super::text::{centred_offset, display_width, truncate};
 
 pub(super) fn bar(frame: &mut Frame, now: &NowPlaying, area: Rect, mouse: &mut MouseMap, view: Option<View>) {
     if area.height < 3 || area.width < 12 {

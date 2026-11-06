@@ -1,8 +1,17 @@
 //! Opt-in CPU work comparison. No network, audio device, GUI, or real sleeps.
 //! This measures App maintenance and Ratatui work, not whole-process CPU %.
-use super::*;
+use std::time::{Duration, Instant};
+
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+
+use crate::player::{PlayState, Snapshot};
 use crate::refresh::Refresh;
-use ratatui::{Terminal, backend::TestBackend};
+use crate::source::cover::Cover;
+use crate::source::watch::Lyrics;
+
+use super::navigation::View;
+use super::now_playing::{NowPlaying, Panel, Tab};
 
 #[test]
 #[ignore = "headless performance measurement; run in release mode with --nocapture"]

@@ -1,7 +1,26 @@
 //! Persistent player actions and dialogs, independent of the page underneath.
 
-use super::*;
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent};
+
+use crate::config;
 use crate::source::library::Playlist;
+use crate::source::worker::Request;
+
+use super::{App, Overlay, preferences};
+use super::input::MouseAction;
+use super::menu::{MenuAction, MenuItem, MenuPage};
+
+#[cfg(test)]
+use crossterm::event::KeyModifiers;
+
+#[cfg(test)]
+use crate::source::Track;
+#[cfg(test)]
+use crate::source::worker::Response;
+
+#[cfg(test)]
+use super::now_playing::NowPlaying;
 
 #[derive(Debug)]
 pub struct PlaylistPicker {
@@ -527,7 +546,7 @@ mod tests {
         app.clear_account_actions();
         assert!(app.pending_save.is_none() && !app.overlay.is_open());
         assert!(app.now.as_ref().unwrap().liked.is_none());
-        assert!(app.listening.is_none());
+        assert!(app.playback.listening_track().is_none());
     }
 
 }

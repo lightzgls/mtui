@@ -1,7 +1,32 @@
 //! User action sequences with controlled worker timing. No audio or network.
 use super::*;
-use crate::player::TestDriver;
 use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::config;
+use crate::config::CoverStyle;
+use crate::discord::Presence;
+use crate::graphics::Graphics;
+use crate::player::{Command, PlayState, Player, PlayerEvent, Snapshot, TestDriver};
+use crate::source::{ArtistRef, BrowseEndpoint, StreamUrl, Track};
+use crate::source::artist::{ArtistPage, ArtistSong};
+use crate::source::cover::Cover;
+use crate::source::home::{Card, Shelf, Target};
+use crate::source::watch::{Lyrics, QueuePage, Watch};
+use crate::source::worker::{Request, Response, SourceWorker};
+use crate::tray::TrayCommand;
+
+use super::artist::ArtistView;
+use super::artwork::CoverSize;
+use super::input::{MouseAction, POINTER_SCALE};
+use super::menu::{MenuAction, MenuPage};
+use super::navigation::{Mode, PageRequestKind, View};
+use super::now_playing::{
+    NowPlaying, Panel, QUEUE_AHEAD, QUEUE_BEHIND, QUEUE_MEMORY, RepeatMode, Tab,
+};
+use super::playback::mute_transition;
 
 pub(super) fn fixture() -> (App, TestDriver, Receiver<Request>) {
     let (player, driver) = Player::for_test();
@@ -1504,15 +1529,19 @@ fn the_lyrics_reading_view_survives_track_changes_and_ignores_queue_actions() {
     assert!(app.now.as_ref().unwrap().lyrics_expanded, "hidden lyrics controls must not alter another panel");
 }
 
+fn resolved_stream(index: usize) -> StreamUrl {
+    StreamUrl {
+        url: format!("https://fixture.invalid/song-{index}.m4a"),
+        expires_at: None, content_length: Some(1024),
+        format: mtui_resolver::AudioFormat { itag: Some(140) },
+        source: mtui_resolver::ResolveSource::Cache,
+    }
+}
+
 fn resolve(app: &mut App, index: usize) {
     app.apply(Response::Resolved {
         id: track(index).id, title: track(index).title,
-        stream: Ok(StreamUrl {
-            url: format!("https://fixture.invalid/song-{index}.m4a"),
-            expires_at: None, content_length: Some(1024),
-            format: mtui_resolver::AudioFormat { itag: Some(140) },
-            source: mtui_resolver::ResolveSource::Cache,
-        }),
+        stream: Ok(resolved_stream(index)),
     });
 }
 
@@ -1588,6 +1617,60 @@ fn selecting_another_song_discards_the_previous_seek_and_late_url() {
     assert_eq!(app.now.as_ref().unwrap().video_id, "song-1");
 }
 
+#[test]
+fn a_stale_resolve_cannot_consume_the_new_tracks_deferred_seek() {
+    for stale_succeeds in [false, true] {
+        let (mut app, driver, _requests) = fixture();
+        app.play_track(track(0), false);
+        app.handle_mouse_action(MouseAction::SeekTo(POINTER_SCALE)).unwrap();
+        app.play_track(track(1), false);
+        app.handle_mouse_action(MouseAction::SeekTo(POINTER_SCALE / 2)).unwrap();
+        app.apply(Response::Resolved {
+            id: track(0).id, title: track(0).title,
+            stream: if stale_succeeds { Ok(resolved_stream(0)) } else { Err("old failure".into()) },
+        });
+        assert_eq!(app.playback.pending_id(), Some("song-1"));
+        assert!(app.playback.failure().is_none());
+        resolve(&mut app, 1);
+        let commands: Vec<_> = driver.commands.try_iter().collect();
+        assert!(matches!(commands.as_slice(), [Command::Load { .. }, Command::Load { .. },
+            Command::Play { id, .. }, Command::Seek(position)]
+            if id == "song-1" && *position == Duration::from_secs(120)), "{commands:?}");
+    }
+}
+
+#[test]
+fn recovery_answers_match_the_current_play_and_cannot_restart_after_stop() {
+    for replacement in [false, true] {
+        let (mut app, driver, _requests) = fixture();
+        app.play_track(track(1), false);
+        resolve(&mut app, 1);
+        driver.commands.try_iter().for_each(drop);
+        let answer = |index| if replacement {
+            Response::Replacement { id: track(index).id, stream: Ok(resolved_stream(index)) }
+        } else {
+            Response::Resolved { id: track(index).id, title: track(index).title, stream: Ok(resolved_stream(index)) }
+        };
+        let from = Duration::from_secs(58);
+        driver.events.send(PlayerEvent::NeedsUrl { id: track(1).id, from }).unwrap();
+        app.poll_player();
+        app.apply(answer(0));
+        assert!(app.playback.is_recovering());
+        assert!(driver.commands.try_recv().is_err());
+        app.apply(answer(1));
+        let commands: Vec<_> = driver.commands.try_iter().collect();
+        assert!(matches!(commands.as_slice(), [Command::Resume { from: position, .. }] if *position == from), "{commands:?}");
+        assert!(!app.playback.is_recovering());
+        driver.events.send(PlayerEvent::NeedsUrl { id: track(1).id, from }).unwrap();
+        app.poll_player();
+        app.stop();
+        app.apply(answer(1));
+        assert!(matches!(driver.commands.try_iter().collect::<Vec<_>>().as_slice(), [Command::Stop]));
+        assert!(app.playback.listening_track().is_none());
+        assert!(!app.playback.is_recovering());
+    }
+}
+
 // SEEK-04: Stop owns silence even when resolution succeeds afterwards.
 #[test]
 fn stop_after_an_end_click_cancels_the_song_and_late_resolution() {
@@ -1598,7 +1681,7 @@ fn stop_after_an_end_click_cancels_the_song_and_late_resolution() {
     resolve(&mut app, 0);
     let commands: Vec<_> = driver.commands.try_iter().collect();
     assert!(matches!(commands.as_slice(), [Command::Load { .. }, Command::Stop]), "{commands:?}");
-    assert!(app.now.is_none() && app.pending.is_none());
+    assert!(app.now.is_none() && !app.playback.is_loading());
 }
 
 // SEEK-05: live/unknown duration has no invented endpoint or absolute seek.
@@ -1671,8 +1754,8 @@ fn an_old_eof_while_resolving_a_new_choice_cannot_advance_it() {
     app.advance(1, false);
     state(&driver, PlayState::Idle, Duration::ZERO);
     app.tick_playback();
-    assert_eq!(app.pending.as_deref(), Some("song-1"));
-    assert_eq!(app.listening.as_ref().map(|(track, _)| track.id.as_str()), Some("song-1"),
+    assert_eq!(app.playback.pending_id(), Some("song-1"));
+    assert_eq!(app.playback.listening_track().map(|track| track.id.as_str()), Some("song-1"),
         "an old EOF must not discard the new song's history/recovery identity");
     assert_eq!(requests.try_iter().filter(|r| matches!(r, Request::Resolve { .. })).count(), 1);
 }
@@ -1690,7 +1773,7 @@ fn an_end_seek_that_finishes_during_buffering_still_advances_once() {
     requests.try_iter().for_each(drop);
     state(&driver, PlayState::Idle, Duration::ZERO);
     for _ in 0..20 { app.tick_playback(); }
-    assert_eq!(app.pending.as_deref(), Some("song-1"));
+    assert_eq!(app.playback.pending_id(), Some("song-1"));
     assert_eq!(requests.try_iter().filter(|r| matches!(r, Request::Resolve { .. })).count(), 1);
 }
 
@@ -1704,7 +1787,7 @@ fn a_buffering_failure_is_reported_without_advancing_the_queue() {
     state(&driver, PlayState::Idle, Duration::ZERO);
     driver.snapshot.lock().unwrap().error = Some("network timeout".into());
     app.tick_playback();
-    assert!(app.playback_error.is_some());
+    assert!(app.playback.failure().is_some());
     assert_eq!(app.now.as_ref().unwrap().video_id, "song-0");
     assert!(!requests.try_iter().any(|r| matches!(r, Request::Resolve { .. })));
 }
@@ -1720,7 +1803,7 @@ fn a_failed_resolve_during_buffering_is_not_mistaken_for_an_end_seek() {
     app.apply(Response::Resolved { id: "song-0".into(), title: "Song 0".into(), stream: Err("network timeout".into()) });
     state(&driver, PlayState::Idle, Duration::ZERO);
     app.tick_playback();
-    assert!(app.playback_error.is_some());
+    assert!(app.playback.failure().is_some());
     assert_eq!(app.now.as_ref().unwrap().video_id, "song-0");
     assert!(!requests.try_iter().any(|r| matches!(r, Request::Resolve { .. })));
 }
@@ -1734,8 +1817,8 @@ fn a_late_recovery_event_after_next_is_ignored() {
     driver.commands.try_iter().for_each(drop);
     driver.events.send(PlayerEvent::NeedsUrl { id: "song-0".into(), from: Duration::from_secs(240) }).unwrap();
     app.poll_player();
-    assert!(app.resuming.is_none());
-    assert_eq!(app.pending.as_deref(), Some("song-1"));
+    assert!(!app.playback.is_recovering());
+    assert_eq!(app.playback.pending_id(), Some("song-1"));
     assert!(driver.commands.try_recv().is_err());
 }
 

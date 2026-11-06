@@ -1,5 +1,25 @@
 //! Recommendations use the same artwork cards as browsing, with exact hit areas.
-use super::*;
+
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+
+use crate::app::{CardShape, MouseAction, NowPlaying, Panel, RelatedRow};
+
+use super::cards::{Tiles, render_card_artist_link};
+use super::mouse::{MouseMap, MouseTarget};
+use super::player::{message, waiting_on};
+use super::text::truncate;
+
+#[cfg(test)]
+use crate::app::Tab;
+#[cfg(test)]
+use crate::source::home::Shelf;
+
+#[cfg(test)]
+use super::mouse::contains;
 
 pub(super) struct Geometry {
     rows: Vec<(usize, Rect)>,

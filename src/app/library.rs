@@ -1,7 +1,35 @@
 //! Library caches retain each category's position without copying collections into Back history.
 
-use super::*;
+use std::time::Instant;
+
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent};
+
+use crate::config;
+use crate::source::BrowseEndpoint;
 use crate::source::library::browse::{Category, Item, Page, Sort};
+use crate::source::worker::Request;
+
+use super::App;
+use super::menu::{MenuAction, MenuItem};
+use super::navigation::{HistoryEntry, Mode, View};
+use super::preferences::VOLUME_STEP;
+
+#[cfg(test)]
+use std::time::Duration;
+
+#[cfg(test)]
+use crossterm::event::KeyModifiers;
+
+#[cfg(test)]
+use crate::source::Track;
+#[cfg(test)]
+use crate::source::home::{Card, Target};
+#[cfg(test)]
+use crate::source::worker::Response;
+
+#[cfg(test)]
+use super::input::MouseAction;
 
 #[derive(Debug, Clone)]
 pub struct Collection {
@@ -313,7 +341,7 @@ impl App {
         } else {
             self.status.clear();
         }
-        self.selection_settled = Some(Instant::now());
+        self.prefetch.selection_changed(Instant::now());
     }
 
     pub(super) fn cycle_library_sort(&mut self) {
@@ -400,7 +428,7 @@ impl App {
         };
         if let Some(selected) = selected {
             self.library.collection_mut().selected = selected;
-            self.selection_settled = Some(Instant::now());
+            self.prefetch.selection_changed(Instant::now());
             if selected + columns >= self.library.collection().items.len() {
                 self.request_library(true);
             }

@@ -133,8 +133,8 @@ impl ArtCache {
     /// [`CAPACITY`].
     ///
     /// A key still waiting on the art thread is dropped here like any other,
-    /// and its answer will then be filed under a key nothing is looking at --
-    /// which the next [`Self::want`] simply asks for again. That is the right
+    /// and [`Self::store`] discards its late answer. The next call to
+    /// [`Self::want_visible`] asks for it again. That is the right
     /// trade: the alternative is a pinned entry per outstanding request, which
     /// is an unbounded set held open by whatever is slowest to answer.
     fn evict(&mut self) {

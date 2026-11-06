@@ -6,8 +6,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
-use super::{MouseMap, MouseTarget, centred, shell, truncate};
 use crate::app::MouseAction;
+
+use super::shell;
+use super::mouse::{MouseMap, MouseTarget};
+use super::text::{centred, truncate};
 
 pub(super) struct Dialog {
     pub body: Rect,

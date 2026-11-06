@@ -128,6 +128,9 @@ For isolated smoke, full, and repeated test runs, use `./scripts/test.ps1`.
 See the [testing guide](docs/testing.md). The runner keeps logs and
 a JSON summary under `target/test-runs/` and leaves live/account tests ignored.
 
+See the [architecture guide](docs/architecture.md) for module ownership,
+the source layout, and refactoring conventions.
+
 ## Acknowledgments and references
 
 [Pear Desktop](https://github.com/pear-devs/pear-desktop) was the main inspiration for MTUI's listening experience. Thank you to the Pear Desktop team, and to the maintainers and contributors whose work supports this project:

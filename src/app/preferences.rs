@@ -2,8 +2,13 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use super::{App, MenuPage, Overlay, moved_cursor};
+use crate::config;
 use crate::config::{CoverStyle, ImageRenderer};
+use crate::player::{Command, OutputDevice};
+
+use super::{App, Overlay};
+use super::menu::MenuPage;
+use super::navigation::moved_cursor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Setting {
@@ -404,6 +409,287 @@ pub fn renderer_label(renderer: ImageRenderer) -> &'static str {
         ImageRenderer::Automatic => "Automatic",
         ImageRenderer::Kitty => "Kitty images",
         ImageRenderer::PixelArt => "Terminal cells",
+    }
+}
+
+pub(super) const VOLUME_STEP: f32 = 0.05;
+
+pub(super) const PRECISION_VOLUME_STEP: f32 = 0.01;
+
+pub(super) const DEFAULT_UNMUTED_VOLUME: f32 = 1.0;
+
+pub(super) fn next_output_device(
+    current: Option<&str>,
+    outputs: &[OutputDevice],
+    forward: bool,
+) -> Option<String> {
+    let choices = outputs.len() + 1;
+    let current = current
+        .and_then(|id| outputs.iter().position(|output| output.id == id))
+        .map_or(0, |index| index + 1);
+    let next = if forward {
+        (current + 1) % choices
+    } else {
+        (current + choices - 1) % choices
+    };
+    next.checked_sub(1)
+        .and_then(|index| outputs.get(index))
+        .map(|output| output.id.clone())
+}
+
+impl App {
+
+    pub fn cover_style(&self) -> CoverStyle {
+        self.cover_style
+    }
+
+
+    pub fn image_renderer(&self) -> ImageRenderer {
+        self.image_renderer
+    }
+
+
+    pub fn output_device_id(&self) -> Option<&str> {
+        self.output_device.as_deref()
+    }
+
+
+    pub fn output_device_label(&self) -> &str {
+        let Some(id) = self.output_device.as_deref() else {
+            return "System default";
+        };
+        self.output_devices
+            .iter()
+            .find(|output| output.id == id)
+            .map(|output| output.name.as_str())
+            .unwrap_or("Unavailable output")
+    }
+
+
+    /// Turns the Discord card on or off, and remembers which.
+    ///
+    /// Written to disk rather than kept for the session: this decides whether
+    /// what someone listens to is visible to everyone they share a server with,
+    /// and a privacy switch that quietly flips back on at the next launch is
+    /// not one.
+    pub(super) fn toggle_presence(&mut self) {
+        let enabled = self.presence.toggle();
+        self.status = self.presence.status();
+        // Best effort. A config directory that cannot be written costs the user
+        // the setting surviving a restart, which is not worth refusing the
+        // keypress over -- and the status line has already said where it landed.
+        if let Err(error) = config::Presence::save(enabled) {
+            crate::diagnostics::error("config", &format!("could not save presence: {error:#}"));
+            self.status = "could not save Discord preference; changed for this session only".to_string();
+        }
+    }
+
+
+    pub(super) fn toggle_start_in_tray(&mut self) {
+        if !cfg!(windows) {
+            self.status = "start in tray is only available on Windows".to_string();
+            return;
+        }
+        let enabled = !self.start_in_tray;
+        let settings = config::Settings {
+            start_in_tray: enabled,
+            tray_click_pauses: self.tray_click_pauses,
+            precision_volume: self.precision_volume,
+            show_key_hints: self.show_key_hints,
+            cover_style: self.cover_style,
+            image_renderer: self.image_renderer,
+            volume: self.snapshot().volume,
+            output_device: self.output_device.clone(),
+        };
+        match settings.save() {
+            Ok(()) => {
+                self.start_in_tray = enabled;
+                self.status = if enabled {
+                    "MTUI will keep a notification-area icon".to_string()
+                } else {
+                    "MTUI will show a tray icon only while backgrounded".to_string()
+                };
+            }
+            Err(err) => {
+                crate::diagnostics::error("config", &format!("could not save settings: {err:#}"));
+                self.status = format!("could not save settings: {err:#}");
+            }
+        }
+    }
+
+
+    pub(super) fn toggle_tray_click_pauses(&mut self) {
+        if !cfg!(windows) {
+            self.status = "tray click controls are only available on Windows".to_string();
+            return;
+        }
+        let enabled = !self.tray_click_pauses;
+        let settings = config::Settings {
+            start_in_tray: self.start_in_tray,
+            tray_click_pauses: enabled,
+            precision_volume: self.precision_volume,
+            show_key_hints: self.show_key_hints,
+            cover_style: self.cover_style,
+            image_renderer: self.image_renderer,
+            volume: self.snapshot().volume,
+            output_device: self.output_device.clone(),
+        };
+        match settings.save() {
+            Ok(()) => {
+                self.tray_click_pauses = enabled;
+                self.status = if enabled {
+                    "tray clicks pause or resume; right-click to show the player".to_string()
+                } else {
+                    "tray clicks show the player".to_string()
+                };
+            }
+            Err(err) => {
+                crate::diagnostics::error("config", &format!("could not save settings: {err:#}"));
+                self.status = format!("could not save settings: {err:#}");
+            }
+        }
+    }
+
+
+    pub(super) fn toggle_precision_volume(&mut self) {
+        let enabled = !self.precision_volume;
+        let settings = config::Settings {
+            start_in_tray: self.start_in_tray,
+            tray_click_pauses: self.tray_click_pauses,
+            precision_volume: enabled,
+            show_key_hints: self.show_key_hints,
+            cover_style: self.cover_style,
+            image_renderer: self.image_renderer,
+            volume: self.volume_save.map_or_else(|| self.snapshot().volume, |(_, volume)| volume),
+            output_device: self.output_device.clone(),
+        };
+        match settings.save() {
+            Ok(()) => {
+                self.precision_volume = enabled;
+                self.status = if enabled {
+                    "precision volume on: scroll over the cover to adjust by 1%".into()
+                } else { "precision volume off".into() };
+            }
+            Err(err) => {
+                crate::diagnostics::error("config", &format!("could not save settings: {err:#}"));
+                self.status = format!("could not save settings: {err:#}");
+            }
+        }
+    }
+
+
+    pub(super) fn cycle_cover_style(&mut self, forward: bool) {
+        let style = if forward {
+            self.cover_style.next()
+        } else {
+            self.cover_style.previous()
+        };
+        self.set_cover_style(style);
+    }
+
+
+    pub(super) fn set_cover_style(&mut self, style: CoverStyle) {
+        let settings = config::Settings {
+            start_in_tray: self.start_in_tray,
+            tray_click_pauses: self.tray_click_pauses,
+            precision_volume: self.precision_volume,
+            show_key_hints: self.show_key_hints,
+            cover_style: style,
+            image_renderer: self.image_renderer,
+            volume: self.snapshot().volume,
+            output_device: self.output_device.clone(),
+        };
+        match settings.save() {
+            Ok(()) => {
+                self.cover_style = style;
+                self.images.clear();
+                self.status = format!("song covers set to {}", style.label());
+            }
+            Err(err) => {
+                crate::diagnostics::error("config", &format!("could not save settings: {err:#}"));
+                self.status = format!("could not save settings: {err:#}");
+            }
+        }
+    }
+
+
+    pub(super) fn cycle_image_renderer(&mut self, forward: bool) {
+        let renderer = if forward {
+            self.image_renderer.next()
+        } else {
+            self.image_renderer.previous()
+        };
+        self.set_image_renderer(renderer);
+    }
+
+
+    pub(super) fn set_image_renderer(&mut self, renderer: ImageRenderer) {
+        let settings = config::Settings {
+            start_in_tray: self.start_in_tray,
+            tray_click_pauses: self.tray_click_pauses,
+            precision_volume: self.precision_volume,
+            show_key_hints: self.show_key_hints,
+            cover_style: self.cover_style,
+            image_renderer: renderer,
+            volume: self.snapshot().volume,
+            output_device: self.output_device.clone(),
+        };
+        match settings.save() {
+            Ok(()) => {
+                self.image_renderer = renderer;
+                self.images.clear();
+                self.status = format!("image renderer set to {}", renderer.label());
+            }
+            Err(err) => {
+                crate::diagnostics::error("config", &format!("could not save settings: {err:#}"));
+                self.status = format!("could not save settings: {err:#}");
+            }
+        }
+    }
+
+
+    pub(super) fn refresh_output_devices(&mut self) {
+        match crate::player::available_output_devices() {
+            Ok(devices) => self.output_devices = devices,
+            Err(error) => crate::diagnostics::warn(
+                "player",
+                &format!("could not refresh audio outputs: {error:#}"),
+            ),
+        }
+    }
+
+
+    pub(super) fn cycle_audio_output(&mut self, forward: bool) {
+        self.refresh_output_devices();
+        let next = next_output_device(self.output_device.as_deref(), &self.output_devices, forward);
+        self.set_audio_output(next);
+    }
+
+
+    pub(super) fn set_audio_output(&mut self, next: Option<String>) {
+        if next.as_deref() == self.output_device.as_deref() {
+            self.status = "this audio output is already selected".to_string();
+            return;
+        }
+        let label = next
+            .as_deref()
+            .and_then(|id| self.output_devices.iter().find(|output| output.id == id))
+            .map(|output| output.name.as_str())
+            .unwrap_or("System default")
+            .to_string();
+        match self.player.send(Command::SetOutput(next)) {
+            Ok(()) => self.status = format!("switching audio output to {label} ..."),
+            Err(error) => self.status = format!("could not switch audio output: {error:#}"),
+        }
+    }
+
+
+    pub(super) fn open_settings(&mut self) {
+        let return_to_menu = self.menu.is_some();
+        self.menu = None;
+        self.refresh_output_devices();
+        self.preferences.open(return_to_menu);
+        self.overlay = Overlay::Settings;
     }
 }
 

@@ -1,6 +1,19 @@
 //! Artist song expansion and ordered playback retain the artist as Back's target.
-use super::*;
 use std::collections::HashSet;
+use std::time::Instant;
+
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent};
+
+use crate::source::{ArtistRef, Track, UNKNOWN_ARTIST};
+use crate::source::artist::{ArtistPage, ArtistSong};
+use crate::source::home::{Card, Target};
+use crate::source::worker::{PageRequestId, Request};
+
+use super::App;
+use super::navigation::{Mode, PageRequestKind, View};
+use super::now_playing::{Panel, Tab};
+use super::preferences::VOLUME_STEP;
 
 impl App {
     pub(super) fn more_artist_songs(&mut self, play: bool) {
@@ -99,5 +112,331 @@ impl App {
             now.cursor[Tab::UpNext.index()] = 0;
         }
         self.status = if truncated { "The loaded top-song list is incomplete.".into() } else { String::new() };
+    }
+}
+
+/// One artist page and its independent cursor state.
+#[derive(Debug, Clone)]
+pub struct ArtistView {
+    pub requested: ArtistRef,
+    pub page: Panel<ArtistPage>,
+    /// Section zero is Top songs when present; the remaining sections are the
+    /// catalogue shelves in API order.
+    pub section: usize,
+    pub song: usize,
+    pub song_offset: usize,
+    pub card: usize,
+    pub top: usize,
+    pub scroll: Vec<usize>,
+    pub songs_expanded: bool,
+    pub songs_request: Option<(PageRequestId, bool)>,
+    pub songs_error: Option<String>,
+}
+
+impl ArtistView {
+    pub(super) fn loading(artist: ArtistRef) -> Self {
+        Self {
+            requested: artist,
+            page: Panel::Loading,
+            section: 0,
+            song: 0,
+            song_offset: 0,
+            card: 0,
+            top: 0,
+            scroll: Vec::new(),
+            songs_expanded: false,
+            songs_request: None,
+            songs_error: None,
+        }
+    }
+
+    pub fn content(&self) -> Option<&ArtistPage> {
+        match &self.page {
+            Panel::Ready(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    pub(super) fn set_page(&mut self, page: Result<ArtistPage, String>) {
+        match page {
+            Ok(page) => {
+                self.requested = page.artist.clone();
+                self.scroll = vec![0; page.shelves.len()];
+                self.page = Panel::Ready(page);
+            }
+            Err(reason) => self.page = Panel::Empty(reason),
+        }
+        self.section = 0;
+        self.song = 0;
+        self.song_offset = 0;
+        self.card = 0;
+        self.top = 0;
+        self.songs_expanded = false;
+        self.songs_request = None;
+        self.songs_error = None;
+    }
+
+    pub(super) fn has_songs(&self) -> bool {
+        self.content()
+            .is_some_and(|page| !page.top_songs.is_empty())
+    }
+
+    pub(super) fn shelf_index(&self) -> Option<usize> {
+        let first = usize::from(self.has_songs());
+        self.section.checked_sub(first)
+    }
+
+    pub fn selected_song(&self) -> Option<&ArtistSong> {
+        (self.has_songs() && self.section == 0)
+            .then(|| self.content()?.top_songs.get(self.song))
+            .flatten()
+    }
+
+    pub fn selected_card(&self) -> Option<&Card> {
+        let shelf = self.shelf_index()?;
+        self.content()?.shelves.get(shelf)?.cards.get(self.card)
+    }
+
+    pub(super) fn selected_track(&self) -> Option<&Track> {
+        self.selected_song().map(|song| &song.track)
+    }
+}
+
+pub(super) fn card_artist(card: &Card) -> Option<ArtistRef> {
+    match &card.target {
+        Target::Artist { artist } => Some(artist.clone()),
+        Target::Play { .. } | Target::Open { .. } => card.artist_ref.clone(),
+    }
+}
+
+impl App {
+
+    pub(super) fn open_artist(&mut self, artist: ArtistRef) {
+        if self.snapshot_blocked() {
+            self.status = "wait for the current page to finish loading".to_string();
+            return;
+        }
+        self.push_current_page();
+        self.status = "Loading artist…".into();
+        self.artist = Some(ArtistView::loading(artist.clone()));
+        self.view = View::Artist;
+        self.mode = Mode::Browse;
+        let request_id = self.begin_page_request(PageRequestKind::Artist);
+        let request = Request::OpenArtist { request_id, artist };
+        if self.source.send(request).is_err() {
+            self.cancel_page_request();
+            if let Some(artist) = self.artist.as_mut() {
+                artist.page = Panel::Empty("source worker is not running".to_string());
+            }
+            self.status = "source worker is not running".to_string();
+        }
+    }
+
+
+    pub(super) fn reload_artist(&mut self) {
+        if self.snapshot_blocked() {
+            self.status = "wait for the current artist to finish loading".to_string();
+            return;
+        }
+        let Some(artist) = self.artist.as_ref().map(|page| page.requested.clone()) else {
+            return;
+        };
+        self.status = "Refreshing artist…".into();
+        self.artist = Some(ArtistView::loading(artist.clone()));
+        self.view = View::Artist;
+        self.mode = Mode::Browse;
+        let request_id = self.begin_page_request(PageRequestKind::Artist);
+        if self
+            .source
+            .send(Request::OpenArtist { request_id, artist })
+            .is_err()
+        {
+            self.cancel_page_request();
+            if let Some(artist) = self.artist.as_mut() {
+                artist.page = Panel::Empty("source worker is not running".to_string());
+            }
+            self.status = "source worker is not running".to_string();
+        }
+    }
+
+
+    pub(super) fn context_artist(&self) -> Option<ArtistRef> {
+        match self.view {
+            View::Library => card_artist(&self.library.selected()?.card),
+            View::Home => card_artist(self.home_card()?),
+            View::Tracks => self.search_items.get(self.selected)
+                .filter(|_| self.browsing.is_none()).and_then(|item| card_artist(&item.card))
+                .or_else(|| self.selected_result_track()?.artist_ref.clone()),
+            View::Artist => {
+                let artist = self.artist.as_ref()?;
+                artist
+                    .selected_song()
+                    .and_then(|song| song.track.artist_ref.clone())
+                    .or_else(|| artist.selected_card().and_then(card_artist))
+            }
+            View::Playing => self.now.as_ref()?.artist_ref.clone(),
+        }
+    }
+
+
+    pub(super) fn open_context_artist(&mut self) {
+        let Some(artist) = self.context_artist() else {
+            return;
+        };
+        if self.view == View::Artist
+            && self
+                .artist
+                .as_ref()
+                .is_some_and(|page| page.requested.endpoint == artist.endpoint)
+        {
+            return;
+        }
+        self.open_artist(artist);
+    }
+
+
+    pub(super) fn open_artist_selection(&mut self) {
+        let Some(artist) = self.artist.as_ref() else {
+            return;
+        };
+        if let Some(track) = artist.selected_song().map(|song| song.track.clone()) {
+            self.play_track(track, false);
+        } else if let Some(card) = artist.selected_card().cloned() {
+            self.activate_card(card);
+        }
+    }
+
+
+    pub(super) fn handle_artist_key(&mut self, key: KeyEvent) -> Result<()> {
+        let before = self
+            .artist
+            .as_ref()
+            .map(|artist| (artist.section, artist.song, artist.card));
+
+        match key.code {
+            KeyCode::Char('a') => self.more_artist_songs(true),
+            KeyCode::Char('e') => self.more_artist_songs(false),
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Enter => self.open_artist_selection(),
+            KeyCode::Char('r') => self.reload_artist(),
+            KeyCode::Char('/') | KeyCode::Char('i') => self.begin_search(),
+            KeyCode::Char('P') | KeyCode::Char('p') => self.open_player(),
+            KeyCode::Char('B') => self.background(),
+            KeyCode::Char('D') => self.toggle_presence(),
+            KeyCode::Char('S') => self.open_settings(),
+            KeyCode::Char('M') => self.begin_music_sign_in(false),
+            KeyCode::Char(' ') => self.toggle_pause(),
+            KeyCode::Char('m') => self.toggle_mute(),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_volume(VOLUME_STEP),
+            KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_volume(-VOLUME_STEP),
+            KeyCode::Esc => self.go_back(),
+            KeyCode::Char('H') => self.go_home(),
+            KeyCode::Char('g') | KeyCode::Home => self.artist_first(),
+            KeyCode::Char('G') | KeyCode::End => self.artist_last(),
+            KeyCode::Char('j') | KeyCode::Down => self.move_artist_vertical(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_artist_vertical(-1),
+            KeyCode::PageDown => self.move_artist_vertical(8),
+            KeyCode::PageUp => self.move_artist_vertical(-8),
+            KeyCode::Char('l') | KeyCode::Right => self.move_artist_card(1),
+            KeyCode::Char('h') | KeyCode::Left => self.move_artist_card(-1),
+            _ => {}
+        }
+
+        let after = self
+            .artist
+            .as_ref()
+            .map(|artist| (artist.section, artist.song, artist.card));
+        if before != after {
+            self.prefetch.selection_changed(Instant::now());
+        }
+        Ok(())
+    }
+
+
+    pub(super) fn artist_first(&mut self) {
+        if let Some(artist) = self.artist.as_mut() {
+            artist.section = 0;
+            artist.song = 0;
+            artist.card = 0;
+        }
+    }
+
+
+    pub(super) fn artist_last(&mut self) {
+        let Some(artist) = self.artist.as_mut() else {
+            return;
+        };
+        let (songs, shelf_cards) = artist.content().map_or((0, Vec::new()), |page| {
+            (
+                page.top_songs.len(),
+                page.shelves.iter().map(|shelf| shelf.cards.len()).collect(),
+            )
+        });
+        artist.section = (shelf_cards.len() + usize::from(songs > 0)).saturating_sub(1);
+        artist.song = songs.saturating_sub(1);
+        artist.card = shelf_cards.last().copied().unwrap_or(0).saturating_sub(1);
+    }
+
+
+    pub(super) fn move_artist_vertical(&mut self, delta: isize) {
+        let Some(artist) = self.artist.as_mut() else {
+            return;
+        };
+        let Some((song_count, shelf_lengths)) = artist.content().map(|page| {
+            (
+                page.top_songs.len(),
+                page.shelves
+                    .iter()
+                    .map(|shelf| shelf.cards.len())
+                    .collect::<Vec<_>>(),
+            )
+        }) else {
+            return;
+        };
+        let has_songs = song_count > 0;
+        let section_count = shelf_lengths.len() + usize::from(has_songs);
+        if section_count == 0 {
+            return;
+        }
+
+        if has_songs && artist.section == 0 {
+            let next = artist.song.saturating_add_signed(delta);
+            if delta > 0 && next >= song_count && section_count > 1 {
+                artist.section = 1;
+                artist.card = 0;
+            } else {
+                artist.song = next.min(song_count.saturating_sub(1));
+            }
+            return;
+        }
+
+        let next = artist.section.saturating_add_signed(delta.signum());
+        artist.section = next.min(section_count - 1);
+        if has_songs && artist.section == 0 {
+            artist.song = song_count.saturating_sub(1);
+        } else {
+            let shelf = artist.section.saturating_sub(usize::from(has_songs));
+            let last = shelf_lengths
+                .get(shelf)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(1);
+            artist.card = artist.card.min(last);
+        }
+    }
+
+
+    pub(super) fn move_artist_card(&mut self, delta: isize) {
+        let Some(artist) = self.artist.as_mut() else {
+            return;
+        };
+        let shelf = artist.shelf_index();
+        let last = shelf
+            .and_then(|index| artist.content()?.shelves.get(index))
+            .map(|shelf| shelf.cards.len().saturating_sub(1));
+        let Some(last) = last else {
+            return;
+        };
+        artist.card = artist.card.saturating_add_signed(delta).min(last);
     }
 }

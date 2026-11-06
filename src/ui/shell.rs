@@ -8,12 +8,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{
-    HEADER_HEIGHT, HERO_HEIGHT, INFO_HEIGHT, MIN_WIDTH_WITH_COVER, MouseMap, MouseTarget,
-    PANEL_MIN_WIDTH, STATUS_HEIGHT, display_width, highlight, truncate,
-};
 use crate::app::{Mode, MouseAction, View};
 use crate::navigation::{Icon, Symbols};
+
+use super::{
+    HEADER_HEIGHT, HERO_HEIGHT, INFO_HEIGHT, MIN_WIDTH_WITH_COVER, PANEL_MIN_WIDTH, STATUS_HEIGHT,
+};
+use super::mouse::{MouseMap, MouseTarget};
+use super::palette::highlight;
+use super::text::{display_width, truncate};
 
 pub(super) const BACKGROUND: Color = Color::Rgb(12, 12, 12);
 pub(super) const SURFACE: Color = Color::Rgb(26, 26, 26);

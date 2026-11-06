@@ -6,9 +6,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::dialog::{self, Chrome};
-use super::{MouseMap, MouseTarget, ambient, centred_offset, display_width, truncate};
 use crate::app::{App, MenuItem, MenuPage, MouseAction};
+
+use super::dialog;
+use super::dialog::Chrome;
+use super::mouse::{MouseMap, MouseTarget};
+use super::palette::ambient;
+use super::text::{centred_offset, display_width, truncate};
 
 struct MenuRenderLine {
     item: Option<usize>,

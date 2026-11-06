@@ -7,12 +7,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::dialog::{self, Chrome};
-use super::{
-    MouseMap, MouseTarget, ambient, bounded_wrap, centred_offset, display_width, padded, truncate,
-};
-use crate::app::preferences::{Picker, SettingRow, State};
 use crate::app::{App, MouseAction};
+use crate::app::preferences::{Picker, SettingRow, State};
+
+use super::dialog;
+use super::dialog::Chrome;
+use super::mouse::{MouseMap, MouseTarget};
+use super::palette::ambient;
+use super::text::{bounded_wrap, centred_offset, display_width, padded, truncate};
 
 pub(super) fn render(frame: &mut Frame, app: &App, mouse: &mut MouseMap) {
     draw(

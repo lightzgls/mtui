@@ -1,18 +1,18 @@
 //! Queue spacing and hit targets use the same visible item geometry.
 
-use super::{
-    MouseMap, MouseTarget, cell, display_width, focused_cell, highlight, message,
-    truncate,
-};
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+
 use crate::app::{MouseAction, NowPlaying};
 use crate::source::Track;
-use ratatui::{
-    Frame,
-    layout::Rect,
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::Paragraph,
-};
+
+use super::mouse::{MouseMap, MouseTarget};
+use super::palette::highlight;
+use super::player::message;
+use super::text::{cell, display_width, focused_cell, truncate};
 
 const MARKER_WIDTH: usize = 3;
 const COLUMN_GAP: usize = 2;

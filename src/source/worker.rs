@@ -259,7 +259,7 @@ pub enum Response {
     /// now looking at. That is the single most visible way a serial worker can
     /// lie about what is playing, and the id is the whole of what prevents it.
     ///
-    /// The failure travels here rather than as [`Self::Failed`] for the same
+    /// The failure travels in this track-scoped response for the same
     /// reason: only a failure that can be tied to a track can be told from one
     /// belonging to some library call that happened to finish at the same time.
     Resolved {
@@ -1022,8 +1022,8 @@ fn run_metadata(rx: Arc<Inbox>, tx: Sender<Response>, account_generation: Arc<At
 
 /// Fetches the panels of the player page.
 ///
-/// Every failure is carried in the response rather than raised as a
-/// [`Response::Failed`]: these arrive beside music that is already playing, and
+/// Every failure is carried in the response for its track. These panels arrive
+/// beside music that is already playing, and
 /// a lyrics fetch that came back empty is a fact about the track, not an error
 /// worth taking the status line away from what is playing.
 fn run_pages(rx: Arc<Inbox>, tx: Sender<Response>) {

@@ -1,5 +1,14 @@
 //! Shelf paging shares its geometry with the visible buttons and click targets.
-use super::*;
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Span;
+use ratatui::widgets::Paragraph;
+
+use crate::app::MouseAction;
+
+use super::shell;
+use super::mouse::{MouseMap, MouseTarget};
 
 pub(super) struct Controls {
     pub heading: Rect,

@@ -1,5 +1,11 @@
 //! Queue actions follow the selected playable song on every browsing page.
-use super::*;
+use crate::source::Track;
+use crate::source::worker::PageRequestId;
+
+use super::App;
+use super::input::MouseAction;
+use super::navigation::View;
+use super::now_playing::{RelatedRow, Tab};
 
 /// A click must still refer to the same song and page after a worker reply.
 #[derive(PartialEq, Eq)]

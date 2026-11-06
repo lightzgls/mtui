@@ -1,6 +1,19 @@
 //! Mixed search rows and provider category filters share keyboard/mouse actions.
-use super::*;
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Paragraph};
+
+use crate::app::{App, CardShape, MouseAction};
 use crate::source::search::Filter;
+
+use super::{browse, shell};
+use super::cards::Tiles;
+use super::mouse::{MouseMap, MouseTarget};
+use super::palette::ambient;
+use super::player::message;
+use super::text::{focused_text, truncate};
 
 pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse: &mut MouseMap) {
     let area = shell::inset(area);

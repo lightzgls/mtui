@@ -1,7 +1,19 @@
 //! Library chrome, compact collection cards, song rows and explicit paging.
 
-use super::*;
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+
+use crate::app::{App, CardShape, MouseAction};
 use crate::source::library::browse::Category;
+
+use super::{browse, shell};
+use super::cards::{Tiles, card_size, render_card_artist_link};
+use super::mouse::{MouseMap, MouseTarget, button_style};
+use super::palette::{ambient, highlight};
+use super::text::truncate;
 
 #[allow(clippy::too_many_arguments)]
 fn button(

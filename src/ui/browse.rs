@@ -1,7 +1,30 @@
 //! Search and collection pages. Only visible rows ask for thumbnail artwork.
 
-use super::*;
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Paragraph};
+
+use crate::app::{App, CardShape, MouseAction};
+use crate::graphics::Graphics;
+use crate::source::Track;
 use crate::source::collection::Details;
+
+use super::shell;
+use super::cards::{Tiles, artist_prefix_width, render_tile, underline_artist};
+use super::mouse::{MouseMap, MouseTarget};
+use super::text::{clock, display_width, focused_text, truncate};
+
+#[cfg(test)]
+use std::time::Duration;
+
+#[cfg(test)]
+use crate::app::{Mode, View};
+#[cfg(test)]
+use crate::art::ArtCache;
+#[cfg(test)]
+use crate::source::cover::Cover;
 
 struct Page<'a> {
     title: &'a str,
