@@ -176,7 +176,7 @@ run_success() {
             if [[ $scenario == old-debian ]]; then grep 'libasound2 libssl3 ' "$home/actions" >/dev/null
             else grep 'libasound2t64 libssl3t64 ' "$home/actions" >/dev/null; fi ;;
         pacman)
-            grep '^pacman -Syu --needed --noconfirm ' "$home/actions" >/dev/null
+            grep -F 'pacman -Syu --needed --noconfirm alsa-lib libssl.so=3-64 ' "$home/actions" >/dev/null
             if grep '^pacman -Sy ' "$home/actions"; then exit 1; fi ;;
     esac
     passed=$((passed + 1))

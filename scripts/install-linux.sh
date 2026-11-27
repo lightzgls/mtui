@@ -75,10 +75,13 @@ install_dependencies() {
             privileged dnf install "${confirm[@]}" --setopt=install_weak_deps=False alsa-lib openssl-libs gtk3 webkit2gtk4.1 dbus-libs libgcc ca-certificates
             ;;
         pacman)
+            local ssl=openssl
+            # The prebuilt binaries need OpenSSL 3 even if the distro has moved on to a newer ABI.
+            if [[ -z $build_directory ]]; then ssl='libssl.so=3-64'; fi
             confirm=()
             (( assume_yes )) && confirm=(--noconfirm)
             printf 'Arch: missing libraries require a full system update to avoid a partial upgrade. Review the transaction before confirming.\n'
-            privileged pacman -Syu --needed "${confirm[@]}" alsa-lib openssl gtk3 webkit2gtk-4.1 dbus ca-certificates
+            privileged pacman -Syu --needed "${confirm[@]}" alsa-lib "$ssl" gtk3 webkit2gtk-4.1 dbus ca-certificates
             ;;
         zypper)
             confirm=()
@@ -90,10 +93,16 @@ install_dependencies() {
 }
 
 runtime_ready() {
-    local binary output
+    local binary output status
     for binary in mtui mtui-sign-in; do
-        output=$(LC_ALL=C ldd "$1/$binary" 2>&1) || return 1
-        [[ $output != *'not found'* ]] || return 1
+        status=0
+        output=$(LC_ALL=C ldd "$1/$binary" 2>&1) || status=$?
+        if (( status != 0 )) || [[ $output == *'not found'* ]]; then
+            if [[ ${2:-} == report ]]; then
+                printf 'MTUI: Runtime check failed for %s (ldd exit %s):\n%s\n' "$binary" "$status" "$output" >&2
+            fi
+            return 1
+        fi
     done
 }
 
@@ -372,7 +381,7 @@ main() {
         printf 'Installing missing playback and sign-in runtime libraries with %s.\n' "$manager"
         install_dependencies
     fi
-    runtime_ready "$extracted" || fail 'The system libraries cannot run this release. Your existing installation was not changed.'
+    runtime_ready "$extracted" report || fail 'The system libraries cannot run this release. Your existing installation was not changed.'
     mkdir -p -- "$root" "$bin"
     for tool in mtui mtui-sign-in; do
         install -m755 "$extracted/$tool" "$root/.$tool.new"

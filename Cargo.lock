@@ -2008,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "mtui"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "anyhow",
  "bytes",
