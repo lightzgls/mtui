@@ -12,6 +12,49 @@ const MAX_BYTES: u64 = 1024 * 1024;
 
 static LOG: OnceLock<Mutex<PathBuf>> = OnceLock::new();
 static PANIC_HOOK: Once = Once::new();
+static YTDLP_VERSION: OnceLock<String> = OnceLock::new();
+type Version = (u64, u64, u64);
+static JS_RUNTIME: OnceLock<(&'static str, Version)> = OnceLock::new();
+static PROVIDER_VERSION: OnceLock<&'static str> = OnceLock::new();
+static LAST_PLAYBACK_FAILURE: Mutex<Option<&'static str>> = Mutex::new(None);
+
+pub(crate) fn note_ytdlp_version(version: String) {
+    // Accept only a version token. Locally supplied executables can print arbitrary text.
+    if version.len() <= 48 && version.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        && version.bytes().all(|b| b.is_ascii_alphanumeric() || b".-+_".contains(&b))
+    {
+        let _ = YTDLP_VERSION.set(version);
+    }
+}
+
+pub(crate) fn note_js_runtime(name: &'static str, version: Version) {
+    let _ = JS_RUNTIME.set((name, version));
+}
+
+pub(crate) fn note_provider_version(version: &'static str) {
+    let _ = PROVIDER_VERSION.set(version);
+}
+
+// Callers pass a fixed summary, never raw error text.
+pub(crate) fn note_playback_failure(failure: &'static str) {
+    if let Ok(mut latest) = LAST_PLAYBACK_FAILURE.lock() {
+        *latest = Some(failure);
+    }
+}
+
+pub(crate) fn report() -> String {
+    let runtime = JS_RUNTIME.get().map_or_else(|| "unavailable".into(), |(name, (major, minor, patch))| {
+        format!("{name} {major}.{minor}.{patch}")
+    });
+    let latest = LAST_PLAYBACK_FAILURE.lock().ok().and_then(|latest| *latest);
+    format!(
+        "MTUI {}\nOS: {} ({})\nyt-dlp: {}\nJavaScript runtime: {}\nPO token provider: {}\nLatest playback error: {}",
+        env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH,
+        YTDLP_VERSION.get().map_or("unknown", String::as_str), runtime,
+        PROVIDER_VERSION.get().copied().unwrap_or("unavailable"),
+        latest.unwrap_or("None in this session"),
+    )
+}
 
 /// Prepares the log and installs a process-wide hook for panics on every thread.
 pub fn init() {

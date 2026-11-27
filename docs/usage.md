@@ -620,6 +620,10 @@ time its foreground window opens.
 in `mtui.log` inside the configuration directory. The log rotates at 1 MiB and
 keeps one backup as `mtui.log.1`. URLs and credential-bearing messages are
 redacted; cookies, tokens, and song titles are not intentionally logged.
+Use **Menu → Copy diagnostics** to share MTUI and playback tool versions, the
+platform, and a brief summary of the latest playback error in this session.
+The report contains no raw log lines, account data, or listening history. If
+your terminal blocks clipboard access, the report is also shown on screen.
 
 **Listening history.** With YouTube Music signed in, MTUI reports a song after
 30 seconds of actual playback. The local journal records the full listening

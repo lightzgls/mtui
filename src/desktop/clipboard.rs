@@ -1,4 +1,4 @@
-//! Native clipboard support for copying Music share links.
+//! Clipboard support for share links and diagnostics reports.
 
 use anyhow::{Result, bail};
 
@@ -60,27 +60,27 @@ pub fn copy(text: &str) -> Result<()> {
         let memory = GlobalAlloc(2, data.len() * 2);
         if memory.is_null() {
             DestroyWindow(owner);
-            bail!("Could not allocate the share link.");
+            bail!("Could not allocate clipboard text.");
         }
         let target = GlobalLock(memory);
         if target.is_null() {
             GlobalFree(memory);
             DestroyWindow(owner);
-            bail!("Could not prepare the share link.");
+            bail!("Could not prepare clipboard text.");
         }
         std::ptr::copy_nonoverlapping(data.as_ptr(), target.cast::<u16>(), data.len());
         GlobalUnlock(memory);
         if OpenClipboard(owner) == 0 {
             GlobalFree(memory);
             DestroyWindow(owner);
-            bail!("Clipboard is busy. Try Copy link again.");
+            bail!("Clipboard is busy. Try again.");
         }
         let success = EmptyClipboard() != 0 && !SetClipboardData(13, memory).is_null();
         CloseClipboard();
         DestroyWindow(owner);
         if !success {
             GlobalFree(memory);
-            bail!("Could not copy the share link.");
+            bail!("Could not copy to the clipboard.");
         }
     }
     Ok(())
@@ -89,4 +89,19 @@ pub fn copy(text: &str) -> Result<()> {
 #[cfg(not(windows))]
 pub fn copy(_text: &str) -> Result<()> {
     bail!("Clipboard copying is available in the Windows build. Select the link to copy it.")
+}
+
+pub fn copy_diagnostics(report: &str) -> Result<&'static str> {
+    #[cfg(windows)]
+    {
+        copy(report)?;
+        Ok("Diagnostics copied.")
+    }
+    #[cfg(not(windows))]
+    {
+        use crossterm::{clipboard::CopyToClipboard, execute};
+        execute!(std::io::stdout(), CopyToClipboard::to_clipboard_from(report))?;
+        // Terminals can silently ignore OSC 52, so the report stays visible.
+        Ok("If copying is blocked, select the report to copy it.")
+    }
 }

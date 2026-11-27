@@ -7,7 +7,7 @@ use crate::runtime::config;
 use crate::player::PlayState;
 use crate::source::catalog::home::{Card, Target};
 
-use crate::app::App;
+use crate::app::{App, Overlay};
 use crate::app::browse::artist::card_artist;
 use crate::app::artwork::CoverSize;
 use crate::app::controls::input::{is_bare_character, is_ctrl_key};
@@ -143,6 +143,7 @@ pub(in crate::app) enum MenuAction {
     OpenAccount,
     OpenSettings,
     OpenHelp,
+    CopyDiagnostics,
     #[cfg(windows)]
     Background,
     Quit,
@@ -221,6 +222,7 @@ pub(crate) fn app_menu_items(has_player: bool) -> Vec<MenuItem> {
         ),
         MenuItem::action("Settings", Some("Ctrl+S"), true, None, MenuAction::OpenSettings),
         MenuItem::action("Keyboard shortcuts", Some("?"), true, None, MenuAction::OpenHelp),
+        MenuItem::action("Copy diagnostics", None, true, None, MenuAction::CopyDiagnostics),
     ]);
     #[cfg(windows)]
     items.push(MenuItem::action(
@@ -796,6 +798,14 @@ impl App {
                 self.preferences.return_to_menu = true;
             }
             MenuAction::OpenHelp => self.open_menu(MenuPage::Help),
+            MenuAction::CopyDiagnostics => {
+                let report = crate::runtime::diagnostics::report();
+                let notice = crate::desktop::clipboard::copy_diagnostics(&report)
+                    .unwrap_or("Could not copy. Select the report to copy it.");
+                self.overlay = Overlay::Message {
+                    body: format!("{report}\n\n{notice}"),
+                };
+            }
             #[cfg(windows)]
             MenuAction::Background => self.background(),
             MenuAction::Quit => self.should_quit = true,

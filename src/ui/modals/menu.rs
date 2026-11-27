@@ -375,6 +375,7 @@ mod tests {
             "Account",
             "Settings",
             "Keyboard shortcuts",
+            "Copy diagnostics",
             "Quit",
         ] {
             assert!(text.contains(label));

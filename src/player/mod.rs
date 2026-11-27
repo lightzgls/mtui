@@ -1342,7 +1342,9 @@ fn update(snapshot: &Arc<Mutex<Snapshot>>, f: impl FnOnce(&mut Snapshot)) {
 }
 
 fn set_error(snapshot: &Arc<Mutex<Snapshot>>, msg: String) {
-    crate::runtime::diagnostics::error("player", &msg);
+    use crate::runtime::diagnostics;
+    diagnostics::note_playback_failure("Audio player failed");
+    diagnostics::error("player", &msg);
     update(snapshot, |s| {
         s.state = PlayState::Idle;
         s.error = Some(msg);

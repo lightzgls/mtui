@@ -855,8 +855,11 @@ impl App {
 
 
     pub(super) fn record_playback_failure(&mut self, why: &str) -> String {
-        crate::runtime::diagnostics::error("playback", why);
-        let summary = playback_failure_summary(why).to_string();
+        use crate::runtime::diagnostics;
+        diagnostics::error("playback", why);
+        let summary = playback_failure_summary(why);
+        diagnostics::note_playback_failure(summary);
+        let summary = summary.to_string();
         self.playback.fail(summary.clone());
         self.status = playback_failure_status(&summary);
         summary

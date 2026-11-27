@@ -27,6 +27,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 
 use crate::source::{command, youtube::YouTube};
+use crate::runtime::diagnostics;
 
 /// The release asset for this platform, and where it comes from.
 ///
@@ -164,7 +165,8 @@ fn check_managed_executable(path: &Path) -> Result<()> {
 /// and only when there is neither do we download.
 pub fn locate() -> Result<YouTube> {
     let system = YouTube::default();
-    if system.version().is_ok() {
+    if let Ok(version) = system.version() {
+        diagnostics::note_ytdlp_version(version);
         return Ok(system);
     }
 
@@ -172,7 +174,8 @@ pub fn locate() -> Result<YouTube> {
     #[cfg(unix)]
     check_managed_executable(&path)?;
     let ours = YouTube::new(path.to_string_lossy().into_owned());
-    if path.exists() && ours.version().is_ok() {
+    if path.exists() && let Ok(version) = ours.version() {
+        diagnostics::note_ytdlp_version(version);
         return Ok(ours);
     }
 
@@ -180,12 +183,13 @@ pub fn locate() -> Result<YouTube> {
     // cut short by a power loss, say. Both are answered by fetching it again.
     install(&path)?;
 
-    ours.version().with_context(|| {
+    let version = ours.version().with_context(|| {
         format!(
             "downloaded yt-dlp to {} but it does not run",
             path.display()
         )
     })?;
+    diagnostics::note_ytdlp_version(version);
     Ok(ours)
 }
 
@@ -194,8 +198,11 @@ pub fn locate() -> Result<YouTube> {
 pub fn with_js_runtime(yt: YouTube) -> Result<YouTube> {
     let mut selected = ["deno", "node", "bun"]
         .into_iter()
-        .find(|runtime| runtime_supported(runtime))
-        .map(str::to_string);
+        .find_map(|runtime| {
+            let version = supported_runtime_version(runtime, runtime)?;
+            diagnostics::note_js_runtime(runtime, version);
+            Some(runtime.to_string())
+        });
 
     let managed = match bin_dir() {
         Ok(dir) => dir.join(DENO_BIN),
@@ -210,7 +217,8 @@ pub fn with_js_runtime(yt: YouTube) -> Result<YouTube> {
     };
 
     if selected.is_none() {
-        if ensure_managed_deno(&managed) {
+        if let Some(version) = ensure_managed_deno(&managed) {
+            diagnostics::note_js_runtime("deno", version);
             selected = Some(runtime_arg(&managed));
         } else {
             eprintln!("mtui: continuing without a JavaScript runtime");
@@ -222,11 +230,12 @@ pub fn with_js_runtime(yt: YouTube) -> Result<YouTube> {
         .as_deref()
         .and_then(deno_executable)
         .map(PathBuf::from)
-        .or_else(|| ensure_managed_deno(&managed).then(|| managed.clone()));
+        .or_else(|| ensure_managed_deno(&managed).map(|_| managed.clone()));
 
     if let Some(deno) = provider_deno {
         match install_pot_provider(&deno) {
             Ok((plugin_dir, server_home)) => {
+                diagnostics::note_provider_version(POT_VERSION);
                 yt = yt.with_pot_provider(
                     plugin_dir.to_string_lossy().into_owned(),
                     server_home.to_string_lossy().into_owned(),
@@ -243,20 +252,22 @@ pub fn with_js_runtime(yt: YouTube) -> Result<YouTube> {
     Ok(yt)
 }
 
-fn ensure_managed_deno(managed: &Path) -> bool {
+fn ensure_managed_deno(managed: &Path) -> Option<(u64, u64, u64)> {
     #[cfg(unix)]
     if let Err(error) = check_managed_executable(managed) {
         eprintln!("mtui: {error:#}");
-        return false;
+        return None;
     }
-    if runtime_supported_at("deno", managed) {
-        return true;
+    if let Some(version) = supported_runtime_version("deno", managed) {
+        return Some(version);
     }
-    if let Err(error) = install_deno(managed) {
-        eprintln!("mtui: could not install Deno: {error:#}");
-        return false;
+    match install_deno(managed) {
+        Ok(version) => Some(version),
+        Err(error) => {
+            eprintln!("mtui: could not install Deno: {error:#}");
+            None
+        }
     }
-    true
 }
 
 fn deno_executable(runtime: &str) -> Option<&str> {
@@ -269,20 +280,16 @@ fn deno_executable(runtime: &str) -> Option<&str> {
     }
 }
 
-fn runtime_supported(runtime: &str) -> bool {
-    runtime_supported_at(runtime, runtime)
-}
-
-fn runtime_supported_at(runtime: &str, executable: impl AsRef<std::ffi::OsStr>) -> bool {
+fn supported_runtime_version(runtime: &str, executable: impl AsRef<std::ffi::OsStr>) -> Option<(u64, u64, u64)> {
     let Ok(output) = command(executable)
         .arg("--version")
         .stdin(Stdio::null())
         .output()
     else {
-        return false;
+        return None;
     };
     if !output.status.success() {
-        return false;
+        return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let version = match runtime {
@@ -294,16 +301,15 @@ fn runtime_supported_at(runtime: &str, executable: impl AsRef<std::ffi::OsStr>) 
         "bun" => Some(stdout.trim()),
         _ => None,
     };
-    let Some(version) = version.and_then(parse_version) else {
-        return false;
-    };
-    match runtime {
+    let version = version.and_then(parse_version)?;
+    let supported = match runtime {
         "deno" => version >= (2, 3, 0),
         "node" => version >= (22, 0, 0),
         // yt-dlp deprecated Bun and supports no release after 1.3.14.
         "bun" => ((1, 2, 11)..=(1, 3, 14)).contains(&version),
         _ => false,
-    }
+    };
+    supported.then_some(version)
 }
 
 fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
@@ -502,7 +508,7 @@ fn deno_download_url() -> Result<&'static str> {
     }
 }
 
-fn install_deno(dest: &Path) -> Result<()> {
+fn install_deno(dest: &Path) -> Result<(u64, u64, u64)> {
     let dir = dest.parent().expect("Deno path always has a parent");
     fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
     let archive = dir.join("deno.zip.part");
@@ -538,11 +544,11 @@ fn install_deno(dest: &Path) -> Result<()> {
         }
         fs::rename(&executable, dest)
             .with_context(|| format!("could not move Deno to {}", dest.display()))?;
-        if !runtime_supported_at("deno", dest) {
+        let Some(version) = supported_runtime_version("deno", dest) else {
             bail!("downloaded Deno to {} but it does not run", dest.display());
-        }
+        };
         eprintln!("mtui: installed Deno into {}", dir.display());
-        Ok(())
+        Ok(version)
     })();
 
     let _ = fs::remove_file(&archive);
@@ -778,11 +784,11 @@ mod tests {
     #[test]
     #[ignore = "downloads and prepares the PO token provider"]
     fn installs_a_working_pot_provider() {
-        let deno = if runtime_supported("deno") {
+        let deno = if supported_runtime_version("deno", "deno").is_some() {
             PathBuf::from("deno")
         } else {
             let managed = bin_dir().unwrap().join(DENO_BIN);
-            assert!(ensure_managed_deno(&managed));
+            assert!(ensure_managed_deno(&managed).is_some());
             managed
         };
         let (plugin_dir, server_home) = install_pot_provider(&deno).unwrap();
@@ -834,7 +840,7 @@ mod tests {
         let dest = dir.join(DENO_BIN);
 
         install_deno(&dest).expect("Deno should install");
-        assert!(runtime_supported_at("deno", &dest));
+        assert!(supported_runtime_version("deno", &dest).is_some());
 
         let _ = fs::remove_dir_all(&dir);
     }
