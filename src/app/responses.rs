@@ -61,6 +61,7 @@ impl App {
         }
         let page_request = match &response {
             Response::Results { request_id, .. }
+            | Response::ListeningHistory { request_id, .. }
             | Response::Browsed { request_id, .. }
             | Response::Artist { request_id, .. } => Some(*request_id),
             _ => None,
@@ -74,6 +75,7 @@ impl App {
         }
 
         match response {
+            Response::ListeningHistory { plays, .. } => self.apply_listening_history(plays),
             Response::Library { request_id, generation, category, page } => self.apply_library(request_id, generation, category, *page),
             Response::Rating { request_id, video_id, changed, result } => self.apply_rating(request_id, &video_id, changed, result),
             Response::Playlists { request_id, choices } => self.apply_playlists(request_id, choices),

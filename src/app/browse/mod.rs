@@ -7,3 +7,4 @@ pub(super) mod navigation;
 pub(super) mod search;
 pub(super) mod search_input;
 pub(super) mod selection;
+pub(crate) mod listening_history;

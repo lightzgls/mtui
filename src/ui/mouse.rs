@@ -134,6 +134,7 @@ impl MouseMap {
         self.targets.iter().rev().find_map(|target| match *target {
             MouseTarget::Area(area, MouseAction::OpenArtistSong(index)) if contains(area, column, row) => Some(MouseAction::SelectArtistSong(index)),
             MouseTarget::Area(area, MouseAction::OpenLibraryItem(index)) if contains(area, column, row) => Some(MouseAction::SelectLibraryItem(index)),
+            MouseTarget::Area(area, MouseAction::PlayHistoryTrack(index)) if contains(area, column, row) => Some(MouseAction::SelectHistoryTrack(index)),
             MouseTarget::Area(area, MouseAction::OpenArtistCard { shelf, card }) if contains(area, column, row) => Some(MouseAction::SelectArtistCard { shelf, card }),
             MouseTarget::Area(area, MouseAction::OpenHomeCard { shelf, card })
                 if contains(area, column, row) =>

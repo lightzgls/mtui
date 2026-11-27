@@ -133,6 +133,9 @@ impl MenuItem {
 pub(in crate::app) enum MenuAction {
     GoHome,
     OpenLibrary,
+    OpenListeningHistory,
+    PlayHistoryTrack,
+    RefreshListeningHistory,
     OpenLibrarySelection,
     OpenLikedMusic,
     SortLibrary,
@@ -208,6 +211,7 @@ pub(crate) fn app_menu_items(has_player: bool) -> Vec<MenuItem> {
     let mut items = vec![
         MenuItem::action("Home", Some("H"), true, Some("Go to"), MenuAction::GoHome),
         MenuItem::action("Library", Some("L"), true, None, MenuAction::OpenLibrary),
+        MenuItem::action("Listening history", None, true, None, MenuAction::OpenListeningHistory),
         MenuItem::action("Search", Some("/"), true, None, MenuAction::BeginSearch),
     ];
     items.extend([
@@ -349,6 +353,10 @@ impl App {
     pub(in crate::app) fn page_action_items(&self) -> Vec<MenuItem> {
         let mut items = match self.view {
             View::Library => self.library_action_items(),
+            View::ListeningHistory => vec![
+                MenuItem::action("Play selected song", Some("Enter"), !self.page_loading() && self.listening_history.error.is_none() && !self.listening_history.rows.is_empty(), Some("Listening history"), MenuAction::PlayHistoryTrack),
+                MenuItem::action("Refresh history", Some("r"), !self.page_loading(), None, MenuAction::RefreshListeningHistory),
+            ],
             View::Home => {
                 let selected = self.home_card();
                 let (label, enabled) = match selected {
@@ -798,6 +806,9 @@ impl App {
                 self.go_home();
             }
             MenuAction::OpenLibrary => self.open_library(),
+            MenuAction::OpenListeningHistory => self.open_listening_history(),
+            MenuAction::PlayHistoryTrack => self.play_history_track(self.listening_history.selected),
+            MenuAction::RefreshListeningHistory => self.refresh_listening_history(),
             MenuAction::OpenLibrarySelection => self.open_library_item(self.library.collection().selected),
             MenuAction::OpenLikedMusic => self.open_liked_music(),
             MenuAction::SortLibrary => self.cycle_library_sort(),

@@ -31,6 +31,9 @@ impl App {
                 } else { self.results.get(index)? };
                 (MouseAction::SelectTrack(index), track.id.clone())
             }
+            MouseAction::PlayHistoryTrack(index) if self.view == View::ListeningHistory => (
+                MouseAction::SelectHistoryTrack(index), self.listening_history.rows.get(index)?.id.clone(),
+            ),
             MouseAction::OpenArtistSong(index) if self.view == View::Artist => (
                 MouseAction::SelectArtistSong(index),
                 self.artist.as_ref()?.content()?.top_songs.get(index)?.track.id.clone(),
@@ -67,6 +70,7 @@ impl App {
         match self.view {
             View::Home => self.home_card()?.track(),
             View::Tracks => self.selected_result_track().cloned(),
+            View::ListeningHistory => self.listening_history.track(self.listening_history.selected),
             View::Artist => {
                 let artist = self.artist.as_ref()?;
                 artist.selected_track().cloned().or_else(|| artist.selected_card()?.track())

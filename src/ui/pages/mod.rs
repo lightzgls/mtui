@@ -4,5 +4,6 @@ pub(super) mod artist;
 mod browse;
 pub(super) mod home;
 pub(super) mod library;
+pub(super) mod listening_history;
 pub(super) mod results;
 mod search;

@@ -64,6 +64,7 @@ struct CompletionRequest {
 }
 
 pub enum Request {
+    ListeningHistory { request_id: PageRequestId },
     Library {
         request_id: u64,
         generation: u64,
@@ -209,6 +210,7 @@ pub enum Request {
 }
 
 pub enum Response {
+    ListeningHistory { request_id: PageRequestId, plays: Result<Vec<crate::source::listening::journal::Play>, String> },
     Library {
         request_id: u64,
         generation: u64,
@@ -536,7 +538,8 @@ impl SourceWorker {
                 self.account_tx.try_send(AccountWork { request: req, session })
                     .map_err(|_| anyhow::anyhow!("account worker is busy or unavailable; try again shortly"))
             }
-            Request::Library { .. }
+            Request::ListeningHistory { .. }
+            | Request::Library { .. }
             | Request::OpenBrowse { .. }
             | Request::Search { .. }
             | Request::ArtistSongs { .. }
@@ -597,6 +600,7 @@ fn name(req: &Request) -> &'static str {
         Request::RetryReports => "RetryReports",
         Request::ClearReports => "ClearReports",
         Request::OpenBrowse { .. } => "OpenBrowse",
+        Request::ListeningHistory { .. } => "ListeningHistory",
         Request::OpenArtist { .. } => "OpenArtist",
         Request::ArtistSongs { .. } => "ArtistSongs",
         Request::Watch { .. } => "Watch",
@@ -983,6 +987,10 @@ fn run_metadata(rx: Arc<Inbox>, tx: Sender<Response>, account_generation: Arc<At
     while let Some(work) = rx.recv() {
         http.set_cancellation(work.cancel.clone());
         let response = match work.request {
+            Request::ListeningHistory { request_id } => Some(Response::ListeningHistory {
+                request_id, plays: crate::source::listening::journal::recent_plays()
+                    .map_err(|_| "Could not read the local listening history.".into()),
+            }),
             Request::Library { request_id, generation, category, endpoint, token, read_account } => {
                 let page = (|| {
                     if generation != account_generation.load(Ordering::SeqCst) {

@@ -626,6 +626,30 @@ pub struct Journal {
     plays: Vec<Play>,
 }
 
+/// Reads the local history for display without compacting the journal or
+/// contacting YouTube. Keep repeated listens and cap the in-memory page.
+pub(crate) fn recent_plays() -> anyhow::Result<Vec<Play>> {
+    let path = crate::runtime::config::dir()?.join(JOURNAL_FILE);
+    let file = match open_private(&path, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    read_recent_plays(BufReader::new(file))
+}
+
+fn read_recent_plays(reader: impl BufRead) -> anyhow::Result<Vec<Play>> {
+    let mut recent = VecDeque::new();
+    for line in reader.split(b'\n') {
+        let Ok(play) = serde_json::from_slice::<Play>(&line?) else { continue; };
+        if recent.len() == MAX_RECORDS { recent.pop_front(); }
+        recent.push_back(play);
+    }
+    let mut plays: Vec<_> = recent.into_iter().rev().collect();
+    plays.sort_by_key(|play| std::cmp::Reverse(play.at));
+    Ok(plays)
+}
+
 impl Journal {
     /// Reads the journal, or starts an empty one.
     ///
@@ -874,7 +898,8 @@ pub fn forget_pending_reports() -> std::io::Result<()> {
 /// Journal compaction remains on load; outbox appends and compaction share a
 /// lock so a checkpoint cannot disappear underneath a rewrite.
 pub fn record_final(track: &Track, report: PendingReport) {
-    let play = Play::new(track, Duration::from_secs(report.listened));
+    let mut play = Play::new(track, Duration::from_secs(report.listened));
+    play.at = report.at;
     if play.listened < NOISE {
         return;
     }
@@ -960,6 +985,18 @@ fn recency(at: u64, now: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_read_keeps_repeated_plays_in_timestamp_order_and_skips_bad_lines() {
+        let mut journal = Vec::new();
+        for (id, at) in [("repeat", 30), ("other", 10), ("repeat", 20)] {
+            serde_json::to_writer(&mut journal, &play(id, "Artist", 45, at)).unwrap();
+            journal.extend_from_slice(b"\n\xffbad\n");
+        }
+        let rows = read_recent_plays(journal.as_slice()).unwrap();
+        let order: Vec<_> = rows.iter().map(|play| (play.id.as_str(), play.at)).collect();
+        assert_eq!(order, [("repeat", 30), ("repeat", 20), ("other", 10)]);
+    }
 
     const DAY: u64 = 86_400;
 

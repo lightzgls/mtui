@@ -105,6 +105,9 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
     } else if app.view == View::Library {
         library::render(frame, app, content_area, mouse);
         None
+    } else if app.view == View::ListeningHistory {
+        pages::listening_history::render(frame, app, content_area, mouse);
+        None
     } else {
         let (list_area, cover_area) = split_cover(app, content_area);
         if let Some(area) = list_area {
@@ -114,7 +117,7 @@ pub fn render(frame: &mut Frame, app: &mut App, mouse: &mut MouseMap) {
                 View::Artist => render_artist(frame, app, area, mouse),
                 View::Library => library::render(frame, app, area, mouse),
                 // Handled above.
-                View::Playing => {}
+                View::Playing | View::ListeningHistory => {}
             }
         }
         cover_area

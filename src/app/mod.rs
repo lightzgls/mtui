@@ -90,6 +90,7 @@ pub struct App {
     pub query: String,
     pub query_cursor: usize,
     pub results: Vec<Track>,
+    pub(crate) listening_history: browse::listening_history::State,
     pub search_items: Vec<crate::source::catalog::search::Item>,
     pub search_filter: crate::source::catalog::search::Filter,
     /// Index into `results`. Meaningless when `results` is empty.
@@ -293,6 +294,7 @@ impl App {
             query_cursor: 0,
             results: Vec::new(),
             search_items: Vec::new(),
+            listening_history: Default::default(),
             search_filter: crate::source::catalog::search::Filter::All,
             selected: 0,
             offset: 0,

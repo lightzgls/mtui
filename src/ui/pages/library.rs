@@ -137,7 +137,8 @@ pub(in crate::ui) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse:
     let new_width = if app.library.connected && inner.width >= 29 {
         mouse.hinted_label(new_button, Some("N"), inner.width).width() as u16
     } else { 0 };
-    let title_width = inner.width.saturating_sub(new_width);
+    let history_width = if inner.width.saturating_sub(new_width) >= 25 { 9 } else { 0 };
+    let title_width = inner.width.saturating_sub(new_width + history_width);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -159,6 +160,10 @@ pub(in crate::ui) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse:
     if new_width > 0 {
         button(frame, mouse, Rect::new(inner.right() - new_width, inner.y, new_width, 1),
             new_button, false, true, MouseAction::NewLibraryPlaylist, accent);
+    }
+    if history_width > 0 {
+        button(frame, mouse, Rect::new(inner.x + title_width, inner.y, history_width, 1),
+            " History ", false, true, MouseAction::OpenListeningHistory, accent);
     }
     if inner.height < 2 {
         return;

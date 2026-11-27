@@ -630,7 +630,12 @@ platform, and a brief summary of the latest playback error in this session.
 The report contains no raw log lines, account data, or listening history. If
 your terminal blocks clipboard access, the report is also shown on screen.
 
-**Listening history.** With YouTube Music signed in, MTUI reports a song after
+**Listening history.** Open **Library → History** or **Menu → Listening history** to see recorded
+plays, newest first. The list shows the song, artist, and local time. Press
+Enter or double-click a row to play the song again. This list reads MTUI's local
+journal and is available without signing in. Press `r` to refresh it.
+
+With YouTube Music signed in, MTUI reports a song after
 30 seconds of actual playback. The local journal records the full listening
 duration when you skip, finish, or quit. Pauses, buffering, and seek jumps do not
 count as listening. Reports are persisted before network delivery, retried every 30

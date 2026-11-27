@@ -25,6 +25,7 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Library,
+    ListeningHistory,
     /// The landing page: YouTube Music's home feed as shelves of cards. What
     /// the program opens on, because a music player that opens on an empty list
     /// asks the user to think of something before it will do anything.
@@ -57,6 +58,7 @@ pub(in crate::app) struct TrackPage {
 #[derive(Debug, Clone)]
 pub(in crate::app) enum HistoryEntry {
     Library { cursor: library::Cursor, status: String },
+    ListeningHistory(super::listening_history::State),
     Home {
         status: String,
     },
@@ -75,6 +77,7 @@ impl HistoryEntry {
     pub(in crate::app) fn view(&self) -> View {
         match self {
             Self::Library { .. } => View::Library,
+            Self::ListeningHistory(_) => View::ListeningHistory,
             Self::Home { .. } => View::Home,
             Self::Tracks(_) => View::Tracks,
             Self::Artist { .. } => View::Artist,
@@ -87,6 +90,7 @@ impl HistoryEntry {
 pub(in crate::app) enum PageRequestKind {
     Search,
     Browse,
+    ListeningHistory,
     Artist,
 }
 
@@ -167,6 +171,7 @@ impl App {
     pub fn list_title(&self) -> String {
         match (self.view, &self.browsing) {
             (View::Library, _) => " library ".into(),
+            (View::ListeningHistory, _) => " listening history ".into(),
             (View::Home, _) => " home ".to_string(),
             (View::Playing, _) => " now playing ".to_string(),
             (View::Artist, _) => self
@@ -196,6 +201,7 @@ impl App {
     pub(in crate::app) fn current_page(&self) -> Option<HistoryEntry> {
         match self.view {
             View::Library => Some(HistoryEntry::Library { cursor: self.library.cursor(), status: self.status.clone() }),
+            View::ListeningHistory => Some(HistoryEntry::ListeningHistory(self.listening_history.clone())),
             View::Home => Some(HistoryEntry::Home {
                 status: self.status.clone(),
             }),
@@ -251,6 +257,11 @@ impl App {
                 self.view = View::Library;
                 self.status = status;
                 if self.library.connected && !self.library.collection().loaded { self.request_library(false); }
+            }
+            HistoryEntry::ListeningHistory(state) => {
+                self.listening_history = state;
+                self.view = View::ListeningHistory;
+                self.status.clear();
             }
             HistoryEntry::Home { status } => {
                 self.status = status;

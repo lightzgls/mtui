@@ -262,6 +262,7 @@ impl App {
 
     pub(in crate::app) fn context_artist(&self) -> Option<ArtistRef> {
         match self.view {
+            View::ListeningHistory => None,
             View::Library => card_artist(&self.library.selected()?.card),
             View::Home => card_artist(self.home_card()?),
             View::Tracks => self.search_items.get(self.selected)

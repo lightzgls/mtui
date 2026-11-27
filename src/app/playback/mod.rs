@@ -945,6 +945,7 @@ impl App {
     /// row in the results.
     pub(super) fn selected_id(&self) -> Option<String> {
         match self.view {
+            View::ListeningHistory => self.listening_history.rows.get(self.listening_history.selected).map(|play| play.id.clone()),
             View::Library => self.library.selected().and_then(|item| item.available.then_some(item)).and_then(|item| item.track.as_ref()).map(|track| track.id.clone()),
             View::Tracks => Some(self.selected_result_track()?.id.clone()),
             View::Home => match &self.home_card()?.target {

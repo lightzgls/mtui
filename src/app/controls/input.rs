@@ -28,6 +28,9 @@ pub enum MouseAction {
     OpenLikedMusic,
     LibrarySignIn,
     NewLibraryPlaylist,
+    OpenListeningHistory,
+    PlayHistoryTrack(usize),
+    SelectHistoryTrack(usize),
     OpenPlayer,
     OpenAppMenu,
     EditSearch,
@@ -200,6 +203,7 @@ impl App {
             Mode::Editing => self.handle_editing_key(key),
             Mode::Browse => match self.view {
                 View::Library => self.handle_library_key(key),
+                View::ListeningHistory => self.handle_listening_history_key(key),
                 View::Home => self.handle_home_key(key),
                 View::Tracks => self.handle_browse_key(key),
                 View::Artist => self.handle_artist_key(key),
@@ -258,7 +262,7 @@ impl App {
         if self.mode == Mode::Editing && (matches!(action,
             MouseAction::SelectHomeCard { .. } | MouseAction::SelectTrack(_)
                 | MouseAction::SelectArtistSong(_) | MouseAction::SelectArtistCard { .. }
-                | MouseAction::SelectLibraryItem(_))
+                | MouseAction::SelectLibraryItem(_) | MouseAction::SelectHistoryTrack(_))
             || (self.view == View::Playing && matches!(action, MouseAction::SelectPageRow(_))))
         {
             self.cancel_search_request();
@@ -295,6 +299,11 @@ impl App {
             MouseAction::OpenLikedMusic if self.view == View::Library => self.open_liked_music(),
             MouseAction::LibrarySignIn if self.view == View::Library => self.begin_music_sign_in(false),
             MouseAction::NewLibraryPlaylist if self.view == View::Library && self.library.connected => self.new_playlist(None),
+            MouseAction::OpenListeningHistory => self.open_listening_history(),
+            MouseAction::PlayHistoryTrack(index) if self.view == View::ListeningHistory => self.play_history_track(index),
+            MouseAction::SelectHistoryTrack(index) if self.view == View::ListeningHistory => {
+                if index < self.listening_history.rows.len() { self.listening_history.selected = index; }
+            }
             MouseAction::OpenPlayer => self.open_player(),
             MouseAction::OpenAppMenu => self.toggle_root_menu(),
             MouseAction::OpenPageActions if self.mode == Mode::Browse => {

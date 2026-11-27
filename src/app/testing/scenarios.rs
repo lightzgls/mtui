@@ -614,7 +614,7 @@ fn player_button_shortcuts_leave_search_text_entry_and_modals_in_control() {
 fn song_clicks_select_then_double_click_enter_or_context_menu_works_across_pages() {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     for activation in ["double-click", "Enter", "context menu"] {
-        for view in [View::Home, View::Tracks, View::Artist, View::Library, View::Playing] {
+        for view in [View::Home, View::Tracks, View::Artist, View::Library, View::ListeningHistory, View::Playing] {
             let (mut app, driver, requests) = fixture();
             queue(&mut app, RepeatMode::Off, 0);
             let action = match view {
@@ -640,6 +640,10 @@ fn song_clicks_select_then_double_click_enter_or_context_menu_works_across_pages
                         card: song_card(9), track: Some(track(9)), available: true,
                     }];
                     MouseAction::OpenLibraryItem(0)
+                }
+                View::ListeningHistory => {
+                    app.listening_history.rows = vec![crate::source::listening::journal::Play::new(&track(9), Duration::from_secs(30))].into();
+                    MouseAction::PlayHistoryTrack(0)
                 }
                 View::Playing => {
                     let now = app.now.as_mut().unwrap();
@@ -806,7 +810,7 @@ fn drags_timeouts_page_changes_and_replaced_songs_cannot_complete_an_old_double_
 #[test]
 fn selected_song_menus_queue_the_correct_song_on_every_browsing_page_without_interrupting_playback() {
     use crate::source::catalog::search::{Filter, Item};
-    for view in [View::Home, View::Tracks, View::Artist, View::Library, View::Playing] {
+    for view in [View::Home, View::Tracks, View::Artist, View::Library, View::ListeningHistory, View::Playing] {
         for next in [true, false] {
             let (mut app, driver, requests) = fixture();
             queue(&mut app, RepeatMode::Off, 0);
@@ -833,6 +837,9 @@ fn selected_song_menus_queue_the_correct_song_on_every_browsing_page_without_int
                     app.library.collection_mut().items = vec![crate::source::catalog::library::browse::Item {
                         card: song_card(9), track: Some(track(9)), available: true,
                     }];
+                }
+                View::ListeningHistory => {
+                    app.listening_history.rows = vec![crate::source::listening::journal::Play::new(&track(9), Duration::from_secs(30))].into();
                 }
                 View::Playing => {
                     let now = app.now.as_mut().unwrap();
