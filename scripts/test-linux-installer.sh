@@ -44,22 +44,22 @@ if [[ ${1:-} == worker ]]; then
         fi
     }
     # These mocks are called indirectly through the installer's command array.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     sudo() { "$@"; }
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     record_package_manager() {
         printf '%s\n' "$*" >> "$HOME/actions"
         [[ $scenario != dependency-failure ]] || return 1
         if [[ $* != 'apt-get update' ]]; then touch "$HOME/dependencies"; fi
     }
-    # shellcheck disable=SC2317,SC2032
+    # shellcheck disable=SC2317,SC2329,SC2032
     apt-get() { record_package_manager apt-get "$@"; }
     apt-cache() { [[ $scenario != old-debian ]]; }
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     dnf() { record_package_manager dnf "$@"; }
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     pacman() { record_package_manager pacman "$@"; }
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     zypper() { record_package_manager zypper "$@"; }
     if [[ $scenario == conflict ]]; then
         mkdir -p "$HOME/.local/bin"
@@ -106,19 +106,19 @@ if [[ ${1:-} == worker ]]; then
         if [[ $scenario == package-uninstall ]]; then
             export TEST_NATIVE_MANAGER=$manager_name
             # These are exported into the generated standalone uninstaller.
-            # shellcheck disable=SC2317
+            # shellcheck disable=SC2317,SC2329
             dpkg-query() { [[ $TEST_NATIVE_MANAGER == apt-get ]] && printf 'installed'; }
-            # shellcheck disable=SC2317,SC2032
+            # shellcheck disable=SC2317,SC2329,SC2032
             apt-get() { printf 'apt-get %s\n' "$*" >> "$HOME/actions"; }
-            # shellcheck disable=SC2317
+            # shellcheck disable=SC2317,SC2329
             pacman() { if [[ $1 == -Q ]]; then [[ $TEST_NATIVE_MANAGER == pacman ]]; else printf 'pacman %s\n' "$*" >> "$HOME/actions"; fi; }
-            # shellcheck disable=SC2317
+            # shellcheck disable=SC2317,SC2329
             rpm() { if [[ $1 == -q ]]; then [[ $TEST_NATIVE_MANAGER == dnf || $TEST_NATIVE_MANAGER == zypper || $TEST_NATIVE_MANAGER == rpm ]]; else printf 'rpm %s\n' "$*" >> "$HOME/actions"; fi; }
-            # shellcheck disable=SC2317
+            # shellcheck disable=SC2317,SC2329
             dnf() { printf 'dnf %s\n' "$*" >> "$HOME/actions"; }
-            # shellcheck disable=SC2317
+            # shellcheck disable=SC2317,SC2329
             zypper() { printf 'zypper %s\n' "$*" >> "$HOME/actions"; }
-            # shellcheck disable=SC2317
+            # shellcheck disable=SC2317,SC2329
             apk() { if [[ $1 == info ]]; then [[ $TEST_NATIVE_MANAGER == apk ]]; else printf 'apk %s\n' "$*" >> "$HOME/actions"; fi; }
             export -f dpkg-query pacman rpm apk apt-get sudo
             case $manager_name in dnf) export -f dnf ;; zypper) export -f zypper ;; esac
