@@ -578,8 +578,9 @@ match. Automatic recovery and manual Retry both bypass failed cached URLs.
 An opening HTTP 403 triggers one fresh-URL recovery before an error is shown.
 
 **Cover art.** The player and Discord prefer the track's square YouTube Music
-artwork. If Music artwork is missing or cannot be downloaded or decoded, MTUI
-falls back to the YouTube video thumbnail.
+artwork. After the Music lookup finishes, Discord uses the YouTube video
+thumbnail if no Music artwork is available. The player also falls back to the
+video thumbnail if Music artwork cannot be downloaded or decoded.
 
 **Graphics.** MTUI detects Kitty graphics and Sixel support automatically. The
 Settings panel's **Artwork display** choice can keep automatic detection, force

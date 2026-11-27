@@ -115,8 +115,8 @@ pub struct Activity {
     /// lines are already spent on the title and the artist. `None` for the
     /// singles and plain YouTube uploads that genuinely have no album.
     pub album: Option<String>,
-    /// Native square artwork, once the Music watch response has arrived.
-    /// `None` publishes no cover image; video thumbnails are never substituted.
+    /// Native Music artwork, or a video thumbnail when the Music lookup has
+    /// finished without a cover. `None` waits for that lookup without an image.
     pub artwork_url: Option<String>,
     pub paused: bool,
     /// Where the progress bar should be, or `None` for no bar at all.
@@ -920,7 +920,7 @@ mod tests {
         assert_eq!(payload["large_text"], serde_json::Value::Null);
         assert_eq!(payload["assets"]["large_text"], "Currents");
         assert_eq!(payload["assets"]["large_url"], REPOSITORY);
-        assert!(payload["assets"].get("large_image").is_none(), "wait for Music artwork instead of publishing a video thumbnail");
+        assert!(payload["assets"].get("large_image").is_none(), "wait for artwork selection");
         assert_eq!(payload["timestamps"]["start"], 1_700_000_000_000u64);
         assert_eq!(payload["timestamps"]["end"], 1_700_000_467_000u64);
 
@@ -953,12 +953,17 @@ mod tests {
     }
 
     #[test]
-    fn native_music_artwork_is_the_only_image_published() {
+    fn selected_artwork_is_published_and_changes_the_card() {
         let waiting = activity();
         assert!(waiting.payload()["assets"].get("large_image").is_none());
+        let mut video = waiting.clone();
+        video.artwork_url = Some("https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg".into());
+        assert!(!waiting.same_as(&video));
+        assert_eq!(video.payload()["assets"]["large_image"], video.artwork_url.as_deref().unwrap());
         let mut sleeve = waiting.clone();
         sleeve.artwork_url = Some("https://lh3.googleusercontent.com/sleeve=w544-h544-l90-rj".into());
         assert!(!waiting.same_as(&sleeve));
+        assert!(!video.same_as(&sleeve));
         assert_eq!(sleeve.payload()["assets"]["large_image"], sleeve.artwork_url.unwrap());
     }
 

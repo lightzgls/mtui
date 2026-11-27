@@ -1231,6 +1231,28 @@ fn discord_artwork_follows_only_the_current_tracks_watch_response() {
 }
 
 #[test]
+fn discord_uses_video_artwork_when_music_metadata_has_no_cover() {
+    for watch in [Ok(Watch::default()), Err("Music metadata unavailable".into())] {
+        let (mut app, driver, _requests) = fixture();
+        app.play_track(track(0), false);
+        state(&driver, PlayState::Playing, Duration::from_secs(10));
+        assert!(app.activity().unwrap().artwork_url.is_none(), "wait for Music metadata first");
+
+        app.apply_watch("song-0", watch);
+        assert_eq!(app.activity().unwrap().artwork_url.as_deref(),
+            Some("https://i.ytimg.com/vi/song-0/mqdefault.jpg"),
+            "a video without Music artwork must show its thumbnail instead of the app icon");
+
+        app.play_track(track(1), false);
+        app.apply_watch("song-0", Ok(Watch::default()));
+        assert!(app.activity().unwrap().artwork_url.is_none(), "stale metadata must not select a fallback");
+        app.apply_watch("song-1", Ok(Watch::default()));
+        assert_eq!(app.activity().unwrap().artwork_url.as_deref(),
+            Some("https://i.ytimg.com/vi/song-1/mqdefault.jpg"));
+    }
+}
+
+#[test]
 fn cover_requests_wait_for_music_metadata_and_use_video_only_as_fallback() {
     let sleeve = "https://lh3.googleusercontent.com/sleeve=w544-h544-l90-rj";
     for (watch, expected) in [

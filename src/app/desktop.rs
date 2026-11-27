@@ -76,7 +76,11 @@ impl App {
                 artist => artist.to_string(),
             },
             album: now.album.clone(),
-            artwork_url: now.artwork_url.clone(),
+            // Wait for Music metadata so a native cover does not briefly flash
+            // a video thumbnail. Videos with no Music cover still need an image.
+            artwork_url: now.artwork_url.clone().or_else(|| {
+                now.watched.then(|| crate::source::cover::thumb_url(&now.video_id))
+            }),
             paused,
             clock,
         })
