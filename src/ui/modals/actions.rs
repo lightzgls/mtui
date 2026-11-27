@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::app::{App, MouseAction, NowPlaying, Tab, View};
 use crate::app::controls::actions::PlaylistPicker;
+use crate::app::controls::playlist::Editor;
 use crate::ui::shell;
 use crate::ui::mouse::{MouseMap, MouseTarget};
 use crate::ui::palette::ambient;
@@ -185,7 +186,7 @@ pub(in crate::ui) fn playlists(
     } else if let Some(error) = picker.error.as_deref() {
         Some(error)
     } else if picker.choices.is_empty() {
-        Some("No editable playlists yet. Create one in YouTube Music, then refresh.")
+        Some("No editable playlists yet.")
     } else {
         None
     };
@@ -238,7 +239,9 @@ pub(in crate::ui) fn playlists(
     let footer = dialog.footer;
     let refresh = mouse.hinted_label("Refresh", Some("r"), footer.width);
     let right = refresh.width() as u16;
-    let available = footer.width.saturating_sub(right + 1);
+    let create = mouse.hinted_label("New playlist", Some("N"), footer.width.saturating_sub(right + 1));
+    let create_width = create.width() as u16;
+    let available = footer.width.saturating_sub(right + create_width + 2);
     frame.render_widget(
         Paragraph::new(truncate(
             picker.notice.as_deref().unwrap_or(if mouse.show_key_hints() { "Enter save · Esc close" } else { "" }),
@@ -257,12 +260,63 @@ pub(in crate::ui) fn playlists(
             .targets
             .push(MouseTarget::Area(rect, MouseAction::RetryPlaylists));
     }
+    if !picker.loading && !picker.saving && !footer.is_empty() && create_width > 0 && create_width + right < footer.width {
+        let rect = Rect::new(footer.right() - right - create_width - 1, footer.y, create_width, 1);
+        frame.render_widget(Paragraph::new(create).style(Style::default().fg(accent)), rect);
+        mouse.targets.push(MouseTarget::Area(rect, MouseAction::NewPlaylistForSong));
+    }
+}
+
+fn edit_playlist(frame: &mut Frame, editor: &Editor, accent: Color, mouse: &mut MouseMap) {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let dialog = chrome(frame, editor.heading(), 11, mouse);
+    let body = dialog.body;
+    if body.is_empty() { return; }
+    let width = body.width.saturating_sub(2);
+    let x = body.x + 1;
+    let mut y = body.y;
+    if let Some(title) = editor.title() {
+        let input = Rect::new(x, y, width, 1);
+        let before = &title[..editor.cursor];
+        let room = usize::from(width.saturating_sub(1));
+        let mut start = editor.cursor;
+        let mut used = 0;
+        for (at, grapheme) in before.grapheme_indices(true).rev() {
+            used += display_width(grapheme);
+            if used > room { break; }
+            start = at;
+        }
+        let value = if title.is_empty() { "Playlist name" } else { &title[start..] };
+        let color = if title.is_empty() { Color::DarkGray } else { Color::White };
+        frame.render_widget(Paragraph::new(truncate(value, width as usize)).style(Style::default().fg(color)), input);
+        if editor.request_id.is_none() && width > 0 {
+            frame.set_cursor_position((x + display_width(&title[start..editor.cursor]) as u16, y));
+        }
+        y += 1;
+    }
+    let (text, color) = match (editor.request_id, editor.error.as_deref()) {
+        (Some(_), _) => ("Waiting for YouTube Music…", Color::Gray),
+        (_, Some(error)) => (error, Color::Yellow),
+        _ => (editor.prompt.as_str(), Color::Gray),
+    };
+    if y < body.bottom() {
+        frame.render_widget(Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: true })
+            .style(Style::default().fg(color)), Rect::new(x, y, width, body.bottom() - y));
+    }
+    if editor.request_id.is_none() && !dialog.footer.is_empty() {
+        let label = mouse.hinted_label(editor.submit_label(), Some("Enter"), dialog.footer.width);
+        let button = Rect::new(dialog.footer.x, dialog.footer.y, label.width() as u16, 1);
+        frame.render_widget(Paragraph::new(label).style(Style::default().fg(accent)), button);
+        mouse.targets.push(MouseTarget::Area(button, MouseAction::SubmitPlaylistEdit));
+    }
 }
 
 pub(in crate::ui) fn overlay(frame: &mut Frame, app: &App, mouse: &mut MouseMap) {
     match &app.overlay {
         crate::app::Overlay::Share { url, notice } => share(frame, url, notice.as_deref(), mouse),
         crate::app::Overlay::SavePlaylist(picker) => playlists(frame, picker, ambient(app), mouse),
+        crate::app::Overlay::EditPlaylist(editor) => edit_playlist(frame, editor, ambient(app), mouse),
         _ => {}
     }
 }

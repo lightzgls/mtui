@@ -47,6 +47,7 @@ fn button(
         MouseAction::LibrarySort => Some("o".into()),
         MouseAction::RefreshLibrary => Some("r".into()),
         MouseAction::LibrarySignIn => Some("M".into()),
+        MouseAction::NewLibraryPlaylist => Some("N".into()),
         _ => None,
     };
     frame.render_widget(
@@ -132,6 +133,11 @@ pub(in crate::ui) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse:
     } else {
         "Not signed in"
     };
+    let new_button = " New playlist ";
+    let new_width = if app.library.connected && inner.width >= 29 {
+        mouse.hinted_label(new_button, Some("N"), inner.width).width() as u16
+    } else { 0 };
+    let title_width = inner.width.saturating_sub(new_width);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -143,13 +149,17 @@ pub(in crate::ui) fn render(frame: &mut Frame, app: &mut App, area: Rect, mouse:
             Span::styled(
                 format!(
                     " · {}",
-                    truncate(account, inner.width.saturating_sub(10) as usize)
+                    truncate(account, title_width.saturating_sub(10) as usize)
                 ),
                 Style::default().fg(Color::Gray),
             ),
         ])),
-        Rect::new(inner.x, inner.y, inner.width, 1),
+        Rect::new(inner.x, inner.y, title_width, 1),
     );
+    if new_width > 0 {
+        button(frame, mouse, Rect::new(inner.right() - new_width, inner.y, new_width, 1),
+            new_button, false, true, MouseAction::NewLibraryPlaylist, accent);
+    }
     if inner.height < 2 {
         return;
     }

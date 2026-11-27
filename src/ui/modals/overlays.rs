@@ -29,7 +29,7 @@ pub(in crate::ui) fn render_overlay(frame: &mut Frame, app: &App, mouse: &mut Mo
         Overlay::SignIn(phase) => render_sign_in(frame, phase),
         Overlay::Message { body } => render_message(frame, body),
         Overlay::Settings => preferences::render(frame, app, mouse),
-        Overlay::Share { .. } | Overlay::SavePlaylist(_) => actions::overlay(frame, app, mouse),
+        Overlay::Share { .. } | Overlay::SavePlaylist(_) | Overlay::EditPlaylist(_) => actions::overlay(frame, app, mouse),
     }
 }
 

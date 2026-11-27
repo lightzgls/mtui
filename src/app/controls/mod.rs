@@ -3,4 +3,5 @@
 pub(crate) mod actions;
 pub(super) mod input;
 pub(super) mod menu;
+pub(crate) mod playlist;
 pub(crate) mod preferences;

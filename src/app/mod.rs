@@ -64,6 +64,7 @@ pub enum Overlay {
     Settings,
     Share { url: String, notice: Option<String> },
     SavePlaylist(Box<actions::PlaylistPicker>),
+    EditPlaylist(Box<controls::playlist::Editor>),
 }
 
 impl Overlay {

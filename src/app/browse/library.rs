@@ -187,6 +187,15 @@ impl App {
         self.request_library(false);
     }
 
+    pub(in crate::app) fn refresh_playlist_library(&mut self) {
+        for category in [Category::All, Category::Playlists] {
+            self.library.collections[category.index()].loaded = false;
+        }
+        if self.view == View::Library && matches!(self.library.category, Category::All | Category::Playlists) {
+            self.request_library(false);
+        }
+    }
+
     pub(in crate::app) fn request_library(&mut self, append: bool) {
         if !self.library.connected {
             return;
@@ -454,6 +463,7 @@ impl App {
             KeyCode::Char('H') | KeyCode::Esc => self.go_home(),
             KeyCode::Char('P') | KeyCode::Char('p') => self.open_player(),
             KeyCode::Char('M') => self.begin_music_sign_in(false),
+            KeyCode::Char('N') if self.library.connected => self.new_playlist(None),
             KeyCode::Char('S') => self.open_settings(),
             KeyCode::Char('B') => self.background(),
             KeyCode::Char('q') => self.should_quit = true,
@@ -469,11 +479,12 @@ impl App {
 
     pub(in crate::app) fn library_action_items(&self) -> Vec<MenuItem> {
         vec![
+            MenuItem::action("New playlist", Some("N"), self.library.connected, Some("Library"), MenuAction::NewPlaylist),
             MenuItem::action(
                 "Open or play selected item",
                 Some("Enter"),
                 self.library.selected().is_some_and(|item| item.available),
-                Some("Library"),
+                None,
                 MenuAction::OpenLibrarySelection,
             ),
             MenuItem::action(

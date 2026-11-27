@@ -76,6 +76,7 @@ pub enum Request {
     SetRating { request_id: u64, video_id: String, liked: bool },
     Playlists { request_id: u64, video_id: String },
     SaveToPlaylist { request_id: u64, video_id: String, playlist_id: String },
+    ChangePlaylist { request_id: u64, change: crate::source::catalog::library::PlaylistChange },
     Search {
         request_id: PageRequestId,
         query: String,
@@ -217,6 +218,7 @@ pub enum Response {
     Rating { request_id: u64, video_id: String, changed: bool, result: Result<bool, String> },
     Playlists { request_id: u64, choices: Result<Vec<crate::source::catalog::library::Playlist>, String> },
     PlaylistSaved { request_id: u64, result: Result<(), String> },
+    PlaylistChanged { request_id: u64, result: Result<(), String> },
     Results {
         request_id: PageRequestId,
         tracks: Result<Vec<crate::source::catalog::search::Item>, String>,
@@ -528,7 +530,8 @@ impl SourceWorker {
             Request::Rating { .. }
             | Request::SetRating { .. }
             | Request::Playlists { .. }
-            | Request::SaveToPlaylist { .. } => {
+            | Request::SaveToPlaylist { .. }
+            | Request::ChangePlaylist { .. } => {
                 let session = Session::capture(self.account_generation.clone())?;
                 self.account_tx.try_send(AccountWork { request: req, session })
                     .map_err(|_| anyhow::anyhow!("account worker is busy or unavailable; try again shortly"))
@@ -582,6 +585,7 @@ fn name(req: &Request) -> &'static str {
         Request::SetRating { .. } => "SetRating",
         Request::Playlists { .. } => "Playlists",
         Request::SaveToPlaylist { .. } => "SaveToPlaylist",
+        Request::ChangePlaylist { .. } => "ChangePlaylist",
         Request::Search { .. } => "Search",
         Request::Resolve { .. } => "Resolve",
         Request::Prefetch { .. } => "Prefetch",
@@ -961,6 +965,9 @@ fn run_accounts(rx: Receiver<AccountWork>, tx: Sender<Response>) {
             }),
             Request::SaveToPlaylist { request_id, video_id, playlist_id } => Some(Response::PlaylistSaved {
                 request_id, result: crate::source::catalog::library::save_for(&http, &work.session, &video_id, &playlist_id).map_err(|e| e.to_string()),
+            }),
+            Request::ChangePlaylist { request_id, change } => Some(Response::PlaylistChanged {
+                request_id, result: crate::source::catalog::library::change_playlist(&http, &work.session, &change).map_err(|e| e.to_string()),
             }),
             other => {
                 debug_assert!(false, "{} was routed to the account thread", name(&other));

@@ -18,6 +18,62 @@ pub struct Playlist {
     pub contains: Option<bool>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum PlaylistChange {
+    Create { title: String, video_id: Option<String> },
+    Rename { id: String, title: String },
+    Remove { id: String, video_id: String, entry_id: String },
+    MoveBefore { id: String, entry_id: String, successor: String },
+}
+
+pub(crate) fn change_playlist(http: &Http, session: &Session, change: &PlaylistChange) -> Result<()> {
+    change_playlist_with(change, |endpoint, body| post(http, session, endpoint, body))
+}
+
+pub(crate) fn playlist_title(title: &str) -> Result<&str> {
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 150 || title.contains(['<', '>'])
+        || title.chars().any(char::is_control)
+    {
+        bail!("Enter a name of 1–150 characters without < or >.");
+    }
+    Ok(title)
+}
+
+fn change_playlist_with(
+    change: &PlaylistChange,
+    request: impl FnOnce(&str, Value) -> Result<Value>,
+) -> Result<()> {
+    let (id, action) = match change {
+        PlaylistChange::Create { title, video_id } => {
+            let mut body = json!({"title": playlist_title(title)?, "description": "", "privacyStatus": "PRIVATE"});
+            if let Some(video_id) = video_id {
+                body["videoIds"] = json!([video_id]);
+            }
+            let result = request("playlist/create", body)?;
+            if result["playlistId"].as_str().is_some_and(|id| !id.is_empty()) {
+                return Ok(());
+            }
+            bail!("Creation was not confirmed. Check your Library before trying again.");
+        }
+        PlaylistChange::Rename { id, title } => (id, json!({
+            "action": "ACTION_SET_PLAYLIST_NAME", "playlistName": playlist_title(title)?
+        })),
+        PlaylistChange::Remove { id, video_id, entry_id } => (id, json!({
+            "action": "ACTION_REMOVE_VIDEO", "removedVideoId": video_id, "setVideoId": entry_id
+        })),
+        PlaylistChange::MoveBefore { id, entry_id, successor } => (id, json!({
+            "action": "ACTION_MOVE_VIDEO_BEFORE", "setVideoId": entry_id,
+            "movedSetVideoIdSuccessor": successor
+        })),
+    };
+    let result = request("browse/edit_playlist", json!({"playlistId": id, "actions": [action]}))?;
+    if result["status"].as_str() != Some("STATUS_SUCCEEDED") {
+        bail!("The edit was not confirmed. Refresh the playlist before trying again.");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn session() -> Result<Session> {
     Session::current()
@@ -280,6 +336,18 @@ fn confirmed_save(json: &Value, video_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creating_with_a_song_makes_one_private_write_and_requires_a_playlist_id() {
+        let change = PlaylistChange::Create { title: " Evening ".into(), video_id: Some("video".into()) };
+        let result = change_playlist_with(&change, |endpoint, body| {
+            assert_eq!(endpoint, "playlist/create");
+            assert_eq!(body, json!({"title":"Evening", "description":"", "privacyStatus":"PRIVATE", "videoIds":["video"]}));
+            Ok(json!({"playlistId":"PLnew"}))
+        });
+        assert!(result.is_ok());
+        assert!(change_playlist_with(&change, |_, _| Ok(json!({"status":"STATUS_SUCCEEDED"}))).is_err());
+    }
 
     #[test]
     fn overlay_rating_requires_the_matching_target() {

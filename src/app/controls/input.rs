@@ -27,6 +27,7 @@ pub enum MouseAction {
     RefreshLibrary,
     OpenLikedMusic,
     LibrarySignIn,
+    NewLibraryPlaylist,
     OpenPlayer,
     OpenAppMenu,
     EditSearch,
@@ -62,6 +63,8 @@ pub enum MouseAction {
     SavePlaying,
     OpenPlayerActions,
     ChoosePlaylist(usize),
+    NewPlaylistForSong,
+    SubmitPlaylistEdit,
     ClosePlayerDialog,
     RetryPlaylists,
     CopyShareLink,
@@ -291,6 +294,7 @@ impl App {
             MouseAction::RefreshLibrary if self.view == View::Library => self.refresh_library(),
             MouseAction::OpenLikedMusic if self.view == View::Library => self.open_liked_music(),
             MouseAction::LibrarySignIn if self.view == View::Library => self.begin_music_sign_in(false),
+            MouseAction::NewLibraryPlaylist if self.view == View::Library && self.library.connected => self.new_playlist(None),
             MouseAction::OpenPlayer => self.open_player(),
             MouseAction::OpenAppMenu => self.toggle_root_menu(),
             MouseAction::OpenPageActions if self.mode == Mode::Browse => {
@@ -522,6 +526,7 @@ impl App {
     pub(in crate::app) fn handle_overlay_key(&mut self, key: KeyEvent) -> Result<()> {
         if self.handle_player_dialog_key(key) { return Ok(()); }
         match &mut self.overlay {
+            Overlay::EditPlaylist(_) => self.playlist_editor_key(key),
             Overlay::Share { .. } | Overlay::SavePlaylist(_) => {}
             Overlay::None => {}
             // A failed session import is the one phase with somewhere to go:

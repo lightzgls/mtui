@@ -382,6 +382,11 @@ Like and playlist saves use the signed-in account and show pending, confirmed,
 or failed states. The playlist picker marks songs already saved and keeps the
 song it was opened for even if playback moves to another track.
 
+To create a private YouTube Music playlist, choose **New playlist** in Library
+or press `N`. Choose **New playlist** in **Save to playlist** to include the
+current song when creating it. Open a playlist you own and use **Edit** or
+press `.` to rename it, remove the selected song, or move that song up or down.
+
 `Ctrl-K` shows a compact menu grouped into navigation, app preferences, and
 window actions. Its displayed shortcuts work while the menu is open. Settings
 groups audio output and precision volume under Playback, cover choices under Appearance,

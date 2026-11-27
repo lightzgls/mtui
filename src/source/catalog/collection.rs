@@ -15,6 +15,9 @@ pub struct Details {
     pub description: String,
     pub art: Option<String>,
     pub truncated: bool,
+    /// Present only for playlists YouTube Music marks editable. Entries align
+    /// with the displayed tracks, including repeated video IDs.
+    pub editable_entries: Option<Vec<Option<String>>>,
 }
 
 pub struct Page {
@@ -67,7 +70,12 @@ pub fn fetch(http: &Http, endpoint: &BrowseEndpoint, title: &str) -> Result<Page
         token = page_continuation(&json);
         let remaining = MAX_TRACKS - page.tracks.len();
         page.details.truncated |= more.len() > remaining;
-        page.tracks.extend(more.into_iter().take(remaining));
+        for (track, entry) in more.into_iter().take(remaining) {
+            page.tracks.push(track);
+            if let Some(entries) = &mut page.details.editable_entries {
+                entries.push(entry);
+            }
+        }
     }
     page.details.truncated |= token.is_some();
     Ok(page)
@@ -100,7 +108,7 @@ fn track_contents(json: &Value) -> Option<&Value> {
     find(json, "musicShelfRenderer").and_then(|shelf| shelf.get("contents"))
 }
 
-fn tracks(contents: &Value) -> Vec<Track> {
+fn tracks(contents: &Value) -> Vec<(Track, Option<String>)> {
     contents
         .as_array()
         .into_iter()
@@ -110,7 +118,17 @@ fn tracks(contents: &Value) -> Vec<Track> {
             row["musicItemRendererDisplayPolicy"].as_str()
                 != Some("MUSIC_ITEM_RENDERER_DISPLAY_POLICY_GREY_OUT")
         })
-        .filter_map(home::parse_row)
+        .filter_map(|row| {
+            let track = home::parse_row(row)?;
+            let from_menu = || row.pointer("/menu/menuRenderer/items")?.as_array()?.iter()
+                .filter_map(|item| item.pointer("/menuServiceItemRenderer/serviceEndpoint/playlistEditEndpoint/actions")?.as_array())
+                .flatten()
+                .find(|action| action["action"] == "ACTION_REMOVE_VIDEO" && action["removedVideoId"] == track.id)
+                .and_then(|action| action["setVideoId"].as_str());
+            let entry = row.pointer("/playlistItemData/playlistSetVideoId").and_then(Value::as_str)
+                .or_else(from_menu).filter(|id| !id.is_empty()).map(str::to_owned);
+            Some((track, entry))
+        })
         .take(MAX_TRACKS + 1)
         .collect()
 }
@@ -165,9 +183,15 @@ fn parse(json: &Value, fallback: &str) -> Result<Page> {
     }
     let header = find(json, "musicResponsiveHeaderRenderer")
         .or_else(|| find(json, "musicDetailHeaderRenderer"));
-    let Some(contents) = track_contents(json) else {
-        bail!("This collection is unavailable. It may be private, removed, or require sign-in.");
+    let editable = find(json, "musicEditablePlaylistDetailHeaderRenderer").is_some();
+    let contents = if editable {
+        find(json, "musicPlaylistShelfRenderer").and_then(|shelf| shelf.get("contents"))
+    } else {
+        track_contents(json)
     };
+    if contents.is_none() && !editable {
+        bail!("This collection is unavailable. It may be private, removed, or require sign-in.");
+    }
     let header = header.unwrap_or(&Value::Null);
     let title = text(&header["title"]);
     let subtitle = [text(&header["subtitle"]), text(&header["secondSubtitle"])]
@@ -178,9 +202,10 @@ fn parse(json: &Value, fallback: &str) -> Result<Page> {
     let description = find(&header["description"], "description")
         .map(text)
         .unwrap_or_else(|| text(&header["description"]));
-    let mut tracks = tracks(contents);
+    let mut tracks = contents.map_or_else(Vec::new, tracks);
     let truncated = tracks.len() > MAX_TRACKS;
     tracks.truncate(MAX_TRACKS);
+    let (tracks, entries) = tracks.into_iter().unzip();
     Ok(Page {
         details: Details {
             title: if title.is_empty() {
@@ -192,6 +217,7 @@ fn parse(json: &Value, fallback: &str) -> Result<Page> {
             description: description.chars().take(600).collect(),
             art: home::art_url(header.get("thumbnail")),
             truncated,
+            editable_entries: editable.then_some(entries),
         },
         tracks,
     })
@@ -241,6 +267,24 @@ mod tests {
         assert_eq!(continuation(&contents).as_deref(), Some("next"));
         let json = json!({"onResponseReceivedActions":[{"appendContinuationItemsAction":{"continuationItems":contents}}]});
         assert_eq!(tracks(track_contents(&json).unwrap()).len(), 2);
+    }
+
+    #[test]
+    fn editable_playlist_keeps_distinct_entry_ids_for_duplicate_songs() {
+        let mut first = row("same");
+        first["musicResponsiveListItemRenderer"]["playlistItemData"]["playlistSetVideoId"] = json!("first");
+        let mut second = row("same");
+        second["musicResponsiveListItemRenderer"]["menu"]["menuRenderer"]["items"] = json!([
+            {"menuServiceItemRenderer":{"serviceEndpoint":{"playlistEditEndpoint":{"actions":[
+                {"action":"ACTION_REMOVE_VIDEO","removedVideoId":"same","setVideoId":"second"}
+            ]}}}}
+        ]);
+        let page = parse(&json!({
+            "musicEditablePlaylistDetailHeaderRenderer": {},
+            "musicPlaylistShelfRenderer": {"contents":[first, second]}
+        }), "Playlist").unwrap();
+        assert_eq!(page.tracks.len(), 2);
+        assert_eq!(page.details.editable_entries, Some(vec![Some("first".into()), Some("second".into())]));
     }
 
     #[test]

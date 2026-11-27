@@ -78,6 +78,7 @@ impl App {
             Response::Rating { request_id, video_id, changed, result } => self.apply_rating(request_id, &video_id, changed, result),
             Response::Playlists { request_id, choices } => self.apply_playlists(request_id, choices),
             Response::PlaylistSaved { request_id, result } => self.apply_playlist_saved(request_id, result),
+            Response::PlaylistChanged { request_id, result } => self.apply_playlist_change(request_id, result),
             Response::Results { tracks, .. } => {
                 let tracks = match tracks {
                     Ok(tracks) => tracks,
@@ -130,15 +131,16 @@ impl App {
                     }
                 };
                 let tracks = page.tracks;
+                let actual_title = page.details.title.clone();
                 self.collection = Some(page.details);
                 self.collection_error = None;
                 if self.view == View::Tracks {
                     self.status.clear();
                 }
                 self.results = tracks;
-                self.selected = 0;
-                self.offset = 0;
-                self.browsing = Some(title);
+                self.selected = self.selected.min(self.results.len().saturating_sub(1));
+                self.offset = self.offset.min(self.selected);
+                self.browsing = Some(if actual_title.is_empty() { title } else { actual_title });
                 self.browsing_endpoint = Some(endpoint);
                 self.prefetch.selection_changed(Instant::now());
             }

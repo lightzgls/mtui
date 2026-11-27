@@ -36,7 +36,7 @@ pub struct PlaylistPicker {
 }
 
 impl App {
-    fn next_account_request(&mut self) -> u64 {
+    pub(super) fn next_account_request(&mut self) -> u64 {
         self.account_request = self.account_request.wrapping_add(1);
         self.account_request
     }
@@ -311,7 +311,7 @@ impl App {
             now.like_pending = false;
             now.liked = None;
         }
-        if matches!(self.overlay, Overlay::SavePlaylist(_)) {
+        if matches!(self.overlay, Overlay::SavePlaylist(_) | Overlay::EditPlaylist(_)) {
             self.overlay = Overlay::None;
         }
     }
@@ -382,6 +382,10 @@ impl App {
     }
 
     pub(in crate::app) fn handle_player_dialog_mouse(&mut self, action: MouseAction) -> bool {
+        if matches!(self.overlay, Overlay::EditPlaylist(_)) {
+            self.playlist_editor_mouse(action);
+            return true;
+        }
         if !matches!(
             self.overlay,
             Overlay::Share { .. } | Overlay::SavePlaylist(_)
@@ -392,6 +396,7 @@ impl App {
             MouseAction::ClosePlayerDialog => self.overlay = Overlay::None,
             MouseAction::CopyShareLink => self.copy_share_link(),
             MouseAction::ChoosePlaylist(index) => self.choose_playlist(index),
+            MouseAction::NewPlaylistForSong => self.new_playlist_for_song(),
             MouseAction::RetryPlaylists => self.reload_playlists(),
             _ => {}
         }
@@ -433,6 +438,7 @@ impl App {
                 self.choose_playlist(index);
             }
             KeyCode::Char('r') => self.reload_playlists(),
+            KeyCode::Char('N') => self.new_playlist_for_song(),
             _ => {}
         }
         true

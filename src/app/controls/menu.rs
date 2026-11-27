@@ -138,6 +138,11 @@ pub(in crate::app) enum MenuAction {
     SortLibrary,
     MoreLibrary,
     RefreshLibrary,
+    NewPlaylist,
+    RenamePlaylist,
+    RemovePlaylistEntry,
+    MovePlaylistEntryUp,
+    MovePlaylistEntryDown,
     BeginSearch,
     OpenPlayer,
     OpenAccount,
@@ -439,6 +444,14 @@ impl App {
                         None,
                         MenuAction::OpenArtist,
                     ));
+                }
+                if self.can_rename_playlist() {
+                    items.extend([
+                        MenuItem::action("Rename playlist", None, true, Some("Playlist"), MenuAction::RenamePlaylist),
+                        MenuItem::action("Remove selected track", None, self.can_remove_playlist_entry(), None, MenuAction::RemovePlaylistEntry),
+                        MenuItem::action("Move selected track up", None, self.can_move_playlist_entry(false), None, MenuAction::MovePlaylistEntryUp),
+                        MenuItem::action("Move selected track down", None, self.can_move_playlist_entry(true), None, MenuAction::MovePlaylistEntryDown),
+                    ]);
                 }
                 items
             }
@@ -790,6 +803,11 @@ impl App {
             MenuAction::SortLibrary => self.cycle_library_sort(),
             MenuAction::MoreLibrary => self.request_library(true),
             MenuAction::RefreshLibrary => self.refresh_library(),
+            MenuAction::NewPlaylist => self.new_playlist(None),
+            MenuAction::RenamePlaylist => self.rename_playlist(),
+            MenuAction::RemovePlaylistEntry => self.remove_playlist_entry(),
+            MenuAction::MovePlaylistEntryUp => self.move_playlist_entry(false),
+            MenuAction::MovePlaylistEntryDown => self.move_playlist_entry(true),
             MenuAction::BeginSearch => self.begin_search(),
             MenuAction::OpenPlayer => self.open_player(),
             MenuAction::OpenAccount => self.open_menu(MenuPage::Account),

@@ -47,6 +47,7 @@ impl App {
         }
         if self.session_pending()
             || matches!(&self.overlay, Overlay::SavePlaylist(picker) if picker.loading || picker.saving)
+            || matches!(&self.overlay, Overlay::EditPlaylist(editor) if editor.request_id.is_some())
             || self.pending_save.is_some()
             || self.now.as_ref().is_some_and(|now| now.like_pending)
             || !self.session.renewal.take_due()

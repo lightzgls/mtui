@@ -367,6 +367,7 @@ fn collection_header(
     for (label, key, action, enabled) in [
         (" Play ", "a", MouseAction::PlayCollection, ready),
         (" Shuffle ", "z", MouseAction::ShuffleCollection, ready),
+        (" Edit ", ".", MouseAction::OpenPageActions, !page.busy && page.error.is_none()),
         (
             if page.error.is_some() {
                 " Retry "
@@ -377,6 +378,7 @@ fn collection_header(
             !page.busy,
         ),
     ] {
+        if action == MouseAction::OpenPageActions && details.editable_entries.is_none() { continue; }
         if display_width(label) > usize::from(text.right().saturating_sub(x)) { break; }
         let label = mouse.hinted_label(label, Some(key), text.right().saturating_sub(x));
         let width = label.width() as u16;
