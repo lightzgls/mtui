@@ -37,20 +37,12 @@ use stream_download::source::DecodeError;
 /// is the number that decides time-to-first-sound.
 const CHUNK_BYTES: u64 = 256 * 1024;
 
-/// How long a chunk request may take to connect, and to finish altogether.
-///
-/// Every other client in this program sets these; this one did not, and it is
-/// the one that matters most. The decoder reads from the ring buffer on the
-/// audio callback thread, so a connect that hangs does not fail slowly -- it
-/// stops the sound and holds the thread that produces it.
-///
-/// Generous against what these requests really cost: a ranged 256 KB chunk
-/// arrives at ~6 MB/s, so about forty milliseconds. One that has taken ten
-/// seconds is not slow, it is gone. `timeout` rather than `read_timeout`
-/// because it bounds the whole request -- a body trickling in just fast enough
-/// to reset a per-read timer would otherwise never trip either.
+/// Bound the connection handshake separately from reads. A 256 KiB range can
+/// take more than ten seconds on a link fast enough to play the audio, so
+/// allow each successful read to reset the timer. The downloader also bounds
+/// how long it waits for a complete range before reconnecting.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Attempts at one chunk before its offset is reported as a failure.
 ///
@@ -454,14 +446,13 @@ impl ChunkedClient {
 /// Timeouts are not optional here, whatever they are elsewhere. The decoder
 /// reads this buffer from the audio callback thread, so a socket that hangs
 /// does not degrade playback, it holds the thread playback comes out of. The
-/// values are generous against the ~6 MB/s these requests really run at:
-/// anything slower than this has already failed, it just has not said so.
+/// inactivity deadline lets the client retry when the connection stalls.
 fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .pool_max_idle_per_host(2)
         .pool_idle_timeout(Duration::from_secs(30))
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
         .build()
         // Only fails if the TLS backend cannot be initialised, and by this
         // point several other clients in the process have already built one.
@@ -1164,6 +1155,41 @@ mod tests {
             assert_eq!(requests.len(), 2);
             assert!(requests.iter().all(|request|request.contains("bytes=3-5")), "unexpected loopback requests: {requests:?}");
         }
+    }
+
+    #[test]
+    fn a_slow_range_can_take_longer_than_the_read_timeout() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/audio", listener.local_addr().unwrap()).parse().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = BufReader::new(&socket);
+            loop {
+                let mut line = String::new();
+                assert!(request.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6\r\nContent-Length: 3\r\nConnection: close\r\n\r\nD").unwrap();
+            for byte in [b"E", b"F"] {
+                thread::sleep(READ_TIMEOUT * 3 / 5);
+                socket.write_all(byte).unwrap();
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = runtime.block_on(fetch_chunk(&build_client(), &url, 3, 5));
+        match result {
+            Chunk::Data(bytes) => assert_eq!(bytes, b"DEF".as_slice()),
+            Chunk::Failed { error, status } => panic!("slow range failed: {error:?}, {status:?}"),
+            Chunk::End => panic!("slow range ended without audio"),
+        }
+        server.join().unwrap();
     }
 
     #[test]

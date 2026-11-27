@@ -56,12 +56,10 @@ const PREFETCH_BYTES: u64 = 32 * 1024;
 
 /// How long `stream-download` waits on a chunk before reconnecting itself.
 ///
-/// Raised from the crate's 5 s default so that it sits *outside* the chunked
-/// client's own timeouts rather than inside them. A chunk is delivered as one
-/// `bytes()` await, so with the default a chunk still legitimately arriving --
-/// or one being retried after a transient fault -- was cut off from above and
-/// reconnected underneath, re-requesting bytes that were already on their way.
-/// The client below now owns that decision; this only has to be slower than it.
+/// Later ranges are delivered only after the entire body has been checked.
+/// Leave enough time for a range to arrive on a slow connection, or for the
+/// HTTP client to retry after a stall. This still bounds how long the decoder
+/// can wait for a range that is arriving too slowly to use.
 const RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A network audio stream presented as `Read + Seek`, ready for a decoder.
