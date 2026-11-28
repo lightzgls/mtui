@@ -132,8 +132,8 @@ impl Cover {
     #[cfg(windows)]
     pub fn rgba(&self) -> Vec<u8> {
         let mut rgba = Vec::with_capacity((self.width * self.height * 4) as usize);
-        for pixel in self.rgb.chunks_exact(3) {
-            rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+        for &[red, green, blue] in self.rgb.as_chunks::<3>().0 {
+            rgba.extend_from_slice(&[red, green, blue, 255]);
         }
         rgba
     }
