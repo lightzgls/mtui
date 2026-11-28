@@ -25,6 +25,8 @@ pub struct MediaInfo {
     pub id: String,
     pub title: String,
     pub artist: String,
+    #[cfg(windows)]
+    pub artwork: Option<MediaArtwork>,
     pub state: crate::player::PlayState,
     pub position: Duration,
     pub duration: Option<Duration>,
@@ -32,6 +34,27 @@ pub struct MediaInfo {
     pub can_previous: bool,
     pub can_seek: bool,
     pub volume: f32,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct MediaArtwork(pub crate::source::cover::Cover);
+
+#[cfg(windows)]
+impl PartialEq for MediaArtwork {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.shares_pixels(&other.0)
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for MediaArtwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaArtwork")
+            .field("width", &self.0.width)
+            .field("height", &self.0.height)
+            .finish()
+    }
 }
 
 #[cfg(windows)]

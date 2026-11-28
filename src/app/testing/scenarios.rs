@@ -1068,6 +1068,17 @@ fn system_media_controls_publish_track_and_use_the_existing_queue_and_seek_paths
     assert_eq!(info.duration, Some(Duration::from_secs(240)));
     assert_eq!(info.position, Duration::from_secs(30));
     assert!(info.can_next && info.can_seek && !info.can_previous);
+    #[cfg(windows)]
+    {
+        assert!(info.artwork.is_none());
+        app.request_cover(info.id.clone(), None);
+        let edge = app.cover_edge();
+        app.apply(Response::Cover {
+            id: info.id.clone(), art: Some(Cover::solid(32, 32)), artwork_url: None, edge,
+        });
+        assert!(app.media_info().artwork.is_some(), "publish art arriving after the title");
+        assert_eq!(app.media_info().artwork, app.media_info().artwork, "retain the artwork across ticks");
+    }
     driver.commands.try_iter().for_each(drop);
     app.handle_media(MediaCommand::Pause);
     app.handle_media(MediaCommand::Pause);
@@ -1081,6 +1092,8 @@ fn system_media_controls_publish_track_and_use_the_existing_queue_and_seek_paths
     app.handle_media(MediaCommand::Next);
     assert_eq!(app.now.as_ref().unwrap().video_id, "song-1");
     assert!(!app.media_info().can_seek);
+    #[cfg(windows)]
+    assert!(app.media_info().artwork.is_none(), "the next title must not inherit the previous cover");
     app.handle_media(MediaCommand::Previous);
     assert_eq!(app.now.as_ref().unwrap().video_id, "song-0");
     app.stop();

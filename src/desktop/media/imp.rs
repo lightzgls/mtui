@@ -5,11 +5,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use windows::core::{HSTRING, factory, w};
 use windows::Foundation::{TimeSpan, TypedEventHandler};
+use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapEncoder, BitmapPixelFormat};
 use windows::Media::{
     MediaPlaybackStatus, MediaPlaybackType, PlaybackPositionChangeRequestedEventArgs,
     SystemMediaTransportControls, SystemMediaTransportControlsButton,
     SystemMediaTransportControlsButtonPressedEventArgs, SystemMediaTransportControlsTimelineProperties,
 };
+use windows::Storage::Streams::{InMemoryRandomAccessStream, RandomAccessStreamReference};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::WinRT::{
@@ -22,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WNDCLASSW,
 };
 
-use super::{MediaCommand, MediaInfo};
+use super::{MediaArtwork, MediaCommand, MediaInfo};
 
 const WM_PUBLISH: u32 = WM_APP + 1;
 
@@ -144,7 +146,9 @@ impl Controls {
             crate::player::PlayState::Idle => MediaPlaybackStatus::Stopped,
         };
         self.smtc.SetPlaybackStatus(status)?;
-        if previous.is_none_or(|old| old.id != info.id || old.title != info.title || old.artist != info.artist) {
+        if previous.is_none_or(|old| {
+            old.id != info.id || old.title != info.title || old.artist != info.artist || old.artwork != info.artwork
+        }) {
             let display = self.smtc.DisplayUpdater()?;
             display.ClearAll()?;
             if active {
@@ -153,6 +157,11 @@ impl Controls {
                 let music = display.MusicProperties()?;
                 music.SetTitle(&HSTRING::from(&info.title))?;
                 music.SetArtist(&HSTRING::from(&info.artist))?;
+                if let Some(artwork) = &info.artwork
+                    && let Err(error) = thumbnail(artwork).and_then(|image| display.SetThumbnail(&image))
+                {
+                    crate::runtime::diagnostics::error("media", &format!("could not publish artwork: {error}"));
+                }
             }
             display.Update()?;
         }
@@ -167,6 +176,20 @@ impl Controls {
         self.smtc.UpdateTimelineProperties(&timeline)?;
         Ok(())
     }
+}
+
+fn thumbnail(artwork: &MediaArtwork) -> windows::core::Result<RandomAccessStreamReference> {
+    let mut cover = artwork.0.clone();
+    cover.shrink(544);
+    let stream = InMemoryRandomAccessStream::new()?;
+    let encoder = BitmapEncoder::CreateAsync(BitmapEncoder::PngEncoderId()?, &stream)?.join()?;
+    encoder.SetPixelData(
+        BitmapPixelFormat::Rgba8, BitmapAlphaMode::Ignore, cover.width, cover.height, 96.0, 96.0,
+        &cover.rgba(),
+    )?;
+    encoder.FlushAsync()?.join()?;
+    stream.Seek(0)?;
+    RandomAccessStreamReference::CreateFromStream(&stream)
 }
 
 impl Drop for Controls {
@@ -261,6 +284,17 @@ mod tests {
         let music = controls.smtc.DisplayUpdater().unwrap().MusicProperties().unwrap();
         assert_eq!(music.Title().unwrap(), "Native test track");
         assert_eq!(music.Artist().unwrap(), "MTUI test artist");
+        let previous = info.clone();
+        info.artwork = Some(MediaArtwork(crate::source::cover::Cover::from_rgb(3, 2, [216, 72, 39].repeat(6))));
+        controls.publish(&info, Some(&previous)).unwrap();
+        let display = controls.smtc.DisplayUpdater().unwrap();
+        let stream = display.Thumbnail().unwrap().OpenReadAsync().unwrap().join().unwrap();
+        let image = windows::Graphics::Imaging::BitmapDecoder::CreateAsync(&stream).unwrap().join().unwrap();
+        assert_eq!((image.PixelWidth().unwrap(), image.PixelHeight().unwrap()), (3, 2));
+        let previous = info.clone();
+        info.artwork = None;
+        controls.publish(&info, Some(&previous)).unwrap();
+        assert!(display.Thumbnail().is_err(), "clearing artwork must clear the native thumbnail");
         info.state = crate::player::PlayState::Paused;
         controls.publish(&info, None).unwrap();
         assert_eq!(controls.smtc.PlaybackStatus().unwrap(), MediaPlaybackStatus::Paused);

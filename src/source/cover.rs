@@ -19,6 +19,7 @@
 //! The Music watch response names the current track's square sleeve. When it
 //! is missing or cannot be loaded, the video thumbnail supplies a fallback.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -88,7 +89,7 @@ pub struct Cover {
     /// The colour the picture reads as, for the border and title drawn around
     /// it. See [`accent_of`].
     pub accent: (u8, u8, u8),
-    rgb: Vec<u8>,
+    rgb: Arc<Vec<u8>>,
 }
 
 impl Cover {
@@ -98,7 +99,7 @@ impl Cover {
         if longest <= edge { return; }
         let width = (self.width * edge / longest).max(1);
         let height = (self.height * edge / longest).max(1);
-        self.rgb = self.resample(width, height);
+        self.rgb = Arc::new(self.resample(width, height));
         self.width = width;
         self.height = height;
     }
@@ -110,7 +111,7 @@ impl Cover {
             accent: accent_of(&rgb),
             width,
             height,
-            rgb,
+            rgb: Arc::new(rgb),
         }
     }
 
@@ -121,6 +122,20 @@ impl Cover {
         let y = y.min(self.height - 1);
         let i = ((y * self.width + x) * 3) as usize;
         (self.rgb[i], self.rgb[i + 1], self.rgb[i + 2])
+    }
+
+    #[cfg(windows)]
+    pub fn shares_pixels(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.rgb, &other.rgb)
+    }
+
+    #[cfg(windows)]
+    pub fn rgba(&self) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((self.width * self.height * 4) as usize);
+        for pixel in self.rgb.chunks_exact(3) {
+            rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+        }
+        rgba
     }
 
     /// Resamples to an exact pixel size for the sixel renderer, which needs the
@@ -813,7 +828,7 @@ mod tests {
         assert_ne!(trim_bars(32, 32, &rgb), (0, 0, 32, 32), "the old trimming must reproduce this case");
         let cover = prepare_cover(32, 32, rgb.clone(), MAX_EDGE);
         assert_eq!((cover.width, cover.height), (32, 32));
-        assert_eq!(cover.rgb, rgb, "keep the complete composition without moving or cropping any pixel");
+        assert_eq!(cover.rgb.as_slice(), rgb, "keep the complete composition without moving or cropping any pixel");
         assert_eq!(cover.pixel(1, 2), (240, 240, 240));
         assert_eq!(cover.pixel(31, 31), (4, 5, 6));
 
@@ -827,7 +842,7 @@ mod tests {
     fn rectangular_video_padding_is_still_removed() {
         let cover = prepare_cover(20, 10, pillarboxed(20, 10, 5), MAX_EDGE);
         assert_eq!((cover.width, cover.height), (10, 10));
-        assert_eq!(cover.rgb, [200, 30, 90].repeat(100));
+        assert_eq!(cover.rgb.as_slice(), [200, 30, 90].repeat(100));
     }
 
     #[test]

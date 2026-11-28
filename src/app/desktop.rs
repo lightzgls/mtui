@@ -164,6 +164,11 @@ impl App {
         let loading = self.playback.is_loading();
         crate::desktop::media::MediaInfo {
             id: now.video_id.clone(), title: now.title.clone(), artist: now.artist.clone(),
+            #[cfg(windows)]
+            artwork: self.cover.as_ref()
+                .filter(|_| self.cover_id.as_deref() == Some(now.video_id.as_str()))
+                .cloned()
+                .map(crate::desktop::media::MediaArtwork),
             state: if loading { PlayState::Buffering } else { snapshot.state },
             position: if loading { Duration::ZERO } else { snapshot.position },
             duration: now.duration,

@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "mtui"
-version = "0.11.10"
+version = "0.11.11"
 default-run = "mtui"
 edition = "2024"
 description = "A terminal music player for YouTube Music, built to stay small in memory"
@@ -121,7 +121,7 @@ libc = "0.2"
 # Native SMTC is attached to MTUI's own persistent window, not its console helper.
 # This version is already used by the Windows audio backend.
 windows = { version = "0.62.2", features = [
-    "Foundation", "Media", "Win32_Foundation", "Win32_Graphics_Gdi",
+    "Foundation", "Graphics_Imaging", "Media", "Storage_Streams", "Win32_Foundation", "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader", "Win32_System_WinRT",
     "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
 ] }

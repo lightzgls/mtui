@@ -77,7 +77,7 @@ less install.sh
 bash install.sh
 ```
 
-Options: `bash install.sh --version 0.11.9` pins a stable release;
+Options: `bash install.sh --version 0.11.11` pins a stable release;
 `--yes` accepts package-manager confirmations, including Arch system updates;
 `--skip-deps` only works when
 all runtime libraries are already available. Other glibc distributions can use
@@ -136,7 +136,7 @@ mtui
 APT installs any missing runtime libraries, including WebKitGTK for sign-in.
 The package also adds a terminal launcher to your desktop's application menu.
 Upgrade by installing the newer `.deb` the same way, then restart MTUI.
-The v0.11.8 package has Debian version `0.11.8-1`, which upgrades earlier
+The v0.11.11 package has Debian version `0.11.11-1`, which upgrades earlier
 MTUI packages.
 Run `mtui-uninstall` to remove the package and all local MTUI data. Using
 `sudo apt remove mtui` alone removes the package while leaving user data.
